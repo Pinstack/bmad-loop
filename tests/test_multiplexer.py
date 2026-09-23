@@ -1110,7 +1110,17 @@ def test_new_session_argv_byte_identical(monkeypatch, tmp_path):
 
     TmuxMultiplexer().new_session("s", tmp_path)
 
-    assert rec.argv == ["tmux", "new-session", "-d", "-s", "s", "-c", str(tmp_path)]
+    assert rec.argv == [
+        "tmux",
+        "new-session",
+        "-d",
+        "-s",
+        "s",
+        "-n",
+        "shell",
+        "-c",
+        str(tmp_path),
+    ]
 
 
 def test_new_window_posix_argv_byte_identical(monkeypatch, tmp_path):

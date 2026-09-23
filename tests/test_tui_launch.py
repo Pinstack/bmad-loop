@@ -107,12 +107,16 @@ def test_start_run_detached_argv(fake_run, tmp_path: Path):
         "-d",
         "-s",
         "bmad-loop-ctl",
+        "-n",
+        "shell",
         "-c",
         str(tmp_path),
         # no `-e` pairs: session env is not part of the released verb, and on
         # tmux this ONE ctl session is shared by every project on the machine,
         # so no single project's value could be right for its window 0 anyway.
     ]
+    # window 0 of the shared ctl session must never list as a run window
+    assert launch._CTL_WINDOW_RE.match(ns[ns.index("-n") + 1]) is None
 
     nw = fake_run.by_verb("new-window")[0]
     assert nw[:2] == ["tmux", "new-window"]

@@ -75,6 +75,13 @@ class BaseTmuxBackend(TerminalMultiplexer):
     #: tuple; psmux deliberately does not (its own wordings are covered — see
     #: the note in :mod:`.psmux_backend`).
     _SESSION_GONE_STDERR: tuple[str, ...] = ("no server running", "can't find session")
+    #: ``-n`` name of every session's window 0, so no window bmad-loop creates is
+    #: left for the multiplexer to name (psmux auto-renames unnamed windows to
+    #: their foreground process). One literal for both ``new_session`` argvs.
+    #: It must never be run-shaped (``run-``/``sweep-``/``resume-``/``resolve-``,
+    #: ``tui.launch._CTL_WINDOW_RE``), or window 0 of the shared ctl session
+    #: would list as a run window.
+    _INITIAL_WINDOW_NAME = "shell"
     #: Diagnostic from the last :meth:`version` probe (see
     #: :meth:`TerminalMultiplexer.version_error`). A class-level default so an
     #: instance that never probed answers None instead of AttributeError.
@@ -249,11 +256,22 @@ class BaseTmuxBackend(TerminalMultiplexer):
     def new_session(
         self, name: str, cwd: Path, cols: int | None = None, lines: int | None = None
     ) -> None:
-        # Window 0 is a plain shell so the session survives task windows closing.
+        # Window 0 is a plain shell so the session survives task windows closing,
+        # named like every other window bmad-loop creates (see _INITIAL_WINDOW_NAME).
         # Geometry is pinned only when both dimensions are given (detached agent
         # sessions); the control session omits it and takes tmux's default size.
         geometry = ["-x", str(cols), "-y", str(lines)] if cols and lines else []
-        self._tmux("new-session", "-d", "-s", name, "-c", str(cwd), *geometry)
+        self._tmux(
+            "new-session",
+            "-d",
+            "-s",
+            name,
+            "-n",
+            self._INITIAL_WINDOW_NAME,
+            "-c",
+            str(cwd),
+            *geometry,
+        )
 
     def set_session_option(self, name: str, option: str, value: str) -> None:
         # set-option has no '=' exact-match form; callers pass a unique full

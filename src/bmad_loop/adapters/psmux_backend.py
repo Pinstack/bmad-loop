@@ -503,7 +503,17 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         geometry = ["-x", str(cols), "-y", str(lines)] if cols and lines else []
         try:
             proc = self._run(
-                ["new-session", "-d", "-s", name, "-c", str(cwd), *geometry],
+                [
+                    "new-session",
+                    "-d",
+                    "-s",
+                    name,
+                    "-n",
+                    self._INITIAL_WINDOW_NAME,
+                    "-c",
+                    str(cwd),
+                    *geometry,
+                ],
                 check=False,
                 env=env,
             )

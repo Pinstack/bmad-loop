@@ -341,6 +341,8 @@ def test_new_session_bypasses_nesting_guard(rec, monkeypatch, tmp_path):
         "-d",
         "-s",
         "s",
+        "-n",
+        "shell",
         "-c",
         str(tmp_path),
         "-x",
