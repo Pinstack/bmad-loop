@@ -326,6 +326,52 @@ def test_render_prompt_passthrough_and_template():
     assert claude.render_prompt("just do it") == "just do it"
 
 
+_BYPASS = ("--permission-mode", "bypassPermissions")
+
+
+@pytest.mark.parametrize(
+    ("launch_args", "bypass_args", "extra_args", "missing"),
+    [
+        # inherit: None means the profile's bypass_args are used as-is
+        ((), _BYPASS, None, ()),
+        # kept: every bypass token present in the override
+        ((), _BYPASS, ("--permission-mode", "bypassPermissions", "--verbose"), ()),
+        # partially kept
+        ((), _BYPASS, ("--permission-mode", "acceptEdits"), ("bypassPermissions",)),
+        # dropped
+        ((), _BYPASS, ("--verbose",), _BYPASS),
+        # explicit empty override drops them all
+        ((), _BYPASS, (), _BYPASS),
+        # a token already in launch_args is in the resolved argv
+        (("--yolo",), ("--yolo",), ("--verbose",), ()),
+        # a profile without bypass flags has nothing to drop
+        ((), (), ("--verbose",), ()),
+        # order kept, duplicates collapsed
+        ((), ("-b", "-a", "-b"), (), ("-b", "-a")),
+    ],
+)
+def test_missing_bypass_tokens(launch_args, bypass_args, extra_args, missing):
+    """DW-349: extra_args REPLACES bypass_args, so the helper names the bypass
+    tokens absent from `launch_args + extra_args` — only for an explicit override."""
+    prof = CLIProfile(
+        name="x",
+        binary="x",
+        hooks=HookSpec("none", "", {}),
+        launch_args=launch_args,
+        bypass_args=bypass_args,
+    )
+    assert prof.missing_bypass_tokens(extra_args) == missing
+
+
+def test_missing_bypass_tokens_on_the_shipped_claude_profile():
+    claude = get_profile("claude")
+    assert claude.missing_bypass_tokens(("--verbose",)) == (
+        "--permission-mode",
+        "bypassPermissions",
+    )
+    assert claude.missing_bypass_tokens(None) == ()
+
+
 def test_user_profile_overlay(tmp_path):
     profiles_dir = tmp_path / ".bmad-loop" / "profiles"
     profiles_dir.mkdir(parents=True)

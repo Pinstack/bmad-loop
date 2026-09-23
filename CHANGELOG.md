@@ -19,6 +19,9 @@ breaking changes may land in a minor release.
   when the age crosses `limits.dev_stall_grace_s` and one `session-active` when the
   transcript moves again; `0` disables the pair. The TUI agent line shows the open
   stretch as `· idle <age>`. Observability only: nothing bounds the stretch.
+- Warn when `adapter.extra_args` drops the profile's `bypass_args` (e.g. claude's
+  `--permission-mode bypassPermissions`): `validate` reports `policy.bypass-dropped` and
+  `--dry-run` prints a stderr `warning:` per affected role; replace semantics unchanged (DW-349).
 - Expose a read-only `ctx.delivery_id` (declarative: `BMAD_LOOP_DELIVERY_ID`) on
   `post_migrate`, which may repeat per completion — deduplicate on it (DW-317).
 

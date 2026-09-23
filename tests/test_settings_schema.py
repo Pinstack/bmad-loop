@@ -127,6 +127,17 @@ def test_defaults_match_referenced_dataclass():
             assert f.default == getattr(dc, f.key), f"{f.section}.{f.key}"
 
 
+def test_extra_args_fields_explain_the_bypass_replace_rule():
+    """DW-349: `extra_args` REPLACES the profile's `bypass_args`, so every
+    `extra_args` field (the base table and each stage) says so on the settings
+    screen; the stage entry also names the client-match inheritance."""
+    fields = {f.section: f for f in core_fields() if f.key == "extra_args"}
+    assert set(fields) == {"adapter", "adapter.dev", "adapter.review", "adapter.triage"}
+    for section, f in fields.items():
+        assert "replaces" in f.description and "bypass_args" in f.description, section
+    assert "only when the client matches" in fields["adapter.dev"].description
+
+
 def test_select_options_match_enum_sets():
     for f in core_fields():
         if f.kind == "select" and (f.section, f.key) in OPTIONS_ENUM:

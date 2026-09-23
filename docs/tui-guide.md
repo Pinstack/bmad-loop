@@ -730,7 +730,9 @@ coupling is validated on save, so an invalid combo (e.g. `per_worktree` with
 `extra_args` fields are special: the switch distinguishes "use the profile's
 default flags" (off — the key stays absent) from "replace them with exactly
 this list" (on — the input is parsed shell-style; an empty list is a valid
-override and is not the same as unset).
+override and is not the same as unset). Because an override replaces the
+profile's `bypass_args`, it must repeat the permission-bypass flags;
+`bmad-loop validate` warns (`policy.bypass-dropped`) when it does not.
 
 `ctrl+s` validates the whole document through the engine's own parser
 (`policy.loads()`) before writing; errors land in a red strip above the

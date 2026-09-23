@@ -211,6 +211,20 @@ class CLIProfile:
             skill, args = head, rest.strip()
         return self.prompt_template.format(prompt=prompt, skill=skill, args=args)
 
+    def missing_bypass_tokens(self, extra_args: tuple[str, ...] | None) -> tuple[str, ...]:
+        """The ``bypass_args`` tokens a policy ``extra_args`` override drops (DW-349).
+
+        The replace rule (``GenericAdapter.interactive_argv``): a non-None
+        ``extra_args`` REPLACES ``bypass_args`` rather than extending it, so any
+        bypass token that is not an exact element of ``launch_args + extra_args``
+        is absent from the launched argv. ``None`` means "inherit the profile's
+        bypass flags" and drops nothing; ``()`` is an explicit override and drops
+        them all. Order kept, duplicates collapsed."""
+        if extra_args is None:
+            return ()
+        present = {*self.launch_args, *extra_args}
+        return tuple(t for t in dict.fromkeys(self.bypass_args) if t not in present)
+
 
 def _validate_profile(profile: CLIProfile, source: str) -> None:
     """Enforce every value-level invariant a ``CLIProfile`` must satisfy, whatever

@@ -241,6 +241,7 @@ description = "reasoning effort, free-form (provider/model-specific, e.g. high, 
 [[section.field]]
 key = "extra_args"
 kind = "args"
+description = "when set, replaces the CLI profile's permission-bypass flags (its bypass_args), so repeat them (e.g. claude: --permission-mode bypassPermissions) or unattended sessions may stall on permission prompts"
 [[section.field]]
 key = "cleanup_session_on_finish"
 kind = "switch"
@@ -281,6 +282,7 @@ placeholder = "inherit / provider default"
 [[section.field]]
 key = "extra_args"
 kind = "args"
+description = "inherits from [adapter] only when the client matches (a stage that switches client falls back to that client's bypass flags); when set, replaces the CLI profile's permission-bypass flags (its bypass_args), so repeat them (e.g. claude: --permission-mode bypassPermissions)"
 [[section.field]]
 key = "usage_grace_s"
 kind = "float"

@@ -48,6 +48,7 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "policy",
         "policy.model-qualified",
         "policy.effort-unsupported",
+        "policy.bypass-dropped",
         "policy.isolation-repo-root",
         "adapter.profile",
         "adapter.binary",

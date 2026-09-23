@@ -958,6 +958,17 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     f"only the opencode-http adapter carries a reasoning-effort value",
                     {"role": role, "effort": cfg.effort, "profile": prof.name},
                 )
+            # DW-349: an explicit extra_args REPLACES the profile's bypass_args, so
+            # an override that forgets them launches a session that stalls on a
+            # permission prompt. GENERIC-only for the reason above: it is the one
+            # bundled kind whose argv consumes bypass_args. Advisory, like the
+            # effort check — the run is still runnable, just likely to stall.
+            if prof is not None and (missing := _bypass_drops(cfg, prof)):
+                report.warn(
+                    "policy.bypass-dropped",
+                    _bypass_dropped_message(role, prof, missing),
+                    {"role": role, "profile": prof.name, "missing": list(missing)},
+                )
 
     base_findings = install.missing_base_skills(project, dev_trees)
     # gated on PROBLEMS, not on any finding: an advisory review layer (a `when`
@@ -1277,6 +1288,56 @@ def _unknown_adapter_kinds(project: Path, pol) -> list[str]:
                 f"(install the plugin that provides it, or fix the profile's `adapter`)"
             )
     return problems
+
+
+def _bypass_drops(cfg, profile: CLIProfile) -> tuple[str, ...]:
+    """The bypass tokens ``cfg.extra_args`` drops from ``profile``'s argv (DW-349).
+
+    The one home of the predicate `validate` and every dry-run share: scoped to
+    the bundled GENERIC kind — the only one whose argv consumes ``bypass_args``
+    (an out-of-tree kind's consumption is unknowable, so it stays silent) — and
+    delegating the replace rule to ``CLIProfile.missing_bypass_tokens``."""
+    from .adapters import registry as adapter_registry
+
+    if profile.adapter != adapter_registry.GENERIC:
+        return ()
+    return profile.missing_bypass_tokens(cfg.extra_args)
+
+
+def _bypass_dropped_message(role: str, profile: CLIProfile, missing: tuple[str, ...]) -> str:
+    """One wording for the DW-349 warning, shared by `validate` and every dry-run.
+
+    Names the dropped tokens AND the full bypass sequence to include: on a
+    partial drop (e.g. ``--permission-mode acceptEdits``) adding only the missing
+    token would leave a still-broken argv."""
+    return (
+        f"{role} adapter.extra_args replaces {profile.name}'s bypass_args and drops "
+        f"{' '.join(missing)} — unattended sessions may stall on permission prompts; "
+        f"include `{' '.join(profile.bypass_args)}` in extra_args to keep the bypass"
+    )
+
+
+def _warn_bypass_dropped(pol, project: Path, roles: tuple[str, ...]) -> None:
+    """Dry-run stderr twin of validate's ``policy.bypass-dropped`` finding (DW-349).
+
+    Prints one ``warning:`` line to stderr for each of ``roles`` (the roles the
+    calling run type launches) whose resolved ``extra_args`` drops profile bypass
+    tokens, before the schedule is printed. A profile that will not parse is
+    skipped silently: the renderer raises the ``ProfileError`` itself. stderr
+    only, rc unchanged — stdout stays the preview."""
+    from .adapters.profile import ProfileError, get_profile
+
+    for role in roles:
+        cfg = pol.adapter.resolved(role)
+        try:
+            profile = get_profile(cfg.name, project)
+        except ProfileError:
+            continue
+        if missing := _bypass_drops(cfg, profile):
+            print(
+                f"warning: {_bypass_dropped_message(role, profile, missing)}",
+                file=sys.stderr,
+            )
 
 
 def _warn_preflight_would_abort(
@@ -2278,6 +2339,7 @@ def _dry_run(
         return _dry_run_stories(paths, pol, args, spec_folder)
 
     _warn_preflight_would_abort(paths, pol)
+    _warn_bypass_dropped(pol, paths.project, ("dev", "review"))
 
     def render(role: str, prompt: str) -> str:
         return _render_invocation(pol, paths.project, role, prompt)
@@ -2324,6 +2386,7 @@ def _dry_run_stories(
     """Print the linear stories-mode schedule (list order, checkpoints, live
     on-disk state) — no topo waves, one story per line, spawns nothing."""
     _warn_preflight_would_abort(paths, pol, require_stories=True)
+    _warn_bypass_dropped(pol, paths.project, ("dev", "review"))
     folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
     # The real dispatch always uses the project-relative folder (the engine
     # relativizes it); render the identical string here so dry-run and run agree —
@@ -2854,6 +2917,9 @@ def _sweep_dry_run(
             for dw_id, entry in projected_missing_severity:
                 print(f"  {dw_id:8s} {entry.title}  [pre-migration projection]")
     if selection.selected or projected_selected:
+        # Before the projected-legacy early return below: a sweep launches triage
+        # and then dev + review for its bundles, whichever preview branch prints.
+        _warn_bypass_dropped(pol, paths.project, ("triage", "dev", "review"))
         print("a sweep would triage the open entries in one LLM session, then run bundles")
         if projected_selected and (only_ids is not None or min_severity is not None):
             print(

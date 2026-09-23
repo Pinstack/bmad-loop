@@ -9867,6 +9867,316 @@ def test_validate_effort_silent_when_unset(project, capsys):
     assert not any(f["check"] == "policy.effort-unsupported" for f in doc["findings"])
 
 
+def _bypass_findings(project, capsys, policy: str) -> list[dict]:
+    install_bmad_config(project)
+    _write_policy(project.project, policy)
+    write_sprint(project, {"epic-1": "backlog"})
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    return [f for f in doc["findings"] if f["check"] == "policy.bypass-dropped"]
+
+
+def test_validate_warns_when_extra_args_drops_the_bypass_flags(project, capsys):
+    """DW-349: a base `extra_args` REPLACES claude's bypass_args, so every role
+    inheriting it launches without `--permission-mode bypassPermissions` — validate
+    says so per role, advisory, naming the role, profile and dropped tokens."""
+    findings = _bypass_findings(
+        project, capsys, '[adapter]\nname = "claude"\nextra_args = ["--verbose"]\n'
+    )
+    assert sorted(f["detail"]["role"] for f in findings) == ["dev", "review", "triage"]
+    assert {f["severity"] for f in findings} == {"warning"}
+    dev = next(f for f in findings if f["detail"]["role"] == "dev")
+    assert dev["detail"] == {
+        "role": "dev",
+        "profile": "claude",
+        "missing": ["--permission-mode", "bypassPermissions"],
+    }
+    assert (
+        "dev adapter.extra_args replaces claude's bypass_args and drops "
+        "--permission-mode bypassPermissions" in dev["message"]
+    )
+
+
+def test_validate_bypass_warning_names_only_the_partially_dropped_token(project, capsys):
+    findings = _bypass_findings(
+        project,
+        capsys,
+        '[adapter]\nname = "claude"\n[adapter.dev]\nextra_args = ["--permission-mode", "acceptEdits"]\n',
+    )
+    assert [f["detail"]["role"] for f in findings] == ["dev"]
+    assert findings[0]["detail"]["missing"] == ["bypassPermissions"]
+
+
+def test_validate_bypass_warning_on_an_explicit_empty_override(project, capsys):
+    findings = _bypass_findings(
+        project, capsys, '[adapter]\nname = "claude"\n[adapter.review]\nextra_args = []\n'
+    )
+    assert [f["detail"]["role"] for f in findings] == ["review"]
+
+
+def test_validate_bypass_silent_when_the_tokens_are_kept(project, capsys):
+    """An override that carries every bypass token draws no warning.
+
+    ABLATION: make the check ignore `extra_args` content (warn whenever it is not
+    None) and this reddens; the control asserts the override really loaded."""
+    policy = (
+        '[adapter]\nname = "claude"\n'
+        'extra_args = ["--permission-mode", "bypassPermissions", "--verbose"]\n'
+    )
+    assert _bypass_findings(project, capsys, policy) == []
+    loaded = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    assert loaded.adapter.extra_args is not None and "--verbose" in loaded.adapter.extra_args
+
+
+def test_validate_bypass_silent_when_extra_args_unset(project, capsys):
+    """No override → the profile's bypass flags are used → no finding, on the
+    very profile that would warn.
+
+    ABLATION: drop the `extra_args is None` short-circuit in
+    `missing_bypass_tokens` (treat None as `()`) and this reddens."""
+    assert _bypass_findings(project, capsys, CLAUDE_ONLY_POLICY) == []
+
+
+def test_validate_bypass_silent_on_the_opencode_kind(project, capsys):
+    """The opencode-http kind never consumes bypass_args, so an override there drops
+    nothing — even on a profile that (pointlessly) declares some.
+
+    ABLATION: drop the GENERIC-kind predicate in `_bypass_drops` and this
+    reddens; the controls pin that the overlay really carries a bypass token the override
+    lacks, so the silence is the kind predicate and nothing else."""
+    profiles_dir = project.project / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True, exist_ok=True)
+    (profiles_dir / "ocbypass.toml").write_text(
+        'name = "ocbypass"\nbinary = "opencode"\nadapter = "opencode-http"\n'
+        'bypass_args = ["--yes"]\n[hooks]\ndialect = "none"\n',
+        encoding="utf-8",
+    )
+    policy = '[adapter]\nname = "ocbypass"\nmodel = "a/b"\nextra_args = ["--verbose"]\n'
+    assert _bypass_findings(project, capsys, policy) == []
+    from bmad_loop.adapters.profile import get_profile
+
+    prof = get_profile("ocbypass", project.project)
+    assert prof.adapter == "opencode-http"
+    assert prof.missing_bypass_tokens(("--verbose",)) == ("--yes",)
+
+
+def test_validate_bypass_warning_does_not_change_the_exit_code(project, capsys, monkeypatch):
+    """Advisory: an otherwise-clean project whose extra_args drops the bypass still
+    exits 0 with `ok` true."""
+    _make_validate_pass(
+        project, monkeypatch, capsys, policy=CLAUDE_ONLY_POLICY + 'extra_args = ["--verbose"]\n'
+    )
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    assert doc["ok"] is True
+    warned = [f for f in doc["findings"] if f["check"] == "policy.bypass-dropped"]
+    assert sorted(f["detail"]["role"] for f in warned) == ["dev", "review", "triage"]
+
+
+def test_validate_bypass_message_names_the_full_include_sequence(project, capsys):
+    """A partial drop must not advise "add them": adding only `bypassPermissions`
+    after `acceptEdits` still leaves a broken argv, so the message names the whole
+    bypass sequence to include."""
+    findings = _bypass_findings(
+        project,
+        capsys,
+        '[adapter]\nname = "claude"\n[adapter.dev]\nextra_args = ["--permission-mode", "acceptEdits"]\n',
+    )
+    (dev,) = findings
+    assert "drops bypassPermissions" in dev["message"]
+    assert "include `--permission-mode bypassPermissions` in extra_args" in dev["message"]
+
+
+def test_validate_bypass_silent_for_a_stage_that_switches_client(project, capsys):
+    """A stage that switches client inherits no `extra_args` (policy resolves it to
+    None), so it launches with its own client's bypass flags — no dev finding.
+
+    ABLATION: have validate pass the base table (`pol.adapter`) to `_bypass_drops`
+    instead of the resolved role config and this reddens; the control pins that
+    the base override really is live for the roles that keep the base client."""
+    policy = (
+        '[adapter]\nname = "codex"\nextra_args = ["--verbose"]\n[adapter.dev]\nname = "claude"\n'
+    )
+    findings = _bypass_findings(project, capsys, policy)
+    roles = sorted(f["detail"]["role"] for f in findings)
+    assert roles == ["review", "triage"]
+    assert {f["detail"]["profile"] for f in findings} == {"codex"}
+    loaded = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    assert loaded.adapter.resolved("dev").extra_args is None
+    assert loaded.adapter.resolved("review").extra_args == ("--verbose",)
+
+
+def _bypass_err_lines(err: str) -> list[str]:
+    return [ln for ln in err.splitlines() if "bypass_args" in ln]
+
+
+def _cli_dry_run(project, capsys, *extra: str):
+    rc = cli.main(["run", "--project", str(project.project), *extra, "--dry-run"])
+    assert rc == 0
+    return capsys.readouterr()
+
+
+def _sprint_dry_run(project, capsys, policy: str):
+    install_bmad_config(project)
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    _write_policy(project.project, policy)
+    return _cli_dry_run(project, capsys)
+
+
+def test_dry_run_warns_on_stderr_when_extra_args_drops_the_bypass(project, capsys, monkeypatch):
+    """DW-349: `run --dry-run` names the dropped tokens on stderr, once per role a
+    sprint run launches (dev + review), and stdout is exactly what it is with the
+    warning stubbed out — the argv still shows the replace semantics unchanged."""
+    policy = '[adapter]\nname = "claude"\nextra_args = ["--verbose"]\n'
+    warned = _sprint_dry_run(project, capsys, policy)
+    lines = _bypass_err_lines(warned.err)
+    assert len(lines) == 2
+    assert lines[0].startswith("warning: dev adapter.extra_args replaces claude's bypass_args")
+    assert lines[1].startswith("warning: review adapter.extra_args")
+    assert all("drops --permission-mode bypassPermissions" in ln for ln in lines)
+
+    monkeypatch.setattr(cli, "_warn_bypass_dropped", lambda *a, **k: None)
+    baseline = _cli_dry_run(project, capsys)
+    assert _bypass_err_lines(baseline.err) == []
+    assert warned.out == baseline.out
+    dev_line = next(ln for ln in warned.out.splitlines() if "dev:" in ln)
+    assert dev_line.endswith("--verbose") and "bypassPermissions" not in dev_line
+
+
+def test_dry_run_silent_when_extra_args_keeps_the_bypass(project, capsys):
+    """ABLATION: make `_warn_bypass_dropped` warn on any non-None extra_args and
+    this reddens; the dev-line control proves the override was rendered."""
+    policy = (
+        '[adapter]\nname = "claude"\n'
+        'extra_args = ["--permission-mode", "bypassPermissions", "--verbose"]\n'
+    )
+    result = _sprint_dry_run(project, capsys, policy)
+    assert _bypass_err_lines(result.err) == []
+    dev_line = next(ln for ln in result.out.splitlines() if "dev:" in ln)
+    assert dev_line.endswith("--permission-mode bypassPermissions --verbose")
+
+
+def test_dry_run_silent_on_the_opencode_kind(project, capsys):
+    """The opencode-http kind never consumes bypass_args, so the preview stays
+    silent even for a profile that declares some and an override that lacks them.
+
+    ABLATION: drop the GENERIC-kind predicate in `_bypass_drops` and this reddens;
+    the control pins that the profile really would report a missing token."""
+    from bmad_loop.adapters.profile import get_profile
+
+    profiles_dir = project.project / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True, exist_ok=True)
+    (profiles_dir / "ocbypass.toml").write_text(
+        'name = "ocbypass"\nbinary = "opencode"\nadapter = "opencode-http"\n'
+        'bypass_args = ["--yes"]\n[hooks]\ndialect = "none"\n',
+        encoding="utf-8",
+    )
+    policy = '[adapter]\nname = "ocbypass"\nmodel = "a/b"\nextra_args = ["--verbose"]\n'
+    result = _sprint_dry_run(project, capsys, policy)
+    assert _bypass_err_lines(result.err) == []
+    assert get_profile("ocbypass", project.project).missing_bypass_tokens(("--verbose",)) == (
+        "--yes",
+    )
+
+
+def _stories_dry_run(project, capsys, policy: str):
+    install_bmad_config(project)
+    _setup_stories_fixture(project, [_stories_entry("1")])
+    _write_policy(project.project, policy)
+    return _cli_dry_run(project, capsys, "--spec", STORIES_SPEC_FOLDER)
+
+
+def test_stories_dry_run_warns_for_dev_and_review(project, capsys):
+    """A stories run launches dev AND review sessions, so a base override that
+    drops the bypass warns for both."""
+    result = _stories_dry_run(
+        project, capsys, '[adapter]\nname = "claude"\nextra_args = ["--verbose"]\n'
+    )
+    lines = _bypass_err_lines(result.err)
+    assert [ln.split()[1] for ln in lines] == ["dev", "review"]
+    assert "Story id: 1." in result.out
+
+
+def test_stories_dry_run_warns_for_a_review_only_override(project, capsys):
+    """The stories preview renders no review argv, but the run launches review —
+    a review-only override that drops the bypass still warns, and only for review.
+
+    ABLATION: pass `("dev",)` from `_dry_run_stories` and this reddens."""
+    result = _stories_dry_run(
+        project, capsys, '[adapter]\nname = "claude"\n[adapter.review]\nextra_args = []\n'
+    )
+    lines = _bypass_err_lines(result.err)
+    assert len(lines) == 1
+    assert lines[0].startswith("warning: review adapter.extra_args replaces claude's bypass_args")
+
+
+def _sweep_dry_run_cli(project, capsys, policy: str):
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    _write_policy(project.project, policy)
+    rc = cli.main(["sweep", "--dry-run", "--project", str(project.project)])
+    assert rc == 0
+    return capsys.readouterr()
+
+
+def test_sweep_dry_run_warns_for_the_triage_role(project, capsys):
+    result = _sweep_dry_run_cli(
+        project,
+        capsys,
+        '[adapter]\nname = "claude"\n[adapter.triage]\nextra_args = ["--verbose"]\n',
+    )
+    lines = _bypass_err_lines(result.err)
+    assert len(lines) == 1 and lines[0].startswith("warning: triage adapter.extra_args")
+    triage_line = next(ln for ln in result.out.splitlines() if "triage:" in ln)
+    assert triage_line.startswith("  triage: claude ")
+
+
+def test_sweep_dry_run_warns_on_the_projected_legacy_selector_branch(project, capsys):
+    """The projected-legacy `--min-severity` preview returns early after its
+    provisional-ids note, before the triage argv line; the bypass warning still
+    fires there.
+
+    ABLATION: move the `_warn_bypass_dropped` call below that early return and
+    this reddens; the stdout control pins that the early-return branch ran."""
+    from conftest import write_legacy_ledger
+
+    install_bmad_config(project)
+    write_legacy_ledger(
+        project,
+        "# Deferred Work\n\n### D-1: High legacy\n\nseverity: high\nreason: high item\n",
+        commit=False,
+    )
+    _write_policy(
+        project.project,
+        '[adapter]\nname = "claude"\n[adapter.triage]\nextra_args = ["--verbose"]\n',
+    )
+    rc = cli.main(
+        ["sweep", "--min-severity", "high", "--dry-run", "--project", str(project.project)]
+    )
+    assert rc == 0
+    result = capsys.readouterr()
+    assert "triage: projected legacy ids are provisional" in result.out
+    lines = _bypass_err_lines(result.err)
+    assert len(lines) == 1 and lines[0].startswith("warning: triage adapter.extra_args")
+
+
+def test_sweep_dry_run_warns_for_a_bundle_role(project, capsys):
+    """A sweep runs dev + review sessions for its bundles, so a dev-only override
+    that drops the bypass warns although the preview renders only the triage argv.
+
+    ABLATION: pass `("triage",)` from `_sweep_dry_run` and this reddens."""
+    result = _sweep_dry_run_cli(
+        project,
+        capsys,
+        '[adapter]\nname = "claude"\n[adapter.dev]\nextra_args = ["--verbose"]\n',
+    )
+    lines = _bypass_err_lines(result.err)
+    assert len(lines) == 1 and lines[0].startswith("warning: dev adapter.extra_args")
+    triage_line = next(ln for ln in result.out.splitlines() if "triage:" in ln)
+    assert triage_line.startswith("  triage: claude ")
+
+
 def test_validate_stories_mode_skips_sprint_gate(project, capsys):
     """Item 8: a stories-mode project (no sprint-status.yaml) validates its
     stories.yaml manifest instead of failing on the missing sprint gate."""
