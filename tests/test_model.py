@@ -344,6 +344,36 @@ def test_salvage_refile_pending_defaults_false_for_legacy_state():
     assert StoryTask.from_dict(doc).salvage_refile_pending is False
 
 
+def test_migration_delivery_fields_round_trip():
+    """DW-317: the completion identity, latch and replay counts survive state.json."""
+    counts = {"converted": 2, "entries_now": 3, "open_now": 1}
+    task = StoryTask(
+        story_key="sweep-migrate",
+        epic=0,
+        migration_delivery_id="abc123",
+        migration_delivery_pending=True,
+        migration_delivery_counts=counts,
+    )
+    back = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+    assert back.migration_delivery_id == "abc123"
+    assert back.migration_delivery_pending is True
+    assert back.migration_delivery_counts == counts
+
+
+def test_migration_delivery_fields_default_for_pre_upgrade_state():
+    doc = StoryTask(story_key="sweep-migrate", epic=0).to_dict()
+    for key in (
+        "migration_delivery_id",
+        "migration_delivery_pending",
+        "migration_delivery_counts",
+    ):
+        del doc[key]
+    back = StoryTask.from_dict(doc)
+    assert back.migration_delivery_id is None
+    assert back.migration_delivery_pending is False
+    assert back.migration_delivery_counts is None
+
+
 def test_legacy_park_eligible_state_loads_but_is_not_persisted():
     """Retired authorization state is tolerated but cannot influence new runs."""
     doc = StoryTask(story_key="1-1-a", epic=1).to_dict()

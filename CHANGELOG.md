@@ -19,6 +19,8 @@ breaking changes may land in a minor release.
   when the age crosses `limits.dev_stall_grace_s` and one `session-active` when the
   transcript moves again; `0` disables the pair. The TUI agent line shows the open
   stretch as `· idle <age>`. Observability only: nothing bounds the stretch.
+- Expose a read-only `ctx.delivery_id` (declarative: `BMAD_LOOP_DELIVERY_ID`) on
+  `post_migrate`, which may repeat per completion — deduplicate on it (DW-317).
 
 ### Changed
 
@@ -36,6 +38,8 @@ breaking changes may land in a minor release.
 - Re-raise a sweep ledger publish whose `git status` times out, fails to spawn or cannot
   read the index; only a ledger in no repository still degrades to
   `sweep-ledger-commit-unavailable` (DW-336).
+- Replay a sweep migration's `sweep-migrated` row and `post_migrate` on resume after a
+  host death past the durable `DONE` save (DW-317).
 - Never read or unlink a sweep migration recovery record by path on hosts without dir-fd
   anchoring (native Windows): an interrupted migration escalates, and a stale record
   present at a fresh start refuses (DW-315).

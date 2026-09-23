@@ -94,6 +94,7 @@ class HookContext:
         verification_stage: str | None = None,
         verification_sequence: int | None = None,
         decision_action: str | None = None,
+        delivery_id: str | None = None,
         settings: dict[str, Any] | None = None,
         shared: dict[str, Any] | None = None,
         proposed_prompt: str | None = None,
@@ -140,6 +141,7 @@ class HookContext:
         self._verification_stage = verification_stage
         self._verification_sequence = verification_sequence
         self._decision_action = decision_action
+        self._delivery_id = delivery_id
         self._settings = dict(settings) if settings is not None else {}
         # free-form, persisted across stages (engine backs it with plugin_shared)
         self.shared: dict[str, Any] = shared if shared is not None else {}
@@ -289,6 +291,24 @@ class HookContext:
     @property
     def decision_action(self) -> str | None:
         return self._decision_action
+
+    @property
+    def delivery_id(self) -> str | None:
+        """Stable identity of the event this emit delivers, or ``None`` on stages
+        that carry none. Today only ``post_migrate`` sets it (DW-317).
+
+        Such a stage gets **at least one delivery attempt**: the engine records
+        the event durably before firing the hook and replays the emit on resume
+        until an emit has returned, so a process or host death can make the SAME
+        event fire again with the SAME ``delivery_id``. A returned emit counts as
+        delivered even when a handler failed: a Python raise, a declarative
+        error, timeout or non-zero exit is absorbed by the bus and never retried,
+        and a veto on ``post_migrate`` is ignored. A handler with non-idempotent
+        side effects should deduplicate on this value. A genuinely new event
+        (e.g. a later re-migration) always carries a new id. Declarative hooks
+        read it as ``BMAD_LOOP_DELIVERY_ID``.
+        """
+        return self._delivery_id
 
     @property
     def settings(self) -> dict[str, Any]:

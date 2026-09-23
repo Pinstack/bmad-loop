@@ -111,6 +111,28 @@ def test_command_results_are_readonly_observation_data():
         c.command_results = ()
 
 
+def test_delivery_id_is_readonly_and_defaults_to_none():
+    assert ctx().delivery_id is None
+    c = ctx("post_migrate", delivery_id="abc123")
+    assert c.delivery_id == "abc123"
+    with pytest.raises(AttributeError):
+        c.delivery_id = "forged"  # type: ignore[misc]
+
+
+def test_declarative_env_carries_delivery_id_only_when_set():
+    seen: list[dict[str, str]] = []
+
+    def runner(cmd, *, cwd, env, timeout):
+        seen.append(dict(env))
+        return 0, ""
+
+    bus = HookBus(registry_of(declarative("post_migrate")), runner=runner)
+    bus.emit("post_migrate", ctx("post_migrate", delivery_id="deadbeef"))
+    bus.emit("post_migrate", ctx("post_migrate"))
+    assert seen[0]["BMAD_LOOP_DELIVERY_ID"] == "deadbeef"
+    assert "BMAD_LOOP_DELIVERY_ID" not in seen[1]
+
+
 def test_a_plugin_cannot_erase_a_critical_escalation_through_result_json():
     """The observe-only claim has to hold at the depth escalations actually live.
 

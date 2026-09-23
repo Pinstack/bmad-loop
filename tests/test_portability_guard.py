@@ -492,6 +492,12 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "decision",
         "decisions",
         "deduped",
+        # `sweep-migrated`'s completion identity (DW-317): a fresh `uuid4().hex`
+        # minted per migration completion, and the dedup key a `post_migrate` hook
+        # sees as `ctx.delivery_id`. Random, so it names no story, branch, commit,
+        # path or run; left as-is so a maintainer can match the row to a hook's
+        # at-least-once deliveries.
+        "delivery_id",
         # Written by `runs.restamp_code_root`'s TRAILING append alone — one of the
         # three producers of `rearm-code-root-restamped`, not a predicate over the
         # kind (the two discharge rows omit it, asserting `code_root_changed=true`

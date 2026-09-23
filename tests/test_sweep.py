@@ -21655,6 +21655,209 @@ def test_commit_only_migration_resume_emits_post_migrate_once_after_publication(
     assert seen == ["sweep-migrate"]
 
 
+def _delivery_observer() -> tuple[PluginRegistry, list[str | None]]:
+    """A python plugin recording every `post_migrate` delivery id it observes."""
+    seen: list[str | None] = []
+
+    class DeliveryObserver(Plugin):
+        def on_post_migrate(self, context):
+            seen.append(context.delivery_id)
+
+    manifest = PluginManifest(name="delivery-observer")
+    plugin = DeliveryObserver(manifest, {})
+    return PluginRegistry([LoadedPlugin(manifest=manifest, instance=plugin)]), seen
+
+
+def _expected_migration_counts() -> tuple[int, int, int]:
+    post = deferredwork.parse_ledger(migrated_ledger())
+    return (len(legacy_manifest()), len(post), sum(1 for e in post if e.open))
+
+
+def test_migration_completion_row_and_hook_share_one_delivery_id(project):
+    """DW-317 happy path: one `sweep-migrated` row carries the id the hook saw,
+    and the pending latch is cleared durably once delivery returns."""
+    registry, seen = _delivery_observer()
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    engine, _ = make_sweep(
+        project,
+        [migrate_effect(project, migrated_ledger(), mapping), triage_effect(plan)],
+        registry=registry,
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    rows = _records(engine, "sweep-migrated")
+    assert len(rows) == 1
+    delivery_id = rows[0]["delivery_id"]
+    assert delivery_id and seen == [delivery_id]
+    assert (
+        rows[0]["converted"],
+        rows[0]["entries_now"],
+        rows[0]["open_now"],
+    ) == _expected_migration_counts()
+    task = load_state(engine.run_dir).tasks["sweep-migrate"]
+    assert task.migration_delivery_id == delivery_id
+    assert task.migration_delivery_pending is False
+
+
+def _crash_migration_delivery(engine, monkeypatch, crash_point: str) -> None:
+    """Raise once inside the delivery tail, after the DONE + latch save."""
+    if crash_point == "before_row":
+        real_append = engine.journal.append
+
+        def append(kind, **fields):
+            if kind == "sweep-migrated":
+                raise OSError("host died before the sweep-migrated row")
+            return real_append(kind, **fields)
+
+        monkeypatch.setattr(engine.journal, "append", append)
+        return
+    real_emit = engine._emit
+
+    def emit(stage, task=None, **fields):
+        if stage != "post_migrate":
+            return real_emit(stage, task, **fields)
+        if crash_point == "before_emit":
+            raise OSError("host died before post_migrate")
+        real_emit(stage, task, **fields)
+        raise OSError("host died before the latch was cleared")
+
+    monkeypatch.setattr(engine, "_emit", emit)
+
+
+@pytest.mark.parametrize(
+    ("crash_point", "first_run_emissions"),
+    [("before_row", 0), ("before_emit", 0), ("after_emit", 1)],
+)
+@pytest.mark.parametrize("dir_fd", [True, False], ids=["dir-fd", "fallback"])
+def test_crash_after_migration_done_replays_completion_on_resume(
+    project, monkeypatch, crash_point, first_run_emissions, dir_fd
+):
+    """DW-317: a host death between the durable DONE save and the latch clear is
+    replayed on resume — exactly one `sweep-migrated` row, `post_migrate` at least
+    once with the SAME delivery id, the latch cleared, no second `--migrate`
+    session. The fallback row pins that replay reads no migrate-* record (DW-315).
+
+    Ablation: drop the cycle-one replay in `_loop` and the resumed emission and
+    the latch-cleared assertions redden; drop the journal idempotency scan and the
+    `before_emit`/`after_emit` rows journal a second `sweep-migrated` row."""
+    if not dir_fd:
+        monkeypatch.setattr(sweep_mod, "DIR_FD_ANCHORED_WRITES", False)
+    elif not sweep_mod.DIR_FD_ANCHORED_WRITES:
+        pytest.skip("dir-fd arm unavailable on this host")
+    registry, seen = _delivery_observer()
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, _ = make_sweep(
+        project,
+        [migrate_effect(project, migrated_ledger(), mapping)],
+        registry=registry,
+    )
+    _crash_migration_delivery(engine, monkeypatch, crash_point)
+
+    first = engine.run()
+
+    assert first.crashed
+    persisted = load_state(engine.run_dir).tasks["sweep-migrate"]
+    assert persisted.phase == Phase.DONE
+    assert persisted.migration_delivery_pending is True
+    delivery_id = persisted.migration_delivery_id
+    assert delivery_id
+    assert len(seen) == first_run_emissions
+    assert len(_records(engine, "sweep-migrated")) == (0 if crash_point == "before_row" else 1)
+
+    touched = _spy_record_opens_and_unlinks(monkeypatch) if not dir_fd else []
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    resumed, adapter = resume_sweep(project, engine, [triage_effect(plan)], registry=registry)
+    second = resumed.run()
+
+    assert not second.crashed and not second.paused
+    assert len(adapter.sessions) == 1 and "--migrate" not in adapter.sessions[0].prompt
+    rows = _records(resumed, "sweep-migrated")
+    assert len(rows) == 1 and rows[0]["delivery_id"] == delivery_id
+    # The replayed row's counts come from the DONE save alone (no record reads).
+    assert (
+        rows[0]["converted"],
+        rows[0]["entries_now"],
+        rows[0]["open_now"],
+    ) == _expected_migration_counts()
+    assert seen == [delivery_id] * (first_run_emissions + 1)
+    task = load_state(resumed.run_dir).tasks["sweep-migrate"]
+    assert task.phase == Phase.DONE
+    assert task.migration_delivery_id == delivery_id
+    assert task.migration_delivery_pending is False
+    assert touched == []
+
+
+def test_pending_migration_delivery_replays_ahead_of_a_ledger_fault(project, monkeypatch):
+    """The replay sits before the cycle reader, so an unreadable ledger on resume
+    cannot strand the latch.
+
+    Ablation: move the replay below `_read_cycle_ledger` and this reddens: the
+    ledger fault stops the run with no emission and the latch still set."""
+    registry, seen = _delivery_observer()
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, _ = make_sweep(
+        project,
+        [migrate_effect(project, migrated_ledger(), mapping)],
+        registry=registry,
+    )
+    _crash_migration_delivery(engine, monkeypatch, "before_emit")
+    assert engine.run().crashed
+    delivery_id = load_state(engine.run_dir).tasks["sweep-migrate"].migration_delivery_id
+    fault_read_text(monkeypatch, project.deferred_work)
+
+    resumed, adapter = resume_sweep(project, engine, [], registry=registry)
+    summary = resumed.run()
+
+    # premise: the injected fault really stopped the run at the cycle reader
+    assert not summary.crashed and not summary.paused
+    stops = _records(resumed, "sweep-repeat-done")
+    assert [row["stop_cause"] for row in stops] == ["ledger-inaccessible"]
+    assert stops[0]["cycles"] == 0
+    assert adapter.sessions == []
+    assert seen == [delivery_id]
+    assert len(_records(resumed, "sweep-migrated")) == 1
+    assert load_state(resumed.run_dir).tasks["sweep-migrate"].migration_delivery_pending is False
+
+
+@pytest.mark.parametrize("shape", ["pre-upgrade", "already-delivered"])
+def test_done_migration_without_a_pending_latch_replays_nothing(project, shape):
+    """Pre-upgrade state (no id, latch False) and an already-delivered completion
+    (id and counts kept, latch False) both resume without a second
+    `sweep-migrated` row or `post_migrate`: the latch, not the id, gates replay."""
+    registry, seen = _delivery_observer()
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, _ = make_sweep(
+        project,
+        [migrate_effect(project, migrated_ledger(), mapping)],
+        registry=registry,
+    )
+    assert engine.run().crashed  # the triage script is empty: crash after migration
+    persisted = load_state(engine.run_dir)
+    task = persisted.tasks["sweep-migrate"]
+    assert task.phase == Phase.DONE and not task.migration_delivery_pending
+    assert task.migration_delivery_id and task.migration_delivery_counts
+    if shape == "pre-upgrade":
+        task.migration_delivery_id = None
+        task.migration_delivery_counts = None
+    save_state(engine.run_dir, persisted)
+    seen.clear()
+
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    resumed, _ = resume_sweep(project, engine, [triage_effect(plan)], registry=registry)
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert seen == []
+    assert len(_records(resumed, "sweep-migrated")) == 1
+
+
 @needs_dir_fd_recovery
 def test_crash_after_real_migration_commit_resumes_as_clean_commit_tail(project, monkeypatch):
     write_legacy_ledger(project, LEGACY_LEDGER)

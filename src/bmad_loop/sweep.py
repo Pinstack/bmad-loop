@@ -18,6 +18,7 @@ import re
 import stat
 import time
 import unicodedata
+import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, NoReturn, TypeVar, assert_never
@@ -1986,6 +1987,17 @@ class SweepEngine(Engine):
                 # TRIAGE_VERIFY is the one pre-upgrade path that still needs the
                 # cycle reader's live text for its legacy restart.
                 self._ensure_migration("")
+            if (
+                cycle == 1
+                and migrate_task is not None
+                and migrate_task.phase == Phase.DONE
+                and migrate_task.migration_delivery_pending
+            ):
+                # DW-317: the host died after DONE was durable but before the
+                # completion notifications were confirmed delivered. Replay them
+                # (at-least-once, same delivery id) ahead of the cycle reader, so
+                # a ledger fault cannot strand the latch.
+                self._deliver_migration_completion(migrate_task, replay=True)
             text, ledger_fault = self._read_cycle_ledger(ledger)
             if ledger_fault is not None:
                 # `cycle - 1`: this cycle did no work at all — the read that would
@@ -3476,17 +3488,57 @@ class SweepEngine(Engine):
             task.migration_ledger_doubt_owned = False
             self.state.sweep_ledger_in_doubt = False
             self._ledger_doubt_inherited = False
+        # DW-317: the completion's identity, its journal payload, and the
+        # pending-delivery latch become durable in the SAME save that records
+        # DONE, so a host death before the notifications land leaves a latch the
+        # next resume replays instead of a finished task that owes nothing. A
+        # fresh id per completion: a later re-migration is a distinct event.
+        post = deferredwork.parse_ledger(rewrite)
+        task.migration_delivery_id = uuid.uuid4().hex
+        task.migration_delivery_counts = {
+            "converted": len(manifest),
+            "entries_now": len(post),
+            "open_now": sum(1 for entry in post if entry.open),
+        }
+        task.migration_delivery_pending = True
         advance(task, Phase.DONE)
         self._save()
-        post = deferredwork.parse_ledger(rewrite)
-        self.journal.append(
-            "sweep-migrated",
-            converted=len(manifest),
-            entries_now=len(post),
-            open_now=sum(1 for entry in post if entry.open),
-        )
-        self._emit("post_migrate", task)
+        self._deliver_migration_completion(task, replay=False)
         return True
+
+    def _deliver_migration_completion(self, task: StoryTask, *, replay: bool) -> None:
+        """Deliver a DONE migration's completion notifications at least once.
+
+        Order is row -> emit -> clear latch, so a process or host-process death
+        at any point degrades to a re-emit, never a loss: the ``sweep-migrated``
+        row is idempotent on the delivery id (appended only if no row carries it
+        yet), while ``post_migrate`` may fire again with the same
+        ``ctx.delivery_id`` and says so. A power loss is not covered: the journal
+        append is not fsynced while ``_save`` is, so the latch-clear save can
+        outlive an unsynced row. The replay reads only persisted task fields — no migrate-*
+        records — so hosts without dir-fd recovery (DW-315) replay too.
+
+        ``replay=False`` is the first delivery of a just-minted id, which no
+        journal row can carry yet; only a resume replay scans the journal, so
+        the live completion path gains no new journal read.
+        """
+        delivery_id = task.migration_delivery_id
+        counts = task.migration_delivery_counts or {}
+        already = replay and any(
+            record.get("kind") == "sweep-migrated" and record.get("delivery_id") == delivery_id
+            for record in self.journal.entries()
+        )
+        if not already:
+            self.journal.append(
+                "sweep-migrated",
+                converted=counts.get("converted", 0),
+                entries_now=counts.get("entries_now", 0),
+                open_now=counts.get("open_now", 0),
+                delivery_id=delivery_id,
+            )
+        self._emit("post_migrate", task, delivery_id=delivery_id)
+        task.migration_delivery_pending = False
+        self._save()
 
     def _migration_input_is_current(self, expected: str) -> bool:
         """Whether the authoritative ledger still equals this cycle's input."""

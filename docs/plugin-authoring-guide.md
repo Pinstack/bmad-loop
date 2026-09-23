@@ -275,6 +275,7 @@ A `[hooks.<stage>]` shell command. The bus runs it with:
   | `BMAD_LOOP_REPO_ROOT` / `BMAD_LOOP_WORKTREE`                                      | git roots                                     |
   | `BMAD_LOOP_STORY_KEY` / `BMAD_LOOP_ROLE` / `BMAD_LOOP_PHASE` / `BMAD_LOOP_BRANCH` | unit context                                  |
   | `BMAD_LOOP_AGENTS`                                                                | comma-separated CLI agent ids in the worktree |
+  | `BMAD_LOOP_DELIVERY_ID`                                                           | dedup key of an at-least-once stage           |
   | `BMAD_LOOP_PLUGIN`                                                                | your plugin's name                            |
   | `BMAD_LOOP_SETTING_<KEY>`                                                         | each resolved setting                         |
 
@@ -332,7 +333,8 @@ stage. It carries:
 - **Read-only facts** (properties, no setter): `run_id`, `story_key`, `epic`,
   `phase`, `attempt`, `role`, `worktree`, `branch`, `repo_root`, `run_dir`,
   `agents`, `result_json` (a copy), `session_status`, `verify_reason`,
-  `decision_action`, `settings`. Observe these; you can never rewrite history.
+  `decision_action`, `delivery_id`, `settings`. Observe these; you can never
+  rewrite history.
 - **A mutable whitelist** — assign only these, and only where the stage allows:
   `proposed_prompt`, `proposed_env`, `proposed_feedback`,
   `proposed_commit_message`, `proposed_decision`.
@@ -566,6 +568,16 @@ a hook context. See the boundary note above `### Review`.
 | `pre_decision` / `post_decision`                       | around a human-decision item     |
 | `pre_bundle` / `post_bundle`                           | around a deferred-work bundle    |
 | `pre_materialize_bundles` / `post_materialize_bundles` | around materializing bundles     |
+
+`post_migrate` gets **at least one delivery attempt**. The engine records the
+completed migration before firing it and, if the process or host dies before the emit
+returns, fires it again on resume. A returned emit counts as delivered even when a
+handler failed: a Python raise, a declarative error, timeout or non-zero exit is not
+retried, and a veto on `post_migrate` is ignored. Every delivery of one completion
+carries the same `ctx.delivery_id` (`BMAD_LOOP_DELIVERY_ID` for a declarative hook),
+and a later re-migration gets a new one. A handler with non-idempotent side effects
+should deduplicate on that id. Stages without an id leave `ctx.delivery_id` as `None`
+and do not set the variable.
 
 ---
 

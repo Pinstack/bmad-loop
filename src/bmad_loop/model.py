@@ -293,6 +293,17 @@ class StoryTask:
     # doubt. A later successful idempotent replay may release that doubt, but
     # must never release one inherited from another sweep phase.
     migration_ledger_doubt_owned: bool = False
+    # DW-317: stable identity of one migration completion, minted fresh in the
+    # same save that records DONE (a re-migration mints a new one). Hooks see it
+    # as ``ctx.delivery_id`` / ``BMAD_LOOP_DELIVERY_ID`` to deduplicate the
+    # at-least-once ``post_migrate`` delivery. None = pre-upgrade/no completion.
+    migration_delivery_id: str | None = None
+    # True from that DONE save until the ``sweep-migrated`` row is journaled and
+    # ``post_migrate`` has returned; a cycle-one resume replays while it is set.
+    migration_delivery_pending: bool = False
+    # The ``sweep-migrated`` row's counts (converted / entries_now / open_now),
+    # persisted with the identity so a replay needs no migrate-* record reads.
+    migration_delivery_counts: dict[str, int] | None = None
     baseline_commit: str | None = None
     # untracked, non-ignored paths present at baseline capture (repo-relative
     # posix). On rollback only paths NOT in this set are removed, so files the
@@ -551,6 +562,13 @@ class StoryTask:
             "salvage_refile_pending": self.salvage_refile_pending,
             "migration_recovery_format": self.migration_recovery_format,
             "migration_ledger_doubt_owned": self.migration_ledger_doubt_owned,
+            "migration_delivery_id": self.migration_delivery_id,
+            "migration_delivery_pending": self.migration_delivery_pending,
+            "migration_delivery_counts": (
+                dict(self.migration_delivery_counts)
+                if self.migration_delivery_counts is not None
+                else None
+            ),
             "baseline_commit": self.baseline_commit,
             "baseline_untracked": self.baseline_untracked,
             "baseline_artifacts": self.baseline_artifacts,
@@ -771,6 +789,17 @@ class StoryTask:
             salvage_refile_pending=bool(d.get("salvage_refile_pending", False)),
             migration_recovery_format=int(d.get("migration_recovery_format", 0)),
             migration_ledger_doubt_owned=bool(d.get("migration_ledger_doubt_owned", False)),
+            migration_delivery_id=(
+                str(d["migration_delivery_id"])
+                if d.get("migration_delivery_id") is not None
+                else None
+            ),
+            migration_delivery_pending=bool(d.get("migration_delivery_pending", False)),
+            migration_delivery_counts=(
+                {str(k): int(v) for k, v in d["migration_delivery_counts"].items()}
+                if d.get("migration_delivery_counts") is not None
+                else None
+            ),
             baseline_commit=d.get("baseline_commit"),
             baseline_untracked=(
                 [str(p) for p in d["baseline_untracked"]]
