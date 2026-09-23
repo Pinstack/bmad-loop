@@ -2319,6 +2319,66 @@ def test_validate_migration_allows_an_added_gate_token():
     assert validate_migration(rj, manifest, pre, rewritten_gated_ledger("gate: 3-2, 3-4")) == []
 
 
+_DW1_ORIGIN = "origin: test, 2026-06-01\n"
+_DW1_KEYED = _DW1_ORIGIN + "source_spec: `spec-a.md`\n"
+
+
+def _keyed_migration_case():
+    """(manifest, result.json, snapshot, rewrite) for a migration whose DW-1
+    carries both dedupe keys. The rewrite is the faithful one; each test edits
+    DW-1's key lines in it, and only DW-1's — the converted DW-2 carries a
+    different `origin:` so the `replace` cannot reach it."""
+    before = pre_gated_ledger().replace(_DW1_ORIGIN, _DW1_KEYED, 1)
+    manifest = legacy_manifest(before)
+    assert len(manifest) == 1  # the canonical entry is not a legacy item
+    rj = migrate_result([{"key": manifest[0]["key"], "dw_id": "DW-2"}])
+    rewrite = rewritten_gated_ledger().replace(_DW1_ORIGIN, _DW1_KEYED, 1)
+    return manifest, rj, snapshot_canonical(before), rewrite
+
+
+def test_validate_migration_refuses_a_dropped_origin_dedupe_key():
+    """DW-363. A rewrite that drops a pre-existing entry's `origin:` line is
+    refused: that line is the appenders' dedupe key, and without it the next
+    defer of the same work appends a duplicate entry.
+
+    Ablation: delete the `origin`/`source_spec` loop in `validate_migration` and
+    this test fails on the final assertion while the paired control stays green."""
+    manifest, rj, pre, rewrite = _keyed_migration_case()
+    # the SNAPSHOT carries both keys, backtick-unwrapped
+    assert pre["DW-1"].origins == ("test, 2026-06-01",)
+    assert pre["DW-1"].source_specs == ("spec-a.md",)
+    # paired positive control: the faithful rewrite is fully accepted
+    assert validate_migration(rj, manifest, pre, rewrite) == []
+
+    errors = validate_migration(rj, manifest, pre, rewrite.replace(_DW1_ORIGIN, "", 1))
+    assert errors == ["pre-existing DW-1 lost origin value(s): 'test, 2026-06-01'"]
+
+
+def test_validate_migration_refuses_an_altered_source_spec_dedupe_key():
+    """DW-363. An edited key is a drop plus an add, and the drop half is read —
+    so renaming the `source_spec:` is refused like deleting it.
+
+    Ablation: delete the `origin`/`source_spec` loop in `validate_migration` and
+    this test fails."""
+    manifest, rj, pre, rewrite = _keyed_migration_case()
+    altered = rewrite.replace("`spec-a.md`", "`spec-b.md`", 1)
+    errors = validate_migration(rj, manifest, pre, altered)
+    assert errors == ["pre-existing DW-1 lost source_spec value(s): 'spec-a.md'"]
+
+
+def test_validate_migration_allows_a_rewrapped_source_spec():
+    """DW-363. `field_line_present` matches `source_spec: x` and
+    `` source_spec: `x` `` alike, so dropping the backticks changes no dedupe
+    answer and must not spend a migration attempt.
+
+    Ablation: remove the backtick unwrap in `deferredwork.field_values` and this
+    test fails (the refusal tests above redden too, only because their expected
+    messages name the unwrapped value)."""
+    manifest, rj, pre, rewrite = _keyed_migration_case()
+    rewrapped = rewrite.replace("`spec-a.md`", "spec-a.md", 1)
+    assert validate_migration(rj, manifest, pre, rewrapped) == []
+
+
 def test_duplicate_ids_names_every_repeated_id_once():
     """#519 (user-approved scope addition). The predicate both sides of a
     migration are refused on — the ledger it starts from and the ledger it

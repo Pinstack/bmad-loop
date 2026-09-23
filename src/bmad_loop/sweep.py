@@ -970,11 +970,20 @@ class PreCanonical:
     — are deliberately NOT snapshotted. None of them names a story, so losing one
     cannot change which story is gated, and they are exactly what a legitimate
     reflow of a multi-line declaration moves.
+
+    ``origins`` and ``source_specs`` are the appenders' dedupe keys
+    (:func:`~bmad_loop.deferredwork.field_line_present` in ``_apply_append`` and
+    the engine's defer paths). A rewrite that drops or edits one leaves the entry
+    standing but unrecognisable to the next defer of the same work, which then
+    appends a duplicate (DW-363). Defaulted to ``()`` — held to nothing — so a
+    snapshot built without them keeps its old meaning.
     """
 
     status: str
     gate_tokens: tuple[str, ...]
     severity: str | None
+    origins: tuple[str, ...] = ()
+    source_specs: tuple[str, ...] = ()
 
 
 def snapshot_canonical(text: str) -> dict[str, PreCanonical]:
@@ -997,7 +1006,13 @@ def snapshot_canonical(text: str) -> dict[str, PreCanonical]:
     snapshot: dict[str, PreCanonical] = {}
     for e in deferredwork.parse_ledger(text):
         g = deferredwork.gates(e)
-        snapshot[e.id] = PreCanonical(e.status, g.tokens + g.malformed, e.severity)
+        snapshot[e.id] = PreCanonical(
+            e.status,
+            g.tokens + g.malformed,
+            e.severity,
+            deferredwork.field_values(e, "origin"),
+            deferredwork.field_values(e, "source_spec"),
+        )
     return snapshot
 
 
@@ -1024,9 +1039,10 @@ def validate_migration(
 ) -> list[str]:
     """Deterministic validation of a legacy-ledger migration session: the
     rewritten ledger must contain zero legacy items, preserve every
-    pre-existing canonical entry's status and every ``gate:`` token it
-    declared, continue DW numbering, and the result.json mapping must cover
-    the manifest exactly. Returns errors, empty on success."""
+    pre-existing canonical entry's status, every ``gate:`` token and every
+    ``origin:`` / ``source_spec:`` dedupe key it declared, continue DW
+    numbering, and the result.json mapping must cover the manifest exactly. Returns errors, empty on success.
+    """
     if rj is None:
         rj = {}
     if not isinstance(rj, dict):
@@ -1094,6 +1110,18 @@ def validate_migration(
         lost = [t for t in pre.gate_tokens if t not in kept]
         if lost:
             errors.append(f"pre-existing {dw_id} lost gate token(s): {', '.join(lost)}")
+        # The dedupe keys, bounded the same way and for a matching reason: a
+        # dropped or edited key lets the next defer of this work append a
+        # duplicate (DW-363), while an added line only widens what the entry
+        # already answers for.
+        for field, held in (("origin", pre.origins), ("source_spec", pre.source_specs)):
+            now = set(deferredwork.field_values(e, field))
+            gone = [v for v in held if v not in now]
+            if gone:
+                errors.append(
+                    f"pre-existing {dw_id} lost {field} value(s): "
+                    + ", ".join(repr(v) for v in gone)
+                )
     for dw_id, e in entries.items():
         if dw_id in pre_canonical:
             continue

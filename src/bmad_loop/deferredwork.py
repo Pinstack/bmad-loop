@@ -881,6 +881,41 @@ def gates(entry: DWEntry) -> EntryGates:
     )
 
 
+def field_values(entry: DWEntry, field: str) -> tuple[str, ...]:
+    """Every value one entry's canonical span declares for ``field``, order-preserving.
+
+    The fence-aware reader :func:`field_line_present` is not: that predicate
+    answers the appenders' dedupe question against a raw body, while this one
+    answers "which dedupe keys does the entry hold" for ``validate_migration``,
+    which has to hold a rewrite to them. Filtered through :func:`_quoted` like
+    every gate scan here, so an entry quoting a worked example does not have the
+    example's ``origin:`` snapshotted as a key it owns.
+
+    Anchored like ``status:`` — lowercase, column 0 — which is the only spelling
+    :func:`field_line_present` matches, so an indented or capitalised line is no
+    key to either reader. A FENCED column-0 line is the one place the two part:
+    the raw-body dedupe scan still matches it, this does not hold it. Dropping a
+    fenced line is therefore accepted, while a live key moved into a fence is
+    refused — the loss this guards against is of the key an appender wrote, and
+    appenders write it live. Each value drops surrounding
+    whitespace and ONE wrapping backtick pair: :func:`append_entry` writes
+    ``source_spec`` backtick-wrapped and :func:`field_line_present` matches
+    either spelling, so a rewrap between the two is not a changed key.
+    Duplicates collapse — a repeated line is one key, not two.
+    """
+    pattern = re.compile(rf"^{re.escape(field)}:[ \t]*(.*)$", re.MULTILINE)
+    values: list[str] = []
+    for m in pattern.finditer(entry.body):
+        if _quoted(entry, m.start()):
+            continue
+        value = m.group(1).strip(" \t")
+        if len(value) >= 2 and value.startswith("`") and value.endswith("`"):
+            value = value[1:-1]
+        if value not in values:
+            values.append(value)
+    return tuple(values)
+
+
 def _matchable_token(token: str) -> bool:
     """Whether ``token`` could gate any legal story key — the test that decides
     :attr:`EntryGates.tokens` vs :attr:`EntryGates.malformed`.

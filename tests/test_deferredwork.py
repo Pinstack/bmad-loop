@@ -2412,6 +2412,34 @@ def test_gates_stop_at_the_canonical_span_boundary():
     assert deferredwork.gates(entry).tokens == ()
 
 
+def test_field_values_reads_live_dedupe_keys_and_skips_fenced_examples():
+    """DW-363. `validate_migration` holds a rewrite to what this returns, so a
+    fenced worked example's `origin:` must not become a key the entry owns (a
+    faithful rewrite that trimmed the example would be refused), and the
+    backtick-wrapped `source_spec` must unwrap to the value `field_line_present`
+    matches. Indented or capitalised spellings are not keys: the dedupe scan's
+    column-0 anchor never matched them either.
+
+    Ablation: drop the `_quoted` skip and the fenced `origin: quoted` appears;
+    drop the unwrap and `spec.md` keeps its backticks."""
+    text = (
+        "# Deferred Work\n\n### DW-1: keyed\n\n"
+        "origin: live, 2026-06-01\n"
+        "source_spec: `spec.md`\n"
+        "reason: quotes an example:\n\n"
+        "```markdown\norigin: quoted\n```\n\n"
+        "  origin: indented\nOrigin: capitalised\n"
+        "origin: live, 2026-06-01  \n"
+        "status: open\n"
+    )
+
+    (entry,) = parse_ledger(text)
+
+    assert deferredwork.field_values(entry, "origin") == ("live, 2026-06-01",)
+    assert deferredwork.field_values(entry, "source_spec") == ("spec.md",)
+    assert deferredwork.field_values(entry, "gate") == ()
+
+
 # ------------------------------------------- ATX heading boundary shapes (#516)
 
 

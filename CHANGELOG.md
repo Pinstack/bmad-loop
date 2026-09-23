@@ -35,6 +35,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Refuse a legacy-ledger migration that drops or edits a pre-existing entry's `origin:` or
+  `source_spec:` line — the appenders' dedupe keys — so the next defer of that work no
+  longer appends a duplicate (DW-363).
 - Re-raise a sweep ledger publish whose `git status` times out, fails to spawn or cannot
   read the index; only a ledger in no repository still degrades to
   `sweep-ledger-commit-unavailable` (DW-336).
