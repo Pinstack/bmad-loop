@@ -1289,6 +1289,34 @@ def test_next_seq_empty_starts_at_one():
     assert next_seq("# Deferred Work\n") == 1
 
 
+def test_next_seq_ignores_ids_mentioned_outside_headings(tmp_path):
+    """DW-384: a far-higher id named in prose, a body field or a heading's own
+    title does not steer allocation — only heading ids do. Ablation: scan the
+    whole text again and this mints DW-901."""
+    text = (
+        "# Deferred Work\n\nSee DW-900 in the old tracker.\n\n"
+        "### DW-3: supersedes DW-800\norigin: o\nreason: dup of DW-900\nstatus: open\n"
+    )
+    assert next_seq(text) == 4
+    p = tmp_path / "deferred-work.md"
+    p.write_text(text, encoding="utf-8")
+    assert append_entry(p, title="t", origin="o2", source_spec="s.md", reason="r") == "DW-4"
+
+
+def test_next_seq_counts_malformed_headings():
+    """A heading `parse_ledger` cannot read still spoke for its number, so it is
+    never reused."""
+    for heading in (
+        "### DW-9 no colon",
+        "### DW-9:",
+        "###  DW-9: two spaces",
+        "###\tDW-9: tab",
+        "   ### DW-9: indented",
+        "```\n### DW-9: fenced example\n```",
+    ):
+        assert next_seq(f"### DW-2: a\n\n{heading}\nstatus: open\n") == 10, heading
+
+
 def test_append_entry_numbers_and_writes(tmp_path):
     p = tmp_path / "deferred-work.md"
     p.write_text("# Deferred Work\n\n### DW-4: existing\norigin: test\nstatus: open\n")

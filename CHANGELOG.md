@@ -35,6 +35,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Mint new deferred-work ids from `### DW-<n>` headings only (malformed ones included), so
+  a note citing a far-higher `DW-<n>` no longer burns the id space up to it (DW-384).
 - Refuse a legacy-ledger migration that drops or edits a pre-existing entry's `origin:` or
   `source_spec:` line — the appenders' dedupe keys — so the next defer of that work no
   longer appends a duplicate (DW-363).

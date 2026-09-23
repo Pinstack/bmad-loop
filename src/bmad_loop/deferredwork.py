@@ -1948,13 +1948,24 @@ def append_decision(path: Path, dw_id: str, date: str, label: str, detail: str) 
 
 
 DW_ID_RE = re.compile(r"\bDW-(\d+)\b")
+# The id a `### DW-<n>` heading line carries, read looser than `HEADING_RE` on
+# purpose: a heading with no colon, a blank title, extra whitespace after the
+# hashes or a few spaces of indent is malformed, but its number is still spoken
+# for. Fences are not masked either — erring toward a burned number, never a
+# reused one.
+_SEQ_HEADING_RE = re.compile(r"^ {0,3}###[ \t]+DW-(\d+)\b", re.MULTILINE)
 
 
 def next_seq(text: str) -> int:
-    """The next free DW sequence number — one past the highest DW-<n> anywhere
-    in the ledger (malformed entries included, so a number is never reused and
-    the sweep numbering check stays satisfied)."""
-    nums = [int(m.group(1)) for m in DW_ID_RE.finditer(text)]
+    """The next free DW sequence number — one past the highest id any
+    ``### DW-<n>`` heading carries (malformed headings included, so a number is
+    never reused and the sweep numbering check stays satisfied).
+
+    Headings only (DW-384): a ``DW-<n>`` mentioned in an entry's body, in
+    surrounding prose, or later in a heading's own title names an entry rather
+    than allocating one, so a note citing a far-higher id no longer burns the
+    id space up to it."""
+    nums = [int(m.group(1)) for m in _SEQ_HEADING_RE.finditer(text)]
     return (max(nums) + 1) if nums else 1
 
 
@@ -2222,7 +2233,7 @@ def append_entry(
     severity: str | None = None,
 ) -> str | None:
     """Append a new canonical `### DW-<seq>` entry numbered past the highest
-    existing DW id, returning the new id (e.g. "DW-42").
+    `### DW-<n>` heading id (:func:`next_seq`), returning the new id (e.g. "DW-42").
 
     Idempotent: returns None without writing when an open entry already carries
     the same `origin:` marker and `source_spec:` — so re-running the same defer
