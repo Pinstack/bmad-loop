@@ -38,6 +38,12 @@ breaking changes may land in a minor release.
   refs, and surface and prune candidate-worktree cleanup failures (DW-324, DW-325,
   DW-326, DW-331).
 
+- Refuse, before any ref moves, an exact-path ledger publication whose live exec bit
+  disagrees with the committed mode where Git honours `core.fileMode` — chmod the
+  ledger to match to clear it; re-check checkout identity and the target index before
+  a clean return; re-validate the live ledger after target-index synchronization
+  (DW-328, DW-329, DW-330).
+
 - Read untracked paths verbatim so rollback snapshots and cleanup handle non-ASCII
   and space-edged filenames; a resumed run's pre-fix baseline still protects the
   files it listed; failed-unit diff capture includes them too (#783).

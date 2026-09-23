@@ -9985,7 +9985,8 @@ def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
 @dataclass(frozen=True)
 class _BoundLiveLedger:
     """One raw observation of the live ledger: its bytes beside the stat fields an
-    in-place rewrite of the same inode moves."""
+    in-place rewrite of the same inode moves, and the raw ``st_mode`` — a chmod
+    moves ctime only where ctime is fine-grained, so the mode is held itself."""
 
     data: bytes
     dev: int
@@ -9993,10 +9994,26 @@ class _BoundLiveLedger:
     size: int
     mtime_ns: int
     ctime_ns: int
+    mode: int
 
 
-def _bound_live_ledger_stat(st: os.stat_result) -> tuple[int, int, int, int, int]:
-    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+def _bound_live_ledger_stat(st: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_mode)
+
+
+def _bound_live_mode(repo: Path, observed: _BoundLiveLedger, committed_mode: str) -> None:
+    """Refuse a live exec bit that disagrees with the committed mode (DW-328).
+
+    Git reads the exec bit only where it honours ``core.fileMode``; elsewhere
+    (every Windows init) the live bit is ignored exactly as Git ignores it. A
+    target HEAD does not track commits as ``100644``, so a new ledger must not be
+    executable. The committed mode is the authority — candidate validation pins it to the
+    parent's — so a mismatch is refused, never repaired or published over.
+    """
+    if not _honors_file_mode(repo):
+        return
+    if bool(observed.mode & stat.S_IXUSR) != (committed_mode == "100755"):
+        raise GitError("accepted publication target mode does not match its committed mode")
 
 
 def _bound_live_ledger_identity(
@@ -10536,6 +10553,15 @@ def commit_path_bound(
     nothing else is propagating, and otherwise attached as a note to the error
     that is. Either way, once the temporary directory is gone, a best-effort
     `worktree prune` drops the stale administrative entry.
+
+    Every success return is closed by a final observation. Where Git honours
+    `core.fileMode` the live exec bit must match the committed mode, refused
+    before any ref moves (DW-328); the clean/ignored `None` re-observes the
+    checkout identity and the target index entry after the cleanliness probe
+    (DW-329); and both publishing returns re-validate the live target after
+    index synchronization, so a rival writer during it refuses — the commit
+    already published stays, and replay decides (DW-330). A writer landing
+    after those final observations is the accepted DW-306 residual.
     """
     try:
         rc, top, _detail = _git_out(repo, "rev-parse", "--show-toplevel")
@@ -10595,8 +10621,10 @@ def commit_path_bound(
         raise GitError("real index holds foreign content at the publication target")
 
     if accepted is not None:
+        _bound_live_mode(repo_root, observed, expected_mode)
         _bound_live_ledger_identity(lexical, target, accepted_text, observed=observed)
         _synchronize_bound_index(repo_root, captured, rel, observed_index_entry)
+        _bound_live_ledger_identity(lexical, target, accepted_text, observed=observed)
         return accepted
 
     # Preserve generic clean/ignored behavior when no migration transition needs
@@ -10607,9 +10635,20 @@ def commit_path_bound(
     except GitError as exc:
         raise GitError("publication target cleanliness could not be validated") from exc
     if clean and (head_blob == accepted_oid or ignored_untracked):
+        # Bind the `None` to the captured commit: a checkout move or a target
+        # stage landing after the cleanliness probe refuses (DW-329). A clean
+        # status implies the index holds `head_entry` — None exactly when the
+        # target is ignored-untracked, which has no committed mode to hold.
+        if _bound_checkout_identity(repo_root) != captured:
+            raise GitError("checkout changed during exact-path clean validation")
+        if _bound_index_entry(repo_root, rel) != head_entry:
+            raise GitError("real index target changed during exact-path publication")
+        if not ignored_untracked:
+            _bound_live_mode(repo_root, observed, expected_mode)
         _bound_live_ledger_identity(lexical, target, accepted_text, observed=observed)
         return None
 
+    _bound_live_mode(repo_root, observed, expected_mode)
     active_error: BaseException | None = None
     candidate: str | None = None
     try:
@@ -10745,4 +10784,5 @@ def commit_path_bound(
         candidate,
     )
     _synchronize_bound_index(repo_root, expected_checkout, rel, observed_index_entry)
+    _bound_live_ledger_identity(lexical, target, accepted_text, observed=observed)
     return candidate

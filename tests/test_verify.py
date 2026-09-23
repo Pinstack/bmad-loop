@@ -8554,6 +8554,7 @@ def test_commit_path_bound_skips_newer_invalid_same_ledger_descendant(project):
     extra = repo / "descendant-extra.txt"
     extra.write_text("wider descendant\n", encoding="utf-8")
     git(repo, "update-index", "--chmod=+x", "--", path.name)
+    path.chmod(path.stat().st_mode | 0o111)
     git(repo, "add", "--", extra.name)
     git(repo, "commit", "-q", "-m", "multi-path same-ledger descendant")
     descendant_head = verify.rev_parse_head(repo)
@@ -8585,6 +8586,7 @@ def test_commit_path_bound_propagates_probe_failure_on_a_newer_candidate(project
         baseline_text=baseline,
     )
     git(repo, "update-index", "--chmod=+x", "--", path.name)
+    path.chmod(path.stat().st_mode | 0o111)
     git(repo, "commit", "-q", "-m", "newer ledger mode transition")
     descendant_head = verify.rev_parse_head(repo)
 
@@ -9344,6 +9346,9 @@ def test_commit_path_bound_preserves_tracked_executable_target_mode(project):
     path = repo / "src.txt"
     git(repo, "update-index", "--chmod=+x", "--", path.name)
     git(repo, "commit", "-q", "-m", "track executable ledger")
+    # Match the live exec bit to the committed 100755 (DW-328); Git ignores
+    # the bit where core.fileMode is false.
+    path.chmod(path.stat().st_mode | 0o111)
     baseline = path.read_text(encoding="utf-8")
     accepted = "accepted executable migration ledger\n"
     path.write_text(accepted, encoding="utf-8")
@@ -9370,6 +9375,9 @@ def test_commit_path_bound_keeps_executable_mode_when_a_hook_re_adds_the_target(
     path = repo / "src.txt"
     git(repo, "update-index", "--chmod=+x", "--", path.name)
     git(repo, "commit", "-q", "-m", "track executable ledger")
+    # Match the live exec bit to the committed 100755 (DW-328); Git ignores
+    # the bit where core.fileMode is false.
+    path.chmod(path.stat().st_mode | 0o111)
     baseline = path.read_text(encoding="utf-8")
     accepted = "accepted executable migration ledger\n"
     path.write_text(accepted, encoding="utf-8")
@@ -9950,6 +9958,401 @@ def test_bound_index_reconciliation_can_align_a_moved_symlink_entry(project, mon
     entry = verify._bound_index_entry(repo, rel)
     assert entry is not None and entry.mode == "120000"
     assert entry == verify._bound_tree_entry(repo, symlink_commit, rel)
+
+
+# --- DW-328/329/330: every success return is closed by a final observation
+
+_POSIX_EXEC_BIT = pytest.mark.skipif(
+    os.name == "nt", reason="exec bit is ignored where core.fileMode is false (every Windows init)"
+)
+
+
+def _no_candidate_worktree(monkeypatch):
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("candidate publication was reached")
+
+    monkeypatch.setattr(verify, "path_has_non_tree_ancestor_at_revision", refuse)
+
+
+def _bound_clean_inputs(project):
+    """HEAD already holds the accepted text through a commit that is not an
+    exact one-path transition, so the call takes the clean `None` return."""
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    extra = repo / "clean-extra.txt"
+    extra.write_text("wider commit\n", encoding="utf-8")
+    git(repo, "add", "--", path.name, extra.name)
+    git(repo, "commit", "-q", "-m", "multi-path accepted ledger")
+    return repo, path, baseline, accepted
+
+
+def _bound_ignored_inputs(project):
+    repo = project.project
+    path = repo / "ignored-ledger.md"
+    exclude = repo / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    with exclude.open("a", encoding="utf-8") as handle:
+        handle.write(f"\n/{path.name}\n")
+    accepted = "accepted migration ledger\n"
+    path.write_text(accepted, encoding="utf-8")
+    assert verify.path_ignored(repo, path)
+    return repo, path, "legacy\n", accepted, verify.rev_parse_head(repo)
+
+
+@_POSIX_EXEC_BIT
+@pytest.mark.parametrize("committed_exec", [False, True], ids=["live-plus-x", "live-minus-x"])
+def test_commit_path_bound_refuses_live_mode_mismatch_before_candidate(
+    project, monkeypatch, committed_exec
+):
+    repo = project.project
+    path = repo / "src.txt"
+    assert verify._honors_file_mode(repo)
+    if committed_exec:
+        git(repo, "update-index", "--chmod=+x", "--", path.name)
+        git(repo, "commit", "-q", "-m", "track executable ledger")
+        path.chmod(path.stat().st_mode & ~0o111)
+    else:
+        path.chmod(path.stat().st_mode | 0o111)
+    baseline = path.read_text(encoding="utf-8")
+    accepted = "accepted migration ledger\n"
+    path.write_text(accepted, encoding="utf-8")
+    original = verify.rev_parse_head(repo)
+    index_before = git(repo, "ls-files", "-s", "--", path.name)
+    live_mode = path.stat().st_mode
+    _no_candidate_worktree(monkeypatch)
+
+    with pytest.raises(verify.GitError, match="target mode does not match its committed mode"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original
+    assert git(repo, "ls-files", "-s", "--", path.name) == index_before
+    assert path.stat().st_mode == live_mode
+    assert path.read_text(encoding="utf-8") == accepted
+
+
+@_POSIX_EXEC_BIT
+def test_commit_path_bound_refuses_replay_over_a_live_mode_flip(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+    path.chmod(path.stat().st_mode | 0o111)
+    synced = []
+    monkeypatch.setattr(verify, "_synchronize_bound_index", lambda *a, **k: synced.append(a))
+
+    with pytest.raises(verify.GitError, match="target mode does not match its committed mode"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert synced == []
+    assert verify.rev_parse_head(repo) == published
+
+
+@_POSIX_EXEC_BIT
+def test_commit_path_bound_ignores_live_mode_where_file_mode_is_off(project):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    git(repo, "config", "core.fileMode", "false")
+    path.chmod(path.stat().st_mode | 0o111)
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert published == verify.rev_parse_head(repo)
+    assert git(repo, "ls-tree", published, "--", path.name).startswith("100644 blob ")
+
+
+@_POSIX_EXEC_BIT
+def test_commit_path_bound_publishes_executable_ledger_with_matching_live_bit(project):
+    repo = project.project
+    path = repo / "src.txt"
+    git(repo, "update-index", "--chmod=+x", "--", path.name)
+    git(repo, "commit", "-q", "-m", "track executable ledger")
+    path.chmod(path.stat().st_mode | 0o111)
+    baseline = path.read_text(encoding="utf-8")
+    accepted = "accepted executable migration ledger\n"
+    path.write_text(accepted, encoding="utf-8")
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert published == verify.rev_parse_head(repo)
+    assert git(repo, "ls-tree", published, "--", path.name).startswith("100755 blob ")
+    assert git(repo, "status", "--porcelain", "--", path.name) == ""
+
+
+@_POSIX_EXEC_BIT
+def test_commit_path_bound_refuses_an_executable_never_tracked_ledger(project, monkeypatch):
+    # HEAD does not track the target, so its committed mode is 100644.
+    repo = project.project
+    path = repo / "new-ledger.md"
+    accepted = "accepted migration ledger\n"
+    path.write_text(accepted, encoding="utf-8")
+    path.chmod(path.stat().st_mode | 0o111)
+    baseline_commit = verify.rev_parse_head(repo)
+    _no_candidate_worktree(monkeypatch)
+
+    with pytest.raises(verify.GitError, match="target mode does not match its committed mode"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text="legacy\n",
+            baseline_commit=baseline_commit,
+        )
+
+    assert verify.rev_parse_head(repo) == baseline_commit
+    assert git(repo, "ls-files", "--", path.name) == ""
+
+
+class _PinnedTimesStat:
+    def __init__(self, real, mtime_ns, ctime_ns):
+        self._real = real
+        self.st_mtime_ns = mtime_ns
+        self.st_ctime_ns = ctime_ns
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+@_POSIX_EXEC_BIT
+def test_commit_path_bound_refuses_a_chmod_that_moves_no_stat_time(project, monkeypatch):
+    # A coarse-ctime filesystem can leave ctime (and chmod never moves mtime)
+    # where they were, so only the observed mode itself refuses the flip.
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    target = path.resolve()
+    real_lstat = Path.lstat
+    pinned = {}
+
+    def lstat_with_pinned_times(self, *args, **kwargs):
+        st = real_lstat(self, *args, **kwargs)
+        if self != target:
+            return st
+        pinned.setdefault("times", (st.st_mtime_ns, st.st_ctime_ns))
+        return _PinnedTimesStat(st, *pinned["times"])
+
+    real_validate = verify._validate_bound_candidate
+    flipped = []
+
+    def chmod_after_candidate_validation(*args, **kwargs):
+        real_validate(*args, **kwargs)
+        if not flipped:
+            flipped.append(True)
+            path.chmod(path.stat().st_mode | 0o111)
+
+    monkeypatch.setattr(Path, "lstat", lstat_with_pinned_times)
+    monkeypatch.setattr(verify, "_validate_bound_candidate", chmod_after_candidate_validation)
+
+    with pytest.raises(verify.GitError, match="changed during validation"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert flipped
+    assert verify.rev_parse_head(repo) == original
+
+
+def test_commit_path_bound_returns_none_for_a_clean_accepted_target(project):
+    repo, path, baseline, accepted = _bound_clean_inputs(project)
+    head = verify.rev_parse_head(repo)
+
+    assert (
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+        is None
+    )
+    assert verify.rev_parse_head(repo) == head
+
+
+@pytest.mark.parametrize("move", ["advance", "same-oid-switch"])
+def test_commit_path_bound_refuses_checkout_move_after_the_clean_probe(project, monkeypatch, move):
+    repo, path, baseline, accepted = _bound_clean_inputs(project)
+    original = verify.rev_parse_head(repo)
+    real_clean = verify.path_clean
+
+    def move_after_probe(git_repo, rel):
+        result = real_clean(git_repo, rel)
+        if move == "advance":
+            git(repo, "commit", "-q", "--allow-empty", "-m", "rival advance")
+        else:
+            git(repo, "branch", "same-object-rival", original)
+            git(repo, "symbolic-ref", "HEAD", "refs/heads/same-object-rival")
+        return result
+
+    monkeypatch.setattr(verify, "path_clean", move_after_probe)
+
+    with pytest.raises(
+        verify.GitError, match="checkout changed during exact-path clean validation"
+    ):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+
+@pytest.mark.parametrize("shape", ["tracked", "ignored-untracked"])
+def test_commit_path_bound_refuses_target_stage_after_the_clean_probe(project, monkeypatch, shape):
+    if shape == "tracked":
+        repo, path, baseline, accepted = _bound_clean_inputs(project)
+        baseline_commit = None
+    else:
+        repo, path, baseline, accepted, baseline_commit = _bound_ignored_inputs(project)
+    shadow = repo / "foreign-index.txt"
+    shadow.write_text("foreign staged ledger\n", encoding="utf-8")
+    foreign_oid = git(repo, "hash-object", "-w", "--", str(shadow))
+    shadow.unlink()
+    # The cleanliness probe is `path_clean`, then (for an untracked target)
+    # `path_ignored`; the stage lands after whichever runs last.
+    probe = "path_clean" if shape == "tracked" else "path_ignored"
+    real_probe = getattr(verify, probe)
+
+    def stage_after_probe(*args):
+        result = real_probe(*args)
+        git(repo, "update-index", "--add", "--cacheinfo", "100644", foreign_oid, path.name)
+        return result
+
+    monkeypatch.setattr(verify, probe, stage_after_probe)
+
+    with pytest.raises(verify.GitError, match="real index target changed"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+            baseline_commit=baseline_commit,
+        )
+
+    assert verify.staged_blob_oid(repo, path.name) == foreign_oid
+
+
+@_POSIX_EXEC_BIT
+def test_commit_path_bound_refuses_live_mode_mismatch_behind_a_false_clean(project):
+    # `--assume-unchanged` makes porcelain read clean over a live exec-bit flip,
+    # so only the clean return's own mode check refuses it.
+    repo, path, baseline, accepted = _bound_clean_inputs(project)
+    path.chmod(path.stat().st_mode | 0o111)
+    git(repo, "update-index", "--assume-unchanged", "--", path.name)
+    assert verify.path_clean(repo, path.name)
+
+    with pytest.raises(verify.GitError, match="target mode does not match its committed mode"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+
+@_POSIX_EXEC_BIT
+def test_commit_path_bound_never_mode_checks_an_ignored_untracked_target(project):
+    repo, path, baseline, accepted, baseline_commit = _bound_ignored_inputs(project)
+    path.chmod(path.stat().st_mode | 0o111)
+    head = verify.rev_parse_head(repo)
+
+    assert (
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+            baseline_commit=baseline_commit,
+        )
+        is None
+    )
+    assert verify.rev_parse_head(repo) == head
+
+
+@pytest.mark.parametrize("route", ["fresh", "replay"])
+def test_commit_path_bound_refuses_a_rival_live_write_during_index_sync(
+    project, monkeypatch, route
+):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    published = None
+    if route == "replay":
+        published = verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+    rival = b"rival ledger written during index synchronization\n"
+    real_sync = verify._synchronize_bound_index
+
+    def rewrite_during_sync(*args, **kwargs):
+        real_sync(*args, **kwargs)
+        path.write_bytes(rival)
+
+    monkeypatch.setattr(verify, "_synchronize_bound_index", rewrite_during_sync)
+
+    with pytest.raises(verify.GitError, match="changed during validation"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    head = verify.rev_parse_head(repo)
+    if published is not None:
+        assert head == published
+    else:
+        assert head != original
+        assert git(repo, "show", f"{head}:src.txt") == accepted.rstrip("\n")
+    assert path.read_bytes() == rival
+    # The refusal is nonterminal: replay then refuses the rival text.
+    monkeypatch.setattr(verify, "_synchronize_bound_index", real_sync)
+    with pytest.raises(verify.GitError, match="changed during validation"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+    assert verify.rev_parse_head(repo) == head
 
 
 def test_stories_relpaths_follows_the_root_it_is_given(project, tmp_path):
