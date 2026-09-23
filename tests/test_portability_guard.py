@@ -1569,8 +1569,11 @@ JOURNAL_KINDS = frozenset(
         "sweep-ledger-commit-withheld",
         "sweep-migrated",
         # DW-296/DW-297. Current-format migration recovery evidence was absent,
-        # nonregular, unreadable, malformed, or mutually inconsistent. `detail`
-        # is already routed through diagnostics._JOURNAL_DROP_FIELDS.
+        # nonregular, unreadable, malformed, or mutually inconsistent — or, since
+        # DW-315, unavailable because a host without dir-fd anchoring refuses to
+        # read any recovery record (`<label> record cannot be read without dir-fd
+        # anchoring`). `detail` is already routed through
+        # diagnostics._JOURNAL_DROP_FIELDS.
         "sweep-migration-recovery-invalid",
         "sweep-migration-restore-diverged",
         "sweep-nothing-open",

@@ -3,6 +3,7 @@
 import contextlib
 import io
 import json
+import os
 import re
 import shutil
 import sys
@@ -2139,6 +2140,16 @@ def test_validate_triage_unknown_id():
 
 
 # ---------------------------------------------------- validate_migration
+
+# DW-315: without dir-fd anchoring (native Windows) the sweep never reads or
+# unlinks a migration recovery record by path, so crash recovery escalates and
+# pre-launch retirement leaves the records in place. Tests that exercise record
+# re-reads or removals therefore run only where the dir-fd arm exists; the
+# forced-fallback `test_fallback_*` rows pin the fail-closed arm instead.
+needs_dir_fd_recovery = pytest.mark.skipif(
+    not sweep_mod.DIR_FD_ANCHORED_WRITES,
+    reason="dir-fd recovery-record reads (DW-315 fails closed without them)",
+)
 
 LEGACY_LEDGER = (
     "# Deferred Work\n\n"
@@ -21149,6 +21160,7 @@ def test_sweep_migrates_legacy_then_triages_and_runs_bundle(project):
 
 
 @pytest.mark.parametrize("tampered_record", ["baseline", "manifest", "rewrite", "result"])
+@needs_dir_fd_recovery
 def test_initial_migration_commit_refuses_tampered_durable_evidence(
     project, monkeypatch, tampered_record
 ):
@@ -21352,6 +21364,7 @@ def test_predispatch_host_death_restamps_repaired_head_before_migration_retry(pr
     assert resumed.state.tasks["sweep-migrate"].baseline_commit == repaired_head
 
 
+@needs_dir_fd_recovery
 def test_result_publication_fault_is_nonterminal_and_resume_restores_then_redispatches(
     project, monkeypatch
 ):
@@ -21398,6 +21411,7 @@ def test_result_publication_fault_is_nonterminal_and_resume_restores_then_redisp
 
 
 @pytest.mark.parametrize("ledger_mode", ["ignored", "pre-existing-untracked"])
+@needs_dir_fd_recovery
 def test_result_fault_recovery_supports_nontracked_ledgers(project, monkeypatch, ledger_mode):
     if ledger_mode == "ignored":
         ignore_before_commit(project, "_bmad-output/")
@@ -21437,6 +21451,7 @@ def test_result_fault_recovery_supports_nontracked_ledgers(project, monkeypatch,
     assert len(adapter.sessions) == 2
 
 
+@needs_dir_fd_recovery
 def test_result_fault_resume_refuses_concurrent_ledger_edit(project, monkeypatch):
     write_legacy_ledger(project, LEGACY_LEDGER)
     mapping = _valid_migration_mapping()
@@ -21462,6 +21477,7 @@ def test_result_fault_resume_refuses_concurrent_ledger_edit(project, monkeypatch
     assert "DW-99: rival" in project.deferred_work.read_text(encoding="utf-8")
 
 
+@needs_dir_fd_recovery
 def test_result_fault_resume_refuses_a_rival_that_lands_after_reset(project, monkeypatch):
     write_legacy_ledger(project, LEGACY_LEDGER)
     mapping = _valid_migration_mapping()
@@ -21484,6 +21500,7 @@ def test_result_fault_resume_refuses_a_rival_that_lands_after_reset(project, mon
     assert "DW-99: rival" in project.deferred_work.read_text(encoding="utf-8")
 
 
+@needs_dir_fd_recovery
 def test_rewrite_snapshot_publication_fault_escalates_on_resume_without_reset(project, monkeypatch):
     write_legacy_ledger(project, LEGACY_LEDGER)
     mapping = _valid_migration_mapping()
@@ -21509,6 +21526,7 @@ def test_rewrite_snapshot_publication_fault_escalates_on_resume_without_reset(pr
     assert project.deferred_work.read_text(encoding="utf-8") == accepted_live
 
 
+@needs_dir_fd_recovery
 def test_real_commit_refusal_owns_and_later_releases_ledger_doubt(project, monkeypatch):
     write_legacy_ledger(project, LEGACY_LEDGER)
     mapping = _valid_migration_mapping()
@@ -21537,6 +21555,7 @@ def test_real_commit_refusal_owns_and_later_releases_ledger_doubt(project, monke
     assert not resumed.state.tasks["sweep-migrate"].migration_ledger_doubt_owned
 
 
+@needs_dir_fd_recovery
 def test_commit_replay_does_not_release_inherited_ledger_doubt(project, monkeypatch):
     write_legacy_ledger(project, LEGACY_LEDGER)
     mapping = _valid_migration_mapping()
@@ -21574,6 +21593,7 @@ def test_committing_recovery_routes_an_unreadable_ledger_to_escalation(project, 
 
 
 @pytest.mark.parametrize("first_outcome", ["unavailable", "refused"])
+@needs_dir_fd_recovery
 def test_unavailable_migration_commit_resumes_commit_only(project, monkeypatch, first_outcome):
     write_legacy_ledger(project, LEGACY_LEDGER)
     mapping = _valid_migration_mapping()
@@ -21597,6 +21617,7 @@ def test_unavailable_migration_commit_resumes_commit_only(project, monkeypatch, 
     assert "chore(sweep): migrate legacy" in git(project.project, "log", "--oneline")
 
 
+@needs_dir_fd_recovery
 def test_commit_only_migration_resume_emits_post_migrate_once_after_publication(
     project, monkeypatch
 ):
@@ -21634,6 +21655,7 @@ def test_commit_only_migration_resume_emits_post_migrate_once_after_publication(
     assert seen == ["sweep-migrate"]
 
 
+@needs_dir_fd_recovery
 def test_crash_after_real_migration_commit_resumes_as_clean_commit_tail(project, monkeypatch):
     write_legacy_ledger(project, LEGACY_LEDGER)
     mapping = _valid_migration_mapping()
@@ -21661,6 +21683,7 @@ def test_crash_after_real_migration_commit_resumes_as_clean_commit_tail(project,
     assert len(adapter.sessions) == 1 and "--migrate" not in adapter.sessions[0].prompt
 
 
+@needs_dir_fd_recovery
 def test_result_durable_before_phase_save_resumes_commit_only(project, monkeypatch):
     write_legacy_ledger(project, LEGACY_LEDGER)
     mapping = _valid_migration_mapping()
@@ -21748,6 +21771,7 @@ def test_pending_migration_can_validate_an_already_canonical_operator_repair(pro
     assert len(adapter.sessions) == 2
 
 
+@needs_dir_fd_recovery
 def test_result_fault_recovery_refuses_an_advanced_head_without_reset(project, monkeypatch):
     write_legacy_ledger(project, LEGACY_LEDGER)
     mapping = _valid_migration_mapping()
@@ -21777,6 +21801,7 @@ def test_result_fault_recovery_refuses_an_advanced_head_without_reset(project, m
     assert project.deferred_work.read_text(encoding="utf-8") == accepted_rewrite
 
 
+@needs_dir_fd_recovery
 def test_result_fault_recovery_clears_baseline_before_a_pending_restart(project, monkeypatch):
     write_legacy_ledger(project, LEGACY_LEDGER)
     mapping = _valid_migration_mapping()
@@ -21876,6 +21901,7 @@ def test_unmarked_preupgrade_triage_verify_restarts_without_snapshot_records(pro
     assert len(adapter.sessions) == 2
 
 
+@needs_dir_fd_recovery
 def test_marked_triage_running_ignores_stale_accepted_rewrite(project, monkeypatch):
     write_legacy_ledger(project, LEGACY_LEDGER)
     mapping = _valid_migration_mapping()
@@ -22032,6 +22058,7 @@ def test_committing_resume_rejects_invalid_utf8_recovery_record(project, monkeyp
         "migrate-result.json",
     ],
 )
+@needs_dir_fd_recovery
 def test_committing_resume_escalates_when_recovery_record_read_raises(
     project, monkeypatch, record_name
 ):
@@ -22067,6 +22094,7 @@ def test_committing_resume_escalates_when_recovery_record_read_raises(
     assert project.deferred_work.read_bytes() == live
 
 
+@needs_dir_fd_recovery
 def test_recovery_record_rejection_does_not_recategorize_escalation_io_fault(project, monkeypatch):
     engine, _ = make_sweep(project, [])
     task = StoryTask(story_key="sweep-migrate", epic=0)
@@ -25056,7 +25084,7 @@ def test_fallback_migration_record_read_refuses_a_redirected_parent(project, tmp
     assert summary.paused and adapter.sessions == [] and reached == []
     assert resumed.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
     assert _records(resumed, "sweep-migration-recovery-invalid")[-1]["detail"] == (
-        "unconfined baseline record"
+        "baseline record cannot be read without dir-fd anchoring"
     )
     assert external_record.read_text(encoding="utf-8") == LEGACY_LEDGER
     assert git(project.project, "rev-parse", "HEAD") == head
@@ -25076,10 +25104,329 @@ def test_stale_migration_record_removal_refuses_a_redirected_parent(project, tmp
     engine.run_dir.symlink_to(outside, target_is_directory=True)
     monkeypatch.setattr(sweep_mod, "DIR_FD_ANCHORED_WRITES", False)
 
-    with pytest.raises(OSError, match="confine"):
+    with pytest.raises(OSError, match="without dir-fd anchoring"):
         engine._remove_migration_record(engine.run_dir / "migrate-rewrite.md")
 
     assert external_record.read_text(encoding="utf-8") == "must survive\n"
+
+
+# ---------------------------------- DW-315: fail closed without dir-fd anchoring
+#
+# These rows force the no-dir-fd arm with a monkeypatch and deliberately carry no
+# win32 skip and no symlinks: on the Windows leg the patch is a no-op and the real
+# platform takes the same fail-closed arm, so that leg proves the native path.
+
+_MIGRATION_RECORD_NAMES = frozenset(
+    {"migrate-baseline.md", "migrate-manifest.json", "migrate-rewrite.md", "migrate-result.json"}
+)
+
+
+def _spy_record_opens_and_unlinks(monkeypatch) -> list[tuple[str, str]]:
+    """Record every non-writing `os.open` and every unlink of a migration record.
+
+    Writers open only O_CREAT temp siblings and `os.replace` them into place, so a
+    read-flagged open or any unlink naming a record basename is exactly the
+    record read or stale-record removal DW-315 forbids on the fallback arm."""
+    touched: list[tuple[str, str]] = []
+    real_open, real_unlink, real_remove = os.open, os.unlink, os.remove
+    real_path_unlink = Path.unlink
+    write_flags = os.O_WRONLY | os.O_RDWR | os.O_CREAT
+
+    def record_name(path) -> str | None:
+        if isinstance(path, int):
+            return None
+        name = os.path.basename(os.fsdecode(path))
+        return name if name in _MIGRATION_RECORD_NAMES else None
+
+    def spy_open(path, flags, *args, **kwargs):
+        name = record_name(path)
+        if name is not None and not flags & write_flags:
+            touched.append(("open", name))
+        return real_open(path, flags, *args, **kwargs)
+
+    def spy_unlink(path, *args, **kwargs):
+        name = record_name(path)
+        if name is not None:
+            touched.append(("unlink", name))
+        return real_unlink(path, *args, **kwargs)
+
+    def spy_remove(path, *args, **kwargs):
+        name = record_name(path)
+        if name is not None:
+            touched.append(("unlink", name))
+        return real_remove(path, *args, **kwargs)
+
+    def spy_path_unlink(self, *args, **kwargs):
+        name = record_name(self)
+        if name is not None:
+            touched.append(("unlink", name))
+        return real_path_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", spy_open)
+    monkeypatch.setattr(os, "unlink", spy_unlink)
+    monkeypatch.setattr(os, "remove", spy_remove)
+    monkeypatch.setattr(Path, "unlink", spy_path_unlink)
+    return touched
+
+
+def test_fallback_fresh_migration_commits_from_same_attempt_evidence(project, monkeypatch):
+    """DW-315: a fresh migration on a no-dir-fd host still reaches DONE and commits.
+
+    It commits the values this attempt validated in memory instead of re-reading
+    the durable records, which it still publishes as inert evidence.
+
+    Ablation: drop the `not DIR_FD_ANCHORED_WRITES` in-memory branch in the fresh
+    acceptance block and this reddens: the durable re-read refuses and the task
+    escalates with no commit."""
+    monkeypatch.setattr(sweep_mod, "DIR_FD_ANCHORED_WRITES", False)
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    engine, adapter = make_sweep(
+        project, [migrate_effect(project, migrated_ledger(), mapping), triage_effect(plan)]
+    )
+    touched = _spy_record_opens_and_unlinks(monkeypatch)
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert len(adapter.sessions) == 2
+    assert engine.state.tasks["sweep-migrate"].phase == Phase.DONE
+    assert "chore(sweep): migrate legacy" in git(project.project, "log", "--oneline")
+    assert project.deferred_work.read_text(encoding="utf-8") == migrated_ledger()
+    assert touched == []
+    # All four records still land, as inert evidence for a human.
+    assert (engine.run_dir / "migrate-baseline.md").read_text(encoding="utf-8") == LEGACY_LEDGER
+    assert (engine.run_dir / "migrate-rewrite.md").read_text(encoding="utf-8") == migrated_ledger()
+    assert json.loads((engine.run_dir / "migrate-manifest.json").read_text(encoding="utf-8")) == (
+        legacy_manifest()
+    )
+    assert json.loads((engine.run_dir / "migrate-result.json").read_text(encoding="utf-8")) == (
+        migrate_result(mapping)
+    )
+    assert load_state(engine.run_dir).tasks["sweep-migrate"].migration_recovery_format == 1
+
+
+def test_fallback_committing_resume_escalates_before_any_record_read(project, monkeypatch):
+    """DW-315: a COMMITTING resume on a no-dir-fd host escalates, never commits.
+
+    Ablation: restore the old lstat/`path_is_confined`/`os.open` fallback body of
+    `_migration_record_text` and this reddens: the records are opened by path and
+    the resume publishes the commit."""
+    monkeypatch.setattr(sweep_mod, "DIR_FD_ANCHORED_WRITES", False)
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, _ = make_sweep(
+        project, [migrate_effect(project, migrated_ledger(), _valid_migration_mapping())]
+    )
+    touched = _spy_record_opens_and_unlinks(monkeypatch)
+    monkeypatch.setattr(engine, "_commit_ledger", lambda *_args, **_kwargs: "unavailable")
+    assert engine.run().crashed
+    assert engine.state.tasks["sweep-migrate"].phase == Phase.COMMITTING
+    head = git(project.project, "rev-parse", "HEAD")
+    live = project.deferred_work.read_bytes()
+    resumed, adapter = resume_sweep(project, engine, [])
+    reached = []
+    monkeypatch.setattr(
+        resumed,
+        "_commit_ledger",
+        lambda *_args, **_kwargs: reached.append(True) or "committed",
+    )
+
+    summary = resumed.run()
+
+    assert summary.paused and adapter.sessions == [] and reached == []
+    assert resumed.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
+    assert _records(resumed, "sweep-migration-recovery-invalid")[-1]["detail"] == (
+        "baseline record cannot be read without dir-fd anchoring"
+    )
+    assert touched == []
+    assert git(project.project, "rev-parse", "HEAD") == head
+    assert project.deferred_work.read_bytes() == live
+    assert "chore(sweep): migrate" not in git(project.project, "log", "--oneline")
+
+
+def test_fallback_triage_verify_resume_with_durable_rewrite_escalates_without_redispatch(
+    project, monkeypatch
+):
+    """DW-315: a marked TRIAGE_VERIFY resume on a no-dir-fd host escalates.
+
+    The crash lands after the accepted rewrite is durable (the result write
+    faults), which on a dir-fd host restores the baseline and redispatches.
+
+    Ablation: restore the old fallback body of `_migration_record_text` and this
+    reddens: the records are opened by path and the resume takes the
+    restore-and-redispatch arm instead of escalating."""
+    monkeypatch.setattr(sweep_mod, "DIR_FD_ANCHORED_WRITES", False)
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, _ = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
+    real_write = sweep_mod.atomic_write_text_confined
+
+    def fail_result(path, text, **kwargs):
+        if path.name == "migrate-result.json":
+            raise OSError("result publication fault")
+        return real_write(path, text, **kwargs)
+
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", fail_result)
+    touched = _spy_record_opens_and_unlinks(monkeypatch)
+    assert engine.run().crashed
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", real_write)
+    persisted = load_state(engine.run_dir).tasks["sweep-migrate"]
+    assert persisted.phase == Phase.TRIAGE_VERIFY
+    assert persisted.migration_recovery_format == 1
+    assert (engine.run_dir / "migrate-rewrite.md").read_text(encoding="utf-8") == migrated_ledger()
+    head = git(project.project, "rev-parse", "HEAD")
+    live = project.deferred_work.read_bytes()
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    resumed, adapter = resume_sweep(
+        project,
+        engine,
+        [migrate_effect(project, migrated_ledger(), mapping), triage_effect(plan)],
+    )
+
+    summary = resumed.run()
+
+    assert summary.paused and adapter.sessions == []
+    assert resumed.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
+    assert _records(resumed, "sweep-migration-recovery-invalid")[-1]["detail"] == (
+        "baseline record cannot be read without dir-fd anchoring"
+    )
+    assert touched == []
+    assert git(project.project, "rev-parse", "HEAD") == head
+    assert project.deferred_work.read_bytes() == live
+
+
+def test_fallback_escalated_migration_recovers_after_operator_deletes_records(project, monkeypatch):
+    """DW-315 end to end: an interrupted no-dir-fd migration is recoverable by hand.
+
+    COMMITTING crash -> the resume escalates -> with the legacy ledger restored,
+    the next resume refuses on the leftover rewrite record with a message naming
+    its path and the remedy, dispatching nothing -> once the operator deletes the
+    `migrate-*` records, a resume re-migrates to DONE and commits."""
+    monkeypatch.setattr(sweep_mod, "DIR_FD_ANCHORED_WRITES", False)
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, _ = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
+    monkeypatch.setattr(engine, "_commit_ledger", lambda *_args, **_kwargs: "unavailable")
+    assert engine.run().crashed
+    assert engine.state.tasks["sweep-migrate"].phase == Phase.COMMITTING
+
+    escalating, escalating_adapter = resume_sweep(project, engine, [])
+    assert escalating.run().paused and escalating_adapter.sessions == []
+    assert escalating.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
+
+    git(project.project, "checkout", "--", ".")
+    assert project.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
+    stale = engine.run_dir / "migrate-rewrite.md"
+    assert stale.read_text(encoding="utf-8") == migrated_ledger()
+    refusing, refusing_adapter = resume_sweep(
+        project, engine, [migrate_effect(project, migrated_ledger(), mapping)]
+    )
+    refused = refusing.run()
+    assert refused.crashed and refusing_adapter.sessions == []
+    assert (
+        f"cannot remove stale migration record {stale} without dir-fd anchoring; "
+        "delete it by hand, then resume"
+    ) in str(refused.crash_error)
+    assert stale.exists()
+    assert "chore(sweep): migrate" not in git(project.project, "log", "--oneline")
+
+    for record in engine.run_dir.glob("migrate-*"):
+        record.unlink()
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    resumed, adapter = resume_sweep(
+        project,
+        engine,
+        [migrate_effect(project, migrated_ledger(), mapping), triage_effect(plan)],
+    )
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert len(adapter.sessions) == 2
+    assert resumed.state.tasks["sweep-migrate"].phase == Phase.DONE
+    assert "chore(sweep): migrate legacy" in git(project.project, "log", "--oneline")
+    assert project.deferred_work.read_text(encoding="utf-8") == migrated_ledger()
+
+
+def test_fallback_fresh_start_refuses_a_present_stale_rewrite_record(project, monkeypatch):
+    """DW-315: a stale rewrite record present at a fresh no-dir-fd start refuses.
+
+    The existing `except OSError` setup path clears the baseline, nothing is
+    dispatched, and the record survives.
+
+    Ablation: restore the old `path_is_confined` + `path.unlink()` fallback tail
+    of `_remove_migration_record` and this reddens: the record is unlinked and
+    the migration session is dispatched."""
+    monkeypatch.setattr(sweep_mod, "DIR_FD_ANCHORED_WRITES", False)
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, adapter = make_sweep(
+        project, [migrate_effect(project, migrated_ledger(), _valid_migration_mapping())]
+    )
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    stale = engine.run_dir / "migrate-rewrite.md"
+    stale.write_text("stale rewrite\n", encoding="utf-8")
+    touched = _spy_record_opens_and_unlinks(monkeypatch)
+
+    summary = engine.run()
+
+    assert summary.crashed and adapter.sessions == []
+    assert (
+        f"cannot remove stale migration record {stale} without dir-fd anchoring; "
+        "delete it by hand, then resume"
+    ) in str(summary.crash_error)
+    assert touched == []
+    assert stale.read_text(encoding="utf-8") == "stale rewrite\n"
+    persisted = load_state(engine.run_dir).tasks["sweep-migrate"]
+    assert persisted.phase == Phase.PENDING
+    assert persisted.baseline_commit is None and persisted.baseline_untracked is None
+    assert project.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
+
+
+def test_fallback_prelaunch_retirement_leaves_records_and_refuses(project, monkeypatch):
+    """DW-315: pre-launch retirement on a no-dir-fd host unlinks no record.
+
+    Durable PENDING with no baseline or marker is saved first, so the leftovers
+    are inert: fallback recovery escalates before it would read any of them.
+
+    Ablation: drop the `if DIR_FD_ANCHORED_WRITES:` guard around the retirement
+    loop and this reddens: the present baseline record makes the removal refuse
+    with OSError instead of the RuntimeError (and, with the old removal body
+    restored too, the records are unlinked)."""
+    monkeypatch.setattr(sweep_mod, "DIR_FD_ANCHORED_WRITES", False)
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, adapter = make_sweep(
+        project, [migrate_effect(project, migrated_ledger(), _valid_migration_mapping())]
+    )
+    rival = LEGACY_LEDGER + "\n<!-- concurrent migration input -->\n"
+    real_write = sweep_mod.atomic_write_text_confined
+    landed = []
+
+    def publish_then_rival(path, text, **kwargs):
+        result = real_write(path, text, **kwargs)
+        if path.name == "migrate-manifest.json" and not landed:
+            landed.append(True)
+            project.deferred_work.write_text(rival, encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", publish_then_rival)
+    touched = _spy_record_opens_and_unlinks(monkeypatch)
+
+    summary = engine.run()
+
+    assert summary.crashed and adapter.sessions == [] and landed == [True]
+    assert "RuntimeError: migration ledger changed before adapter launch" in str(
+        summary.crash_error
+    )
+    assert touched == []
+    persisted = load_state(engine.run_dir).tasks["sweep-migrate"]
+    assert persisted.phase == Phase.PENDING and persisted.attempt == 0
+    assert persisted.baseline_commit is None and persisted.baseline_untracked is None
+    assert persisted.migration_recovery_format == 0
+    assert project.deferred_work.read_text(encoding="utf-8") == rival
+    assert (engine.run_dir / "migrate-baseline.md").read_text(encoding="utf-8") == LEGACY_LEDGER
+    assert json.loads((engine.run_dir / "migrate-manifest.json").read_text(encoding="utf-8")) == (
+        legacy_manifest()
+    )
 
 
 def test_the_confined_migration_records_land_under_a_disjoint_repo_root(project, tmp_path):
@@ -32240,6 +32587,7 @@ def test_first_integration_after_terminal_crash_keeps_merge_hooks_and_commit_pin
 
 
 @pytest.mark.parametrize("record_name", ["migrate-baseline.md", "migrate-manifest.json"])
+@needs_dir_fd_recovery
 def test_migration_refuses_rival_after_recovery_record_publication(
     project, monkeypatch, record_name
 ):
@@ -32278,6 +32626,7 @@ def test_migration_refuses_rival_after_recovery_record_publication(
     ids=["setup-reread", "post-record-reread", "post-hook-prelaunch-reread"],
 )
 @pytest.mark.parametrize("fault_type", [deferredwork.LedgerReadError, OSError])
+@needs_dir_fd_recovery
 def test_migration_reread_fault_retires_predispatch_authority(
     project, monkeypatch, fault_at, fault_type
 ):
@@ -32362,6 +32711,7 @@ def test_migration_hook_rival_is_refused_at_the_true_launch_boundary(project, st
     assert project.deferred_work.read_text(encoding="utf-8") == rival
 
 
+@needs_dir_fd_recovery
 def test_migration_mutating_veto_retires_authority_without_adapter_launch(project):
     write_legacy_ledger(project, LEGACY_LEDGER)
     rival = LEGACY_LEDGER + "\n<!-- vetoing hook rival -->\n"
@@ -32422,6 +32772,7 @@ def test_migration_normal_launch_runs_the_prelaunch_validator_once(project, monk
     assert checks == [LEGACY_LEDGER, LEGACY_LEDGER, LEGACY_LEDGER]
 
 
+@needs_dir_fd_recovery
 def test_migration_cleanup_fault_follows_durable_no_authority_state(project, monkeypatch):
     write_legacy_ledger(project, LEGACY_LEDGER)
     engine, adapter = make_sweep(
@@ -32456,6 +32807,7 @@ def test_migration_cleanup_fault_follows_durable_no_authority_state(project, mon
 
 
 @pytest.mark.parametrize("window", ["before-staging", "after-staging"])
+@needs_dir_fd_recovery
 def test_migration_rival_during_bound_publication_replays_commit_only(project, monkeypatch, window):
     write_legacy_ledger(project, LEGACY_LEDGER)
     mapping = _valid_migration_mapping()
@@ -32546,6 +32898,7 @@ def test_migration_committed_ledger_deletion_during_session_refuses_publication(
     ]
 
 
+@needs_dir_fd_recovery
 def test_migration_post_commit_hook_rewrite_of_live_ledger_never_earns_done(project):
     """A `post-commit` hook runs after the commit exists and cannot change it, so
     a hook that rewrites the AUTHORITATIVE ledger by absolute path lands bytes
@@ -32587,6 +32940,7 @@ def test_migration_post_commit_hook_rewrite_of_live_ledger_never_earns_done(proj
     assert [row["detail"] for row in invalid] == ["live ledger differs from accepted rewrite"]
 
 
+@needs_dir_fd_recovery
 def test_migration_prepared_publication_fault_is_sanitized_and_replayable(project, monkeypatch):
     write_legacy_ledger(project, LEGACY_LEDGER)
     mapping = _valid_migration_mapping()

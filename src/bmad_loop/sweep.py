@@ -41,7 +41,6 @@ from .platform_util import (
     atomic_write_text_confined,
     neutralize_surrogates,
     open_dir_confined,
-    path_is_confined,
     safe_segment,
 )
 from .runs import StateRootError, _project_of_run_dir, events_dir_for
@@ -3269,15 +3268,15 @@ class SweepEngine(Engine):
                     raise _MigrationRecordInvalid(f"unconfined {label} record")
                 fd = os.open(path.name, flags, dir_fd=parent_fd)
             else:
-                try:
-                    path.lstat()
-                except (FileNotFoundError, NotADirectoryError):
-                    if optional:
-                        return None
-                    raise _MigrationRecordInvalid(f"missing {label} record")
-                if not path_is_confined(root, path):
-                    raise _MigrationRecordInvalid(f"unconfined {label} record")
-                fd = os.open(path, flags)
+                # DW-315, fail closed after interruption: without dir-fd
+                # anchoring, a lexical confinement check cannot bind the later
+                # open to the same parent, so a swapped ancestor could redirect
+                # this recovery-authority read. Refuse before any lstat or
+                # open, `optional` included; a fresh migration never reaches
+                # here because it carries its evidence in memory.
+                raise _MigrationRecordInvalid(
+                    f"{label} record cannot be read without dir-fd anchoring"
+                )
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise _MigrationRecordInvalid(f"nonregular {label} record")
             with os.fdopen(fd, "r", encoding="utf-8") as stream:
@@ -3301,7 +3300,15 @@ class SweepEngine(Engine):
                 os.close(parent_fd)
 
     def _remove_migration_record(self, path: Path) -> None:
-        """Remove a stale run record without following redirected ancestors."""
+        """Remove a stale run record through a bound parent, or refuse (DW-315).
+
+        With dir-fd anchoring the unlink never follows a redirected ancestor.
+        Without it (DW-315) no unlink is ever attempted: an absent
+        record returns, and a present one raises ``OSError`` so the caller's
+        existing refusal path runs. The missing-probe is safe even through a
+        redirected parent, because a fallback host never reads records back as
+        recovery authority — a record hidden that way stays inert evidence.
+        """
         root = _project_of_run_dir(self.run_dir)
         if DIR_FD_ANCHORED_WRITES:
             parent_fd = open_dir_confined(root, path.parent)
@@ -3319,9 +3326,10 @@ class SweepEngine(Engine):
             path.lstat()
         except (FileNotFoundError, NotADirectoryError):
             return
-        if not path_is_confined(root, path):
-            raise OSError(f"cannot confine stale migration record {path.name}")
-        path.unlink()
+        raise OSError(
+            f"cannot remove stale migration record {path} without dir-fd anchoring; "
+            "delete it by hand, then resume"
+        )
 
     def _migration_baseline_and_manifest(self, task: StoryTask) -> tuple[str, list[dict[str, Any]]]:
         baseline = self._migration_record_text(
@@ -3491,11 +3499,13 @@ class SweepEngine(Engine):
         *,
         refund_attempt: bool,
     ) -> NoReturn:
-        """Persist no-launch authority before best-effort record retirement.
+        """Persist no-launch authority, then retire records where dir-fd allows.
 
-        A cleanup fault is intentionally allowed to propagate only after the
-        durable state says PENDING with no baseline or current-format marker.
-        Thus leftover files are inert evidence, never recovery authority.
+        With dir-fd anchoring the records are removed best-effort; without it
+        (DW-315) they are left in place. A cleanup fault is intentionally allowed
+        to propagate only after the durable state says PENDING with no baseline
+        or current-format marker. Thus leftover files are inert evidence, never
+        recovery authority.
         """
         task.phase = Phase.PENDING
         task.baseline_commit = None
@@ -3504,13 +3514,18 @@ class SweepEngine(Engine):
         if refund_attempt and task.attempt > 0:
             task.attempt -= 1
         self._save()
-        for name in (
-            _MIGRATE_BASELINE_RECORD,
-            _MIGRATE_MANIFEST_RECORD,
-            _MIGRATE_REWRITE_RECORD,
-            _MIGRATE_RESULT_RECORD,
-        ):
-            self._remove_migration_record(self.run_dir / name)
+        # DW-315: fallback hosts never unlink a record by an unbound name, so
+        # they skip retirement. The leftovers are inert there — fallback
+        # recovery escalates before it reads any record — and the durable
+        # PENDING state above already denies them authority.
+        if DIR_FD_ANCHORED_WRITES:
+            for name in (
+                _MIGRATE_BASELINE_RECORD,
+                _MIGRATE_MANIFEST_RECORD,
+                _MIGRATE_REWRITE_RECORD,
+                _MIGRATE_RESULT_RECORD,
+            ):
+                self._remove_migration_record(self.run_dir / name)
         raise RuntimeError("migration ledger changed before adapter launch")
 
     def _ensure_migration(self, text: str) -> None:
@@ -3797,6 +3812,16 @@ class SweepEngine(Engine):
                     json.dumps(result.result_json, indent=2),
                     confine_root=confine_root,
                 )
+                if not DIR_FD_ANCHORED_WRITES:
+                    # DW-315, fail closed after interruption: fallback hosts
+                    # cannot re-read records through a bound parent, and their
+                    # crash recovery always escalates, so the records are inert
+                    # evidence there. This same attempt's in-memory values were
+                    # validated above by `validate_migration`; commit those.
+                    advance(task, Phase.COMMITTING)
+                    self._save()
+                    self._finish_migration_commit(task, text, manifest, new_text)
+                    return
                 # Re-open the complete durable evidence set before granting the
                 # COMMITTING boundary. The local values above were validated
                 # before publication; only these run-owned records survive a

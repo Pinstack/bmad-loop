@@ -36,6 +36,9 @@ breaking changes may land in a minor release.
 - Re-raise a sweep ledger publish whose `git status` times out, fails to spawn or cannot
   read the index; only a ledger in no repository still degrades to
   `sweep-ledger-commit-unavailable` (DW-336).
+- Never read or unlink a sweep migration recovery record by path on hosts without dir-fd
+  anchoring (native Windows): an interrupted migration escalates, and a stale record
+  present at a fresh start refuses (DW-315).
 
 - Check out the exact-path ledger publication's candidate without running repository
   hooks, write it through the confined writer, read candidate objects past `git replace`
