@@ -244,17 +244,26 @@ _JOURNAL_ALIAS_FIELDS = {
 # row here. `sentinel` is scoped for a different reason: its sole producer carries a
 # spec basename, so that known shape is aliased without making the same claim about a
 # future kind that reuses the generic name.
+#
+# `source` on the three merge kinds is the unit's commit SHA (DW-318). Left to
+# `scrub_json`, an identifier-shaped 40-hex value shipped verbatim; it now shares the
+# `commit` namespace with `pre_target_revision`, so one revision gets one alias across
+# both fields. Scoped rather than by-name for the same reason as `target`: `source` is
+# a generic name (`state.source` is a run mode). The producers keep the name for the
+# same correlation reason too — `_replay_unlatched_ledger_carries` keys on it.
 _JOURNAL_KIND_ALIAS_FIELDS: dict[str, dict[str, str]] = {
     "unit-merge-started": {
         "target": "branch",
         "operation_id": "operation",
+        "source": "commit",
         "pre_target_revision": "commit",
     },
     "unit-merged": {
         "target": "branch",
         "operation_id": "operation",
+        "source": "commit",
     },
-    "resume-unit-merge": {"target": "branch", "operation_id": "operation"},
+    "resume-unit-merge": {"target": "branch", "operation_id": "operation", "source": "commit"},
     "sentinel-cleared": {"sentinel": "spec"},
 }
 # Namespaces whose journalled value arrives in more than one shape and must be
@@ -483,8 +492,8 @@ _JOURNAL_KIND_COUNTLIST_FIELDS: dict[str, frozenset[str]] = {
 # field because some other table happened to cover it would mislead the next reader.
 _JOURNAL_KIND_SCHEMAS: dict[str, frozenset[str]] = {
     "preference-escalation": frozenset({"type", "severity", "detail"}),
-    # The six kinds `render_markdown` lifts out of the scrubbed collection and
-    # prints as a JSON block in the DEFAULT dump (DW-191/192/201/246). Their names ARE
+    # The seven kinds `render_markdown` lifts out of the scrubbed collection and
+    # prints as a JSON block in the DEFAULT dump (DW-191/192/201/246/337). Their names ARE
     # authored here, so the premise above does not hold for them — an unclaimed
     # key on one of these is a field a future producer added without routing.
     # Declared anyway, because Markdown is the render an operator pastes into an
@@ -503,6 +512,10 @@ _JOURNAL_KIND_SCHEMAS: dict[str, frozenset[str]] = {
     # this table is consulted; named for the same completeness as `commit` above.
     "sweep-ledger-commit-withheld": frozenset({"message", "file", "reason", "dw_ids"}),
     "sweep-repeat-done": frozenset({"cycles", "reason", "stop_cause"}),
+    # DW-337. Both producers (`_cycle`'s dispatch gate and `_loop`'s in-flight
+    # recovery withhold) write `cycle` and `bundles_not_run`; `reason` is a DROP
+    # field and `story_keys` a `_JOURNAL_KEYLIST_FIELDS` name, both reached first.
+    "sweep-bundles-withheld": frozenset({"cycle", "bundles_not_run", "reason", "story_keys"}),
 }
 
 # Policy keys whose values can carry secrets/paths/free text. Dropped or reduced

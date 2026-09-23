@@ -419,6 +419,10 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     # The stale-restore record carries SHA strings under this name and is routed;
     # this recovery notice carries only the already-derived integer count.
     "rollback-manual-required": frozenset({"commits"}),
+    # `source` is a commit SHA on the three merge kinds and aliased there (DW-318);
+    # here it is the run mode and the literal manifest name `stories.yaml`.
+    "run-start": frozenset({"source"}),
+    "deferred-close-declaration-unreadable": frozenset({"source"}),
 }
 
 # Every OTHER field name journalled today: a declared inventory, not a per-name
@@ -711,7 +715,6 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "since_ts",
         "site",
         "skip",
-        "source",
         "spec_folder",
         "stage",
         "state_kind",
@@ -1340,8 +1343,9 @@ JOURNAL_KINDS = frozenset(
         "sweep-bundle-skipped",
         "sweep-bundles-truncated",
         # DW-194/202/210: decision-effect doubt withheld this cycle's bundles.
-        # No new diagnostics routing: cycle/bundles_not_run are already benign;
-        # reason is already a drop field and carries fixed token ledger-unreadable.
+        # cycle/bundles_not_run are benign; reason is a drop field (fixed token
+        # ledger-unreadable); story_keys is a keylist field. Declared in
+        # `_JOURNAL_KIND_SCHEMAS` (DW-337) so a future unrouted field fails closed.
         "sweep-bundles-withheld",
         "sweep-cycle",
         # DW-197. `_loop`'s own repair/write ledger read refused at the top of a

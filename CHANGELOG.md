@@ -44,6 +44,11 @@ breaking changes may land in a minor release.
   a clean return; re-validate the live ledger after target-index synchronization
   (DW-328, DW-329, DW-330).
 
+- Alias the `source` revision on `unit-merge-started`, `resume-unit-merge` and
+  `unit-merged` to the same `commit` pseudonym as `pre_target_revision` in diagnostics
+  dumps, and declare the `sweep-bundles-withheld` schema so an unrouted field on it
+  fails closed in the Markdown block (DW-318, DW-337).
+
 - Read untracked paths verbatim so rollback snapshots and cleanup handle non-ASCII
   and space-edged filenames; a resumed run's pre-fix baseline still protects the
   files it listed; failed-unit diff capture includes them too (#783).

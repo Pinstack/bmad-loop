@@ -1640,6 +1640,13 @@ def test_integration_receipt_identities_are_pseudonymized_in_merge_records():
     assert operation_aliases == [operation_aliases[0]] * 3
     assert operation_aliases[0] != operation
     assert scrubbed[0]["pre_target_revision"] != revision
+    # DW-318: `source` is the same revision namespace — one SHA, one alias across
+    # every merge kind and `pre_target_revision`. Ablation: drop the `source` rows
+    # from `_JOURNAL_KIND_ALIAS_FIELDS` and the 40-hex value survives `scrub_json`.
+    commit_alias = scrubbed[0]["pre_target_revision"]
+    assert commit_alias.startswith("commit-")
+    assert [entry["source"] for entry in scrubbed] == [commit_alias] * 3
+    assert revision not in json.dumps(scrubbed), "LEAK: raw merge revision"
     assert any(ns == "operation" and original == operation for ns, original, _ in pseudo.entries())
     assert any(ns == "commit" and original == revision for ns, original, _ in pseudo.entries())
 
@@ -2241,16 +2248,26 @@ def test_markdown_sweep_unknown_key_fails_closed_before_the_backstop(project):
             },
         ),
         ("sweep-repeat-done", {"cycles": 2, "reason": "no-open", "stop_cause": "no-open"}),
+        (
+            "sweep-bundles-withheld",
+            {
+                "cycle": 3,
+                "bundles_not_run": 2,
+                "reason": "ledger-unreadable",
+                "story_keys": [STORY_KEY],
+            },
+        ),
     ],
 )
 def test_an_unrouted_field_on_a_markdown_sweep_kind_fails_closed(kind, declared):
-    """The six kinds `render_markdown` prints as a JSON block carry a declared
+    """The seven kinds `render_markdown` prints as a JSON block carry a declared
     schema, so a field a future producer adds WITHOUT routing collapses to a
     presence marker instead of riding `scrub_json` into the pasted dump. Graded
     both ways, as the `preference-escalation` row is: the off-schema value is GONE
     and the declared identity fields (`file`, `refuse_cause`, `stop_cause`,
-    `cycles`) are NOT — a schema that flattened the record would pass an
-    absence-only assertion while destroying what the block is rendered for.
+    `cycles`, `cycle`, `bundles_not_run`) are NOT — a schema that flattened the
+    record would pass an absence-only assertion while destroying what the block is
+    rendered for.
 
     Ablation: drop `kind`'s row from `_JOURNAL_KIND_SCHEMAS` and the `AcmeVault`
     absence assertion reds — `scrub_json` is the identity on that string."""
@@ -2262,7 +2279,7 @@ def test_an_unrouted_field_on_a_markdown_sweep_kind_fails_closed(kind, declared)
     assert "customer" not in scrubbed
     assert scrubbed["customer_present"] is True
     assert "AcmeVault" not in json.dumps(scrubbed), "LEAK: off-schema sweep value"
-    for name in ("file", "refuse_cause", "stop_cause", "cycles"):
+    for name in ("file", "refuse_cause", "stop_cause", "cycles", "cycle", "bundles_not_run"):
         if name in declared:
             assert scrubbed[name] == declared[name]
     for name in ("message", "repo", "error", "reason"):
@@ -2273,6 +2290,9 @@ def test_an_unrouted_field_on_a_markdown_sweep_kind_fails_closed(kind, declared)
     if "dw_ids" in declared:
         # the keylist route runs ahead of the schema: aliased, never collapsed
         assert len(scrubbed["dw_ids"]) == 1 and "DW-7" not in json.dumps(scrubbed)
+    if "story_keys" in declared:
+        # same precedence for the story-key list on `sweep-bundles-withheld`
+        assert len(scrubbed["story_keys"]) == 1 and STORY_KEY not in json.dumps(scrubbed)
 
 
 def test_env_tmux_version_folds_a_multi_line_probe(monkeypatch):
