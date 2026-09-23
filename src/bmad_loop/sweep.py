@@ -3275,7 +3275,9 @@ class SweepEngine(Engine):
                 # open, `optional` included; a fresh migration never reaches
                 # here because it carries its evidence in memory.
                 raise _MigrationRecordInvalid(
-                    f"{label} record cannot be read without dir-fd anchoring"
+                    f"{label} record cannot be read without dir-fd anchoring; "
+                    "restore the pre-migration ledger, delete the migrate-* "
+                    f"records in {path.parent}, then resume"
                 )
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise _MigrationRecordInvalid(f"nonregular {label} record")
@@ -3328,7 +3330,7 @@ class SweepEngine(Engine):
             return
         raise OSError(
             f"cannot remove stale migration record {path} without dir-fd anchoring; "
-            "delete it by hand, then resume"
+            f"delete every migrate-* record in {path.parent} by hand, then resume"
         )
 
     def _migration_baseline_and_manifest(self, task: StoryTask) -> tuple[str, list[dict[str, Any]]]:
@@ -3813,11 +3815,13 @@ class SweepEngine(Engine):
                     confine_root=confine_root,
                 )
                 if not DIR_FD_ANCHORED_WRITES:
-                    # DW-315, fail closed after interruption: fallback hosts
-                    # cannot re-read records through a bound parent, and their
-                    # crash recovery always escalates, so the records are inert
-                    # evidence there. This same attempt's in-memory values were
-                    # validated above by `validate_migration`; commit those.
+                    # DW-315, fail closed after interruption: this arm has no
+                    # bound-parent record reader, because the recorded DW-315
+                    # decision chose fail-closed over porting one (e.g. via
+                    # `win32_at`). Every resume that would read the records
+                    # escalates instead, so they are inert evidence here. This
+                    # same attempt's in-memory values were validated above by
+                    # `validate_migration`; commit those.
                     advance(task, Phase.COMMITTING)
                     self._save()
                     self._finish_migration_commit(task, text, manifest, new_text)

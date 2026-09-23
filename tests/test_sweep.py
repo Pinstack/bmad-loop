@@ -25084,7 +25084,9 @@ def test_fallback_migration_record_read_refuses_a_redirected_parent(project, tmp
     assert summary.paused and adapter.sessions == [] and reached == []
     assert resumed.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
     assert _records(resumed, "sweep-migration-recovery-invalid")[-1]["detail"] == (
-        "baseline record cannot be read without dir-fd anchoring"
+        "baseline record cannot be read without dir-fd anchoring; "
+        "restore the pre-migration ledger, delete the migrate-* "
+        f"records in {resumed.run_dir}, then resume"
     )
     assert external_record.read_text(encoding="utf-8") == LEGACY_LEDGER
     assert git(project.project, "rev-parse", "HEAD") == head
@@ -25237,7 +25239,9 @@ def test_fallback_committing_resume_escalates_before_any_record_read(project, mo
     assert summary.paused and adapter.sessions == [] and reached == []
     assert resumed.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
     assert _records(resumed, "sweep-migration-recovery-invalid")[-1]["detail"] == (
-        "baseline record cannot be read without dir-fd anchoring"
+        "baseline record cannot be read without dir-fd anchoring; "
+        "restore the pre-migration ledger, delete the migrate-* "
+        f"records in {resumed.run_dir}, then resume"
     )
     assert touched == []
     assert git(project.project, "rev-parse", "HEAD") == head
@@ -25289,7 +25293,9 @@ def test_fallback_triage_verify_resume_with_durable_rewrite_escalates_without_re
     assert summary.paused and adapter.sessions == []
     assert resumed.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
     assert _records(resumed, "sweep-migration-recovery-invalid")[-1]["detail"] == (
-        "baseline record cannot be read without dir-fd anchoring"
+        "baseline record cannot be read without dir-fd anchoring; "
+        "restore the pre-migration ledger, delete the migrate-* "
+        f"records in {resumed.run_dir}, then resume"
     )
     assert touched == []
     assert git(project.project, "rev-parse", "HEAD") == head
@@ -25301,7 +25307,7 @@ def test_fallback_escalated_migration_recovers_after_operator_deletes_records(pr
 
     COMMITTING crash -> the resume escalates -> with the legacy ledger restored,
     the next resume refuses on the leftover rewrite record with a message naming
-    its path and the remedy, dispatching nothing -> once the operator deletes the
+    its path and the remedy (delete every `migrate-*` record), dispatching nothing -> once the operator deletes the
     `migrate-*` records, a resume re-migrates to DONE and commits."""
     monkeypatch.setattr(sweep_mod, "DIR_FD_ANCHORED_WRITES", False)
     write_legacy_ledger(project, LEGACY_LEDGER)
@@ -25326,7 +25332,7 @@ def test_fallback_escalated_migration_recovers_after_operator_deletes_records(pr
     assert refused.crashed and refusing_adapter.sessions == []
     assert (
         f"cannot remove stale migration record {stale} without dir-fd anchoring; "
-        "delete it by hand, then resume"
+        f"delete every migrate-* record in {stale.parent} by hand, then resume"
     ) in str(refused.crash_error)
     assert stale.exists()
     assert "chore(sweep): migrate" not in git(project.project, "log", "--oneline")
@@ -25372,7 +25378,7 @@ def test_fallback_fresh_start_refuses_a_present_stale_rewrite_record(project, mo
     assert summary.crashed and adapter.sessions == []
     assert (
         f"cannot remove stale migration record {stale} without dir-fd anchoring; "
-        "delete it by hand, then resume"
+        f"delete every migrate-* record in {stale.parent} by hand, then resume"
     ) in str(summary.crash_error)
     assert touched == []
     assert stale.read_text(encoding="utf-8") == "stale rewrite\n"
