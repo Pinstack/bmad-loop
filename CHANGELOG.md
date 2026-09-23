@@ -33,6 +33,11 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Check out the exact-path ledger publication's candidate without running repository
+  hooks, write it through the confined writer, read candidate objects past `git replace`
+  refs, and surface and prune candidate-worktree cleanup failures (DW-324, DW-325,
+  DW-326, DW-331).
+
 - Read untracked paths verbatim so rollback snapshots and cleanup handle non-ASCII
   and space-edged filenames; a resumed run's pre-fix baseline still protects the
   files it listed; failed-unit diff capture includes them too (#783).

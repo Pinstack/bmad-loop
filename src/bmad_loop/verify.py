@@ -1947,7 +1947,10 @@ def _git_env(repo: Path, *args: str, env: dict[str, str]) -> tuple[int, str]:
 
 
 def git_bytes(
-    repo: Path, *args: str, timeout_s: int | None = None
+    repo: Path,
+    *args: str,
+    timeout_s: int | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run one `git -C <repo> …` through the chokepoint, capturing raw BYTES.
 
@@ -1969,8 +1972,13 @@ def git_bytes(
     caller whose surface must not appear hung, the shorter per-call `timeout_s`
     (#390). The two faults with no rc to return still raise — a timeout as
     `GitError`, a spawn failure as `GitSpawnError` — since neither can be
-    expressed as a `CompletedProcess`."""
-    return _run_git(["git", "-C", str(repo), *args], repo, binary=True, timeout_s=timeout_s)
+    expressed as a `CompletedProcess`.
+
+    `env` is opt-in and mirrors `_git_out`'s: it replaces the inherited
+    environment for this one child (`LC_ALL=C` still merged on top)."""
+    return _run_git(
+        ["git", "-C", str(repo), *args], repo, binary=True, timeout_s=timeout_s, env=env
+    )
 
 
 def git_version_at_least(reported: str, want: tuple[int, int]) -> bool:
@@ -4984,13 +4992,18 @@ def attempt_dirty(
     return bool(created)
 
 
-def _entry_at_revision(repo: Path, revision: str, rel: str) -> tuple[str, str, str] | None:
+def _entry_at_revision(
+    repo: Path, revision: str, rel: str, *, env: dict[str, str] | None = None
+) -> tuple[str, str, str] | None:
     """Return ``(mode, type, oid)`` for one literal path at ``revision``.
 
     ``ls-tree`` gives absence as an empty successful result while keeping an
     invalid revision or object-database fault as a non-zero command. That
     distinction is load-bearing for recovery: absence is a proven baseline
     ownership state; a Git failure is not authority to reset.
+
+    ``env`` is opt-in (default: the inherited environment); the bound
+    publication passes `_bound_git_env()` so the read sees raw objects.
     """
     proc = _run_git(
         [
@@ -5006,6 +5019,7 @@ def _entry_at_revision(repo: Path, revision: str, rel: str) -> tuple[str, str, s
         ],
         repo,
         binary=True,
+        env=env,
     )
     if proc.returncode != 0:
         detail = (proc.stdout + proc.stderr).decode("utf-8", "replace").strip()
@@ -10124,9 +10138,25 @@ class _BoundGitEntry:
     oid: str
 
 
+def _bound_git_env() -> dict[str, str]:
+    """The environment for the bound publication's raw-object reads (DW-331).
+
+    `git replace` refs are ordinary repository state a session can write, and
+    with them honoured a replaced captured parent checks out, diffs and lists
+    as its replacement while the published commit still records the raw
+    parent — so unrelated changes would ride into the raw commit with every
+    probe agreeing it is exact. `GIT_NO_REPLACE_OBJECTS` makes the candidate
+    checkout, `_bound_parent`, `_bound_changed_paths` and `_bound_tree_entry`
+    read the raw objects the published commit actually carries; the other
+    publication reads (the baseline `cat-file`, `_accepted_bound_transition`'s
+    `rev-list`, the non-tree-ancestor and cleanliness probes, the index
+    `reset`) still honour replace refs."""
+    return {**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"}
+
+
 def _bound_tree_entry(repo: Path, revision: str, rel: str) -> _BoundGitEntry | None:
     try:
-        entry = _entry_at_revision(repo, revision, rel)
+        entry = _entry_at_revision(repo, revision, rel, env=_bound_git_env())
     except GitError as exc:
         raise GitError(f"committed publication target could not be observed in {repo}") from exc
     if entry is None:
@@ -10230,6 +10260,7 @@ def _bound_changed_paths(repo: Path, parent: str, revision: str) -> set[str]:
         parent,
         revision,
         "--",
+        env=_bound_git_env(),
     )
     if proc.returncode != 0:
         raise GitError(f"git candidate scope probe failed in {repo}")
@@ -10241,7 +10272,9 @@ class _BoundCandidateMismatch(GitError):
 
 
 def _bound_parent(repo: Path, revision: str) -> str:
-    rc, lineage, _detail = _git_out(repo, "rev-list", "--parents", "--max-count=1", revision)
+    rc, lineage, _detail = _git_out(
+        repo, "rev-list", "--parents", "--max-count=1", revision, env=_bound_git_env()
+    )
     if rc != 0:
         raise GitError(f"git candidate parent probe failed in {repo}")
     parts = lineage.split()
@@ -10479,6 +10512,30 @@ def commit_path_bound(
     tracked has since been deleted by a rival commit, and the publication
     refuses rather than re-adding it. Without it an absent target has no
     authority and is refused the same way.
+
+    The candidate checkout runs with repository hooks disabled (`-c
+    core.hooksPath=<empty dir>`, command-line config outranking any
+    repo-configured path): a post-checkout hook would otherwise run before the
+    accepted bytes land and could leave any pathname behind (DW-326). Only that
+    checkout is hook-free — the candidate `git commit` still runs the repo's
+    pre-commit and commit-msg hooks, and validation catches what they change.
+    The accepted bytes are written through the descriptor-anchored confined
+    writer, so on POSIX a symlink or FIFO at the leaf is replaced rather than
+    written through and a redirected ancestor refuses the write (win32 gets the
+    confined writer's documented check-then-write degrade); the staged mode is
+    pinned to the captured target's with `git add --chmod`.
+
+    The candidate checkout and the validator's parent, path-scope and tree-entry
+    reads (`_bound_parent`, `_bound_changed_paths`, `_bound_tree_entry`) run
+    under `GIT_NO_REPLACE_OBJECTS=1`, so those decisions are made on the raw
+    objects the published commit carries rather than on `git replace`
+    substitutes (DW-331); the other publication reads still honour replace refs.
+
+    Cleanup of the candidate worktree is never silently dropped (DW-324/325): a
+    `worktree remove` that exits non-zero or raises is raised as `GitError` when
+    nothing else is propagating, and otherwise attached as a note to the error
+    that is. Either way, once the temporary directory is gone, a best-effort
+    `worktree prune` drops the stale administrative entry.
     """
     try:
         rc, top, _detail = _git_out(repo, "rev-parse", "--show-toplevel")
@@ -10561,71 +10618,124 @@ def commit_path_bound(
         raise GitError("candidate publication parent shape could not be validated") from exc
     if has_non_tree_parent:
         raise GitError("candidate publication path has a non-directory committed parent")
-    with tempfile.TemporaryDirectory() as td:
-        candidate_root = Path(td) / "candidate"
-        rc, _out = _git(
-            repo_root,
-            "worktree",
-            "add",
-            "--detach",
-            str(candidate_root),
-            captured.oid,
-        )
-        if rc != 0:
-            raise GitError(f"git detached candidate checkout failed in {repo_root}")
-        try:
-            candidate_path = candidate_root / rel
+    cleanup_fault = False
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            candidate_root = Path(td) / "candidate"
+            hooks_dir = Path(td) / "no-hooks"
             try:
-                candidate_path.parent.mkdir(parents=True, exist_ok=True)
-                candidate_path.write_bytes(accepted_bytes)
-            except (OSError, RuntimeError, ValueError) as exc:
-                raise GitError("exact-path candidate content could not be written") from exc
-            rc, _out = _git(candidate_root, "add", "--", *_literal_specs([rel]))
-            if rc != 0:
-                raise GitError(f"git exact-path candidate staging failed in {repo_root}")
-            staged_entry = _bound_index_entry(candidate_root, rel)
-            if staged_entry != _BoundGitEntry(expected_mode, "blob", accepted_oid):
-                raise GitError("exact-path candidate staging changed accepted content")
-            _bound_live_ledger_identity(lexical, target, accepted_text, observed=observed)
-            if _bound_checkout_identity(repo_root) != captured:
-                raise GitError("checkout changed before exact-path candidate hooks")
-            rc, _out = _git(candidate_root, "commit", "-m", message)
-            if rc != 0:
-                raise GitError(f"git exact-path candidate commit failed in {repo_root}")
-            try:
-                candidate = rev_parse_head(candidate_root)
-            except GitError as exc:
-                raise GitError("exact-path candidate identity could not be validated") from exc
-            _validate_bound_candidate(
+                hooks_dir.mkdir()
+            except OSError as exc:
+                raise GitError("detached candidate hook isolation could not be prepared") from exc
+            rc, _out = _git_env(
                 repo_root,
-                candidate,
-                captured.oid,
-                rel,
-                accepted_oid,
-                baseline_oid,
-            )
-            _bound_live_ledger_identity(lexical, target, accepted_text, observed=observed)
-            _publish_bound_candidate(
-                repo_root,
-                captured,
-                candidate,
-                rel,
-                accepted_oid,
-                baseline_oid,
-            )
-        except BaseException as exc:
-            active_error = exc
-            raise
-        finally:
-            rc, _out = _git(
-                repo_root,
+                "-c",
+                f"core.hooksPath={hooks_dir}",
                 "worktree",
-                "remove",
-                "--force",
+                "add",
+                "--detach",
                 str(candidate_root),
+                captured.oid,
+                env=_bound_git_env(),
             )
-            if rc != 0 and active_error is None:
-                raise GitError(f"git detached candidate cleanup failed in {repo_root}")
+            if rc != 0:
+                raise GitError(f"git detached candidate checkout failed in {repo_root}")
+            try:
+                candidate_path = candidate_root / rel
+                executable = expected_mode == "100755"
+
+                def _pin_exec_bit(fd: int | None) -> None:
+                    # The confined writer creates at 0600; carry the captured
+                    # target's exec bit onto the inode so a hook that re-adds
+                    # the file stages the same mode `--chmod` pins below.
+                    if fd is None or not executable:
+                        return
+                    os.fchmod(fd, (os.fstat(fd).st_mode & 0o777) | 0o100)
+
+                try:
+                    candidate_path.parent.mkdir(parents=True, exist_ok=True)
+                    atomic_write_bytes_confined(
+                        candidate_path,
+                        accepted_bytes,
+                        confine_root=candidate_root,
+                        _after_replace=_pin_exec_bit,
+                    )
+                except (OSError, RuntimeError, ValueError) as exc:
+                    raise GitError("exact-path candidate content could not be written") from exc
+                rc, _out = _git(
+                    candidate_root,
+                    "add",
+                    "--chmod=+x" if executable else "--chmod=-x",
+                    "--",
+                    *_literal_specs([rel]),
+                )
+                if rc != 0:
+                    raise GitError(f"git exact-path candidate staging failed in {repo_root}")
+                staged_entry = _bound_index_entry(candidate_root, rel)
+                if staged_entry != _BoundGitEntry(expected_mode, "blob", accepted_oid):
+                    raise GitError("exact-path candidate staging changed accepted content")
+                _bound_live_ledger_identity(lexical, target, accepted_text, observed=observed)
+                if _bound_checkout_identity(repo_root) != captured:
+                    raise GitError("checkout changed before exact-path candidate hooks")
+                rc, _out = _git(candidate_root, "commit", "-m", message)
+                if rc != 0:
+                    raise GitError(f"git exact-path candidate commit failed in {repo_root}")
+                try:
+                    candidate = rev_parse_head(candidate_root)
+                except GitError as exc:
+                    raise GitError("exact-path candidate identity could not be validated") from exc
+                _validate_bound_candidate(
+                    repo_root,
+                    candidate,
+                    captured.oid,
+                    rel,
+                    accepted_oid,
+                    baseline_oid,
+                )
+                _bound_live_ledger_identity(lexical, target, accepted_text, observed=observed)
+                _publish_bound_candidate(
+                    repo_root,
+                    captured,
+                    candidate,
+                    rel,
+                    accepted_oid,
+                    baseline_oid,
+                )
+            except BaseException as exc:
+                active_error = exc
+                raise
+            finally:
+                cleanup_detail: str | None = None
+                cleanup_exc: GitError | None = None
+                try:
+                    rc, out = _git(
+                        repo_root,
+                        "worktree",
+                        "remove",
+                        "--force",
+                        str(candidate_root),
+                    )
+                    if rc != 0:
+                        cleanup_detail = out
+                except GitError as exc:
+                    cleanup_exc = exc
+                    cleanup_detail = str(exc)
+                if cleanup_detail is not None:
+                    cleanup_fault = True
+                    if active_error is None:
+                        raise GitError(
+                            f"git detached candidate cleanup failed in {repo_root}: "
+                            f"{cleanup_detail}"
+                        ) from cleanup_exc
+                    active_error.add_note(
+                        f"git detached candidate cleanup also failed in {repo_root}: "
+                        f"{cleanup_detail}"
+                    )
+    finally:
+        # `worktree prune` only drops entries whose directory is gone, so it
+        # runs here, after `TemporaryDirectory` has deleted the checkout.
+        if cleanup_fault:
+            worktree_prune(repo_root)
 
     assert candidate is not None
     _bound_live_ledger_identity(lexical, target, accepted_text, observed=observed)

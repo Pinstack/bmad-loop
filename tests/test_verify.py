@@ -9362,6 +9362,33 @@ def test_commit_path_bound_preserves_tracked_executable_target_mode(project):
     assert git(repo, "diff", "--cached", "--name-only") == ""
 
 
+def test_commit_path_bound_keeps_executable_mode_when_a_hook_re_adds_the_target(project):
+    # `--chmod=+x` pins the staged mode, but a pre-commit hook that re-adds the
+    # file stages the inode's own mode: the confined writer creates it 0600, so
+    # without the exec bit carried onto the inode the hook flips it to 100644.
+    repo = project.project
+    path = repo / "src.txt"
+    git(repo, "update-index", "--chmod=+x", "--", path.name)
+    git(repo, "commit", "-q", "-m", "track executable ledger")
+    baseline = path.read_text(encoding="utf-8")
+    accepted = "accepted executable migration ledger\n"
+    path.write_text(accepted, encoding="utf-8")
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\ngit add -- src.txt\n")
+    hook.chmod(0o755)
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert published == verify.rev_parse_head(repo)
+    assert git(repo, "ls-tree", published, "--", path.name).startswith("100755 blob ")
+
+
 def test_commit_path_bound_rejects_hook_mode_mutation(project):
     repo, path, baseline, accepted = _bound_publish_inputs(project)
     original = verify.rev_parse_head(repo)
@@ -9406,6 +9433,286 @@ def test_commit_path_bound_refuses_committed_symlink_parent_before_candidate_wri
         )
 
     assert not (outside / "ledger.md").exists()
+
+
+# DW-324/325/326/331: the detached candidate worktree's hardening.
+
+
+def _raw_git(repo, *args, env=None, input_bytes=None):
+    """A test-owned git spawn that never honours replace refs — the raw view a
+    published commit is judged by."""
+    proc = subprocess.run(
+        ["git", "--no-replace-objects", "-C", str(repo), *args],
+        capture_output=True,
+        check=True,
+        env=env,
+        input=input_bytes,
+    )
+    return proc.stdout.decode("utf-8").strip()
+
+
+def _raw_tree_with(repo, base, tmp_dir, changes):
+    """The tree of `base` with each `path -> bytes` of `changes` written in,
+    built in a throwaway index so the real one is untouched."""
+    env = {**os.environ, "GIT_INDEX_FILE": str(tmp_dir / "scratch-index")}
+    _raw_git(repo, "read-tree", base, env=env)
+    for rel, data in changes.items():
+        oid = _raw_git(repo, "hash-object", "-w", "--stdin", input_bytes=data)
+        _raw_git(repo, "update-index", "--add", "--cacheinfo", f"100644,{oid},{rel}", env=env)
+    return _raw_git(repo, "write-tree", env=env)
+
+
+def _commit_tree(repo, tree, *parents, message="bound fixture"):
+    args = ["commit-tree", tree]
+    for parent in parents:
+        args += ["-p", parent]
+    return _raw_git(repo, *args, "-m", message)
+
+
+def _intercept_candidate_checkout(monkeypatch, after_add):
+    """Run `after_add(candidate_root)` right after the candidate `worktree add`
+    returns — the window between checkout and the accepted-bytes write."""
+    real_git_env = verify._git_env
+
+    def intercept(git_repo, *args, **kwargs):
+        result = real_git_env(git_repo, *args, **kwargs)
+        if "worktree" in args and "add" in args and result[0] == 0:
+            after_add(Path(args[args.index("--detach") + 1]))
+        return result
+
+    monkeypatch.setattr(verify, "_git_env", intercept)
+
+
+@pytest.mark.parametrize("hooks_location", ["git-dir", "configured-hooks-path"])
+def test_commit_path_bound_candidate_checkout_runs_no_post_checkout_hook(
+    project, tmp_path, hooks_location
+):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    post_checkout = tmp_path / "post-checkout-ran"
+    pre_commit = tmp_path / "pre-commit-ran"
+    if hooks_location == "git-dir":
+        hooks = repo / ".git" / "hooks"
+    else:
+        # A repo-configured `core.hooksPath` (husky/lefthook): the command-line
+        # `-c` override must still outrank it for the candidate checkout.
+        hooks = tmp_path / "configured-hooks"
+        hooks.mkdir()
+        git(repo, "config", "core.hooksPath", hooks.as_posix())
+    hook = hooks / "post-checkout"
+    hook.write_text(f"#!/bin/sh\n: > '{post_checkout.as_posix()}'\n")
+    hook.chmod(0o755)
+    gate = hooks / "pre-commit"
+    gate.write_text(f"#!/bin/sh\n: > '{pre_commit.as_posix()}'\n")
+    gate.chmod(0o755)
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert published == verify.rev_parse_head(repo)
+    assert git(repo, "show", f"{published}:src.txt") == accepted.rstrip("\n")
+    assert not post_checkout.exists()
+    # Only the checkout is hook-free: the candidate commit is still gated.
+    assert pre_commit.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_commit_path_bound_replaces_a_leaf_symlink_left_after_checkout(
+    project, tmp_path_factory, monkeypatch
+):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    outside = tmp_path_factory.mktemp("outside") / "outside.txt"
+    outside.write_bytes(b"outside bytes\n")
+
+    def swap_leaf(candidate_root):
+        leaf = candidate_root / "src.txt"
+        leaf.unlink()
+        leaf.symlink_to(outside)
+
+    _intercept_candidate_checkout(monkeypatch, swap_leaf)
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert outside.read_bytes() == b"outside bytes\n"
+    assert published == verify.rev_parse_head(repo)
+    assert git(repo, "ls-tree", published, "--", "src.txt").startswith("100644 blob ")
+    assert git(repo, "show", f"{published}:src.txt") == accepted.rstrip("\n")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_commit_path_bound_refuses_an_ancestor_symlink_left_after_checkout(
+    project, tmp_path_factory, monkeypatch
+):
+    repo = project.project
+    ledger_dir = repo / "ledger-dir"
+    ledger_dir.mkdir()
+    path = ledger_dir / "ledger.md"
+    baseline = "legacy migration ledger\n"
+    path.write_text(baseline, encoding="utf-8")
+    git(repo, "add", "--", "ledger-dir/ledger.md")
+    git(repo, "commit", "-q", "-m", "track nested ledger")
+    original = verify.rev_parse_head(repo)
+    accepted = "accepted migration ledger\n"
+    path.write_text(accepted, encoding="utf-8")
+    outside = tmp_path_factory.mktemp("outside-dir")
+
+    def swap_ancestor(candidate_root):
+        nested = candidate_root / "ledger-dir"
+        (nested / "ledger.md").unlink()
+        nested.rmdir()
+        nested.symlink_to(outside, target_is_directory=True)
+
+    _intercept_candidate_checkout(monkeypatch, swap_ancestor)
+    with pytest.raises(verify.GitError, match="candidate content could not be written"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+            baseline_commit=original,
+        )
+
+    assert list(outside.iterdir()) == []
+    assert verify.rev_parse_head(repo) == original
+
+
+def test_commit_path_bound_builds_on_the_raw_captured_parent(project, tmp_path):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    head = verify.rev_parse_head(repo)
+    head_parents = _raw_git(repo, "rev-list", "--parents", "--max-count=1", head).split()[1:]
+    smuggled_tree = _raw_tree_with(
+        repo, head, tmp_path, {"smuggled.txt": b"smuggled through a replace ref\n"}
+    )
+    replacement = _commit_tree(repo, smuggled_tree, *head_parents, message="replacement")
+    git(repo, "replace", head, replacement)
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert published is not None
+    raw_lineage = _raw_git(repo, "rev-list", "--parents", "--max-count=1", published).split()
+    assert raw_lineage == [published, head]
+    assert (
+        _raw_git(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", head, published)
+        == "src.txt"
+    )
+
+
+@pytest.mark.parametrize(
+    ("masked_read", "message"),
+    [
+        ("parent", "unexpected parent"),
+        ("scope", "outside its declared scope"),
+        ("ledger", "does not contain the accepted ledger"),
+    ],
+)
+def test_bound_candidate_validation_reads_raw_objects_past_a_replace_ref(
+    project, tmp_path, masked_read, message
+):
+    repo = project.project
+    rel = "src.txt"
+    baseline = (repo / rel).read_text(encoding="utf-8")
+    accepted = "accepted migration ledger\n"
+    expected_parent = verify.rev_parse_head(repo)
+    accepted_oid = verify.git_normalized_blob_oid_for_bytes(repo, rel, accepted.encode())
+    baseline_oid = verify.git_normalized_blob_oid_for_bytes(repo, rel, baseline.encode())
+    accepted_tree = _raw_tree_with(repo, expected_parent, tmp_path, {rel: accepted.encode()})
+    if masked_read == "parent":
+        rival = _commit_tree(repo, f"{expected_parent}^{{tree}}", expected_parent)
+        raw = _commit_tree(repo, accepted_tree, rival)
+    elif masked_read == "scope":
+        wide_tree = _raw_tree_with(
+            repo, expected_parent, tmp_path, {rel: accepted.encode(), "extra.txt": b"extra\n"}
+        )
+        raw = _commit_tree(repo, wide_tree, expected_parent)
+    else:
+        rival_tree = _raw_tree_with(repo, expected_parent, tmp_path, {rel: b"rival ledger\n"})
+        raw = _commit_tree(repo, rival_tree, expected_parent)
+    # The replacement is a candidate the validator would accept: exact parent,
+    # exact one-path delta, the accepted blob.
+    looks_valid = _commit_tree(repo, accepted_tree, expected_parent, message="looks valid")
+    verify._validate_bound_candidate(
+        repo, looks_valid, expected_parent, rel, accepted_oid, baseline_oid
+    )
+    git(repo, "replace", raw, looks_valid)
+
+    with pytest.raises(verify._BoundCandidateMismatch, match=message):
+        verify._validate_bound_candidate(
+            repo, raw, expected_parent, rel, accepted_oid, baseline_oid
+        )
+
+
+def _fail_candidate_cleanup(monkeypatch, fault):
+    real_git = verify._git
+
+    def failing_remove(git_repo, *args, **kwargs):
+        if args[:2] == ("worktree", "remove"):
+            if fault == "raise":
+                raise verify.GitError("injected cleanup timeout")
+            return 1, "injected cleanup fault"
+        return real_git(git_repo, *args, **kwargs)
+
+    monkeypatch.setattr(verify, "_git", failing_remove)
+
+
+@pytest.mark.parametrize("fault", ["rc", "raise"])
+def test_commit_path_bound_notes_a_cleanup_fault_on_the_propagating_error(
+    project, monkeypatch, fault
+):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\nexit 1\n")
+    hook.chmod(0o755)
+    _fail_candidate_cleanup(monkeypatch, fault)
+
+    with pytest.raises(verify.GitError, match="candidate commit failed") as raised:
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    notes = getattr(raised.value, "__notes__", [])
+    assert any("candidate cleanup also failed" in note for note in notes)
+    assert verify.rev_parse_head(repo) == original
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+@pytest.mark.parametrize("fault", ["rc", "raise"])
+def test_commit_path_bound_raises_and_prunes_a_cleanup_only_fault(project, monkeypatch, fault):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    _fail_candidate_cleanup(monkeypatch, fault)
+
+    with pytest.raises(verify.GitError, match="detached candidate cleanup failed"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) != original
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
 
 
 def test_prepared_ref_timeout_before_commit_is_not_indeterminate(project):

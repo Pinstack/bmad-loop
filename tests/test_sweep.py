@@ -32313,19 +32313,28 @@ def test_migration_rival_during_bound_publication_replays_commit_only(project, m
     accepted = migrated_ledger()
     rival = accepted + "\n<!-- publication rival -->\n"
     real_git = verify._git
+    real_git_env = verify._git_env
     landed = []
 
-    def inject_rival(git_repo, *args, **kwargs):
-        before_stage = window == "before-staging" and args[:2] == ("worktree", "add")
-        after_stage = (
-            window == "after-staging" and args[:1] == ("commit",) and git_repo != project.project
-        )
-        if (before_stage or after_stage) and not landed:
+    def land_rival():
+        if not landed:
             landed.append(True)
             project.deferred_work.write_text(rival, encoding="utf-8")
+
+    def inject_rival(git_repo, *args, **kwargs):
+        if window == "after-staging" and args[:1] == ("commit",) and git_repo != project.project:
+            land_rival()
         return real_git(git_repo, *args, **kwargs)
 
+    def inject_rival_at_checkout(git_repo, *args, **kwargs):
+        # The hook-disabled candidate checkout runs `git -c core.hooksPath=…
+        # worktree add` through `_git_env` (DW-326/331).
+        if window == "before-staging" and "worktree" in args and "add" in args:
+            land_rival()
+        return real_git_env(git_repo, *args, **kwargs)
+
     monkeypatch.setattr(verify, "_git", inject_rival)
+    monkeypatch.setattr(verify, "_git_env", inject_rival_at_checkout)
     first = engine.run()
 
     assert first.crashed and landed == [True] and len(first_adapter.sessions) == 1
@@ -32334,6 +32343,7 @@ def test_migration_rival_during_bound_publication_replays_commit_only(project, m
     assert project.deferred_work.read_text(encoding="utf-8") == rival
 
     monkeypatch.setattr(verify, "_git", real_git)
+    monkeypatch.setattr(verify, "_git_env", real_git_env)
     project.deferred_work.write_text(accepted, encoding="utf-8")
     plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "later"}])
     resumed, resumed_adapter = resume_sweep(project, engine, [triage_effect(plan)])
