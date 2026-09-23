@@ -58,11 +58,21 @@ _MODULE_VERSION_PAT = re.compile(r"(?m)^(module_version:\s*)\S+")
 _MARKET_PAT = re.compile(r'(?m)^(\s*"version"\s*:\s*")[^"]*(")')
 
 
+def parse_canonical(text: str) -> str | None:
+    """The ``__version__`` value in ``__init__.py`` source ``text``, or ``None``.
+
+    The single owner of that parse: :func:`read_canonical` reads the checkout with
+    it, and ``release.py`` reads a ``git show`` blob of another commit with it.
+    """
+    m = _INIT_PAT.search(text)
+    return m.group(0).split('"')[1] if m else None
+
+
 def read_canonical() -> str:
-    m = _INIT_PAT.search(INIT.read_text())
-    if not m:
+    version = parse_canonical(INIT.read_text())
+    if version is None:
         sys.exit(f"error: could not find __version__ in {INIT}")
-    return m.group(0).split('"')[1]
+    return version
 
 
 def _sub_once(pat: re.Pattern[str], repl: str, text: str, path: Path) -> str:

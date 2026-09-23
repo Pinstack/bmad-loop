@@ -40,6 +40,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Verify an existing `vX.Y.Z` tag in `scripts/release.py publish` instead of trusting it:
+  the commit the tag points to on `origin` must carry the version (or, on a lost
+  `gh release create` race, be exactly the targeted commit); a mismatch, a local-only
+  tag or a failed `git ls-remote` fails the publish (DW-352).
 - Report hooks registered in `validate`/`probe-adapter` only when every Stop-mapped event
   runs a relay naming `Stop` from an executed (`type: command`) handler and no event's relay
   names the wrong canonical event; `init` now adds the real handler beside a non-command

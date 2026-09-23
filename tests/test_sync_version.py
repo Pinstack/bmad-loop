@@ -103,3 +103,16 @@ def test_second_plugin_stale_is_caught(marketplace):
         }
     )
     assert sync_version.check() == 1
+
+
+# --- parse_canonical: the one owner of the __version__ parse ---------------- #
+# release.py reads `git show <commit>:__init__.py` blobs through it, so it must
+# agree with read_canonical on the checkout and answer None, not exit, on a miss.
+def test_parse_canonical_agrees_with_read_canonical():
+    assert sync_version.parse_canonical(sync_version.INIT.read_text()) == (
+        sync_version.read_canonical()
+    )
+
+
+def test_parse_canonical_is_none_without_a_version():
+    assert sync_version.parse_canonical('"""no version here."""\n') is None
