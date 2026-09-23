@@ -33,6 +33,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Re-raise a sweep ledger publish whose `git status` times out, fails to spawn or cannot
+  read the index; only a ledger in no repository still degrades to
+  `sweep-ledger-commit-unavailable` (DW-336).
+
 - Check out the exact-path ledger publication's candidate without running repository
   hooks, write it through the confined writer, read candidate objects past `git replace`
   refs, and surface and prune candidate-worktree cleanup failures (DW-324, DW-325,

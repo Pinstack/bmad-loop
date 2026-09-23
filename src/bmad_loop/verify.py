@@ -138,6 +138,22 @@ class GitTimeoutError(GitError):
     operator anything."""
 
 
+class GitNotARepositoryError(GitError):
+    """Git answered that the directory is in NO repository: its discovery walk
+    failed (`fatal: not a git repository (or any ...)`). A GitError so every
+    existing guard is unchanged; a distinct type because that answer is a steady
+    property of the destination, where a timeout, a spawn failure or an unreadable
+    index is a fault in a real repository — `sweep._commit_ledger` degrades only
+    on this type and re-raises the rest (DW-336). `path_clean` is its only
+    producer."""
+
+
+# Git's repository-discovery failure (`setup.c`), stable under `_run_git`'s
+# `LC_ALL=C`, matched at the START of a stderr line. The trailing "(or any " is
+# what excludes the gitfile form (`not a git repository: <path>`).
+_NOT_A_REPOSITORY_PREFIX = "fatal: not a git repository (or any "
+
+
 class _GitCommitIndeterminate(GitError):
     """A prepared ref transaction may have committed but lost its acknowledgement."""
 
@@ -4570,7 +4586,19 @@ def path_clean(repo: Path, rel: str) -> bool:
     merged stream that chatter is indistinguishable from a porcelain record — a
     clean path would answer DIRTY on a noisy host, and every already-clean publish
     would then stage and re-interrogate a file it had nothing to say about. The
-    error path keeps the merge, where stderr is the informative half."""
+    error path keeps the merge, where stderr is the informative half.
+
+    A failure with a STDERR line that STARTS with git's repository-discovery prefix,
+    `fatal: not a git repository (or any ` — the "(or any of the parent
+    directories)" and "(or any parent up to mount point ...)" forms — raises
+    :class:`GitNotARepositoryError` with the same message; every other failure stays
+    a plain `GitError` (DW-336). The text is stable because `_run_git` pins
+    `LC_ALL=C`, and it is matched at the start of a stderr line alone, so neither a
+    porcelain record nor operator path text quoted mid-line (`cannot change to
+    '<repo>'`) can forge it. The match is deliberately that narrow: a broken gitfile
+    (`not a git repository: <path>`) or a `safe.directory` refusal is a real
+    repository's fault, which a caller that degrades on an absent repository must
+    still see."""
     # A resolved symlink target may have any basename, including pathspec magic.
     # Match commit_paths' literal scope and include new publications even when
     # the operator hides untracked files in their interactive status display.
@@ -4589,6 +4617,8 @@ def path_clean(repo: Path, rel: str) -> bool:
     )
     if proc.returncode != 0:
         merged = (proc.stdout + proc.stderr).strip()
+        if any(line.startswith(_NOT_A_REPOSITORY_PREFIX) for line in proc.stderr.splitlines()):
+            raise GitNotARepositoryError(f"git status failed in {repo}: {merged}")
         raise GitError(f"git status failed in {repo}: {merged}")
     return proc.stdout.strip() == ""
 

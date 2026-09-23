@@ -9084,9 +9084,13 @@ def test_a_ledger_commit_git_attempted_and_refused_ends_the_sweep_loudly(project
     The STORE family keeps its DW-160 degrade on the same fault, and the second
     half pins that: the split is by family, not a blanket re-raise.
 
-    Ablation: drop the `if attempted and family == "ledger": raise` arm and the
-    first half reds with a `sweep-ledger-commit-unavailable` row for a repository
-    that answered `git status` a moment earlier."""
+    Ablation: exempt the ledger family from the re-raise entirely (the store's
+    unconditional degrade) and the first half reds with a
+    `sweep-ledger-commit-unavailable` row for a repository that answered `git
+    status` a moment earlier. Dropping `attempted or` alone stays green, since
+    `commit_paths` never raises `GitNotARepositoryError` and the DW-336 clause
+    re-raises the refusal anyway: `attempted` is kept as defense-in-depth for an
+    attempted commit."""
     from bmad_loop import decisions as decisions_store
 
     write_ledger(project, {"DW-1": "open", "DW-2": "open"})
@@ -9132,6 +9136,148 @@ def test_a_ledger_commit_git_attempted_and_refused_ends_the_sweep_loudly(project
     [failed] = _records(engine, "sweep-ledger-commit-unavailable")
     assert failed["file"] == "decisions.json"
     assert "pre-commit hook refused" in failed["error"]
+
+
+def _path_clean_raising(fault):
+    """A `verify.path_clean` stand-in that raises `fault`, recording each basename it
+    was asked about so a row can prove the publish reached git's first call."""
+    asked: list[str] = []
+
+    def path_clean(root, name):
+        asked.append(name)
+        raise fault
+
+    return path_clean, asked
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        verify.GitTimeoutError("git status timed out after 60s"),
+        verify.GitSpawnError("could not spawn git: [Errno 24] Too many open files"),
+        verify.GitError(
+            "git status failed: fatal: Unable to create '.git/index.lock': File exists."
+        ),
+    ],
+    ids=["timeout", "spawn", "index-lock"],
+)
+def test_a_ledger_path_clean_fault_in_a_real_repo_escapes_the_close_phase(
+    project, monkeypatch, fault
+):
+    """DW-336. `path_clean` raised one plain `GitError` for a destination in no
+    repository AND for a timeout, a spawn failure or an index `git status` could not
+    read inside a real one, and `_commit_ledger` degraded on all four. So a close
+    that LANDED on disk, followed by a `path_clean` that timed out, carried on with
+    the ledger dirty — into the cycle's bundles, whose `commit_story` `add -A` would
+    sweep it into a story commit or whose failed rollback would discard it. Now the
+    ledger family degrades only on the typed `GitNotARepositoryError`; each of the
+    three real-repository faults escapes `_close_resolved` after the write.
+
+    Premise before outcome: `project` IS a repository, `path_clean` was reached for
+    the ledger (so the fault came from git's first call, not a refusal ahead of it),
+    DW-1 is `done` on disk and still `open` at HEAD. No `sweep-ledger-commit-
+    unavailable` row, and the doubt stays unarmed — the raise, not the doubt, is
+    what stops the run.
+
+    Ablation: restore the flat `except` (`if attempted and family == "ledger":
+    raise` as the only re-raise) and every row reds on `DID NOT RAISE`."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    rel = ledger_rel(project)
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    engine._save()  # a state file to read the un-armed verdict back from
+    plan = TriagePlan(
+        open_ids=frozenset({"DW-1", "DW-2"}),
+        already_resolved=(ResolvedEntry("DW-1", "fixed by a1b2c3d"),),
+    )
+    faulty, asked = _path_clean_raising(fault)
+    monkeypatch.setattr(verify, "path_clean", faulty)
+
+    with pytest.raises(type(fault)) as info:
+        engine._close_resolved(plan)
+    assert info.value is fault
+    assert not isinstance(fault, verify.GitNotARepositoryError)  # premise: a real-repo fault
+    assert asked == ["deferred-work.md"]  # premise: the publish reached git's first call
+    assert ledger_entries(project)["DW-1"].done  # the landed close stays on disk
+    at_head = {
+        e.id: e for e in deferredwork.parse_ledger(git(project.project, "show", f"HEAD:{rel}"))
+    }
+    assert at_head["DW-1"].open  # ...and off HEAD
+    assert _records(engine, "sweep-ledger-commit-unavailable") == []  # not a degrade
+    assert not engine._ledger_unfit_to_publish()
+    assert load_state(engine.run_dir).sweep_ledger_in_doubt is False
+
+
+def test_a_ledger_path_clean_timeout_escapes_the_decision_phase_publish(project, monkeypatch):
+    """DW-336 for the decision phase's tail publisher: a human closes DW-1, the
+    effect lands (`decision:` line and close on disk), and the publish's
+    `path_clean` times out inside the real `project` repository. The timeout
+    escapes `_decisions_phase` instead of degrading to a
+    `sweep-ledger-commit-unavailable` row the cycle carried on past.
+
+    Ablation: restore the flat `except` (`if attempted and family == "ledger":
+    raise` as the only re-raise) and this reds on `DID NOT RAISE`."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    rel = ledger_rel(project)
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    engine._save()
+    engine.prompting = True
+    engine.prompter = DecisionPrompter(input_fn=lambda _p: "1", print_fn=lambda _l: None)
+    fault = verify.GitTimeoutError("git status timed out after 60s")
+    faulty, asked = _path_clean_raising(fault)
+    monkeypatch.setattr(verify, "path_clean", faulty)
+
+    with pytest.raises(verify.GitTimeoutError) as info:
+        engine._decisions_phase(
+            TriagePlan(
+                open_ids=frozenset({"DW-1", "DW-2"}),
+                decisions=(_close_or_keep_decision("DW-1"),),
+            )
+        )
+    assert info.value is fault
+    assert asked == ["deferred-work.md"]  # premise: the publish reached git's first call
+    on_disk = project.deferred_work.read_text(encoding="utf-8")
+    assert _decision_lines(on_disk) == 1  # the landed effect stays on disk
+    assert ledger_entries(project)["DW-1"].done
+    assert _decision_lines(git(project.project, "show", f"HEAD:{rel}")) == 0  # ...off HEAD
+    assert _records(engine, "sweep-ledger-commit-unavailable") == []
+    assert load_state(engine.run_dir).sweep_ledger_in_doubt is False
+
+
+def test_a_store_prune_still_degrades_on_a_path_clean_timeout(project, monkeypatch):
+    """DW-336 narrowed the LEDGER family alone. The pre-answer prune is STORE-family
+    bookkeeping — the cycle's last call or a materialize-time drop, where the on-disk
+    record is what matters and re-dropping later is cheap — so a `GitTimeoutError`
+    out of its `path_clean` still degrades to the journal row, as it did before.
+
+    Ablation: restore the flat `except` (`if attempted and family == "ledger":
+    raise` as the only re-raise) and this row stays GREEN — it pins the other
+    direction. Drop `family == "ledger"` from the narrowed re-raise, so it applies
+    to both families, and this reds with the timeout escaping the prune."""
+    from bmad_loop import decisions as decisions_store
+
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    decisions_store.record_pre_answer(
+        project.project,
+        "DW-2",
+        DecisionOption(key="2", label="Keep", effect="keep-open"),
+        date="2026-06-12",
+    )
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "store")
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    faulty, asked = _path_clean_raising(verify.GitTimeoutError("git status timed out after 60s"))
+    monkeypatch.setattr(verify, "path_clean", faulty)
+
+    stale = decisions_store.load_pre_answers(project.project)["DW-2"]
+    engine._prune_dropped_pre_answer("DW-2", "stale-option", stale)  # must not raise
+    assert asked == ["decisions.json"]  # premise: the publish reached git's first call
+    assert "DW-2" not in decisions_store.load_pre_answers(project.project)  # write survived
+    [failed] = _records(engine, "sweep-ledger-commit-unavailable")
+    assert failed["file"] == "decisions.json"
+    assert "timed out" in failed["error"]
 
 
 def test_commit_ledger_requires_the_published_path():
@@ -12128,16 +12274,18 @@ _SETTLE_COMMIT = "chore(sweep): commit a ledger write an interrupted phase left 
 
 
 def _degrade_publishers(monkeypatch, engine, messages):
-    """Make the named ledger publishers miss the one way a ledger publish still
-    DEGRADES rather than raises: a `verify.GitError` out of `path_clean`, ahead of
-    any commit attempt — git could not read the tree (an `index.lock` a rival
-    process held for the moment, say), so `_commit_ledger`'s `attempted` flag never
-    flips and the fault takes the `sweep-ledger-commit-unavailable` arm. A
-    `GitError` out of `commit_paths` is the OTHER shape, a commit git was asked to
-    make and refused, and since S05 that one ends the sweep loudly for the ledger
-    family (`test_a_ledger_commit_git_attempted_and_refused_ends_the_sweep_loudly`)
-    — so it is exactly what a "missed publish the run carried on past" must NOT be
-    modelled with. Every publisher outside `messages` keeps its real git.
+    """Make the named ledger publishers miss the one way a ledger publish still DEGRADES
+    rather than raises: a `verify.GitNotARepositoryError` out of `path_clean`, ahead of
+    any commit attempt — git answered that the destination is in no repository, so
+    `_commit_ledger`'s `attempted` flag never flips and the fault takes the
+    `sweep-ledger-commit-unavailable` arm. Every other `GitError` raises for the ledger
+    family (outside the migration branch): a `commit_paths` fault (a commit git was
+    asked to make and refused, since S05 —
+    `test_a_ledger_commit_git_attempted_and_refused_ends_the_sweep_loudly`) and, since
+    DW-336, a `path_clean` timeout, spawn failure or unreadable index
+    (`test_a_ledger_path_clean_fault_in_a_real_repo_escapes_the_close_phase`) — so none
+    of those is what a "missed publish the run carried on past" may be modelled with.
+    Every publisher outside `messages` keeps its real git.
 
     Scoped to the MESSAGE by wrapping `_commit_ledger` itself, since `path_clean`
     carries no message to gate on: the instrument `_arm_at_the_repeat_boundary`
@@ -12145,13 +12293,15 @@ def _degrade_publishers(monkeypatch, engine, messages):
     later in the cycle and faulting it too would leave nothing to grade."""
     real_commit = engine._commit_ledger
 
-    def tree_unreadable(root, name):
-        raise verify.GitError("git status failed: index.lock exists")
+    def no_repository(root, name):
+        raise verify.GitNotARepositoryError(
+            "git status failed: fatal: not a git repository (or any of the parent directories)"
+        )
 
     def commit_ledger(message, **kwargs):
         if message in messages:
             with monkeypatch.context() as m:
-                m.setattr(verify, "path_clean", tree_unreadable)
+                m.setattr(verify, "path_clean", no_repository)
                 return real_commit(message, **kwargs)
         return real_commit(message, **kwargs)
 
@@ -12169,12 +12319,12 @@ def test_a_no_progress_stop_publishes_a_close_its_own_publisher_missed(project, 
 
     The window is real and it is not the crash window DW-193 closed: nothing crashes
     here. `_close_resolved`'s `pending` arm REACHED its publish and the publish
-    DEGRADED — `_commit_ledger` catches a `verify.GitError` raised AHEAD of any
-    commit attempt (`path_clean`: git could not read the tree) and journals
-    `sweep-ledger-commit-unavailable`, deliberately, because bookkeeping must never
-    abort a sweep over a tree it cannot interrogate. (A commit git was ASKED to make
-    and refused is the other shape, and since S05 that one raises for the ledger
-    family — see `_degrade_publishers`.) The cycle then closed nothing of its own, so
+    DEGRADED — `_commit_ledger` catches a `verify.GitNotARepositoryError` raised
+    AHEAD of any commit attempt (`path_clean`: the destination is in no repository)
+    and journals `sweep-ledger-commit-unavailable`, deliberately, because
+    bookkeeping must never abort a sweep over a destination that answers the same
+    way every cycle. (Every other `GitError` raises for the ledger family — see
+    `_degrade_publishers`.) The cycle then closed nothing of its own, so
     `progressed` is False, and before this change the `no-progress` return sat ABOVE
     the boundary `_commit_ledger`: the durable close stayed off HEAD for the rest of
     the run with no publisher left to reach it. Nor is it the crash window S05's
@@ -12261,8 +12411,8 @@ def test_a_max_cycles_stop_publishes_a_close_its_own_publisher_missed(project, m
 
     Premise before outcome, exactly as the sibling row: the flip is asserted `done` on
     disk and `open` in the HEAD blob, and the close phase's pre-attempt
-    `verify.GitError` miss is asserted afterwards. DW-3 stays open so the cap, not an empty open set, is what
-    stops the run.
+    `verify.GitNotARepositoryError` miss is asserted afterwards. DW-3 stays open so
+    the cap, not an empty open set, is what stops the run.
 
     Ablation: move the boundary `_commit_ledger` back below the
     `cycle >= self.max_cycles` return and this reds with no `sweep-ledger-commit` row
@@ -12327,9 +12477,10 @@ def test_terminal_boundary_retries_a_failed_decision_commit(
 ):
     """A real decision audit reaches HEAD after its own publisher degraded (DW-223).
 
-    The decision phase's miss is the pre-attempt shape (`_degrade_publishers`: git
-    could not read the tree), the only `GitError` a ledger publish still degrades on
-    since S05. Two terminal stops, and since S05 two different first responders:
+    The decision phase's miss is the pre-attempt shape (`_degrade_publishers`: the
+    destination is in no repository), the only `GitError` a ledger publish still
+    degrades on since DW-336. Two terminal stops, and since S05 two different first
+    responders:
 
     * `max-cycles` — nothing crashes; the landed close hits the one-cycle cap, and
       the BOUNDARY publisher, hoisted above the stop, is the retry.
@@ -12348,8 +12499,8 @@ def test_terminal_boundary_retries_a_failed_decision_commit(
     Ablations: move the boundary `_commit_ledger` back below the two returns and
     `max-cycles-False` reds with no `sweep-ledger-commit` row and DW-1 `open` at
     HEAD, `no-progress-False` reds on the missing `sweep-ledger-commit-clean` row;
-    let a pre-attempt `GitError` escape `_commit_ledger`'s handler and every row
-    crashes at the decision publisher instead of reaching its stop.
+    let a pre-attempt `GitNotARepositoryError` escape `_commit_ledger`'s handler and
+    every row crashes at the decision publisher instead of reaching its stop.
     """
     write_ledger(project, {"DW-1": "open", "DW-2": "open"})
     rel = ledger_rel(project)
@@ -15251,7 +15402,9 @@ def test_a_ledger_commit_in_a_non_git_project_keeps_the_write_and_journals(proje
     owner-of-the-file rule is graded on both families rather than asserted in prose.
 
     Ablation: drop the `except verify.GitError` arm in `_commit_ledger` and this reds
-    with the `GitError` escaping `_close_resolved`.
+    with the `GitError` escaping `_close_resolved`. The CLASSIFICATION is load-bearing
+    too (DW-336): drop the `GitNotARepositoryError` raise in `verify.path_clean` and
+    this reds the same way, because the ledger family now degrades only on that type.
 
     The git arm does NOT arm the run's doubt (DW-260), and the two trailing
     assertions pin that: git declining to publish a file it could reach says

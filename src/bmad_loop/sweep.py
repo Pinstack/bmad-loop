@@ -2213,9 +2213,10 @@ class SweepEngine(Engine):
             # Publish the workspace ledger at the repeat-cycle boundary, before
             # no-progress, max-cycles, or cycle N+1. This also retries a close or
             # decision publish that degraded earlier in the cycle (DW-223) — the
-            # pre-attempt degrade, a tree git could not read at that moment; a
-            # commit git was asked to make and refused raised out of that phase
-            # instead (S05), so it never reaches here.
+            # pre-attempt degrade, which since DW-336 is only the not-a-repository
+            # answer; a timeout, spawn failure or unreadable index (DW-336) and a
+            # commit git was asked to make and refused (S05) raise out of that
+            # phase instead, so they never reach here.
             # Keep this single site below the ledger-fault/unfit stops above;
             # non-repeat, decisions-only and no-open exits return earlier.
             # There is no landed-write gate here: even a skip-only terminal cycle
@@ -2223,9 +2224,10 @@ class SweepEngine(Engine):
             # including out-of-band edits without a recovered close beside them.
             # Unrelated files stay with their owner. The whole-file trade is the
             # same as `_publish_stranded_close`; `_close_resolved` inventories the
-            # nine publication sites. A pre-attempt git fault stays a best-effort
-            # miss here too; an attempted commit git refuses raises, as at every
-            # ledger publisher.
+            # nine publication sites. A ledger in no repository stays a
+            # best-effort miss here too; a timeout, spawn failure or unreadable
+            # index, and an attempted commit git refuses, raise, as at every
+            # ledger publisher (DW-336).
             self._commit_ledger(
                 "chore(sweep): commit ledger at the sweep cycle boundary",
                 path=self.workspace.paths.deferred_work,
@@ -5764,39 +5766,49 @@ class SweepEngine(Engine):
         replays make that the ordinary case, not the rare one: a resumed cycle
         re-closing ids already `done` reproduces the committed bytes exactly.
 
-        A `verify.GitError` from a tree git cannot INTERROGATE degrades to a
-        journal row naming the resolved directory and the error, and under this
-        rule that degrade is REQUIRED rather than a kindness. `cli`'s sweep
-        precondition only requires `paths.repo_root` to be a git repository, so
-        neither the project nor a freestanding artifacts directory need be one,
-        and `git status` there answers `fatal: not a git repository`. Letting
-        that raise through would abort the whole sweep over a destination that
-        will answer the same way on every cycle — strictly worse than the missed
-        commit it replaces. `decisions.apply_pre_answer` degrades on `GitError`
-        for the store ("best effort, so a non-git or dirty tree never blocks the
-        on-disk record") and this keeps them agreeing.
+        A destination in NO repository degrades to a journal row naming the
+        resolved directory and the error, and under this rule that degrade is
+        REQUIRED rather than a kindness. `cli`'s sweep precondition only requires
+        `paths.repo_root` to be a git repository, so neither the project nor a
+        freestanding artifacts directory need be one, and `git status` there
+        answers `fatal: not a git repository`. Letting that raise through would
+        abort the whole sweep over a destination that will answer the same way on
+        every cycle — strictly worse than the missed commit it replaces.
+        `decisions.apply_pre_answer` degrades on `GitError` for the store ("best
+        effort, so a non-git or dirty tree never blocks the on-disk record") and
+        the STORE family keeps degrading on every `GitError`.
 
-        A `GitError` from a commit that was ATTEMPTED is a different fault, and
-        for the LEDGER family it propagates. `path_clean` runs first, so by the
+        The LEDGER family has one rule (DW-336): it degrades only on a typed
+        not-a-repository answer (`verify.GitNotARepositoryError`, which
+        `path_clean` raises off git's discovery-failure stderr) or a failed
+        resolve; every other `GitError` propagates. `path_clean` used to raise
+        one plain `GitError` for a missing repository, a timeout, a spawn failure
+        and an index `git status` could not read, so a repair write followed by a
+        timed-out `path_clean` carried on with a dirty ledger — the hazard the
+        next paragraph names. The migration branch is outside the rule: its
+        `unavailable` already ends the run through `_finish_migration_commit`.
+
+        A `GitError` from a commit that was ATTEMPTED is the other half of that rule,
+        and for the LEDGER family it propagates. `path_clean` runs first, so by the
         time `commit_paths` raises, git has already answered for this tree: the
-        destination is a repository, the ledger is dirty in it, and the commit
-        itself failed — a hook refused it, the index could not be written, the
-        disk filled. That is not a destination that cannot be published to; it is
-        a publication that failed, and the five ledger publishers raised on it
-        before they were re-rooted (DW-175) — "their raise is the pre-existing
-        contract, and nothing here should quiet a commit failure nobody asked to
-        re-root", which the re-rooting then quieted by accident of sharing one
-        handler with the store. Restored, because the degrade had a hazard behind
-        it and not just a doctrine: the cycle's bundles run next, against a
-        baseline this commit was meant to clean, and a dirty ledger there is
-        swept into a story commit by `commit_story`'s `add -A` or discarded by a
-        failed bundle's rollback — closures and `decision:` lines already
-        journalled as landed. The STORE family keeps degrading on an attempted
-        commit too, as it did before this PR (DW-160): its two prunes are the
-        cycle's last call and a materialize-time drop, the on-disk record is what
-        matters for a pre-answer, and re-dropping later is cheap. Observation may
-        degrade, repair writes must raise (AGENTS.md); the ledger commit is the
-        publication step of a repair, and the store commit is bookkeeping.
+        destination is a repository, the ledger is dirty in it, and the commit itself
+        failed — a hook refused it, the index could not be written, the disk filled.
+        That is not a destination that cannot be published to; it is a publication
+        that failed, and the five ledger publishers raised on it before they were
+        re-rooted (DW-175) — "their raise is the pre-existing contract, and nothing
+        here should quiet a commit failure nobody asked to re-root", which the
+        re-rooting then quieted by accident of sharing one handler with the store.
+        Restored, because the degrade had a hazard behind it and not just a doctrine:
+        the cycle's bundles run next, against a baseline this commit was meant to
+        clean, and a dirty ledger there is swept into a story commit by
+        `commit_story`'s `add -A` or discarded by a failed bundle's rollback —
+        closures and `decision:` lines already journalled as landed. The STORE family
+        keeps degrading on an attempted commit too, as it did before this PR (DW-160):
+        its two prunes are the cycle's last call and a materialize-time drop, the
+        on-disk record is what matters for a pre-answer, and re-dropping later is
+        cheap. Observation may degrade, repair writes must raise (AGENTS.md); the
+        ledger commit is the publication step of a repair, and the store commit is
+        bookkeeping.
 
         The RESOLVE degrades to the same row for the not-a-repository reason, but
         from an arm of its OWN (DW-260): `path.resolve()` can raise `OSError` (a
@@ -5814,6 +5826,9 @@ class SweepEngine(Engine):
         `verify.commit_paths` wraps its own resolves and `lstat` probes the same
         way, and `unpublishable_target` returns a token rather than raising.
         `verify.last_commit_for` guards its own resolve against the same pair.
+        Inside that arm the ledger family degrades only on
+        `GitNotARepositoryError` (DW-336, above); the store family on any
+        `GitError`.
         Best effort applies to Git interrogation and resolution only: journal
         I/O failures propagate, as they do for other journal writes, and so does
         either arming arm's `state.json` write (`_record_ledger_doubt()` →
@@ -5878,7 +5893,11 @@ class SweepEngine(Engine):
         `_write_intent` exactly as it did behind a refusal. The git arm — a
         `GitError` after a successful resolve — does NOT arm: git declining to
         publish a file it could reach is bookkeeping, not evidence about the
-        file. Both arming arms are ledger-family only.
+        file. Both arming arms are ledger-family only. DW-336 leaves the
+        ledger-family `target-unreadable` refusal a doubt-arming refusal, not a
+        raise: DW-237 split the read `OSError` out of the undecodable cause, and
+        DW-244's doubt arm withholds the cycle's bundles, so the carry-on hazard
+        DW-336 closes for the git arm does not exist there.
 
         The guard NARROWS a window it does not close, and the residual is worth
         naming the way `_prune_dropped_pre_answer` names its own: a TRACKED target
@@ -6013,15 +6032,24 @@ class SweepEngine(Engine):
                         live_path=path,
                     )
         except verify.GitError as e:
-            if attempted and family == "ledger":
-                raise  # a ledger commit git was asked to make failed: publication failed
+            # DW-336: the LEDGER family degrades only on git's typed "no
+            # repository here" answer or in the migration branch (whose
+            # `unavailable` `_finish_migration_commit` turns into the run's end);
+            # a timeout, a spawn failure, an unreadable index or an ATTEMPTED
+            # commit is a publication that failed, and re-raises.
+            if family == "ledger" and (
+                attempted
+                or (accepted_text is None and not isinstance(e, verify.GitNotARepositoryError))
+            ):
+                raise
             # `verify.GitError` ALONE: `_run_git` translates spawn/timeout/decode
             # faults and `commit_paths` its own resolves and `lstat` probes into
             # this taxonomy, and `unpublishable_target` returns rather than raises,
             # so nothing an `OSError`/`RuntimeError` arm could catch here escapes
-            # the helpers untranslated. The RESOLVED directory in `repo`, which is
-            # the one git was actually asked about. No doubt is armed: see the
-            # docstring.
+            # the helpers untranslated. Reached by the ledger family only for a
+            # destination in no repository (or the migration branch). The RESOLVED
+            # directory in `repo`, which is the one git was actually asked about.
+            # No doubt is armed: see the docstring.
             self.journal.append(
                 "sweep-ledger-commit-unavailable",
                 message=message,
@@ -6084,7 +6112,7 @@ class SweepEngine(Engine):
         # commit put it there or because it already was. That settles any debt a
         # publisher latched (`_owe_ledger_commit`) — and only that answer does:
         # the degrade and refusal arms above return with the latch untouched,
-        # since a tree git cannot interrogate, or a target that is absent or
+        # since a destination in no repository, or a target that is absent or
         # undecodable, says nothing about whether the write reached HEAD, and
         # neither does the `commit_paths` race below (dirty, then gone untracked
         # before `git add`), which is why `clean or sha` and not `not refusal`.

@@ -526,8 +526,10 @@ its descendants recursively.
 
 Refusal is best effort and does not itself raise or roll back the on-disk
 answer. A sweep ledger refusal arms ledger doubt; the surrounding loop still
-applies its own read and stop rules. A Git fault ahead of the commit attempt — a
-tree git could not interrogate — is also reported best effort. A ledger commit git
+applies its own read and stop rules. Ahead of the commit attempt, only a ledger
+whose directory is in no git repository (and the store, on any Git fault) is also
+reported best effort; a ledger `git status` that times out, fails to spawn or
+cannot read the index ends the sweep (DW-336). A ledger commit git
 was ASKED to make and refused (a hook, an unwritable index, a full disk) is not:
 `path_clean` has already answered for the tree by then, so the publication itself
 failed, and the sweep ends loudly rather than letting the cycle's bundles run
@@ -544,13 +546,13 @@ target name. The resolved `repo` directory, when available, is the file's parent
 which may be a subdirectory of its Git repository. A resolve failure reports
 the lexical parent because it could not obtain the resolved one.
 
-| Journal kind                      | Meaning                                                                                                                                     |
-| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sweep-ledger-commit`             | A commit was made; the row includes its SHA.                                                                                                |
-| `sweep-ledger-commit-clean`       | The path was already clean, or the commit found nothing to do after the dirty check. Nothing was published.                                 |
-| `sweep-ledger-commit-refused`     | Target validation refused the operand; `refuse_cause` gives one of the four tokens above, with `error` for decode/OS faults.                |
-| `sweep-ledger-commit-unavailable` | Resolution or Git failed ahead of a ledger commit attempt (or at all, for the store); the row names the file, directory, message and error. |
-| `sweep-ledger-commit-withheld`    | An earlier ledger-doubt verdict prevented a gated publication. Recovery probes can include the ids whose writes were not proved.            |
+| Journal kind                      | Meaning                                                                                                                                                      |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `sweep-ledger-commit`             | A commit was made; the row includes its SHA.                                                                                                                 |
+| `sweep-ledger-commit-clean`       | The path was already clean, or the commit found nothing to do after the dirty check. Nothing was published.                                                  |
+| `sweep-ledger-commit-refused`     | Target validation refused the operand; `refuse_cause` gives one of the four tokens above, with `error` for decode/OS faults.                                 |
+| `sweep-ledger-commit-unavailable` | Resolution failed, or the ledger's directory is in no git repository (any Git failure, for the store); the row names the file, directory, message and error. |
+| `sweep-ledger-commit-withheld`    | An earlier ledger-doubt verdict prevented a gated publication. Recovery probes can include the ids whose writes were not proved.                             |
 
 An ignored path can appear clean. The clean row does not distinguish ignored
 from already-published content, and no `git check-ignore` is run. It makes a

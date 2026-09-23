@@ -6164,6 +6164,107 @@ def test_path_clean_ignores_stderr_chatter_on_success(project):
     assert not verify.path_clean(repo, "src.txt")  # ...and a genuine change still shows
 
 
+def test_path_clean_types_a_directory_in_no_repository(tmp_path, monkeypatch):
+    """REAL git in a directory no repository encloses answers `fatal: not a git
+    repository (or any ...)`, and `path_clean` types that answer as
+    `GitNotARepositoryError` — the one `GitError` `sweep._commit_ledger`'s ledger
+    family still degrades on (DW-336). `GIT_CEILING_DIRECTORIES` at the parent stops
+    discovery there, so an enclosing checkout (a tmp dir under a repo) cannot turn
+    the row into a clean answer.
+
+    Ablation: drop the subtype raise in `path_clean` and this fails on the plain
+    `GitError`."""
+    bare = tmp_path / "outside"
+    bare.mkdir()
+    (bare / "ledger.md").write_text("x\n", encoding="utf-8")
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    with pytest.raises(verify.GitNotARepositoryError, match="not a git repository"):
+        verify.path_clean(bare, "ledger.md")
+
+
+def test_path_clean_leaves_a_broken_gitfile_untyped(tmp_path, monkeypatch):
+    """A `.git` gitfile pointing at a missing gitdir answers `fatal: not a git
+    repository: <path>` — no `(or any `. That is a corrupt repository pointer, not an
+    absent repository, so it stays a plain `GitError` a ledger publish re-raises.
+
+    Ablation: widen the match to `fatal: not a git repository` and this fails on the
+    subtype."""
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    (broken / ".git").write_text(f"gitdir: {tmp_path / 'missing'}\n", encoding="utf-8")
+    (broken / "ledger.md").write_text("x\n", encoding="utf-8")
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    with pytest.raises(verify.GitError, match="not a git repository") as info:
+        verify.path_clean(broken, "ledger.md")
+    assert not isinstance(info.value, verify.GitNotARepositoryError)
+
+
+def test_path_clean_matches_the_discovery_failure_in_stderr_only(tmp_path, monkeypatch):
+    """The discovery prefix counts only on STDERR: a stdout record carrying the same
+    text (a path git lists under that name) is not git's answer about the repository,
+    so an rc-128 failure with it in stdout alone stays a plain `GitError`.
+
+    Ablation: match against the merged `stdout + stderr` and this fails on the
+    subtype."""
+
+    def stub(cmd, repo, **kw):
+        return subprocess.CompletedProcess(
+            cmd,
+            128,
+            stdout="?? fatal: not a git repository (or any of the parent directories)\n",
+            stderr="fatal: unable to read index\n",
+        )
+
+    monkeypatch.setattr(verify, "_run_git", stub)
+    with pytest.raises(verify.GitError, match="unable to read index") as info:
+        verify.path_clean(tmp_path, "ledger.md")
+    assert not isinstance(info.value, verify.GitNotARepositoryError)
+
+
+def _stub_status_failure(monkeypatch, stderr):
+    """Pin `_run_git` to an rc-128 `git status` failing with `stderr` alone."""
+
+    def stub(cmd, repo, **kw):
+        return subprocess.CompletedProcess(cmd, 128, stdout="", stderr=stderr)
+
+    monkeypatch.setattr(verify, "_run_git", stub)
+
+
+def test_path_clean_types_the_mount_point_discovery_failure(tmp_path, monkeypatch):
+    """Git's OTHER discovery-failure form, printed when the walk stops at a
+    filesystem boundary: `(or any parent up to mount point ...)`, followed by a
+    `Stopping at filesystem boundary` advisory line. It is the same answer — no
+    repository encloses the directory — so it takes the same type.
+
+    Ablation: lengthen the prefix to `(or any of the parent directories)` and this
+    fails on the plain `GitError`."""
+    _stub_status_failure(
+        monkeypatch,
+        "fatal: not a git repository (or any parent up to mount point /mnt)\n"
+        "Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).\n",
+    )
+    with pytest.raises(verify.GitNotARepositoryError, match="mount point /mnt"):
+        verify.path_clean(tmp_path, "ledger.md")
+
+
+def test_path_clean_ignores_the_discovery_prefix_quoted_mid_line(tmp_path, monkeypatch):
+    """Git quotes operator path text in its own messages (`cannot change to
+    '<repo>'`), so a repository path that happens to contain the discovery prefix
+    must not type a different fault as not-a-repository: the prefix counts only at
+    the START of a stderr line.
+
+    Ablation: match with an unanchored `_NOT_A_REPOSITORY_PREFIX in proc.stderr`
+    and this fails on the subtype."""
+    _stub_status_failure(
+        monkeypatch,
+        "fatal: cannot change to '/x/fatal: not a git repository (or any y': "
+        "No such file or directory\n",
+    )
+    with pytest.raises(verify.GitError, match="cannot change to") as info:
+        verify.path_clean(tmp_path, "ledger.md")
+    assert not isinstance(info.value, verify.GitNotARepositoryError)
+
+
 def test_verify_dev_bundle_empty_artifacts_listing_refuses_the_receipt_under_host_noise(project):
     """`_artifact_dir_entries` inherits `path_clean`'s hazard: `status --porcelain`
     exits 0 while warning on stderr, so read against a merged stream an EMPTY
