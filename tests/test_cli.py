@@ -10153,6 +10153,92 @@ def test_validate_inspects_old_registered_script_before_migration(project, capsy
     )
 
 
+def test_validate_flags_unresolvable_legacy_interpreter(project, capsys, monkeypatch):
+    from bmad_loop.install import install_into
+
+    install_bmad_config(project)
+    _write_policy(project.project)
+    assert install_into(project.project, clis=("claude",), skills=False) == 0
+    config = project.project / ".claude/settings.json"
+    data = json.loads(config.read_text())
+    stop = data["hooks"]["Stop"][0]["hooks"][0]
+    stop["command"] = 'python-missing-xyz "$CLAUDE_PROJECT_DIR"/.bmad-loop/bmad_loop_hook.py Stop'
+    config.write_text(json.dumps(data))
+    (project.project / ".bmad-loop/bmad_loop_hook.py").write_text("# legacy script\n")
+    capsys.readouterr()
+
+    _rc, doc = _validate_json(project.project, capsys)
+    flagged = [
+        f
+        for f in doc["findings"]
+        if f["check"] == "hooks.relay-present"
+        and f["severity"] == "problem"
+        and "python-missing-xyz" in f["message"]
+    ]
+    assert len(flagged) == 1
+    assert flagged[0]["detail"] == {
+        "path": "python-missing-xyz",
+        "interpreter": "python-missing-xyz",
+    }
+
+    # A resolvable interpreter is not flagged (absolute, so CI PATH is irrelevant).
+    stop["command"] = (
+        f'"{Path(sys.executable).as_posix()}" "$CLAUDE_PROJECT_DIR"/.bmad-loop/bmad_loop_hook.py Stop'
+    )
+    config.write_text(json.dumps(data))
+    _rc, doc = _validate_json(project.project, capsys)
+    assert not [
+        f
+        for f in doc["findings"]
+        if f["check"] == "hooks.relay-present" and "interpreter" in f.get("detail", {})
+    ]
+    assert any(
+        f["check"] == "hooks.relay-present" and f["severity"] == "ok" for f in doc["findings"]
+    )
+
+    # The uv form: only its first token is a PATH lookup, never the `python` after it.
+    stop["command"] = (
+        'uv run --no-project python "$CLAUDE_PROJECT_DIR"/.bmad-loop/bmad_loop_hook.py Stop'
+    )
+    config.write_text(json.dumps(data))
+    monkeypatch.setattr(
+        cli.shutil, "which", lambda name, *a, **k: "/usr/bin/uv" if name == "uv" else None
+    )
+    _rc, doc = _validate_json(project.project, capsys)
+    interpreter_findings = [
+        f
+        for f in doc["findings"]
+        if f["check"] == "hooks.relay-present" and "interpreter" in f.get("detail", {})
+    ]
+    assert not interpreter_findings
+    assert not [
+        f
+        for f in doc["findings"]
+        if f["check"] == "hooks.relay-present" and f.get("detail", {}).get("path") == "python"
+    ]
+
+
+def test_validate_refuses_relay_registered_only_on_session_start(project, capsys):
+    from bmad_loop.install import install_into
+
+    install_bmad_config(project)
+    _write_policy(project.project)
+    assert install_into(project.project, clis=("claude",), skills=False) == 0
+    config = project.project / ".claude/settings.json"
+    data = json.loads(config.read_text())
+    data["hooks"] = {"SessionStart": data["hooks"]["SessionStart"]}
+    config.write_text(json.dumps(data))
+    capsys.readouterr()
+
+    _rc, doc = _validate_json(project.project, capsys)
+    assert any(
+        f["check"] == "hooks.registered"
+        and f["severity"] == "problem"
+        and f["detail"]["profile"] == "claude"
+        for f in doc["findings"]
+    )
+
+
 def test_validate_ignores_unused_legacy_copy(project, capsys):
     from bmad_loop.install import install_into
 

@@ -35,6 +35,11 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Report hooks registered in `validate`/`probe-adapter` only when every Stop-mapped event
+  runs a relay naming `Stop` from an executed (`type: command`) handler and no event's relay
+  names the wrong canonical event; `init` now adds the real handler beside a non-command
+  one, and `validate` flags a legacy relay interpreter it cannot find (DW-342, DW-343,
+  DW-344, DW-345).
 - Mint new deferred-work ids from `### DW-<n>` headings only (malformed ones included), so
   a note citing a far-higher `DW-<n>` no longer burns the id space up to it (DW-384).
 - Refuse a legacy-ledger migration that drops or edits a pre-existing entry's `origin:` or

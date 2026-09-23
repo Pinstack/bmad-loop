@@ -58,8 +58,10 @@ from bmad_loop.install import (
     missing_base_skills,
     missing_stories_support,
     provision_worktree,
+    registered_relay_interpreters,
     registered_relay_paths,
     relay_executable,
+    relay_registered,
     renderer_stub_resolved,
     resolve_dev_primitive,
     resolve_review_layers,
@@ -144,6 +146,21 @@ def _installed_relay_suffix(event: str) -> str:
     return f"{name} relay {event}"
 
 
+def _assert_installed_relay(command: str, event: str) -> None:
+    """Exactly `[exe, "relay", event]` with a real, absolute, executable entry point.
+
+    Parsed here with shlex, never through `relay_executable_text`: a harness must
+    not depend on the artifact it validates. init's commands carry no backslashes
+    (#773), so POSIX-mode splitting reads every host's spelling.
+    """
+    parts = shlex.split(command)
+    assert len(parts) == 3 and parts[1:] == ["relay", event], command
+    executable = Path(parts[0])
+    assert executable.is_absolute(), command
+    assert executable.name in {"bmad-loop", "bmad-loop.exe"}, command
+    assert executable.is_file() and os.access(executable, os.X_OK), command
+
+
 def _registrations(profile, command="python3 /x/.bmad-loop/bmad_loop_hook.py {event}"):
     return {
         native: command.format(event=canonical)
@@ -214,8 +231,9 @@ def test_init_migrates_legacy_relay_and_preserves_user_hook(tmp_path):
         for hook in group["hooks"]
     ]
     assert commands.count("make lint") == 1
-    assert sum(command.endswith(_installed_relay_suffix("Stop")) for command in commands) == 1
-    assert all("bmad_loop_hook.py" not in command for command in commands)
+    relays = [command for command in commands if command != "make lint"]
+    assert len(relays) == 1
+    _assert_installed_relay(relays[0], "Stop")
     assert install_into(tmp_path, skills=False) == 0
     assert config.read_bytes() == migrated
 
@@ -259,7 +277,8 @@ def test_init_migrates_windows_legacy_relay_on_posix(tmp_path, old_command):
         for hook in group["hooks"]
     ]
     assert old_command not in commands
-    assert sum(command.endswith(_installed_relay_suffix("Stop")) for command in commands) == 1
+    assert len(commands) == 1
+    _assert_installed_relay(commands[0], "Stop")
 
 
 @pytest.mark.parametrize(
@@ -301,8 +320,8 @@ def test_init_replaces_installed_relay_from_either_os(tmp_path, stale_command):
     ]
     assert commands.count("make lint") == 1
     assert stale_command not in commands
-    assert sum(command.endswith(_installed_relay_suffix("Stop")) for command in commands) == 1
     assert len(commands) == 2
+    _assert_installed_relay(next(c for c in commands if c != "make lint"), "Stop")
 
 
 @pytest.mark.parametrize(
@@ -328,6 +347,194 @@ def test_registered_relay_paths_reads_installed_relay_from_either_os(
     assert [str(path).replace("\\", "/") for path, _ in paths] == [expected_path.replace("\\", "/")]
     # The spelling is the registered text, which `Path` would normalize on Windows.
     assert [spelling for _, spelling in paths] == [expected_path]
+
+
+_RELAY_EXE = "/opt/bmad/bin/bmad-loop"
+_FLAT_DIALECTS = {"copilot-settings-json", "antigravity-hooks-json"}
+
+
+def _relay_handler(profile, command, handler_type="command"):
+    """One handler in the profile's own shape: flat for copilot/agy, nested otherwise."""
+    item = {"type": handler_type, "command": command}
+    return item if profile.hooks.dialect in _FLAT_DIALECTS else {"hooks": [item]}
+
+
+def _hook_config(profile, handlers_by_native):
+    key = (
+        install_mod.ANTIGRAVITY_HOOK_GROUP
+        if profile.hooks.dialect == "antigravity-hooks-json"
+        else "hooks"
+    )
+    return {key: handlers_by_native}
+
+
+def _native_for(profile, canonical):
+    return next(native for native, event in profile.hooks.events.items() if event == canonical)
+
+
+def _registered(profile, config):
+    return relay_registered(config, profile.hooks.dialect, profile.hooks.events)
+
+
+@pytest.mark.parametrize("name", ["claude", "codex", "gemini", "copilot", "antigravity"])
+def test_relay_registered_after_fresh_init(tmp_path, name):
+    profile = get_profile(name)
+    assert install_into(tmp_path, clis=(name,), skills=False) == 0
+    config = json.loads((tmp_path / profile.hooks.config_path).read_text())
+    assert _registered(profile, config)
+
+
+@pytest.mark.parametrize("name", ["claude", "copilot", "antigravity"])
+def test_relay_registered_accepts_command_stop(name):
+    profile = get_profile(name)
+    stop = _native_for(profile, "Stop")
+    config = _hook_config(profile, {stop: [_relay_handler(profile, f"{_RELAY_EXE} relay Stop")]})
+    assert _registered(profile, config)
+
+
+@pytest.mark.parametrize("name", ["claude", "copilot"])
+def test_relay_registered_refuses_session_start_only(name):
+    profile = get_profile(name)
+    start = _native_for(profile, "SessionStart")
+    config = _hook_config(
+        profile, {start: [_relay_handler(profile, f"{_RELAY_EXE} relay SessionStart")]}
+    )
+    assert not _registered(profile, config)
+
+
+@pytest.mark.parametrize("name", ["claude", "copilot", "antigravity"])
+def test_relay_registered_refuses_wrong_canonical_on_stop(name):
+    profile = get_profile(name)
+    stop = _native_for(profile, "Stop")
+    config = _hook_config(
+        profile, {stop: [_relay_handler(profile, f"{_RELAY_EXE} relay SessionEnd")]}
+    )
+    assert not _registered(profile, config)
+
+
+@pytest.mark.parametrize("name", ["claude", "copilot"])
+def test_relay_registered_refuses_wrong_canonical_elsewhere(name):
+    # A SessionStart firing `relay Stop` completes every session at launch.
+    profile = get_profile(name)
+    stop, start = _native_for(profile, "Stop"), _native_for(profile, "SessionStart")
+    config = _hook_config(
+        profile,
+        {
+            stop: [_relay_handler(profile, f"{_RELAY_EXE} relay Stop")],
+            start: [_relay_handler(profile, f"{_RELAY_EXE} relay Stop")],
+        },
+    )
+    assert not _registered(profile, config)
+
+
+@pytest.mark.parametrize("name", ["claude", "copilot", "antigravity"])
+def test_non_command_stop_relay_is_unregistered_and_merge_adds_command(name):
+    profile = get_profile(name)
+    stop = _native_for(profile, "Stop")
+    registrations = {
+        native: f"{_RELAY_EXE} relay {canonical}"
+        for native, canonical in profile.hooks.events.items()
+    }
+    prompt = _relay_handler(profile, registrations[stop], handler_type="prompt")
+    config = _hook_config(profile, {stop: [prompt]})
+    assert not _registered(profile, config)
+
+    config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
+    assert changed
+    handlers = install_mod.hook_event_container(config, profile.hooks.dialect)[stop]
+    assert prompt in handlers
+    executed = [
+        item
+        for handler in handlers
+        for item in (handler["hooks"] if "hooks" in handler else [handler])
+        if item["type"] == "command"
+    ]
+    assert [item["command"] for item in executed] == [registrations[stop]]
+    assert _registered(profile, config)
+    _, changed = merge_hooks(config, registrations, profile.hooks.dialect)
+    assert not changed
+
+
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        ('python3 "$CLAUDE_PROJECT_DIR"/.bmad-loop/bmad_loop_hook.py Stop', True),
+        ("uv run --no-project python /p/.bmad-loop/bmad_loop_hook.py Stop", True),
+        ("python3 /p/.bmad-loop/bmad_loop_hook.py SessionEnd", False),
+    ],
+    ids=["python3", "uv", "wrong-event"],
+)
+def test_relay_registered_reads_legacy_commands(command, expected):
+    profile = get_profile("claude")
+    config = _hook_config(profile, {"Stop": [_relay_handler(profile, command)]})
+    assert _registered(profile, config) is expected
+
+
+def test_relay_registered_requires_every_stop_native_and_some_stop_native():
+    claude = get_profile("claude")
+
+    def registered(events, config):
+        hooks = dataclasses.replace(claude.hooks, events=events)
+        return relay_registered(config, hooks.dialect, hooks.events)
+
+    stop = {"hooks": [{"type": "command", "command": f"{_RELAY_EXE} relay Stop"}]}
+    two_stops = {"Stop": "Stop", "SubagentStop": "Stop"}
+    # Every native event mapped to Stop must carry the relay, not just one of them.
+    assert not registered(two_stops, {"hooks": {"Stop": [stop]}})
+    assert registered(two_stops, {"hooks": {"Stop": [stop], "SubagentStop": [stop]}})
+
+    # A map with no Stop native can never deliver completion, even when correct.
+    start = {"hooks": [{"type": "command", "command": f"{_RELAY_EXE} relay SessionStart"}]}
+    assert not registered({"SessionStart": "SessionStart"}, {"hooks": {"SessionStart": [start]}})
+
+
+@pytest.mark.parametrize("name", ["claude", "copilot"])
+def test_registered_relay_interpreters_reads_first_token_of_executed_legacy(name):
+    profile = get_profile(name)
+    stop = _native_for(profile, "Stop")
+    config = _hook_config(
+        profile,
+        {
+            stop: [
+                _relay_handler(profile, "python3 /p/.bmad-loop/bmad_loop_hook.py Stop"),
+                _relay_handler(
+                    profile, "uv run --no-project python /p/.bmad-loop/bmad_loop_hook.py Stop"
+                ),
+                _relay_handler(
+                    profile,
+                    "python-prompt-only /p/.bmad-loop/bmad_loop_hook.py Stop",
+                    handler_type="prompt",
+                ),
+                _relay_handler(profile, f"{_RELAY_EXE} relay Stop"),
+            ]
+        },
+    )
+    assert registered_relay_interpreters(config, profile.hooks.dialect, [stop]) == [
+        "python3",
+        "uv",
+    ]
+
+
+@pytest.mark.parametrize("name", ["claude", "copilot"])
+@pytest.mark.parametrize(
+    "ignored",
+    ["/old/bin/bmad-loop relay Stop", "python3 /old/.bmad-loop/bmad_loop_hook.py Stop"],
+    ids=["installed", "legacy"],
+)
+def test_registered_relay_paths_ignores_non_command_handlers(tmp_path, name, ignored):
+    profile = get_profile(name)
+    stop = _native_for(profile, "Stop")
+    config = _hook_config(
+        profile,
+        {
+            stop: [
+                _relay_handler(profile, ignored, handler_type="prompt"),
+                _relay_handler(profile, f"{_RELAY_EXE} relay Stop"),
+            ]
+        },
+    )
+    paths = registered_relay_paths(config, profile.hooks.dialect, [stop], tmp_path)
+    assert [spelling for _, spelling in paths] == [_RELAY_EXE]
 
 
 def test_init_preserves_different_script_with_same_basename(tmp_path):
@@ -361,8 +568,9 @@ def test_init_migrates_flat_legacy_hook_and_preserves_user(tmp_path, name, conta
     current = json.loads(config.read_text())[container][native_stop]
     commands = [item["command"] for item in current]
     assert commands.count("echo mine") == 1
-    assert old["command"] not in commands
-    assert sum(command.endswith(_installed_relay_suffix("Stop")) for command in commands) == 1
+    relays = [command for command in commands if command != "echo mine"]
+    assert len(relays) == 1
+    _assert_installed_relay(relays[0], "Stop")
 
 
 def test_init_removes_stale_relay_beside_current_relay(tmp_path):
@@ -384,7 +592,8 @@ def test_init_removes_stale_relay_beside_current_relay(tmp_path):
         for group in json.loads(config.read_text())["hooks"]["Stop"]
         for hook in group["hooks"]
     ]
-    assert len(commands) == 1 and commands[0].endswith(_installed_relay_suffix("Stop"))
+    assert len(commands) == 1
+    _assert_installed_relay(commands[0], "Stop")
 
 
 def test_init_refuses_missing_installed_command(tmp_path, monkeypatch, capsys):
@@ -836,17 +1045,34 @@ def test_tracking_warning_degrades_on_a_chokepoint_fault(tmp_path, capsys, monke
 
 
 def test_hook_command_uses_selected_process_host(tmp_path, monkeypatch):
-    # The hook interpreter is platform-selected: forcing the Windows host swaps the
-    # registered command's prefix without `install` branching on sys.platform.
+    # The hook command's quoting is platform-selected behind the process host: the
+    # Windows host double-quotes a spaced path (list2cmdline, forward slashes),
+    # the POSIX host single-quotes it (shlex.quote). Asserting BOTH forced hosts
+    # makes an ignored override visible on every OS — on Windows CI the forced
+    # Windows half alone would pass with the override ignored.
     from bmad_loop.process_host import get_process_host
 
-    monkeypatch.setenv("BMAD_LOOP_PROCESS_HOST", "windows")
-    get_process_host.cache_clear()
+    launcher = tmp_path / "user bin" / ("bmad-loop.exe" if os.name == "nt" else "bmad-loop")
+    launcher.parent.mkdir()
+    launcher.write_text("#!/bin/sh\n")
+    launcher.chmod(0o755)
+    monkeypatch.setattr(install_mod.sys, "argv", [str(launcher)])
+    project = tmp_path / "project"
+    project.mkdir()
     try:
-        assert install_into(tmp_path) == 0
-        settings = json.loads((tmp_path / ".claude" / "settings.json").read_text())
+        monkeypatch.setenv("BMAD_LOOP_PROCESS_HOST", "windows")
+        get_process_host.cache_clear()
+        assert install_into(project, skills=False) == 0
+        settings = json.loads((project / ".claude" / "settings.json").read_text())
         cmd = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
-        assert cmd.endswith(_installed_relay_suffix("Stop"))
+        assert cmd == f'"{launcher.as_posix()}" relay Stop'
+
+        # _hook_command directly, not install_into: a forced POSIX host must never
+        # run a whole install on Windows.
+        monkeypatch.setenv("BMAD_LOOP_PROCESS_HOST", "posix")
+        get_process_host.cache_clear()
+        posix_cmd = install_mod._hook_command(project, get_profile("claude"), "Stop")
+        assert posix_cmd == f"{shlex.quote(str(launcher))} relay Stop"
     finally:
         monkeypatch.delenv("BMAD_LOOP_PROCESS_HOST", raising=False)
         get_process_host.cache_clear()
@@ -1024,8 +1250,8 @@ def test_provision_worktree_replaces_seeded_relay_from_either_os(tmp_path, stale
     ]
     assert commands.count("make lint") == 1
     assert stale_command not in commands
-    assert sum(command.endswith(_installed_relay_suffix("Stop")) for command in commands) == 1
     assert len(commands) == 2
+    _assert_installed_relay(next(c for c in commands if c != "make lint"), "Stop")
 
 
 def test_provision_worktree_tracked_config_rewrite_stays_out_of_commits(project, tmp_path):

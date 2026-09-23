@@ -688,6 +688,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
         )
 
     registered_relays: set[tuple[Path, str]] = set()
+    relay_interpreters: set[str] = set()
     for profile in profiles:
         # Keyed on the adapter KIND, not on `hookless`. httpx is the bundled
         # opencode family's optional extra — a fact about one adapter class, which
@@ -753,6 +754,11 @@ def cmd_validate(args: argparse.Namespace) -> int:
             registered_relays.update(
                 install.registered_relay_paths(
                     parsed, profile.hooks.dialect, profile.hooks.events, project
+                )
+            )
+            relay_interpreters.update(
+                install.registered_relay_interpreters(
+                    parsed, profile.hooks.dialect, profile.hooks.events
                 )
             )
         if hooks_ok:
@@ -860,6 +866,18 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     "to update the hook registration",
                     {"path": spelling, "expected_path": expected_text},
                 )
+    # A legacy copied-script relay runs through a PATH interpreter; one that
+    # cannot be found fails every hook run as surely as a missing script. Only
+    # the command's first token is looked up: after `uv run --no-project`, the
+    # `python` word is resolved by uv itself, not by the hook runner's PATH.
+    for interpreter in sorted(relay_interpreters):
+        if shutil.which(interpreter) is None:
+            report.fail(
+                "hooks.relay-present",
+                f"registered hook interpreter {interpreter} cannot be found — "
+                "re-run `bmad-loop init` to register the installed relay",
+                {"path": interpreter, "interpreter": interpreter},
+            )
 
     # Adapter-kind validity is enforced against the LIVE registry, never a
     # hardcoded set: a profile.adapter naming no registered kind is a config error

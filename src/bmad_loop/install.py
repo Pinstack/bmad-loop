@@ -24,7 +24,7 @@ import shlex
 import shutil
 import sys
 import tomllib
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack
 from importlib import resources
 from importlib.resources.abc import Traversable
@@ -1037,6 +1037,12 @@ def relay_executable_text(command: str) -> str | None:
     `Path` normalizes the spelling (on Windows it treats `\\` and `/` alike), so
     callers asking "would init write something different" compare this text.
     """
+    parts = _installed_relay_parts(command)
+    return parts[0] if parts is not None else None
+
+
+def _installed_relay_parts(command: str) -> tuple[str, str] | None:
+    """`(executable text, canonical event)` of an installed console relay command."""
     for posix in (os.name != "nt", os.name == "nt"):
         try:
             parts = shlex.split(command, posix=posix)
@@ -1052,12 +1058,23 @@ def relay_executable_text(command: str) -> str | None:
         for flavor in (PurePosixPath, PureWindowsPath):
             executable = flavor(raw)
             if executable.name in {"bmad-loop", "bmad-loop.exe"} and executable.is_absolute():
-                return raw
+                return raw, parts[2]
     return None
 
 
 def _legacy_relay_script(command: str) -> str | None:
     """Recognize only the Python command that old init actually registered."""
+    parts = _legacy_relay_parts(command)
+    return parts[0] if parts is not None else None
+
+
+def _legacy_relay_parts(command: str) -> tuple[str, str, str] | None:
+    """`(script, canonical event, interpreter token)` of an old copied-script relay.
+
+    The interpreter is the command's FIRST token only (`python3`, `uv`, or an
+    absolute path to either): `uv run --no-project python` resolves its `python`
+    itself, so the word after it is not a PATH lookup this command makes.
+    """
     for posix in (True, False):
         try:
             parts = shlex.split(command, posix=posix)
@@ -1076,12 +1093,22 @@ def _legacy_relay_script(command: str) -> str | None:
         normalized = script.replace("\\", "/")
         if PurePosixPath(normalized).parts[-2:] != (".bmad-loop", "bmad_loop_hook.py"):
             continue
-        interpreter = PurePosixPath(prefix[0].strip('"').replace("\\", "/")).name.lower()
+        token = prefix[0].strip('"')
+        interpreter = PurePosixPath(token.replace("\\", "/")).name.lower()
         if interpreter.startswith("python") and len(prefix) == 1:
-            return script
+            return script, parts[-1], token
         if interpreter in {"uv", "uv.exe"} and prefix[1:] == ["run", "--no-project", "python"]:
-            return script
+            return script, parts[-1], token
     return None
+
+
+def _relay_canonical_event(command: str) -> str | None:
+    """The canonical event a managed relay command reports, or None if unmanaged."""
+    installed = _installed_relay_parts(command)
+    if installed is not None:
+        return installed[1]
+    legacy = _legacy_relay_parts(command)
+    return legacy[1] if legacy is not None else None
 
 
 def _relay_command(command: object) -> bool:
@@ -1099,6 +1126,29 @@ def _commands_in_handler(handler: object) -> Iterator[str]:
             if isinstance(item, dict) and isinstance(item.get("command"), str):
                 yield item["command"]
     elif isinstance(handler.get("command"), str):
+        yield handler["command"]
+
+
+def _executed_commands_in_handler(handler: object) -> Iterator[str]:
+    """Like `_commands_in_handler`, but only commands a CLI actually runs.
+
+    A `type: prompt` (or any non-`command`) handler carrying a relay `command`
+    never executes it, so it must not count as a registration. Nested
+    (claude/codex/gemini) and flat (copilot/agy) shapes alike. Stripping keeps the
+    any-shape `_commands_in_handler`: a managed command is removed wherever it sits.
+    """
+    if not isinstance(handler, dict):
+        return
+    nested = handler.get("hooks")
+    if isinstance(nested, list):
+        for item in nested:
+            if (
+                isinstance(item, dict)
+                and item.get("type") == "command"
+                and isinstance(item.get("command"), str)
+            ):
+                yield item["command"]
+    elif handler.get("type") == "command" and isinstance(handler.get("command"), str):
         yield handler["command"]
 
 
@@ -1136,9 +1186,11 @@ def hook_event_container(config: dict, dialect: str) -> dict:
 
 
 def _relay_in_handlers(handlers) -> bool:
-    """True if any handler in a native-event list carries the relay command."""
+    """True if any handler in a native-event list executes the relay command."""
     return isinstance(handlers, list) and any(
-        _relay_command(command) for handler in handlers for command in _commands_in_handler(handler)
+        _relay_command(command)
+        for handler in handlers
+        for command in _executed_commands_in_handler(handler)
     )
 
 
@@ -1199,10 +1251,35 @@ def strip_relay_hooks(config: dict, dialect: str) -> bool:
     return removed
 
 
-def relay_registered(config: dict, dialect: str, events: Iterable[str]) -> bool:
-    """True if the bmad-loop relay is registered for any of `events`."""
+def relay_registered(config: dict, dialect: str, events: Mapping[str, str]) -> bool:
+    """True if the relay is truthfully registered for a profile's `events`.
+
+    `events` maps each native event to the canonical event it reports. Only
+    executed (`type: command`) handlers count. Registered means every native event
+    mapped to Stop — the completion signal — runs a relay reporting `Stop`, and no
+    mapped native event runs a relay reporting a DIFFERENT canonical event: a
+    SessionStart firing `relay Stop` would complete every session at launch, and a
+    Stop firing `relay SessionEnd` never completes one. Other events need not be
+    present.
+    """
     container = hook_event_container(config, dialect)
-    return any(_relay_in_handlers(container.get(event, [])) for event in events)
+    stop_natives = [native for native, canonical in events.items() if canonical == "Stop"]
+    if not stop_natives:
+        return False
+    satisfied: set[str] = set()
+    for native, canonical in events.items():
+        handlers = container.get(native)
+        if not isinstance(handlers, list):
+            continue
+        for handler in handlers:
+            for command in _executed_commands_in_handler(handler):
+                reported = _relay_canonical_event(command)
+                if reported is None:
+                    continue
+                if reported != canonical:
+                    return False
+                satisfied.add(native)
+    return all(native in satisfied for native in stop_natives)
 
 
 def registered_relay_paths(
@@ -1214,6 +1291,7 @@ def registered_relay_paths(
     executable text as written in the command, or the legacy script path with
     the project directory substituted. The `Path` answers presence questions;
     the spelling answers whether init would now write something different.
+    Only executed (`type: command`) handlers are read — nothing else runs.
     """
     container = hook_event_container(config, dialect)
     paths: list[tuple[Path, str]] = []
@@ -1222,7 +1300,7 @@ def registered_relay_paths(
         if not isinstance(handlers, list):
             continue
         for handler in handlers:
-            for command in _commands_in_handler(handler):
+            for command in _executed_commands_in_handler(handler):
                 executable = relay_executable_text(command)
                 if executable is not None:
                     paths.append((Path(executable), executable))
@@ -1232,6 +1310,26 @@ def registered_relay_paths(
                         path = Path(script.replace("$CLAUDE_PROJECT_DIR", str(project)))
                         paths.append((path, str(path)))
     return paths
+
+
+def registered_relay_interpreters(config: dict, dialect: str, events: Iterable[str]) -> list[str]:
+    """Interpreter tokens (`python3`, `uv`, ...) that legacy relay commands name.
+
+    Only the command's first token, as registered, from executed handlers: an old
+    copied-script relay whose interpreter cannot be found fails every hook run.
+    """
+    container = hook_event_container(config, dialect)
+    interpreters: list[str] = []
+    for event in events:
+        handlers = container.get(event)
+        if not isinstance(handlers, list):
+            continue
+        for handler in handlers:
+            for command in _executed_commands_in_handler(handler):
+                legacy = _legacy_relay_parts(command)
+                if legacy is not None:
+                    interpreters.append(legacy[2])
+    return interpreters
 
 
 def merge_hooks(config: dict, registrations: dict[str, str], dialect: str) -> tuple[dict, bool]:
