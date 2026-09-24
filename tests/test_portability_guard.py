@@ -1962,9 +1962,9 @@ def _git_name_bindings(tree: ast.AST) -> tuple[set[str], set[str]]:
     that shape — in both the sequence and the string branch. ANY binding
     qualifies a name — a later rebind must not launder a spawn that was git
     somewhere in the module — which can only over-flag, and a false positive is
-    a review prompt, not a miss. The tmux detector keeps its literal-only head:
-    widening that older tripwire is a separate decision from the git chokepoint
-    invariant this one enforces."""
+    a review prompt, not a miss. The tmux detector's head has its own resolver,
+    ``_tmux_head_names``, which also reads attribute bindings: the tmux backend
+    names its executable through a class constant, and git has no such idiom."""
     heads: set[str] = set()
     commands: set[str] = set()
     for node in ast.walk(tree):
@@ -1982,6 +1982,90 @@ def _git_name_bindings(tree: ast.AST) -> tuple[set[str], set[str]]:
         if value.value == "git" or value.value.startswith("git "):
             commands.update(targets)
     return heads, commands
+
+
+def _tmux_head_names(tree: ast.AST) -> set[str]:
+    """The names bound anywhere in the module to the constant ``"tmux"`` — a bare
+    name (``TMUX = "tmux"``, or a class-body ``_BINARY = "tmux"``) or an
+    attribute's name (``self.exe = "tmux"``). The tmux twin of
+    ``_git_name_bindings``' head half: the sanctioned backend spawns
+    ``[self._BINARY, *argv]``, so a new module copying that idiom never spells the
+    literal the detector used to require.
+
+    The sequence detector matches a ``Name`` head by id and an ``Attribute`` head
+    by its ``attr`` alone, because ``self._BINARY``, ``cls._BINARY`` and
+    ``Backend._BINARY`` are all spellings of the same class constant. ANY binding
+    qualifies — a rebind does not launder the name — and a same-named attribute
+    bound to "tmux" elsewhere in the module can only over-flag: a false positive
+    is a review prompt, not a miss.
+
+    NOT COVERED, deliberately — anything not named above is out, for example: a
+    rebinding alias (``mux = self._BINARY``, then ``[mux, ...]``); a tuple-unpack
+    or walrus binding (``TMUX, X = "tmux", 1``; ``(t := "tmux")``); a parameter
+    default (``def f(exe="tmux")``); a binding in another module, most likely a
+    ``BaseTmuxBackend`` subclass in another file inheriting ``_BINARY`` (such a
+    subclass is itself a mux backend, part of the seam, as ``psmux_backend.py``
+    is); and the string-form command (``"tmux ls"``). These are live shapes, not
+    hypothetical ones: ``adapters/tmux_base.py`` itself rebinds
+    ``mux = self._BINARY`` and builds an f-string shell snippet from ``{mux}``.
+    This is a review tripwire, not a sandbox."""
+    heads: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        else:
+            continue
+        value = node.value
+        if not isinstance(value, ast.Constant) or value.value != "tmux":
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                heads.add(target.id)
+            elif isinstance(target, ast.Attribute):
+                heads.add(target.attr)
+    return heads
+
+
+def _signal_aliases(tree: ast.AST) -> tuple[set[str], set[str]]:
+    """``(module_aliases, signals_aliases)`` — the names this module can reach
+    ``SIGKILL`` through. ``module_aliases`` always holds ``signal`` (the plain
+    import, and the pre-widening detector's one spelling) plus every
+    ``import signal as X``; ``signals_aliases`` holds every
+    ``from signal import Signals [as Y]``, the enum whose ``.SIGKILL`` member is
+    just as absent on Windows.
+
+    NOT COVERED, deliberately — anything not named above is out, for example: a
+    rebinding alias (``sig = signal``, ``S = signal.Signals``); the enum's
+    subscript and value forms (``Signals["SIGKILL"]``, ``signal.Signals(9)``);
+    ``from signal import *``; ``vars(signal)["SIGKILL"]``;
+    ``operator.attrgetter("SIGKILL")``; and a qualified
+    ``builtins.getattr(signal, "SIGKILL")`` — a review tripwire, not a sandbox."""
+    modules = {"signal"}
+    signals: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules.update(a.asname for a in node.names if a.name == "signal" and a.asname)
+        elif isinstance(node, ast.ImportFrom) and node.module == "signal" and not node.level:
+            signals.update(a.asname or a.name for a in node.names if a.name == "Signals")
+    return modules, signals
+
+
+def _names_sigkill_holder(
+    node: ast.expr, module_aliases: set[str], signals_aliases: set[str]
+) -> bool:
+    """True when ``node`` is something ``SIGKILL`` is an attribute of: the
+    ``signal`` module under any import alias, its ``Signals`` enum reached
+    through such an alias, or a from-imported ``Signals``."""
+    if isinstance(node, ast.Name):
+        return node.id in module_aliases or node.id in signals_aliases
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "Signals"
+        and isinstance(node.value, ast.Name)
+        and node.value.id in module_aliases
+    )
 
 
 def _env_call_key_node(call: ast.Call) -> ast.expr | None:
@@ -2889,6 +2973,8 @@ def _scan_source(src: str, rel: str):
         and call.args
     }
     git_heads, git_commands = _git_name_bindings(tree)
+    tmux_heads = _tmux_head_names(tree)
+    signal_modules, signal_enums = _signal_aliases(tree)
 
     # Calls inside the value of a `probe = ...` assignment that sits inside the
     # `try` of a bare `except Exception` — `deferredwork.py`'s ADVISORY pre-lock
@@ -3013,7 +3099,11 @@ def _scan_source(src: str, rel: str):
     for node in ast.walk(tree):
         # spawn-argv literals: ["tmux", ...] / ["git", ...] — each quarantined to
         # its owner. tmux matches lists only: the which-list *tuple*
-        # ("tmux", ...) is a real lookup shape in the tree. git matches tuples
+        # ("tmux", ...) is a real lookup shape in the tree. A tmux head resolves
+        # through the module's own bindings too — a name, or an attribute by its
+        # name, bound to "tmux" (`TMUX = "tmux"`, the backend's own
+        # `[self._BINARY, *argv]` — see `_tmux_head_names`, which also states
+        # what stays uncovered). git matches tuples
         # too — subprocess accepts any sequence, and git has no legitimate tuple
         # form to spare, so the tuple spelling of a bypass must not slip the
         # net. A path segment ("git" outside a sequence) and prose stay silent.
@@ -3024,10 +3114,10 @@ def _scan_source(src: str, rel: str):
         # exemption covers.
         if isinstance(node, (ast.List, ast.Tuple)) and node.elts:
             first = node.elts[0]
-            if (
-                isinstance(first, ast.Constant)
-                and first.value == "tmux"
-                and isinstance(node, ast.List)
+            if isinstance(node, ast.List) and (
+                (isinstance(first, ast.Constant) and first.value == "tmux")
+                or (isinstance(first, ast.Name) and first.id in tmux_heads)
+                or (isinstance(first, ast.Attribute) and first.attr in tmux_heads)
             ):
                 findings.append(("tmux", rel, node.lineno, line_at(node.lineno)))
             if (isinstance(first, ast.Constant) and first.value == "git") or (
@@ -3322,13 +3412,36 @@ def _scan_source(src: str, rel: str):
                     ("ledgerread", rel, node.lineno, line_at(node.lineno), fn_name, sanctioned)
                 )
 
-        # signal.SIGKILL attribute access (the guarded form is a "SIGKILL"
-        # *string* passed to getattr — not an attribute access — so it's clean)
+        # An unguarded SIGKILL — absent on Windows, so each spelling below raises
+        # there: the attribute on the `signal` module under any import alias, on
+        # its `Signals` enum (reached through such an alias, or from-imported
+        # under any name), a from-import of the name itself, and a `getattr` of
+        # it with no default. The guarded form — `getattr(signal, "SIGKILL",
+        # signal.SIGTERM)`, a string plus a fallback — stays clean, and so does
+        # the module constant it produces (`process_host.SIGKILL`, a bare
+        # `SIGKILL` name). See `_signal_aliases` for what stays uncovered.
         if (
             isinstance(node, ast.Attribute)
             and node.attr == "SIGKILL"
-            and isinstance(node.value, ast.Name)
-            and node.value.id == "signal"
+            and _names_sigkill_holder(node.value, signal_modules, signal_enums)
+        ):
+            findings.append(("sigkill", rel, node.lineno, line_at(node.lineno)))
+        if (
+            isinstance(node, ast.ImportFrom)
+            and node.module == "signal"
+            and not node.level
+            and any(a.name == "SIGKILL" for a in node.names)
+        ):
+            findings.append(("sigkill", rel, node.lineno, line_at(node.lineno)))
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) == 2
+            and not node.keywords
+            and _names_sigkill_holder(node.args[0], signal_modules, signal_enums)
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value == "SIGKILL"
         ):
             findings.append(("sigkill", rel, node.lineno, line_at(node.lineno)))
 
@@ -3673,8 +3786,13 @@ def _of(kind: str):
 
 
 def test_no_tmux_invocation_outside_backend():
-    """Only the tmux backend may build a ``["tmux", ...]`` argv — every other call
-    site goes through the multiplexer seam."""
+    """Only the tmux backend may build a tmux argv — every other call site goes
+    through the multiplexer seam. A tmux argv is a LIST headed by the ``"tmux"``
+    literal or by a name / attribute the module binds to it (``TMUX = "tmux"``;
+    the backend's own ``_BINARY = "tmux"`` read as ``[self._BINARY, *argv]``).
+    NOT COVERED: rebinding aliases and string-form commands (see
+    ``_tmux_head_names``). ``test_tmux_detector_sees_the_backends_own_spelling``
+    keeps this green-for-a-reason rather than green for want of findings."""
     offenders = [(rel, ln, txt) for _, rel, ln, txt in _of("tmux") if rel not in TMUX_BACKENDS]
     assert not offenders, (
         "tmux invoked outside the tmux backend (adapters/tmux_base.py, "
@@ -5289,11 +5407,15 @@ def test_no_hardcoded_posix_paths():
 
 
 def test_no_unguarded_sigkill():
-    """``signal.SIGKILL`` is absent on Windows — reference it only via the
-    ``getattr(signal, "SIGKILL", signal.SIGTERM)`` guard, never as a bare
-    attribute access."""
+    """``SIGKILL`` is absent on Windows — reference it only via the
+    ``getattr(signal, "SIGKILL", signal.SIGTERM)`` guard (or the module constant
+    that guard produces), never unguarded: not as ``signal.SIGKILL`` under any
+    ``import signal as X`` alias, not through the ``Signals`` enum, not as a
+    ``from signal import SIGKILL``, and not as a ``getattr`` with no default.
+    NOT COVERED: rebinding aliases (``sig = signal``) and ``Signals["SIGKILL"]``
+    (see ``_signal_aliases``)."""
     offenders = _of("sigkill")
-    assert not offenders, "unguarded signal.SIGKILL attribute access:\n" + "\n".join(
+    assert not offenders, "unguarded SIGKILL reference:\n" + "\n".join(
         f"  {rel}:{ln}: {txt.strip()}" for _, rel, ln, txt in offenders
     )
 
@@ -5348,6 +5470,232 @@ def test_shell_true_only_in_sanctioned_spots():
         elif ACK not in txt:
             bad.append(f"  {rel}:{ln}: {txt.strip()}  (missing '{ACK}' ack)")
     assert not bad, "shell=True outside verify.py / plugins/bus.py:\n" + "\n".join(bad)
+
+
+# The probe matrix for the seven older tripwires above — tmux, path, sigkill,
+# killprobe, oskill, detach, shell — as `(kind, label, source)` rows. Those guards
+# predate the probe bar, and each tree-wide test is green both when the invariant
+# holds and when its detector branch has silently stopped detecting: before these
+# rows, deleting any of the seven branches left this file green, and the tmux and
+# sigkill detectors flagged nothing on the real tree at all. Every row runs through
+# `_scan_source`, the real scan path. Fix order when a new form turns up: add the
+# row here FIRST and watch it fail.
+_TMUX_CLASS_ATTR_SRC = (
+    "import subprocess\n"
+    "class Backend:\n"
+    '    _BINARY = "tmux"\n'
+    "    def run(self, *argv):\n"
+    "        return subprocess.run([self._BINARY, *argv])\n"
+)
+OLDER_TRIPWIRE_PROBES = [
+    # tmux — a list head that is the literal, or a name / attribute the module
+    # itself binds to "tmux" (see `_tmux_head_names`).
+    ("tmux", "literal-head", 'import subprocess\nsubprocess.run(["tmux", "ls"])\n'),
+    (
+        "tmux",
+        "module-constant",
+        'import subprocess\nTMUX = "tmux"\nsubprocess.run([TMUX, "ls"])\n',
+    ),
+    ("tmux", "annotated-constant", 'TMUX: str = "tmux"\nargv = [TMUX, "ls"]\n'),
+    # Any binding qualifies the name — a rebind must not launder it.
+    ("tmux", "rebound-constant", 'TMUX = "tmux"\nTMUX = "other"\nargv = [TMUX, "ls"]\n'),
+    # The backend's own spelling: a class constant read through `self`. `cls.` and
+    # `ClassName.` are the same constant, so the head resolves by attribute NAME.
+    ("tmux", "class-attr-head", _TMUX_CLASS_ATTR_SRC),
+    (
+        "tmux",
+        "class-attr-via-cls",
+        _TMUX_CLASS_ATTR_SRC.replace(
+            "    def run(self, *argv):\n", "    @classmethod\n    def run(cls, *argv):\n"
+        ).replace("self._BINARY", "cls._BINARY"),
+    ),
+    (
+        "tmux",
+        "class-attr-via-classname",
+        _TMUX_CLASS_ATTR_SRC.replace("self._BINARY", "Backend._BINARY"),
+    ),
+    (
+        "tmux",
+        "instance-attr-binding",
+        'class B:\n    def __init__(self):\n        self.exe = "tmux"\n'
+        '    def argv(self):\n        return [self.exe, "ls"]\n',
+    ),
+    # path — each POSIX root, whole and as a subpath.
+    ("path", "tmp", 'd = "/tmp"\n'),
+    ("path", "tmp-subpath", 'd = "/tmp/x"\n'),
+    ("path", "proc-subpath", 'f = open("/proc/1/stat")\n'),
+    ("path", "dev-null", 'sink = open("/dev/null", "w")\n'),
+    # sigkill — the literal spelling and every unguarded non-literal one.
+    ("sigkill", "literal", "import os, signal\nos.kill(pid, signal.SIGKILL)\n"),
+    ("sigkill", "module-alias", "import signal as sig\nx = sig.SIGKILL\n"),
+    ("sigkill", "from-import", "from signal import SIGKILL\n"),
+    ("sigkill", "from-import-aliased", "from signal import SIGTERM, SIGKILL as K\n"),
+    ("sigkill", "signals-enum", "import signal\nx = signal.Signals.SIGKILL\n"),
+    ("sigkill", "signals-enum-via-alias", "import signal as sig\nx = sig.Signals.SIGKILL\n"),
+    ("sigkill", "signals-from-import", "from signal import Signals\nx = Signals.SIGKILL\n"),
+    (
+        "sigkill",
+        "signals-from-import-aliased",
+        "from signal import Signals as S\nx = S.SIGKILL\n",
+    ),
+    # getattr with no default raises AttributeError on Windows exactly like the
+    # attribute access does — it is the guard's shape minus the guard.
+    ("sigkill", "getattr-no-default", 'import signal\nx = getattr(signal, "SIGKILL")\n'),
+    ("sigkill", "getattr-no-default-alias", 'import signal as sig\nx = getattr(sig, "SIGKILL")\n'),
+    (
+        "sigkill",
+        "getattr-signals-no-default",
+        'import signal\nx = getattr(signal.Signals, "SIGKILL")\n',
+    ),
+    (
+        "sigkill",
+        "getattr-signals-alias-no-default",
+        'from signal import Signals\nx = getattr(Signals, "SIGKILL")\n',
+    ),
+    # killprobe — the signal-0 existence probe.
+    ("killprobe", "signal-zero", "import os\nos.kill(pid, 0)\n"),
+    # oskill — any os.kill, probe and real send alike.
+    ("oskill", "signal-zero", "import os\nos.kill(pid, 0)\n"),
+    ("oskill", "sigterm", "import os, signal\nos.kill(pid, signal.SIGTERM)\n"),
+    # detach — the kwarg and the detach-kwargs dict.
+    (
+        "detach",
+        "kwarg",
+        'import subprocess\nsubprocess.Popen(["x"], start_new_session=True)\n',
+    ),
+    ("detach", "dict-literal", 'kwargs = {"start_new_session": True}\n'),
+    # shell — the kwarg.
+    ("shell", "kwarg", "import subprocess\nsubprocess.run(cmd, shell=True)\n"),
+]
+OLDER_TRIPWIRE_NON_PROBES = [
+    # tmux — the detector is list-only: the which-TUPLE is a real lookup shape.
+    (
+        "tmux",
+        "which-tuple",
+        'import shutil\nok = all(shutil.which(e) for e in ("tmux", "psmux"))\n',
+    ),
+    ("tmux", "which-call", 'import shutil\nok = shutil.which("tmux") is not None\n'),
+    # A class constant bound to a DIFFERENT executable (the psmux backend's own
+    # spelling) and a head the module never binds at all stay silent — the reach
+    # is exactly the names the module ties to "tmux".
+    ("tmux", "psmux-class-attr", _TMUX_CLASS_ATTR_SRC.replace('"tmux"', '"psmux"')),
+    (
+        "tmux",
+        "unbound-head",
+        'import subprocess\ndef run(exe):\n    return subprocess.run([exe, "ls"])\n',
+    ),
+    ("tmux", "prose", 'def f():\n    """Spawns tmux via the backend."""\n    return 1\n'),
+    # path — prose, a shell string that merely CONTAINS /dev/null, and a
+    # lookalike whose `tmp` is not the root.
+    ("path", "docstring-prose", 'def f():\n    """Writes under /tmp/x."""\n    return 1\n'),
+    ("path", "shell-redirect", 'cmd = "command -v foo 2>/dev/null"\n'),
+    ("path", "home-tmp-lookalike", 'p = "~/.gemini/tmp/session"\n'),
+    # sigkill — the guarded getattr, the module constant it produces (and that
+    # constant's use and re-export), and prose.
+    (
+        "sigkill",
+        "guarded-getattr",
+        'import signal\nK = getattr(signal, "SIGKILL", signal.SIGTERM)\n',
+    ),
+    (
+        "sigkill",
+        "guarded-constant-use",
+        "import os, signal\n"
+        'SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)\n'
+        "os.kill(pid, SIGKILL)\n",
+    ),
+    ("sigkill", "reexported-constant", "import process_host\nx = process_host.SIGKILL\n"),
+    # The from-import arm is keyed to the stdlib `signal` module itself: importing
+    # the guarded constant from another module, or from a relative `.signal`, is
+    # not the unguarded name.
+    ("sigkill", "from-import-guarded-constant", "from bmad_loop.process_host import SIGKILL\n"),
+    ("sigkill", "from-import-relative-signal", "from .signal import SIGKILL\n"),
+    ("sigkill", "prose", 'MSG = "escalating SIGTERM to SIGKILL"\n'),
+    ("sigkill", "other-signal", "from signal import SIGTERM\nimport signal\nx = signal.SIGINT\n"),
+    # killprobe — a real signal send is not the existence probe, and the bool
+    # spelling is excluded by the detector on purpose. Neither escapes: both are
+    # `oskill` findings, which confines every os.kill to process_host.py.
+    ("killprobe", "real-signal", "import os, signal\nos.kill(pid, signal.SIGTERM)\n"),
+    ("killprobe", "bool-signal", "import os\nos.kill(pid, False)\n"),
+    # oskill — a Popen/psutil `.kill()` is not os.kill.
+    ("oskill", "process-kill-method", "proc.kill()\n"),
+    # detach / shell — the explicit False spelling.
+    (
+        "detach",
+        "kwarg-false",
+        'import subprocess\nsubprocess.Popen(["x"], start_new_session=False)\n',
+    ),
+    ("detach", "dict-false", 'kwargs = {"start_new_session": False}\n'),
+    ("shell", "kwarg-false", 'import subprocess\nsubprocess.run(["x"], shell=False)\n'),
+]
+OLDER_TRIPWIRE_KINDS = ("tmux", "path", "sigkill", "killprobe", "oskill", "detach", "shell")
+
+
+def test_older_tripwire_probe_tables_cover_every_kind():
+    """Each of the seven older detectors has at least one must-flag and one
+    must-stay-silent row — the floor that stops a kind silently dropping out of
+    the matrix (and a parametrize over an empty slice passing vacuously)."""
+    probed = Counter(row[0] for row in OLDER_TRIPWIRE_PROBES)
+    silenced = Counter(row[0] for row in OLDER_TRIPWIRE_NON_PROBES)
+    missing = [
+        (kind, table)
+        for kind in OLDER_TRIPWIRE_KINDS
+        for table, counts in (("probe", probed), ("non-probe", silenced))
+        if counts[kind] < 1
+    ]
+    assert not missing, f"older-tripwire kinds with no row: {missing}"
+    stray = (set(probed) | set(silenced)) - set(OLDER_TRIPWIRE_KINDS)
+    assert not stray, f"rows for a kind outside the seven: {sorted(stray)}"
+
+
+@pytest.mark.parametrize(
+    ("kind", "label", "source"),
+    OLDER_TRIPWIRE_PROBES,
+    ids=[f"{kind}-{label}" for kind, label, _ in OLDER_TRIPWIRE_PROBES],
+)
+def test_older_tripwire_detectors_flag_every_claimed_shape(kind, label, source):
+    """Each claimed shape produces a finding of its kind, driven through the same
+    `_scan_source` the real scan uses.
+
+    Ablation: delete any one of the seven detector branches in `_scan_source` —
+    or, singly, one arm of a widened one (the tmux Name head, the tmux Attribute
+    head, the sigkill attribute / from-import / getattr arm, either detach form)
+    — and that branch's rows here fail."""
+    found = [f for f in _scan_source(source, "probe.py") if f[0] == kind]
+    assert found, f"the {label!r} shape produced no `{kind}` finding:\n{source}"
+
+
+@pytest.mark.parametrize(
+    ("kind", "label", "source"),
+    OLDER_TRIPWIRE_NON_PROBES,
+    ids=[f"{kind}-{label}" for kind, label, _ in OLDER_TRIPWIRE_NON_PROBES],
+)
+def test_older_tripwire_detectors_stay_silent_on_lookalikes(kind, label, source):
+    """The complement: prose, lookalike strings, the guarded spellings and the
+    explicit-False kwargs produce no finding of the row's kind — flagging them
+    would get the allowlist widened until it means nothing.
+
+    Ablations: drop the tmux branch's `ast.List` check and `tmux-which-tuple`
+    fails; loosen the sigkill getattr arm to `len(node.args) >= 2` and both
+    guarded rows fail (as does the tree-wide guard, on process_host.py); drop the
+    sigkill from-import arm's `node.module == "signal"` filter and
+    `sigkill-from-import-guarded-constant` fails, or its `not node.level` filter
+    and `sigkill-from-import-relative-signal` fails; drop the killprobe branch's
+    `is not False` and `killprobe-bool-signal` fails."""
+    found = [f for f in _scan_source(source, "probe.py") if f[0] == kind]
+    assert not found, f"the {label!r} shape was flagged as `{kind}`:\n{source}"
+
+
+def test_tmux_detector_sees_the_backends_own_spelling():
+    """The backend spawns ``[self._BINARY, *argv]`` with ``_BINARY = "tmux"`` — the
+    idiom a new module would copy. The detector must see it in the backend itself;
+    otherwise ``test_no_tmux_invocation_outside_backend`` is vacuous, green for want
+    of any finding rather than because every finding sits in a backend file."""
+    rels = {rel for _, rel, *_ in _of("tmux")}
+    assert "adapters/tmux_base.py" in rels, (
+        "the tmux detector no longer flags the backend's own `[self._BINARY, ...]` "
+        f"spawn; files it did flag: {sorted(rels)}"
+    )
 
 
 def test_bmad_loop_env_reads_only_in_the_registry():

@@ -46,6 +46,12 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Give the seven older portability tripwires (tmux, path, sigkill, killprobe, oskill,
+  detach, shell) probe rows, and resolve non-literal heads: the tmux guard now catches a
+  name or attribute bound to `"tmux"` (the backend's own `[self._BINARY, ...]`), and the
+  SIGKILL guard catches import aliases, `Signals`, from-imports and a no-default `getattr`.
+  The tmux detector now sees the backend's own spawn, and all seven detectors are graded by
+  probe rows (DW-369).
 - Preflight the triage tree for the complete bundled `bmad-loop-sweep` skill (every file the
   wheel bundles for it): `sweep`, a sweep-run `resume` and an auto-sweep child
   refuse a deleted or partial copy before any side effect, naming the tree and
