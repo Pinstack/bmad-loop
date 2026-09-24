@@ -22,6 +22,12 @@ breaking changes may land in a minor release.
 - Warn when `adapter.extra_args` drops the profile's `bypass_args` (e.g. claude's
   `--permission-mode bypassPermissions`): `validate` reports `policy.bypass-dropped` and
   `--dry-run` prints a stderr `warning:` per affected role; replace semantics unchanged (DW-349).
+- Warn at real `run`/`sweep`/`resume` launches too when `adapter.extra_args` drops the
+  profile's `bypass_args`: the dry-run's stderr `warning:` per launched role, plus a
+  `bypass-dropped` journal event (DW-410).
+- Warn when the installed relay path holds a shell metacharacter the Windows host's hook
+  quoting leaves exposed (e.g. `C:/a&b/bmad-loop.exe`): `init` prints a `warning:` line,
+  `validate` reports `hooks.relay-path-unsafe`; registration unchanged (DW-346).
 - Expose a read-only `ctx.delivery_id` (declarative: `BMAD_LOOP_DELIVERY_ID`) on
   `post_migrate`, which may repeat per completion — deduplicate on it (DW-317).
 - Expose a read-only `ctx.rollback_outcome` (declarative: `BMAD_LOOP_ROLLBACK_OUTCOME`) on

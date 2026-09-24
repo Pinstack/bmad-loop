@@ -80,7 +80,7 @@ from .platform_util import (
     resolve_or_lexical,
     walk_files_unlinked,
 )
-from .process_host import ProcessHostError
+from .process_host import ProcessHostError, get_process_host
 
 # The run-composition helpers now live in runsetup.py (the library layer a non-CLI
 # frontend imports). They are re-exported under their historical private names —
@@ -107,7 +107,7 @@ from .sweep import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
     # Type-only: annotate the profile-lookup map without a module-level adapter
     # import (cli.py imports the adapter package lazily inside functions).
@@ -845,7 +845,30 @@ def cmd_validate(args: argparse.Namespace) -> int:
             # No current executable to compare. The registered path still gets
             # its own presence check below; do not call it stale by inference.
             pass
+    try:
+        quoting_host = get_process_host()
+    except ProcessHostError:
+        quoting_host = None  # the platform preflight's host.process check reports it
     for relay, spelling in sorted(registered_relays):
+        # DW-346: advisory, independent of presence — a metacharacter the host's
+        # hook quoting leaves exposed can split or expand the command in the hook
+        # shell whether or not the file exists. Warn only; `ok` is unaffected. A
+        # legacy copied script is skipped: its registration names it through
+        # `$CLAUDE_PROJECT_DIR`, so the substituted project path is never exposed.
+        unsafe_chars = (
+            quoting_host.unsafe_shell_chars(spelling)
+            if quoting_host and relay.name != "bmad_loop_hook.py"
+            else ()
+        )
+        if unsafe_chars:
+            report.warn(
+                "hooks.relay-path-unsafe",
+                f"registered hook executable {spelling} contains shell "
+                f"metacharacter(s) {' '.join(unsafe_chars)} this host's hook quoting "
+                "leaves unsafe — hook runs may fail; reinstall bmad-loop under a path "
+                "without them and re-run `bmad-loop init`",
+                {"path": spelling, "chars": list(unsafe_chars)},
+            )
         if not relay.is_file():
             report.fail(
                 "hooks.relay-present",
@@ -1340,27 +1363,47 @@ def _bypass_dropped_message(role: str, profile: CLIProfile, missing: tuple[str, 
     )
 
 
-def _warn_bypass_dropped(pol, project: Path, roles: tuple[str, ...]) -> None:
-    """Dry-run stderr twin of validate's ``policy.bypass-dropped`` finding (DW-349).
+def _warn_bypass_dropped(
+    pol,
+    project: Path,
+    roles: tuple[str, ...],
+    *,
+    profiles: Mapping[str, CLIProfile] | None = None,
+    journal: Journal | None = None,
+) -> None:
+    """Stderr twin of validate's ``policy.bypass-dropped`` finding (DW-349, DW-410),
+    for every dry-run AND every real launch (run, sweep — auto-sweep children
+    included — and resume).
 
     Prints one ``warning:`` line to stderr for each of ``roles`` (the roles the
     calling run type launches) whose resolved ``extra_args`` drops profile bypass
-    tokens, before the schedule is printed. A profile that will not parse is
-    skipped silently: the renderer raises the ``ProfileError`` itself. stderr
-    only, rc unchanged — stdout stays the preview."""
+    tokens — before the schedule is printed on a dry-run, before ``engine.run()``
+    on a launch. ``profiles`` (role → profile, as ``_launch_profiles`` /
+    ``runsetup.resolve_profiles`` return) is the launch's frozen resolution; when
+    given it is used instead of re-reading ``get_profile``, so the warning speaks
+    about the bytes the run actually launches. Without it, a profile that will not
+    parse is skipped silently: the renderer/composer raises the ``ProfileError``
+    itself. ``journal`` (a launch only) also records one ``bypass-dropped`` event
+    per hit. stderr only, rc unchanged — stdout stays the preview/render."""
     from .adapters.profile import ProfileError, get_profile
 
     for role in roles:
         cfg = pol.adapter.resolved(role)
-        try:
-            profile = get_profile(cfg.name, project)
-        except ProfileError:
-            continue
+        profile = profiles.get(role) if profiles is not None else None
+        if profile is None:
+            try:
+                profile = get_profile(cfg.name, project)
+            except ProfileError:
+                continue
         if missing := _bypass_drops(cfg, profile):
             print(
                 f"warning: {_bypass_dropped_message(role, profile, missing)}",
                 file=sys.stderr,
             )
+            if journal is not None:
+                journal.append(
+                    "bypass-dropped", role=role, profile=profile.name, missing=list(missing)
+                )
 
 
 def _warn_preflight_would_abort(
@@ -2437,6 +2480,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         trusted_config_digest=trusted_digest,
         profiles=profiles,
     )
+    _warn_bypass_dropped(
+        pol, project, ("dev", "review"), profiles=profiles, journal=composed.journal
+    )
     print(f"run {composed.run_id} starting (attach: bmad-loop attach)")
     summary = composed.engine.run()
     print(summary.render())
@@ -2670,6 +2716,13 @@ def _start_sweep(
         trusted_config_digest=_trusted_config_digest(pol, project, profiles=profiles),
         profiles=profiles,
         on_started=on_started,
+    )
+    _warn_bypass_dropped(
+        pol,
+        project,
+        ("triage", "dev", "review"),
+        profiles=profiles,
+        journal=composed.journal,
     )
     print(f"sweep {composed.run_id} starting (attach: bmad-loop attach)")
     summary = composed.engine.run()
@@ -3476,6 +3529,13 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
         sweep_engine_cls=SweepEngine,
         profiles=profiles,
         sweep_options=sweep_options,
+    )
+    _warn_bypass_dropped(
+        pol,
+        project,
+        ("triage", "dev", "review") if state.run_type == "sweep" else ("dev", "review"),
+        profiles=profiles,
+        journal=composed.journal,
     )
     summary = composed.engine.run()
     print(summary.render())

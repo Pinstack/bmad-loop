@@ -1078,6 +1078,97 @@ def test_hook_command_uses_selected_process_host(tmp_path, monkeypatch):
         get_process_host.cache_clear()
 
 
+def _forced_host(monkeypatch, name):
+    from bmad_loop.process_host import get_process_host
+
+    monkeypatch.setenv("BMAD_LOOP_PROCESS_HOST", name)
+    get_process_host.cache_clear()
+
+
+def _launcher_in(tmp_path, monkeypatch, dirname):
+    launcher = tmp_path / dirname / ("bmad-loop.exe" if os.name == "nt" else "bmad-loop")
+    launcher.parent.mkdir()
+    launcher.write_text("#!/bin/sh\n")
+    launcher.chmod(0o755)
+    monkeypatch.setattr(install_mod.sys, "argv", [str(launcher)])
+    project = tmp_path / "project"
+    project.mkdir()
+    return launcher, project
+
+
+@pytest.fixture
+def _reset_process_host():
+    from bmad_loop.process_host import get_process_host
+
+    yield
+    get_process_host.cache_clear()
+
+
+def test_init_warns_on_unsafe_relay_path_under_windows_host(
+    tmp_path, monkeypatch, capsys, _reset_process_host
+):
+    """DW-346: an unspaced launcher dir holding `&` is registered bare by the
+    Windows host's list2cmdline, so init prints one advisory line — rc 0 and the
+    registered command byte-identical. Ablation: make
+    `WindowsProcessHost.unsafe_shell_chars` return `()`, or delete the
+    `_warn_unsafe_relay_path()` call in `install_into` — this test fails."""
+    launcher, project = _launcher_in(tmp_path, monkeypatch, "a&b")
+    _forced_host(monkeypatch, "windows")
+    assert install_into(project, skills=False) == 0
+    out = capsys.readouterr().out
+    warnings = [line for line in out.splitlines() if line.startswith("  warning:")]
+    assert len(warnings) == 1
+    assert str(launcher) in warnings[0]
+    assert "metacharacter(s) & " in warnings[0]
+    settings = json.loads((project / ".claude" / "settings.json").read_text())
+    assert settings["hooks"]["Stop"][0]["hooks"][0]["command"] == (
+        f"{launcher.as_posix()} relay Stop"
+    )
+
+
+def test_init_silent_on_clean_relay_path_under_windows_host(
+    tmp_path, monkeypatch, capsys, _reset_process_host
+):
+    _, project = _launcher_in(tmp_path, monkeypatch, "bin")
+    _forced_host(monkeypatch, "windows")
+    assert install_into(project, skills=False) == 0
+    assert "warning:" not in capsys.readouterr().out
+
+
+def test_init_silent_for_hookless_only_profiles_under_windows_host(
+    tmp_path, monkeypatch, capsys, _reset_process_host
+):
+    """A hookless profile registers no relay, so there is no path to warn about
+    even when the launcher sits in an `a&b` dir.
+
+    ABLATION: drop the `any(not profile.hookless …)` guard in `install_into` and
+    this reddens."""
+    _, project = _launcher_in(tmp_path, monkeypatch, "a&b")
+    _forced_host(monkeypatch, "windows")
+    assert install_into(project, clis=("opencode",), skills=False) == 0
+    out = capsys.readouterr().out
+    assert "no hooks needed (opencode-http)" in out  # control: the hookless branch ran
+    assert "warning:" not in out
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="a forced POSIX host never runs init on Windows"
+)
+def test_init_silent_on_metachar_relay_path_under_posix_host(
+    tmp_path, monkeypatch, capsys, _reset_process_host
+):
+    """shlex.quote single-quotes every sh metacharacter, so the POSIX host never
+    warns — and still registers the quoted path."""
+    launcher, project = _launcher_in(tmp_path, monkeypatch, "a&b")
+    _forced_host(monkeypatch, "posix")
+    assert install_into(project, skills=False) == 0
+    assert "warning:" not in capsys.readouterr().out
+    settings = json.loads((project / ".claude" / "settings.json").read_text())
+    assert settings["hooks"]["Stop"][0]["hooks"][0]["command"] == (
+        f"{shlex.quote(str(launcher))} relay Stop"
+    )
+
+
 def test_install_into_multiple_clis(tmp_path):
     assert install_into(tmp_path, clis=("codex", "gemini")) == 0
 

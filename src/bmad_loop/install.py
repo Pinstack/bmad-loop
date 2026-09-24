@@ -1082,15 +1082,41 @@ def _review_findings(project: Path, tree: str) -> list[Finding]:
     return findings
 
 
-def _hook_command(project: Path, profile: CLIProfile, canonical_event: str) -> str:
-    """Command for this installation's console entry point, independent of PATH."""
-    del project, profile
+def _relay_executable() -> Path:
+    """This installation's console entry point, independent of PATH: the invoked
+    launcher when it is the ``bmad-loop`` script itself, else the sibling of the
+    running interpreter. Raises ``ProfileError`` when it is not a readable,
+    executable file."""
     name = "bmad-loop.exe" if os.name == "nt" else "bmad-loop"
     invoked = Path(sys.argv[0]).absolute()
     executable = invoked if invoked.name == name else Path(sys.executable).absolute().parent / name
     if not executable.is_file() or not os.access(executable, os.R_OK | os.X_OK):
         raise ProfileError(f"installed bmad-loop command is unavailable: {executable}")
-    return f"{get_process_host().shell_quote(str(executable))} relay {canonical_event}"
+    return executable
+
+
+def _hook_command(project: Path, profile: CLIProfile, canonical_event: str) -> str:
+    """Command for this installation's console entry point, independent of PATH."""
+    del project, profile
+    return f"{get_process_host().shell_quote(str(_relay_executable()))} relay {canonical_event}"
+
+
+def _warn_unsafe_relay_path() -> None:
+    """DW-346: print one advisory line when the relay executable ``init`` just
+    registered carries shell metacharacters this host's hook quoting leaves
+    exposed. Warn only — the registered command is unchanged and ``init`` still
+    succeeds; ``validate`` repeats the check as ``hooks.relay-path-unsafe``."""
+    try:
+        executable = str(_relay_executable())
+    except ProfileError:
+        return  # registration would already have failed on this; nothing to add
+    chars = get_process_host().unsafe_shell_chars(executable)
+    if chars:
+        print(
+            f"  warning: installed relay path {executable} contains shell "
+            f"metacharacter(s) {' '.join(chars)} this host's hook quoting leaves "
+            f"unsafe — hook runs may fail; reinstall bmad-loop under a path without them"
+        )
 
 
 def relay_executable(command: str) -> Path | None:
@@ -3140,6 +3166,8 @@ def install_into(
     for profile in profiles:
         if _register_hooks(project, profile) != 0:
             return 1
+    if any(not profile.hookless for profile in profiles):
+        _warn_unsafe_relay_path()
 
     # 3. bundled skills into each CLI's skill tree (deduped: codex+gemini share
     #    .agents/skills)

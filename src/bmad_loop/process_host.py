@@ -133,6 +133,17 @@ class ProcessHost(ABC):
         (POSIX quoting mangles ``C:\\Program Files\\...`` paths)."""
         return shlex.quote(arg)
 
+    def unsafe_shell_chars(self, path: str) -> tuple[str, ...]:
+        """Shell metacharacters in ``path`` that :meth:`shell_quote` leaves exposed
+        to the hook shell — sorted and deduplicated, ``()`` when the quoted path is
+        safe. Advisory only (DW-346): ``init`` and ``validate`` warn on a non-empty
+        result; nothing refuses. Not abstract: the default is ``()`` because
+        ``shlex.quote`` single-quotes any argument containing an sh metacharacter,
+        and nothing expands inside POSIX single quotes. A Windows host overrides it,
+        since its double-quoting is conditional and leaves expanders live."""
+        del path
+        return ()
+
 
 class PosixProcessHost(ProcessHost):
     """Linux/macOS/WSL: ``os.kill`` for signalling and the read-only existence
@@ -186,6 +197,26 @@ class PosixProcessHost(ProcessHost):
         return self.shell_quote(str(Path(sys.executable).absolute()))
 
 
+# DW-346: characters a Windows hook shell may act on in a registered path. The
+# three shells a hook runner may use are cmd.exe, Git Bash (sh) and PowerShell;
+# which one a given coding CLI actually uses was never measured, so the sets are
+# the union. Inside list2cmdline's double quotes only expanders stay live:
+#   %  cmd.exe variable expansion (%VAR%)
+#   !  cmd.exe delayed expansion (!VAR!, when enabled)
+#   $  sh and PowerShell variable/subexpression expansion
+#   `  sh command substitution; PowerShell escape character
+_WINDOWS_IN_QUOTE_EXPANDERS = frozenset("%!$`")
+# Unquoted (no whitespace in the path, so list2cmdline adds no quotes) the
+# separators and redirections are live too:
+#   & | < >  cmd.exe/sh command separators and redirection (& and | in PowerShell)
+#   ^        cmd.exe escape character
+#   ( )      sh subshell / PowerShell grouping; cmd.exe inside a block
+#   ;        sh and PowerShell statement separator
+#   '        sh and PowerShell quoting
+#   { } ,    sh brace expansion (`a{b,c}` becomes two words); PowerShell script block
+_WINDOWS_BARE_METACHARS = _WINDOWS_IN_QUOTE_EXPANDERS | frozenset("&|<>^();'{},")
+
+
 class WindowsProcessHost(ProcessHost):
     """Native Windows: ``taskkill`` for signalling, psutil for the non-destructive
     liveness probe and create-time identity. Not exercised in this pass — kept so a
@@ -235,8 +266,20 @@ class WindowsProcessHost(ProcessHost):
         # followed by arguments is a parse error without `&` (which would break
         # sh), so paths WITH spaces stay unsupported there. Claude's exec-form
         # `args` would avoid shells entirely but is Claude-only and changes the
-        # registered JSON shape older versions mis-run.
+        # registered JSON shape older versions mis-run. A second known gap (DW-346):
+        # list2cmdline double-quotes only on whitespace, so a metacharacter in an
+        # unspaced path stays bare and one inside quotes may still expand —
+        # `unsafe_shell_chars` below names them, and `init`/`validate` warn
+        # (`hooks.relay-path-unsafe`) instead of changing what gets registered.
         return subprocess.list2cmdline([arg.replace("\\", "/")])
+
+    def unsafe_shell_chars(self, path: str) -> tuple[str, ...]:
+        quoted = self.shell_quote(path)
+        if len(quoted) >= 2 and quoted.startswith('"') and quoted.endswith('"'):
+            live = _WINDOWS_IN_QUOTE_EXPANDERS
+        else:
+            live = _WINDOWS_BARE_METACHARS
+        return tuple(sorted({ch for ch in quoted if ch in live}))
 
 
 def _proc_starttime(pid: int) -> float | None:

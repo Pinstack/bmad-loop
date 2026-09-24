@@ -3225,6 +3225,7 @@ def test_start_sweep_crash_exit_preserves_existing_modes(project, monkeypatch, o
         lambda **_kwargs: types.SimpleNamespace(
             run_id="selector-crash",
             engine=engine,
+            journal=None,  # ComposedRun always carries one; DW-410's launch warning reads it
         ),
     )
 
@@ -7679,7 +7680,8 @@ def test_resume_crash_exit_is_failure_only_for_persisted_named_scope(
     monkeypatch.setattr(
         runsetup,
         "compose_resume",
-        lambda **_kwargs: types.SimpleNamespace(engine=engine),
+        # ComposedRun always carries a journal; DW-410's launch warning reads it.
+        lambda **_kwargs: types.SimpleNamespace(engine=engine, journal=None),
     )
 
     assert cli._resume_paused_run(project.project, run_dir) == expected
@@ -10269,6 +10271,228 @@ def test_sweep_dry_run_warns_for_a_bundle_role(project, capsys):
     assert triage_line.startswith("  triage: claude ")
 
 
+# --------------------------------------- DW-410: bypass drop at a REAL launch
+
+_BYPASS_DROP_POLICY = '[adapter]\nname = "claude"\nextra_args = ["--verbose"]\n'
+_BYPASS_KEPT_POLICY = (
+    '[adapter]\nname = "claude"\n'
+    'extra_args = ["--permission-mode", "bypassPermissions", "--verbose"]\n'
+)
+
+
+def _bypass_journal(run_dir) -> list[dict]:
+    from bmad_loop.journal import JOURNAL_FILE
+
+    path = run_dir / JOURNAL_FILE
+    if not path.is_file():
+        return []
+    records = [json.loads(ln) for ln in path.read_text().splitlines() if ln.strip()]
+    return [r for r in records if r["kind"] == "bypass-dropped"]
+
+
+def _err_at_engine_run(monkeypatch, capsys, *engine_attrs: str) -> list[str]:
+    """Install a stub engine (under each of ``engine_attrs``) whose ``run()``
+    snapshots stderr, so a test can pin that the warning precedes the engine."""
+    seen: list[str] = []
+
+    class _SnapshotEngine(_StubEngine):
+        def run(self):
+            seen.append(capsys.readouterr().err)
+            return super().run()
+
+    for attr in engine_attrs:
+        monkeypatch.setattr(cli, attr, _SnapshotEngine)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+    return seen
+
+
+def _launch_fixture(project, policy: str) -> None:
+    from conftest import git, install_base_skills
+
+    install_bmad_config(project)
+    install_base_skills(project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    _write_policy(project.project, policy)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "setup")
+
+
+def _dry_run_bypass_lines(project, capsys) -> list[str]:
+    assert cli.main(["run", "--project", str(project.project), "--dry-run"]) == 0
+    return _bypass_err_lines(capsys.readouterr().err)
+
+
+def test_real_run_warns_and_journals_when_extra_args_drops_the_bypass(project, monkeypatch, capsys):
+    """DW-410: a real `run` prints the dry-run's exact `warning:` lines on stderr
+    for dev and review BEFORE the engine runs, and journals one `bypass-dropped`
+    per launched role; rc unchanged.
+
+    ABLATION: delete the `_warn_bypass_dropped` call in `cmd_run`, or its
+    `journal.append` — this reddens."""
+    _launch_fixture(project, _BYPASS_DROP_POLICY)
+    expected = _dry_run_bypass_lines(project, capsys)
+    assert len(expected) == 2
+    seen = _err_at_engine_run(monkeypatch, capsys, "Engine")
+
+    run_id = "20990101-000000-b410"
+    assert cli.main(["run", "--project", str(project.project), "--run-id", run_id]) == 0
+    assert len(seen) == 1 and _bypass_err_lines(seen[0]) == expected
+    entries = _bypass_journal(project.project / ".bmad-loop" / "runs" / run_id)
+    assert [(e["role"], e["profile"], e["missing"]) for e in entries] == [
+        ("dev", "claude", ["--permission-mode", "bypassPermissions"]),
+        ("review", "claude", ["--permission-mode", "bypassPermissions"]),
+    ]
+
+
+@pytest.mark.parametrize(
+    "policy", [_BYPASS_KEPT_POLICY, '[adapter]\nname = "claude"\n'], ids=["kept", "unset"]
+)
+def test_real_run_silent_when_the_bypass_is_kept_or_unset(project, monkeypatch, capsys, policy):
+    """ABLATION: make `_warn_bypass_dropped` warn on any launch regardless of
+    `_bypass_drops` and this reddens."""
+    _launch_fixture(project, policy)
+    seen = _err_at_engine_run(monkeypatch, capsys, "Engine")
+    run_id = "20990101-000000-b411"
+    assert cli.main(["run", "--project", str(project.project), "--run-id", run_id]) == 0
+    assert _bypass_err_lines(seen[0] + capsys.readouterr().err) == []
+    run_dir = project.project / ".bmad-loop" / "runs" / run_id
+    assert run_dir.is_dir()  # control: the run really composed
+    assert _bypass_journal(run_dir) == []
+
+
+def test_real_sweep_warns_and_journals_for_triage_dev_and_review(project, monkeypatch, capsys):
+    """DW-410: a real `sweep` launches triage + dev + review, so a base override
+    that drops the bypass warns and journals for all three, before the engine runs.
+
+    ABLATION: delete the `_warn_bypass_dropped` call in `_start_sweep` and this
+    reddens."""
+    from conftest import git, write_ledger
+
+    _launch_fixture(project, _BYPASS_DROP_POLICY)
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "ledger")
+    seen = _err_at_engine_run(monkeypatch, capsys, "SweepEngine")
+
+    run_id = "20990101-000000-b412"
+    assert cli.main(["sweep", "--project", str(project.project), "--run-id", run_id]) == 0
+    lines = _bypass_err_lines(seen[0])
+    assert [ln.split()[1] for ln in lines] == ["triage", "dev", "review"]
+    assert all(ln.startswith("warning: ") for ln in lines)
+    entries = _bypass_journal(project.project / ".bmad-loop" / "runs" / run_id)
+    assert [e["role"] for e in entries] == ["triage", "dev", "review"]
+
+
+def test_real_sweep_silent_when_the_bypass_is_kept(project, monkeypatch, capsys):
+    from conftest import git, write_ledger
+
+    _launch_fixture(project, _BYPASS_KEPT_POLICY)
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "ledger")
+    seen = _err_at_engine_run(monkeypatch, capsys, "SweepEngine")
+    run_id = "20990101-000000-b413"
+    assert cli.main(["sweep", "--project", str(project.project), "--run-id", run_id]) == 0
+    assert len(seen) == 1 and _bypass_err_lines(seen[0]) == []
+    assert _bypass_journal(project.project / ".bmad-loop" / "runs" / run_id) == []
+
+
+def test_warn_bypass_dropped_follows_the_passed_profiles_mapping(project, capsys):
+    """DW-410: a launch hands `_warn_bypass_dropped` the profiles it resolved
+    once; the warning and the journal must describe THOSE bytes, never a fresh
+    `get_profile` read of disk.
+
+    ABLATION: ignore `profiles` (always call `get_profile`) and this reddens —
+    disk's claude drops `--permission-mode bypassPermissions`, the mapping `--yolo`."""
+    import dataclasses
+
+    from bmad_loop.adapters.profile import get_profile
+    from bmad_loop.journal import Journal
+
+    _write_policy(project.project, _BYPASS_DROP_POLICY)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    frozen = dataclasses.replace(get_profile("claude", project.project), bypass_args=("--yolo",))
+    run_dir = project.project / ".bmad-loop" / "runs" / "20990101-000000-b416"
+    run_dir.mkdir(parents=True)
+
+    cli._warn_bypass_dropped(
+        pol, project.project, ("dev",), profiles={"dev": frozen}, journal=Journal(run_dir)
+    )
+    (line,) = _bypass_err_lines(capsys.readouterr().err)
+    assert line.startswith("warning: dev adapter.extra_args replaces claude's bypass_args")
+    assert "drops --yolo" in line
+    assert [(e["role"], e["profile"], e["missing"]) for e in _bypass_journal(run_dir)] == [
+        ("dev", "claude", ["--yolo"])
+    ]
+
+
+def test_story_resume_warns_and_journals_for_dev_and_review(project, monkeypatch, capsys):
+    """DW-410: a resumed story run (`run_type` "story") warns for dev + review.
+
+    ABLATION: delete the `_warn_bypass_dropped` call in `_resume_paused_run`, or
+    hard-code the sweep role set there — this reddens."""
+    from bmad_loop import runs
+
+    _launch_fixture(project, _BYPASS_DROP_POLICY)
+    run_dir = _make_run_with_state(
+        project.project,
+        "20990101-000000-b414",
+        paused_reason="escalation",
+        paused_stage="escalation",
+    )
+    monkeypatch.setattr(runs, "kill_session", lambda rid: None)
+    seen = _err_at_engine_run(monkeypatch, capsys, "Engine")
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+    assert [ln.split()[1] for ln in _bypass_err_lines(seen[0])] == ["dev", "review"]
+    assert [e["role"] for e in _bypass_journal(run_dir)] == ["dev", "review"]
+
+
+def test_sweep_resume_warns_and_journals_for_triage_dev_and_review(project, monkeypatch, capsys):
+    """DW-410: a resumed sweep (`run_type` "sweep") warns for triage + dev + review.
+
+    ABLATION: pass the story role set unconditionally from `_resume_paused_run`
+    and this reddens."""
+    from conftest import install_base_skills
+
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state, save_state
+
+    install_bmad_config(project)
+    install_base_skills(project)
+    write_sprint(project, {})
+    run_dir = _compose_sweep_run(project, _BYPASS_DROP_POLICY)
+    assert _bypass_journal(run_dir) == []  # compose alone journals nothing
+    state = load_state(run_dir)
+    assert state.run_type == "sweep"
+    state.paused_reason, state.paused_stage = "escalation", "escalation"
+    save_state(run_dir, state)
+    monkeypatch.setattr(runs, "kill_session", lambda rid: None)
+    monkeypatch.setattr(runs, "write_pid", lambda _run_dir: None)
+    seen = _err_at_engine_run(monkeypatch, capsys, "SweepEngine")
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+    assert [ln.split()[1] for ln in _bypass_err_lines(seen[0])] == ["triage", "dev", "review"]
+    assert [e["role"] for e in _bypass_journal(run_dir)] == ["triage", "dev", "review"]
+
+
+def test_resume_silent_when_the_bypass_is_kept(project, monkeypatch, capsys):
+    from bmad_loop import runs
+
+    _launch_fixture(project, _BYPASS_KEPT_POLICY)
+    run_dir = _make_run_with_state(
+        project.project,
+        "20990101-000000-b415",
+        paused_reason="escalation",
+        paused_stage="escalation",
+    )
+    monkeypatch.setattr(runs, "kill_session", lambda rid: None)
+    seen = _err_at_engine_run(monkeypatch, capsys, "Engine")
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+    assert len(seen) == 1 and _bypass_err_lines(seen[0]) == []
+    assert _bypass_journal(run_dir) == []
+
+
 def test_validate_stories_mode_skips_sprint_gate(project, capsys):
     """Item 8: a stories-mode project (no sprint-status.yaml) validates its
     stories.yaml manifest instead of failing on the missing sprint gate."""
@@ -10553,6 +10777,123 @@ def test_validate_inspects_old_registered_script_before_migration(project, capsy
         and f["detail"]["path"] == legacy
         for f in doc["findings"]
     )
+
+
+def _register_relay_under(project, monkeypatch, capsys, dirname: str) -> str:
+    """A validate-passing project whose Stop hook names an existing, executable
+    relay under ``dirname`` — so presence stays `ok` and only the path is at issue.
+    Returns the registered spelling."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    relay_dir = project.project.parent / dirname
+    relay_dir.mkdir()
+    relay = relay_dir / ("bmad-loop.exe" if os.name == "nt" else "bmad-loop")
+    relay.write_text("#!/bin/sh\nexit 0\n")
+    relay.chmod(0o755)
+    config = project.project / ".claude/settings.json"
+    data = json.loads(config.read_text())
+    spelling = relay.as_posix()
+    data["hooks"]["Stop"][0]["hooks"][0]["command"] = f"{spelling} relay Stop"
+    config.write_text(json.dumps(data))
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "relay under " + dirname)
+    return spelling
+
+
+def test_validate_warns_on_unsafe_registered_relay_path_under_windows_host(
+    project, capsys, monkeypatch
+):
+    """DW-346: under the Windows host, a registered relay in an unspaced `a&b` dir
+    is quoted by nothing, so validate warns `hooks.relay-path-unsafe` naming the
+    path and chars — advisory: `ok` and rc stay as they were.
+
+    ABLATION: delete the `report.warn("hooks.relay-path-unsafe", …)` in
+    `cmd_validate`, or make `WindowsProcessHost.unsafe_shell_chars` return `()` —
+    this reddens."""
+    from bmad_loop.process_host import get_process_host
+
+    spelling = _register_relay_under(project, monkeypatch, capsys, "a&b")
+    monkeypatch.setenv("BMAD_LOOP_PROCESS_HOST", "windows")
+    get_process_host.cache_clear()
+    try:
+        doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    finally:
+        monkeypatch.delenv("BMAD_LOOP_PROCESS_HOST")
+        get_process_host.cache_clear()
+    assert doc["ok"] is True
+    unsafe = [f for f in doc["findings"] if f["check"] == "hooks.relay-path-unsafe"]
+    assert len(unsafe) == 1
+    assert unsafe[0]["severity"] == "warning"
+    assert unsafe[0]["detail"] == {"path": spelling, "chars": ["&"]}
+    assert spelling in unsafe[0]["message"]
+    # control: the registration really was inspected as present
+    assert any(
+        f["check"] == "hooks.relay-present"
+        and f["severity"] == "ok"
+        and Path(f["detail"]["path"]) == Path(spelling)
+        for f in doc["findings"]
+    )
+
+
+def test_validate_skips_legacy_script_relay_under_windows_host(
+    project, capsys, monkeypatch, tmp_path
+):
+    """A legacy copied-script registration names its script through
+    `$CLAUDE_PROJECT_DIR`, so a project dir holding `&` is never exposed to the
+    hook shell — no `hooks.relay-path-unsafe`, even under the Windows host.
+
+    ABLATION: drop the `relay.name != "bmad_loop_hook.py"` skip in `cmd_validate`
+    and this reddens; the control pins that the legacy path really was inspected."""
+    import shutil as _shutil
+
+    from bmad_loop.install import install_into
+    from bmad_loop.process_host import get_process_host
+
+    install_bmad_config(project)
+    _write_policy(project.project)
+    assert install_into(project.project, clis=("claude",), skills=False) == 0
+    config = project.project / ".claude/settings.json"
+    data = json.loads(config.read_text())
+    data["hooks"]["Stop"][0]["hooks"][0][
+        "command"
+    ] = 'python3 "$CLAUDE_PROJECT_DIR"/.bmad-loop/bmad_loop_hook.py Stop'
+    config.write_text(json.dumps(data))
+    (project.project / ".bmad-loop/bmad_loop_hook.py").write_text("# legacy script\n")
+    moved = tmp_path / "a&b" / "proj"
+    _shutil.copytree(project.project, moved, symlinks=True)
+    capsys.readouterr()
+
+    monkeypatch.setenv("BMAD_LOOP_PROCESS_HOST", "windows")
+    get_process_host.cache_clear()
+    try:
+        _rc, doc = _validate_json(moved, capsys)
+    finally:
+        monkeypatch.delenv("BMAD_LOOP_PROCESS_HOST")
+        get_process_host.cache_clear()
+    legacy = str(moved / ".bmad-loop/bmad_loop_hook.py")
+    assert any(
+        f["check"] == "hooks.relay-present" and f["detail"]["path"] == legacy
+        for f in doc["findings"]
+    )
+    assert not any(f["check"] == "hooks.relay-path-unsafe" for f in doc["findings"])
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the POSIX host never runs on Windows")
+def test_validate_silent_on_metachar_relay_path_under_posix_host(project, capsys, monkeypatch):
+    """shlex.quote single-quotes every sh metacharacter: the POSIX host never
+    flags a registered relay path, whatever it contains."""
+    from bmad_loop.process_host import get_process_host
+
+    _register_relay_under(project, monkeypatch, capsys, "a&b")
+    monkeypatch.setenv("BMAD_LOOP_PROCESS_HOST", "posix")
+    get_process_host.cache_clear()
+    try:
+        doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    finally:
+        monkeypatch.delenv("BMAD_LOOP_PROCESS_HOST")
+        get_process_host.cache_clear()
+    assert doc["ok"] is True
+    assert not any(f["check"] == "hooks.relay-path-unsafe" for f in doc["findings"])
+    assert any(f["check"] == "hooks.relay-stale" for f in doc["findings"])  # control
 
 
 def test_validate_flags_unresolvable_legacy_interpreter(project, capsys, monkeypatch):
@@ -14826,13 +15167,22 @@ def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monke
     `compose_sweep`'s `on_started()` call fails this row alone, while dropping
     `on_started=` from the factory's `_start_sweep` call also reddens
     `test_auto_sweep_proceeds_after_a_benign_limits_edit` — which is the seam
-    below this one, and the reason both exist."""
+    below this one, and the reason both exist.
+
+    DW-410 rides the same swap: the policy's `extra_args` drops the profile's
+    bypass, so the child journals `bypass-dropped` into ITS run's journal, naming
+    the validated profile's `--yes` — not the swapped `--rogue`. ABLATION: drop
+    `profiles=` from `_start_sweep`'s `_warn_bypass_dropped` call (it re-reads the
+    swapped disk) or the call itself, and the journal assert fails."""
     from bmad_loop import bmadconfig, runs
     from bmad_loop.adapters import profile as profile_mod
 
     monkeypatch.setattr(mux_mod, "_usable", lambda mux: True)
     install_bmad_config(project)
-    _write_policy(project.project, PIN_POLICY)
+    _write_policy(
+        project.project,
+        PIN_POLICY.replace('name = "mycli"\n', 'name = "mycli"\nextra_args = ["--verbose"]\n'),
+    )
     _pin_profile(project)
     install_sweep_skill(
         project.project, profile_mod.get_profile("mycli", project.project).skill_tree
@@ -14845,7 +15195,12 @@ def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monke
     def digest_then_swap(*a, **kw):
         digest = real_digest(*a, **kw)
         # The writer wakes the moment the comparison has its answer.
-        _pin_profile(project, PIN_PROFILE.replace('binary = "mycli"', 'binary = "rogue-cli"'))
+        _pin_profile(
+            project,
+            PIN_PROFILE.replace('binary = "mycli"', 'binary = "rogue-cli"').replace(
+                '["--yes"]', '["--rogue"]'
+            ),
+        )
         return digest
 
     monkeypatch.setattr(runsetup, "config_digest", digest_then_swap)
@@ -14881,6 +15236,10 @@ def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monke
     # what survives a project rename (the state root is keyed by resolved path), so
     # a launch that stamped only out of tree loses the pin on the first move.
     assert captured["state"].trusted_config_digest == pin
+    entries = _bypass_journal(project.project / ".bmad-loop" / "runs" / run_id)
+    assert [(e["role"], e["profile"], e["missing"]) for e in entries] == [
+        (role, "mycli", ["--yes"]) for role in ("triage", "dev", "review")
+    ]
 
 
 @pytest.mark.parametrize("how", ["deleted", "partial"])

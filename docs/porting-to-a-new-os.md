@@ -298,6 +298,11 @@ register_process_host("windows", lambda platform: platform == "win32", WindowsPr
   `None` where the platform can't provide one — callers then **refuse to
   force-kill** rather than risk an unrelated process that inherited the pid.
 - `hook_interpreter()` — seam 3, below.
+- `unsafe_shell_chars(path)` — the shell metacharacters `shell_quote()` leaves
+  exposed in `path`; `init` and `validate` warn on them (DW-346). The default
+  `()` suits hosts that always quote; override it alongside `shell_quote()`
+  when the host's quoting is conditional (Windows' list2cmdline quotes only on
+  whitespace).
 
 ---
 

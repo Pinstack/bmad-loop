@@ -374,6 +374,45 @@ def test_shell_quote_windows_forward_slashes_then_list2cmdline(path, quoted):
     assert WindowsProcessHost().shell_quote(path) == quoted
 
 
+_UNSAFE_MATRIX = [
+    ("C:/a&b/bmad-loop.exe", ("&",)),
+    ("C:/x%y^z/bmad-loop.exe", ("%", "^")),
+    ("C:/x%y%z/bmad-loop.exe", ("%",)),
+    ("C:/Program Files (x86)/a&b/bmad-loop.exe", ()),
+    ("C:/my $dir/bmad-loop.exe", ("$",)),
+    ("C:/50% off/bmad-loop.exe", ("%",)),
+    ("C:/Users/me/.venv/Scripts/bmad-loop.exe", ()),
+    (r"C:\a&b\bmad-loop.exe", ("&",)),
+    ("C:/a{b,c}/bmad-loop.exe", (",", "{", "}")),
+]
+_UNSAFE_IDS = [
+    "bare-amp",
+    "bare-sorted-several",
+    "bare-deduped",
+    "quoted-harmless",
+    "quoted-dollar",
+    "quoted-percent",
+    "clean",
+    "backslashes",
+    "brace-expansion",
+]
+
+
+@pytest.mark.parametrize("path,chars", _UNSAFE_MATRIX, ids=_UNSAFE_IDS)
+def test_unsafe_shell_chars_windows(path, chars):
+    """DW-346: the Windows host scans its OWN quoted output — list2cmdline quotes
+    only on whitespace, so an unspaced path leaves every metacharacter bare, while
+    a quoted one leaves only the in-quote expanders live. Ablation: an override
+    returning `()` fails every non-empty row."""
+    assert WindowsProcessHost().unsafe_shell_chars(path) == chars
+
+
+@pytest.mark.parametrize("path", [p for p, _ in _UNSAFE_MATRIX] + ["/opt/a&b;c$`'/bmad-loop"])
+def test_unsafe_shell_chars_posix_never_flags(path):
+    # shlex.quote single-quotes every sh metacharacter; nothing expands inside.
+    assert PosixProcessHost().unsafe_shell_chars(path) == ()
+
+
 def test_hook_interpreter_is_absolute_on_posix(host):
     import sys
 

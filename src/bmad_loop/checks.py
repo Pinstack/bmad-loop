@@ -70,6 +70,7 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "hooks.trust",
         "hooks.relay-present",
         "hooks.relay-stale",
+        "hooks.relay-path-unsafe",
         "mux.backend",
         "mux.preflight",
         "mux.backends-detected",

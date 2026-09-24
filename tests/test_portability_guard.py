@@ -609,6 +609,12 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "limit_bytes",
         "measured_bytes",
         "measurement_is_lower_bound",
+        # `bypass-dropped` (DW-410): the profile bypass tokens an explicit
+        # `[adapter] extra_args` drops — CLI flags copied from the resolved
+        # profile's `bypass_args` (e.g. `--permission-mode bypassPermissions`). A
+        # project overlay profile may hold any string there; a path-shaped value
+        # still falls to `scrub_json`.
+        "missing",
         "mode",
         "model",
         "name",
@@ -648,6 +654,11 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "policy_changed",
         "preserve_ref",
         "problem",
+        # `bypass-dropped` (DW-410): the launched role's CLI profile name (`claude`,
+        # `codex`, …) copied from the resolved profile — the same config name
+        # `adapter_dev`/`adapter_review` carry. A project overlay profile may name
+        # itself anything; a path-shaped value still falls to `scrub_json`.
+        "profile",
         # `dev-decision` and `session-end` (#727): whether the session changed its
         # pane after the first frame or ended a turn. A bare boolean about the
         # verdict — it names no story, no path and no text, and `False` is what
@@ -1075,6 +1086,10 @@ JOURNAL_KINDS = frozenset(
         "session-active",
         "session-idle",
         # cli.py
+        # DW-410: a real launch whose resolved `[adapter] extra_args` drops the
+        # profile's bypass tokens — one per affected launched role. `role`,
+        # `profile` and `missing` are config names/flags from the resolved profile.
+        "bypass-dropped",
         "run-resume",
         # cli.py + runs.py
         "rearm-code-root-restamped",
