@@ -24,6 +24,9 @@ breaking changes may land in a minor release.
   `--dry-run` prints a stderr `warning:` per affected role; replace semantics unchanged (DW-349).
 - Expose a read-only `ctx.delivery_id` (declarative: `BMAD_LOOP_DELIVERY_ID`) on
   `post_migrate`, which may repeat per completion — deduplicate on it (DW-317).
+- Warn in `validate` (`deferred.ledger-untracked`) when the deferred-work ledger exists but
+  is neither committed nor gitignored, since bmad-loop's own commits would otherwise take it
+  in at the first isolated merge or story commit (DW-361).
 
 ### Changed
 

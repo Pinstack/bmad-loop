@@ -13599,6 +13599,89 @@ def test_validate_render_tracked_probe_degrades_without_a_fabricated_result(
     assert "git.render-tracked" not in findings
 
 
+def test_validate_warns_on_a_ledger_neither_tracked_nor_ignored(project, monkeypatch, capsys):
+    """DW-361: the third ledger setting — on disk, never committed, never ignored —
+    is named at startup instead of surfacing as a commit at the first isolated merge.
+
+    Ablation: drop the `_validate_deferred_ledger_tracking` call from `cmd_validate`
+    and this fails on the id lookup."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+
+    # rc 1 only because the untracked ledger dirties the tree (`git.worktree-clean`);
+    # the new finding itself is a warning and never moves the exit code.
+    findings = _validate_findings(project, capsys, rc=1)
+    warning = findings["deferred.ledger-untracked"]
+    assert warning["severity"] == "warning"
+    rel = project.deferred_work.relative_to(project.repo_root).as_posix()
+    assert warning["detail"] == {"ledger": str(project.deferred_work), "path": rel}
+    assert "neither committed nor gitignored" in warning["message"]
+
+
+def test_validate_warns_on_an_untracked_ledger_git_status_hides(project, monkeypatch, capsys):
+    """The leg where the warning is the ONLY signal: with untracked files hidden from
+    `git status`, the ledger no longer dirties the tree, validate passes, a run would
+    start — and the first carry commits the file. rc 0 pins that nothing else speaks."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    git(project.project, "config", "status.showUntrackedFiles", "no")
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+
+    findings = _validate_findings(project, capsys)
+    assert findings["git.worktree-clean"]["severity"] == "ok"
+    assert findings["deferred.ledger-untracked"]["severity"] == "warning"
+
+
+def test_validate_is_silent_on_a_tracked_ledger(project, monkeypatch, capsys):
+    """Clearing leg: a committed ledger is a decision the project made."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    write_ledger(project, {"DW-1": "open"})
+
+    findings = _validate_findings(project, capsys)
+    assert "deferred.ledger-untracked" not in findings
+
+
+def test_validate_is_silent_on_a_gitignored_ledger(project, monkeypatch, capsys):
+    """Clearing leg: an ignored ledger is the other decision — `git add` refuses it,
+    so no carry ever commits it. The rule is committed so the tree stays clean and
+    rc 0 pins that nothing else about the leg fails."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    rel = project.deferred_work.relative_to(project.repo_root).as_posix()
+    gitignore = project.repo_root / ".gitignore"
+    gitignore.write_text(gitignore.read_text(encoding="utf-8") + f"/{rel}\n", encoding="utf-8")
+    git(project.project, "add", ".gitignore")
+    git(project.project, "commit", "-q", "-m", "ignore the ledger")
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+
+    findings = _validate_findings(project, capsys)
+    assert "deferred.ledger-untracked" not in findings
+
+
+def test_validate_ledger_tracking_probe_skips_a_hung_git(project, monkeypatch, capsys):
+    """The ledger-tracking probe rides the same `git_answers` gate as
+    `git.render-tracked`: against a git that timed out it must not spend another
+    deadline, and it must not fabricate a finding either.
+
+    Ablation: drop `git_answers` from the call-site guard and `probes` is non-empty."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+
+    def hung(*_args, **_kwargs):
+        raise verify.GitTimeoutError(f"git status timed out after 120s in {project.project}")
+
+    probes = []
+
+    def counted_tracked(_repo, rel):
+        probes.append(rel)
+        return False
+
+    monkeypatch.setattr(verify, "worktree_clean", hung)
+    monkeypatch.setattr(verify, "path_tracked", counted_tracked)
+
+    findings = _validate_findings(project, capsys, rc=1)
+    assert probes == []
+    assert "deferred.ledger-untracked" not in findings
+
+
 def test_validate_warns_on_a_stale_index_entry(project, capsys):
     """The index is machine-local and never committed, so it CAN fall out of step
     with the specs and board that are the real record. That is only a safe trade

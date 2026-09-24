@@ -594,6 +594,12 @@ def cmd_validate(args: argparse.Namespace) -> int:
         except verify.GitError:
             pass
 
+    # Advisory, and gated on `git_answers` for the same reason as the probe above:
+    # `_validate_deferred_ledger` runs before the `git.worktree-clean` probe, so a
+    # git-backed check placed there would re-pay a hung git's full deadline.
+    if git_answers and paths is not None:
+        _validate_deferred_ledger_tracking(paths, report)
+
     report.extend(_platform_preflight(project))
 
     # #231: notify.desktop defaults to true but only fires when a platform notifier
@@ -1815,6 +1821,57 @@ def _validate_deferred_ledger(
         return
     _validate_hard_gates(paths, text, report, spec_folder=spec_folder)
     _validate_closes_deferred(paths, text, report, spec_folder=spec_folder)
+
+
+def _validate_deferred_ledger_tracking(
+    paths: bmadconfig.ProjectPaths, report: ValidationReport
+) -> None:
+    """WARN when the ledger exists but git neither tracks nor ignores it (DW-361).
+
+    Tracked and gitignored are both decisions a project made; the third setting is
+    one nobody made, and it does not stay put. `git add` takes an untracked,
+    non-ignored path, so since #460 the first isolated merge that carries a ledger
+    write (`_carry_story_deferred_closes`, the harvest carry) commits the whole file,
+    and a non-isolated story commit's `git add -A` sweeps it up the same way. Not
+    wrong, exactly — but a file entering git should not be the first anyone hears
+    of the setting.
+
+    Under git's defaults the same file also fails ``git.worktree-clean``, and
+    ``run``/``sweep`` refuse a dirty tree — so there this line adds the WHICH and the
+    WHY that "commit or stash" does not (and a plain `git stash` leaves an untracked
+    file where it is). Where untracked files are hidden from `git status`
+    (`status.showUntrackedFiles=no`) the tree reads clean, the run starts, and this is
+    the only line that speaks before the commit lands.
+
+    A warning, never a problem: nothing is lost either way.
+    Silent on an absent ledger (nothing to commit yet, and every fresh project would
+    otherwise print it), on one outside ``paths.repo_root`` (``commit_paths`` skips
+    such a path too), and on a git fault — ``git.probe`` owns that report, and an
+    advisory must not fabricate an answer git did not give. An unreadable ledger is
+    already ``deferred.ledger-unreadable``; the presence probe here stays silent on
+    it rather than reporting the one fault twice.
+    """
+    ledger = paths.deferred_work
+    repo = paths.repo_root
+    try:
+        if not S_ISREG(ledger.stat().st_mode):
+            return
+        rel = ledger.resolve().relative_to(repo.resolve()).as_posix()
+    except (OSError, RuntimeError, ValueError):
+        return
+    try:
+        if verify.path_tracked(repo, rel) or verify.path_ignored(repo, ledger):
+            return
+    except verify.GitError:
+        return
+    report.warn(
+        "deferred.ledger-untracked",
+        f"{ledger} is neither committed nor gitignored, so nothing has decided whether it "
+        "belongs in git — left that way, bmad-loop's own commits decide (the first isolated "
+        "merge that carries a ledger write, or a non-isolated story commit's `git add -A`, "
+        "takes it in); commit it or add it to .gitignore to decide on purpose",
+        {"ledger": str(ledger), "path": rel},
+    )
 
 
 def _validate_hard_gates(
