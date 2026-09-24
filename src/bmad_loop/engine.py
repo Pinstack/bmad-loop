@@ -8494,10 +8494,10 @@ class Engine:
 
         A path HEAD does not carry answers True, leaving an untracked board committed
         exactly as before (#460). That is the boundary ``merge_local`` already draws —
-        ``_carried_artifact_rels`` filters ``protected`` to TRACKED paths, because
-        protecting an untracked artifact would halt every run whose project never
-        committed its board — and a second frame drawing it elsewhere would make the
-        pair unreadable.
+        ``_carried_artifact_rels`` protects the board only when it is TRACKED (and
+        ``board_advance_intended`` is set, DW-354), because protecting an untracked
+        artifact would halt every run whose project never committed its board — and a
+        second frame drawing it elsewhere would make the pair unreadable.
 
         BOTH of the places git holds this path are proved, because `commit_paths`
         overwrites both: the working tree it copies into the commit, and the index it

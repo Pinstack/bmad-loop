@@ -426,6 +426,7 @@ _JOURNAL_KIND_KEYLIST_FIELDS: dict[str, dict[str, str]] = {
 _JOURNAL_KIND_COUNTLIST_FIELDS: dict[str, frozenset[str]] = {
     "merge-preflight-refused": frozenset({"tolerated"}),
     "merge-target-cleaned": frozenset({"paths"}),
+    "merge-target-preserved": frozenset({"paths"}),
     "merge-target-tolerated": frozenset({"paths"}),
     "stale-restore-excluded": frozenset({"files"}),
 }

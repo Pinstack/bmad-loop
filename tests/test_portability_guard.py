@@ -1026,6 +1026,8 @@ JOURNAL_DYNAMIC_KIND_SPELLINGS = {
             "attempt-preserve-prune-failed",
             "attempt-preserve-dirty-pruned",
             "attempt-preserve-dirty-prune-failed",
+            "merge-preflight-preserve-pruned",
+            "merge-preflight-preserve-prune-failed",
         }
     ),
 }
@@ -1667,6 +1669,7 @@ JOURNAL_KINDS = frozenset(
         "isolation-flip-orphan-preserved",
         "merge-preflight-refused",
         "merge-target-cleaned",
+        "merge-target-preserved",
         "merge-target-tolerated",
         "scm-failed-diff-unlimited",
         "target-branch",
@@ -7592,6 +7595,7 @@ def prune_preserve_refs(self):
     for family, prune in (
         ("attempt-preserve", verify.prune_preserve_refs),
         ("attempt-preserve-dirty", verify.prune_preserve_dirty_refs),
+        ("merge-preflight-preserve", verify.prune_merge_preflight_preserve_refs),
     ):
         try:
             deleted = prune(root, keep)
@@ -7679,7 +7683,9 @@ def test_journal_minted_kind_probes_expand_the_fstring():
 
     bare_target = (
         "def prune_preserve_refs(self):\n"
-        '    for family in ("attempt-preserve", "attempt-preserve-dirty"):\n'
+        "    for family in (\n"
+        '        "attempt-preserve", "attempt-preserve-dirty", "merge-preflight-preserve"\n'
+        "    ):\n"
         '        self.journal.append(f"{family}-pruned", count=n)\n'
     )
     assert _minted_spellings(bare_target) == {s for s in _MINTED_SPELLINGS if s.endswith("-pruned")}
@@ -7688,7 +7694,7 @@ def test_journal_minted_kind_probes_expand_the_fstring():
         "def prune_preserve_refs(self):\n"
         '    for family in ("attempt-preserve",):\n'
         "        pass\n"
-        '    for family in ("attempt-preserve-dirty",):\n'
+        '    for family in ("attempt-preserve-dirty", "merge-preflight-preserve"):\n'
         '        self.journal.append(f"{family}-pruned", count=n)\n'
     )
     assert _minted_spellings(two_loops) == {s for s in _MINTED_SPELLINGS if s.endswith("-pruned")}

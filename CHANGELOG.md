@@ -40,6 +40,15 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Protect the tracked deferred-work ledger and sprint board at the merge pre-flight only
+  when the task carries a write to them (a ledger payload; a recorded board advance), so
+  an unrelated unstaged operator edit there no longer pauses an isolated run; sweep bundles
+  and stories-mode tasks never carry a board write, so their merges tolerate an unrelated
+  unstaged board edit (DW-354).
+- Park an operator's uncommitted edit to a tracked path the branch also changes under
+  `refs/merge-preflight-preserve/<sha>` (its own `preserve_keep` family) before the merge
+  pre-flight restores it, and journal `merge-target-preserved`; a failed snapshot cleans
+  nothing and escalates or pauses naming the preservation failure (DW-356).
 - Verify an existing `vX.Y.Z` tag in `scripts/release.py publish` instead of trusting it:
   the commit the tag points to on `origin` must carry the version (or, on a lost
   `gh release create` race, be exactly the targeted commit); a mismatch, a local-only

@@ -4181,12 +4181,22 @@ def test_prune_preserve_refs_journals_deleted_per_family(project, monkeypatch):
     flow = _make_flow(workspace=ws, policy=_policy(preserve_keep=3))
     monkeypatch.setattr(verify, "prune_preserve_refs", lambda repo, keep: ["a", "b"])
     monkeypatch.setattr(verify, "prune_preserve_dirty_refs", lambda repo, keep: [])
+    monkeypatch.setattr(
+        verify,
+        "prune_merge_preflight_preserve_refs",
+        lambda repo, keep: ["refs/merge-preflight-preserve/m1"],
+    )
 
     flow.prune_preserve_refs()
 
     assert flow.journal.fields("attempt-preserve-pruned")["count"] == 2
     # empty deletion for the other family journals nothing
     assert "attempt-preserve-dirty-pruned" not in flow.journal.events()
+    # the merge pre-flight family is pruned under its own kind (DW-356)
+    assert flow.journal.fields("merge-preflight-preserve-pruned") == {
+        "count": 1,
+        "refs": ["refs/merge-preflight-preserve/m1"],
+    }
 
 
 def test_prune_preserve_refs_error_journaled_and_other_family_still_runs(project, monkeypatch):
@@ -4201,6 +4211,7 @@ def test_prune_preserve_refs_error_journaled_and_other_family_still_runs(project
 
     monkeypatch.setattr(verify, "prune_preserve_refs", stuck)
     monkeypatch.setattr(verify, "prune_preserve_dirty_refs", lambda repo, keep: ["d1"])
+    monkeypatch.setattr(verify, "prune_merge_preflight_preserve_refs", lambda repo, keep: ["m1"])
 
     flow.prune_preserve_refs()  # a failure in one family must never crash or skip the other
 
@@ -4208,6 +4219,28 @@ def test_prune_preserve_refs_error_journaled_and_other_family_still_runs(project
     assert "attempt-preserve-pruned" in events  # partial deletions stay auditable
     assert flow.journal.fields("attempt-preserve-prune-failed")["failed"] == ["r2"]
     assert "attempt-preserve-dirty-pruned" in events  # the second family still ran
+    assert "merge-preflight-preserve-pruned" in events  # ...and so did the third
+
+
+def test_prune_preserve_refs_merge_preflight_family_failure_is_journaled(project, monkeypatch):
+    """The third family's own failure journals under its own kind and never
+    reaches the run (DW-356)."""
+    ws = Workspace.default(project)
+    flow = _make_flow(workspace=ws, policy=_policy(preserve_keep=3))
+    monkeypatch.setattr(verify, "prune_preserve_refs", lambda repo, keep: [])
+    monkeypatch.setattr(verify, "prune_preserve_dirty_refs", lambda repo, keep: [])
+
+    def stuck(repo, keep):
+        raise verify.GitError("for-each-ref failed")
+
+    monkeypatch.setattr(verify, "prune_merge_preflight_preserve_refs", stuck)
+
+    flow.prune_preserve_refs()
+
+    assert flow.journal.fields("merge-preflight-preserve-prune-failed")["error"] == (
+        "for-each-ref failed"
+    )
+    assert "merge-preflight-preserve-pruned" not in flow.journal.events()
 
 
 # --------------------------------------------------------------- manual recovery

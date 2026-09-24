@@ -382,6 +382,27 @@ class IntegrationCleanupChangedError(IntegrationEvidenceError):
         self.cleaned = tuple(cleaned)
 
 
+class MergePreflightPreserveError(GitError):
+    """The merge pre-flight could not park an operator's uncommitted bytes before
+    restoring the tracked incoming paths that hold them (DW-356).
+
+    Raised by :func:`apply_incoming_collision_plan` BEFORE any mutation: nothing was
+    unlinked or checked out, and ``progress`` is empty. A GitError so every existing
+    guard still catches it; a distinct type so the merge caller can name the failed
+    preservation and ``paths`` instead of wording it as the stray-dirt guard's
+    refusal ("commit, stash or revert") or as an environment fault — the dirt here
+    lies INSIDE the branch's incoming set, and the operator's remedy is to save or
+    discard their edit to exactly these paths."""
+
+    def __init__(self, paths: Iterable[str], detail: str) -> None:
+        self.paths = tuple(paths)
+        super().__init__(
+            "could not park the uncommitted working-tree bytes of "
+            f"{', '.join(self.paths)} under a refs/merge-preflight-preserve/ recovery ref "
+            f"before restoring them: {detail}"
+        )
+
+
 @dataclass(frozen=True)
 class IntegrationRefUpdate:
     old_revision: str
@@ -6002,6 +6023,40 @@ def prune_preserve_dirty_refs(repo: Path, keep: int) -> list[str]:
     )
 
 
+MERGE_PREFLIGHT_PRESERVE_PREFIX = "refs/merge-preflight-preserve/"
+
+
+def prune_merge_preflight_preserve_refs(repo: Path, keep: int) -> list[str]:
+    """Bounded retention for the ``refs/merge-preflight-preserve/*`` snapshots that
+    :func:`apply_incoming_collision_plan` parks before restoring an operator's
+    uncommitted edit to a tracked incoming path (DW-356). The same contract as
+    :func:`prune_preserve_dirty_refs` — keep the ``keep`` newest by committer
+    date, ``update-ref -d`` the tail, report full refnames — over its OWN prefix,
+    so a project minting one ref per merge (a ``per_worktree`` Editor leaking
+    tracked ``.meta`` rewrites) never crowds rollback evidence out of the
+    ``refs/attempt-preserve-dirty/`` budget. Only
+    ``refs/merge-preflight-preserve/`` is ever listed. ``keep <= 0`` means
+    "never prune" — returns ``[]`` without running git.
+
+    Raises :class:`GitError` when the listing fails, or
+    :class:`PrunePreserveError` on a partial delete failure; see
+    :func:`_prune_refs` for the best-effort contract."""
+
+    def _delete(refname: str) -> None:
+        rc, out = _git(repo, "update-ref", "-d", refname)
+        if rc != 0:
+            raise GitError(f"git update-ref -d {refname} failed in {repo}: {out}")
+
+    return _prune_refs(
+        repo,
+        keep,
+        MERGE_PREFLIGHT_PRESERVE_PREFIX,
+        label="merge-preflight-preserve",
+        strip="",
+        delete=_delete,
+    )
+
+
 def snapshot_worktree(
     repo: Path,
     ref_name: str,
@@ -6782,7 +6837,15 @@ def plan_incoming_collisions(
     re-creates the canonical versions.
 
     Guard: only paths that lie within the branch's incoming set are cleaned. A dirty
-    path *outside* that set is real operator work and is never touched. Whether it also
+    path *outside* that set is real operator work and is never touched. A dirty path
+    INSIDE the set is cleaned whoever wrote it — an Editor leak and an operator's own
+    uncommitted edit to a file the branch also changes read the same — so a TRACKED
+    one is parked before it is restored: :func:`apply_incoming_collision_plan` first
+    commits the working-tree bytes of every tracked cleaned path to one snapshot under
+    ``refs/merge-preflight-preserve/<sha>`` and only then checks them out, refusing
+    (:class:`MergePreflightPreserveError`) with nothing mutated when it cannot
+    (DW-356). An untracked cleaned path is the Editor's duplicate of a file the branch
+    adds and is deleted as before. Whether a stray outside the set also
     BLOCKS the merge is decided per path by the INDEX column, not by trackedness
     (#618): the merge writes only paths that differ between `target` and `branch`, so
     a stray git has nothing staged for — untracked, or tracked and edited in the
@@ -6890,14 +6953,128 @@ def plan_incoming_collisions(
     )
 
 
+def _preserve_collision_paths(repo: Path, paths: list[str]) -> str | None:
+    """Park the working-tree bytes of the tracked ``paths`` in one snapshot commit
+    and return the ``refs/merge-preflight-preserve/<sha>`` ref naming it, or
+    ``None`` when there is nothing to park (DW-356).
+
+    :func:`snapshot_worktree`'s mechanism scoped to exactly these paths: a
+    throwaway ``GIT_INDEX_FILE`` seeded ``read-tree HEAD``, the paths staged into
+    it, ``write-tree``, and ``commit-tree -p HEAD`` under the synthetic
+    ``bmad-loop`` identity — the real index and working tree are never touched.
+    A path present on disk is staged with ``add -f`` over its literal pathspec, so
+    a staged-added path that ``.gitignore`` matches is parked rather than refused;
+    a path the operator deleted is dropped from the temp index
+    (``rm --cached --ignore-unmatch``), since ``add`` of a pathspec matching
+    nothing on disk or in the temp index (a staged-add later deleted) is an error,
+    and the ref then simply lacks it — nothing to recover.
+
+    A snapshot tree equal to HEAD's (a staged-only dirty path whose working tree
+    matches HEAD) holds no operator bytes: no commit, no ref, ``None``. The ref is
+    created must-not-exist (``update-ref <ref> <sha> ""``); a ref already holding
+    exactly this commit — only a same-second replay of identical bytes can mint
+    one — is the same evidence and accepted.
+
+    Values are read through ``_git_out`` (stdout only, #442). Raises
+    :class:`GitError` on any git failure and lets the temp directory's ``OSError``
+    through; the caller mutates nothing until this returns."""
+    head = rev_parse_head(repo)
+    present = [p for p in paths if os.path.lexists(repo / p)]
+    absent = [p for p in paths if p not in present]
+    with tempfile.TemporaryDirectory() as td:
+        env = {**os.environ, "GIT_INDEX_FILE": str(Path(td) / "index")}
+        rc, out = _git_env(repo, "read-tree", head, env=env)
+        if rc != 0:
+            raise GitError(f"git read-tree (merge pre-flight snapshot) failed in {repo}: {out}")
+        if present:
+            # core.safecrlf=false: a mixed-EOL edit under autocrlf+safecrlf=true is
+            # refused by `add` (rc 128) though `checkout --` would restore it fine.
+            rc, out = _git_env(
+                repo,
+                "-c",
+                "core.safecrlf=false",
+                "add",
+                "-f",
+                "--",
+                *_literal_specs(present),
+                env=env,
+            )
+            if rc != 0:
+                raise GitError(f"git add (merge pre-flight snapshot) failed in {repo}: {out}")
+        if absent:
+            rc, out = _git_env(
+                repo,
+                "rm",
+                "-q",
+                "--cached",
+                "--ignore-unmatch",
+                "--",
+                *_literal_specs(absent),
+                env=env,
+            )
+            if rc != 0:
+                raise GitError(
+                    f"git rm --cached (merge pre-flight snapshot) failed in {repo}: {out}"
+                )
+        rc, tree, detail = _git_out(repo, "write-tree", env=env)
+        if rc != 0:
+            raise GitError(f"git write-tree (merge pre-flight snapshot) failed in {repo}: {detail}")
+    rc, head_tree, detail = _git_out(repo, "rev-parse", f"{head}^{{tree}}")
+    if rc != 0:
+        raise GitError(f"git rev-parse {head}^{{tree}} failed in {repo}: {detail}")
+    if tree == head_tree:
+        return None  # the working tree already matches HEAD at every path — no bytes to park
+    ident = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "bmad-loop",
+        "GIT_AUTHOR_EMAIL": "bmad-loop@localhost",
+        "GIT_COMMITTER_NAME": "bmad-loop",
+        "GIT_COMMITTER_EMAIL": "bmad-loop@localhost",
+    }
+    rc, snap, detail = _git_out(
+        repo,
+        "commit-tree",
+        tree,
+        "-p",
+        head,
+        "-m",
+        "merge pre-flight snapshot of uncommitted edits to incoming paths",
+        env=ident,
+    )
+    if rc != 0:
+        raise GitError(f"git commit-tree (merge pre-flight snapshot) failed in {repo}: {detail}")
+    ref = f"{MERGE_PREFLIGHT_PRESERVE_PREFIX}{snap}"
+    rc, out = _git(repo, "update-ref", ref, snap, "")
+    if rc != 0:
+        rc_existing, existing, _detail = _git_out(repo, "rev-parse", "-q", "--verify", ref)
+        if rc_existing != 0 or existing != snap:
+            raise GitError(f"git update-ref {ref} failed in {repo}: {out}")
+    return ref
+
+
 def apply_incoming_collision_plan(
     repo: Path,
     plan: IncomingCollisionPlan,
     *,
     before_mutate: Callable[[str], bool] | None = None,
     progress: list[str] | None = None,
+    on_preserved: Callable[[str, list[str]], None] | None = None,
 ) -> list[str]:
     """Apply an already snapshotted collision plan without widening its paths.
+
+    Park, then restore (DW-356). A tracked cleaned path is restored with
+    ``git checkout -- <path>``, and it may hold an operator's uncommitted edit to
+    a file the branch also changes rather than an Editor leak — without a ref
+    those bytes would be gone, never committed, with nothing to read them back
+    from. So after the re-read and parent resolution below and before the first
+    ``before_mutate``/``progress``/mutation, the working-tree bytes of EVERY
+    tracked cleaned path are parked in one snapshot commit under
+    ``refs/merge-preflight-preserve/<sha>`` (:func:`_preserve_collision_paths`),
+    and ``on_preserved``, when given, is called once with ``(ref, paths)``. A plan
+    with no tracked paths, or whose tracked paths already match HEAD in the working
+    tree, makes no ref and no call. When the snapshot cannot be made (``GitError``
+    or ``OSError``) this raises :class:`MergePreflightPreserveError` with the
+    checkout untouched and ``progress`` empty.
 
     ``progress``, when given, receives each path as it is TAKEN UP — after its
     ``before_mutate`` reading passed and before its first mutation — so a caller
@@ -6938,6 +7115,14 @@ def apply_incoming_collision_plan(
                 f"{repo / path}"
             )
         prune_starts[path] = parent
+    tracked_cleaned = [path for path in plan.cleaned if path not in untracked]
+    if tracked_cleaned:
+        try:
+            ref = _preserve_collision_paths(repo, tracked_cleaned)
+        except (GitError, OSError) as exc:
+            raise MergePreflightPreserveError(tracked_cleaned, str(exc)) from exc
+        if ref is not None and on_preserved is not None:
+            on_preserved(ref, tracked_cleaned)
     cleaned: list[str] = []
     for path in plan.cleaned:
         if before_mutate is not None and not before_mutate(path):
@@ -6966,8 +7151,10 @@ def clean_incoming_collisions(
     *,
     protected: tuple[str, ...] = (),
     on_tolerated: Callable[[list[str]], None] | None = None,
+    on_preserved: Callable[[str, list[str]], None] | None = None,
 ) -> list[str]:
-    """Compatibility wrapper that plans and immediately applies cleanup."""
+    """Compatibility wrapper that plans and immediately applies cleanup;
+    ``on_preserved`` is forwarded to :func:`apply_incoming_collision_plan`."""
     plan = plan_incoming_collisions(
         repo,
         target,
@@ -6975,7 +7162,7 @@ def clean_incoming_collisions(
         protected=protected,
         on_tolerated=on_tolerated,
     )
-    return apply_incoming_collision_plan(repo, plan)
+    return apply_incoming_collision_plan(repo, plan, on_preserved=on_preserved)
 
 
 def _merge_in_progress(repo: Path) -> tuple[bool, GitError | None]:

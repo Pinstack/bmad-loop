@@ -856,6 +856,263 @@ def test_collision_cleanup_rechecks_identity_at_each_mutation(project):
     assert collision.read_bytes() == b"new operator bytes"
 
 
+def _merge_preflight_refs(repo):
+    out = git(repo, "for-each-ref", "--format=%(refname)", "refs/merge-preflight-preserve/")
+    return [line for line in out.splitlines() if line]
+
+
+def _dirty_refs(repo):
+    out = git(repo, "for-each-ref", "--format=%(refname)", "refs/attempt-preserve-dirty/")
+    return [line for line in out.splitlines() if line]
+
+
+def test_collision_cleanup_parks_operator_bytes_of_a_tracked_path_before_restoring(
+    project, tmp_path
+):
+    """DW-356: a dirty TRACKED path in the incoming set may be an operator's own
+    uncommitted edit, not an Editor leak, and the cleanup restores it with
+    `checkout --` — so its working-tree bytes are parked under a
+    `refs/merge-preflight-preserve/<sha>` ref first, and the caller is told which
+    ref and which paths. The untracked leak beside it is not parked.
+
+    Ablation: drop the `_preserve_collision_paths` call and no ref exists."""
+    repo = project.project
+    _branch_with(repo, tmp_path, adds={"leak.cs": "branch\n"}, modifies={"src.txt": "branch\n"})
+    (repo / "leak.cs").write_text("editor leaked\n")
+    (repo / "src.txt").write_text("operator's uncommitted work\n")
+    head = verify.rev_parse_head(repo)
+    index_before = git(repo, "ls-files", "-s")
+    calls = []
+
+    cleaned = verify.clean_incoming_collisions(
+        repo, "main", "feat", on_preserved=lambda ref, paths: calls.append((ref, paths))
+    )
+
+    assert sorted(cleaned) == ["leak.cs", "src.txt"]
+    assert (repo / "src.txt").read_text() == "original\n"  # restored
+    assert not (repo / "leak.cs").exists()
+    refs = _merge_preflight_refs(repo)
+    assert len(refs) == 1
+    assert calls == [(refs[0], ["src.txt"])]
+    snap = git(repo, "rev-parse", refs[0])
+    assert refs[0] == f"refs/merge-preflight-preserve/{snap}"  # full snapshot sha
+    assert git(repo, "show", f"{refs[0]}:src.txt") == "operator's uncommitted work"
+    assert git(repo, "rev-parse", f"{refs[0]}^") == head  # parented at HEAD
+    # only the tracked cleaned path is parked, never the untracked leak
+    assert git(repo, "diff", "--name-only", head, refs[0]).splitlines() == ["src.txt"]
+    assert verify.rev_parse_head(repo) == head
+    assert git(repo, "ls-files", "-s") == index_before  # real index untouched
+    assert _dirty_refs(repo) == []  # never the rollback family
+
+
+def test_collision_cleanup_of_untracked_leaks_only_parks_nothing(project, tmp_path):
+    repo = project.project
+    _branch_with(repo, tmp_path, adds={"leak.cs": "branch\n"})
+    (repo / "leak.cs").write_text("editor leaked\n")
+    calls = []
+
+    cleaned = verify.clean_incoming_collisions(
+        repo, "main", "feat", on_preserved=lambda ref, paths: calls.append((ref, paths))
+    )
+
+    assert cleaned == ["leak.cs"]
+    assert calls == []
+    assert _merge_preflight_refs(repo) == []
+
+
+def test_collision_cleanup_of_a_staged_only_path_matching_head_parks_nothing(project, tmp_path):
+    """A tracked incoming path dirty only in the INDEX — its working tree equals
+    HEAD — holds no operator bytes the restore could lose: the snapshot tree equals
+    HEAD's, so no commit, no ref and no callback, and the path is cleaned as before.
+
+    Ablation: drop the `tree == head_tree` short-circuit and a ref is minted."""
+    repo = project.project
+    _branch_with(repo, tmp_path, modifies={"src.txt": "branch\n"})
+    (repo / "src.txt").write_text("staged edit\n")
+    git(repo, "add", "--", "src.txt")
+    (repo / "src.txt").write_text("original\n")  # working tree back at HEAD's bytes
+    calls = []
+
+    cleaned = verify.clean_incoming_collisions(
+        repo, "main", "feat", on_preserved=lambda ref, paths: calls.append((ref, paths))
+    )
+
+    assert cleaned == ["src.txt"]
+    assert calls == []
+    assert _merge_preflight_refs(repo) == []
+
+
+def test_collision_cleanup_parks_a_gitignored_staged_added_path(project, tmp_path):
+    """A staged-added (`A `) incoming path that `.gitignore` matches is parked, not
+    refused: the snapshot stages its literal pathspec with `add -f`, so a merge that
+    used to proceed does not turn into an escalation.
+
+    Ablation: drop `-f` from the snapshot's `add` and this raises
+    `MergePreflightPreserveError`."""
+    repo = project.project
+    _branch_with(repo, tmp_path, adds={"build.log": "branch\n"})
+    exclude = repo / git(repo, "rev-parse", "--git-path", "info/exclude")
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    exclude.write_text("*.log\n")
+    (repo / "build.log").write_text("operator's staged log\n")
+    git(repo, "add", "-f", "--", "build.log")
+    plan = verify.plan_incoming_collisions(repo, "main", "feat")
+    assert plan.cleaned == ("build.log",) and plan.untracked == ()
+    calls = []
+
+    verify.apply_incoming_collision_plan(
+        repo, plan, on_preserved=lambda ref, paths: calls.append((ref, paths))
+    )
+
+    refs = _merge_preflight_refs(repo)
+    assert len(refs) == 1 and calls == [(refs[0], ["build.log"])]
+    assert git(repo, "show", f"{refs[0]}:build.log") == "operator's staged log"
+
+
+def test_collision_cleanup_parks_a_mixed_eol_edit_under_safecrlf(project, tmp_path):
+    """A mixed-line-ending operator edit under `core.autocrlf=true` +
+    `core.safecrlf=true` is parked, not refused: `add` would exit 128 ("CRLF would
+    be replaced by LF") where the restore's `checkout --` succeeds, turning a merge
+    that used to proceed into an escalation.
+
+    Ablation: drop `-c core.safecrlf=false` from the snapshot's `add` and this raises
+    `MergePreflightPreserveError`."""
+    repo = project.project
+    _branch_with(repo, tmp_path, modifies={"src.txt": "branch\n"})
+    git(repo, "config", "core.autocrlf", "true")
+    git(repo, "config", "core.safecrlf", "true")
+    (repo / "src.txt").write_bytes(b"operator crlf\r\noperator lf\n")
+    calls = []
+
+    cleaned = verify.clean_incoming_collisions(
+        repo, "main", "feat", on_preserved=lambda ref, paths: calls.append((ref, paths))
+    )
+
+    assert cleaned == ["src.txt"]
+    refs = _merge_preflight_refs(repo)
+    assert len(refs) == 1 and calls == [(refs[0], ["src.txt"])]
+    parked = git(repo, "show", f"{refs[0]}:src.txt")
+    assert "operator crlf" in parked and "operator lf" in parked
+
+
+def test_collision_cleanup_parks_an_operator_deletion_as_an_absent_path(project, tmp_path):
+    """A tracked incoming path the operator DELETED is parked as its absence: the
+    ref exists (its tree differs from HEAD's) and simply lacks the path — nothing to
+    recover, and no `add` of a pathspec that matches nothing on disk."""
+    repo = project.project
+    _branch_with(repo, tmp_path, modifies={"src.txt": "branch\n"})
+    (repo / "src.txt").unlink()
+    calls = []
+
+    cleaned = verify.clean_incoming_collisions(
+        repo, "main", "feat", on_preserved=lambda ref, paths: calls.append((ref, paths))
+    )
+
+    assert cleaned == ["src.txt"]
+    assert (repo / "src.txt").read_text() == "original\n"
+    refs = _merge_preflight_refs(repo)
+    assert len(refs) == 1 and calls == [(refs[0], ["src.txt"])]
+    assert git(repo, "ls-tree", "--name-only", refs[0], "--", "src.txt") == ""
+
+
+def test_collision_cleanup_of_a_staged_added_then_deleted_path_parks_nothing(project, tmp_path):
+    """An incoming path staged-added and then deleted from the working tree (`AD`)
+    is absent on disk AND from HEAD, so the snapshot's temp index (seeded from
+    HEAD) has no entry for it either: there are no operator bytes to park. It is
+    cleaned without raising, and no ref or callback is minted.
+
+    Ablation: drop `--ignore-unmatch` from the snapshot's `rm --cached` and this
+    raises `MergePreflightPreserveError`."""
+    repo = project.project
+    _branch_with(repo, tmp_path, adds={"added.txt": "branch\n"})
+    (repo / "added.txt").write_text("operator's staged add\n")
+    git(repo, "add", "--", "added.txt")
+    (repo / "added.txt").unlink()
+    plan = verify.plan_incoming_collisions(repo, "main", "feat")
+    assert plan.cleaned == ("added.txt",) and plan.untracked == ()
+    calls = []
+
+    cleaned = verify.apply_incoming_collision_plan(
+        repo, plan, on_preserved=lambda ref, paths: calls.append((ref, paths))
+    )
+
+    assert cleaned == ["added.txt"]
+    assert calls == []
+    assert _merge_preflight_refs(repo) == []
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [verify.GitError("simulated snapshot fault"), OSError("simulated snapshot fault")],
+    ids=["git", "os"],
+)
+def test_collision_cleanup_snapshot_fault_raises_before_any_mutation(
+    project, tmp_path, monkeypatch, fault
+):
+    """A tracked collision whose bytes cannot be parked is never restored: the
+    typed `MergePreflightPreserveError` (naming the paths) leaves every cleaned
+    path as it was and `progress` empty, so the caller's escalation/pause arm fires
+    over an untouched checkout."""
+    repo = project.project
+    _branch_with(repo, tmp_path, adds={"leak.cs": "branch\n"}, modifies={"src.txt": "branch\n"})
+    (repo / "leak.cs").write_text("editor leaked\n")
+    (repo / "src.txt").write_text("operator's uncommitted work\n")
+    plan = verify.plan_incoming_collisions(repo, "main", "feat")
+
+    def refuse(_repo, _paths):
+        raise fault
+
+    monkeypatch.setattr(verify, "_preserve_collision_paths", refuse)
+    progress: list[str] = []
+    calls = []
+    with pytest.raises(verify.MergePreflightPreserveError, match="simulated snapshot fault") as ei:
+        verify.apply_incoming_collision_plan(
+            repo,
+            plan,
+            progress=progress,
+            on_preserved=lambda ref, paths: calls.append((ref, paths)),
+        )
+
+    assert ei.value.paths == ("src.txt",)
+    assert (repo / "src.txt").read_text() == "operator's uncommitted work\n"
+    assert (repo / "leak.cs").read_text() == "editor leaked\n"
+    assert progress == [] and calls == []
+    assert _merge_preflight_refs(repo) == []
+
+
+def test_prune_merge_preflight_preserve_refs_keeps_newest_and_spares_rollback_refs(project):
+    """The pre-flight family has its OWN retention budget: the newest `keep` by
+    committer date survive, the tail is deleted, and `refs/attempt-preserve-dirty/*`
+    is never listed — per-merge refs must not crowd out rollback evidence."""
+    repo = project.project
+    head = verify.rev_parse_head(repo)
+    tree = git(repo, "rev-parse", f"{head}^{{tree}}")
+    shas = []
+    for i in range(3):
+        env = {
+            **os.environ,
+            "GIT_COMMITTER_DATE": f"2026-01-0{i + 1}T00:00:00Z",
+            "GIT_AUTHOR_DATE": f"2026-01-0{i + 1}T00:00:00Z",
+        }
+        sha = subprocess.run(
+            ["git", "-C", str(repo), "commit-tree", tree, "-p", head, "-m", f"snap {i}"],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        shas.append(sha)
+        git(repo, "update-ref", f"refs/merge-preflight-preserve/{sha}", sha)
+        git(repo, "update-ref", f"refs/attempt-preserve-dirty/run-{i}", sha)
+
+    deleted = verify.prune_merge_preflight_preserve_refs(repo, 1)
+
+    assert sorted(deleted) == sorted(f"refs/merge-preflight-preserve/{s}" for s in shas[:2])
+    assert _merge_preflight_refs(repo) == [f"refs/merge-preflight-preserve/{shas[2]}"]
+    assert len(_dirty_refs(repo)) == 3  # the rollback family is untouched
+    assert verify.prune_merge_preflight_preserve_refs(repo, 0) == []
+
+
 @pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
 def test_cleanup_replay_refuses_a_flag_an_operator_set_after_the_cleanup(project, tmp_path, flag):
     """The crash-replay arm restores a `cleanup-pending` receipt's collisions

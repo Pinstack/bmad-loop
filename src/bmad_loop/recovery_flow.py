@@ -1574,14 +1574,17 @@ class RecoveryFlow:
         return retry_preserve_paragraph(self._workspace_get().root, task, self.state.run_id)
 
     def prune_preserve_refs(self) -> None:
-        """Bounded retention for both recovery-ref families at run start — the
-        attempt-preserve/* branches and the refs/attempt-preserve-dirty/*
-        worktree snapshots: keep the newest scm.preserve_keep of each by
-        committer date, delete the tail (mirrors the runs/cleanup retention
-        knobs — without it the refs grow unbounded on a long-lived project).
+        """Bounded retention for the three recovery-ref families at run start —
+        the attempt-preserve/* branches, the refs/attempt-preserve-dirty/*
+        rollback worktree snapshots, and the refs/merge-preflight-preserve/*
+        snapshots of operator edits the merge pre-flight restored (DW-356): keep
+        the newest scm.preserve_keep of each by committer date, delete the tail
+        (mirrors the runs/cleanup retention knobs — without it the refs grow
+        unbounded on a long-lived project). Per family, so per-merge pre-flight
+        refs never crowd rollback evidence out of its budget.
         Best-effort: a git failure is journalled per family and never blocks or
         pauses the run — the refs are a safety net, not run state — and a
-        failure in one family never skips the other. preserve_keep = 0 disables
+        failure in one family never skips the others. preserve_keep = 0 disables
         pruning entirely."""
         keep = self.policy.scm.preserve_keep
         if keep <= 0:
@@ -1590,6 +1593,7 @@ class RecoveryFlow:
         for family, prune in (
             ("attempt-preserve", verify.prune_preserve_refs),
             ("attempt-preserve-dirty", verify.prune_preserve_dirty_refs),
+            ("merge-preflight-preserve", verify.prune_merge_preflight_preserve_refs),
         ):
             try:
                 deleted = prune(workspace.root, keep)

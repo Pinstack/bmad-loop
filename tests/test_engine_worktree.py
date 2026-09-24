@@ -6120,6 +6120,219 @@ def test_merge_refuses_dirt_on_a_path_the_run_commits_for_itself(project):
     assert "merge-target-cleaned" not in kinds and "merge-target-tolerated" not in kinds
 
 
+def _ledger_edit_dev_effect(project, story_key, *, marker):
+    """`wt_dev_effect` (no follow-up review) that then appends `marker` UNSTAGED to
+    the tracked deferred-work ledger in the MAIN checkout — an operator's own edit
+    the branch never touches, so it is a stray outside the incoming set."""
+    base = wt_dev_effect(project, story_key, followup_review=False)
+
+    def effect(spec):
+        result = base(spec)
+        ledger = project.deferred_work
+        ledger.write_text(ledger.read_text(encoding="utf-8") + marker, encoding="utf-8")
+        return result
+
+    return effect
+
+
+def _commit_ledger_and_sprint(project, statuses):
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    commit_sprint(project, statuses)
+    rel = project.deferred_work.relative_to(project.project).as_posix()
+    git(project.project, "ls-files", "--error-unmatch", "--", rel)  # really tracked
+    return rel
+
+
+def test_merge_tolerates_unrelated_ledger_edit_when_the_task_carries_nothing(project):
+    """DW-354. The ledger is protected because the run's post-merge carries commit
+    it by pathspec — but only a task that OWES the ledger a payload (harvested
+    deferrals, story or bundle closes) ever runs that commit. A task with none never
+    touches the ledger after the merge, so an operator's unstaged edit there is as
+    inert as any other unstaged stray and must not pause the run.
+
+    Ablation: protect the tracked ledger unconditionally in
+    `_carried_artifact_rels` and this row escalates with the bookkeeping clause."""
+    marker = "<!-- operator: local note -->\n"
+    rel = _commit_ledger_and_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [_ledger_edit_dev_effect(project, "1-1-a", marker=marker)])
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused and summary.escalated == 0
+    assert engine.state.tasks["1-1-a"].phase == Phase.DONE
+    kinds = journal_kinds(engine)
+    assert "unit-merged" in kinds and "story-escalated" not in kinds
+    tolerated = next(e for e in engine.journal.entries() if e["kind"] == "merge-target-tolerated")
+    assert tolerated["paths"] == [rel]
+    # the edit is neither reverted nor committed
+    assert project.deferred_work.read_text(encoding="utf-8").endswith(marker)
+    versions = _committed_versions(project, rel)
+    assert versions and not any(marker.strip() in v for v in versions)
+
+
+def test_merge_refuses_ledger_edit_when_the_task_carries_into_the_ledger(project):
+    """DW-354's other half: a task owing the ledger a harvest payload WILL commit the
+    ledger by pathspec after the merge, so the operator's unstaged edit there would
+    ride out under the run's `chore(deferred-work)` message — the #618 refusal stands.
+
+    The obligation is set on the task directly rather than produced by a
+    `deferred:` harvest: with a TRACKED ledger the in-worktree harvest writes the
+    unit's own ledger copy, which rides the branch commit, so the ledger lands in
+    the incoming set and never reaches this guard. A record carried over the unit
+    (a retained/replayed harvest) is the shape that leaves the ledger a stray with
+    the carry still owed."""
+    marker = "<!-- operator: local note -->\n"
+    rel = _commit_ledger_and_sprint(project, {"1-1-a": "ready-for-dev"})
+    holder: dict[str, Engine] = {}
+    base = _ledger_edit_dev_effect(project, "1-1-a", marker=marker)
+
+    def effect(spec):
+        holder["engine"].state.tasks["1-1-a"].harvested_deferrals = [_harvest_record()]
+        return base(spec)
+
+    engine, _ = make_engine(project, [effect])
+    holder["engine"] = engine
+
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.done == 0
+    assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
+    reason = engine.state.paused_reason or ""
+    assert "bookkeeping commit" in reason and rel in reason
+    assert project.deferred_work.read_text(encoding="utf-8").endswith(marker)
+    versions = _committed_versions(project, rel)
+    assert versions and not any(marker.strip() in v for v in versions)
+    assert "merge-target-tolerated" not in journal_kinds(engine)
+
+
+@pytest.mark.parametrize(
+    ("obligation", "ledger", "board"),
+    [
+        ({"harvested_deferrals": [_harvest_record()]}, True, False),
+        ({"story_closes_intended": ["DW-1"]}, True, False),
+        ({"bundle_closes_intended": ["DW-1"]}, True, False),
+        # the latch can outlive its payload: never an obligation by itself
+        ({"harvest_carry_commit_pending": True}, False, False),
+        ({"board_advance_intended": "done"}, False, True),
+        ({"board_advance_intended": "done", "story_closes_intended": ["DW-1"]}, True, True),
+        ({}, False, False),
+    ],
+    ids=[
+        "harvest",
+        "story-closes",
+        "bundle-closes",
+        "harvest-commit-pending-alone",
+        "board-advance",
+        "board-and-ledger",
+        "none",
+    ],
+)
+def test_carried_artifact_rels_protects_only_what_the_task_carries(
+    project, obligation, ledger, board
+):
+    """DW-354 at the lowest layer: a TRACKED carried artifact is protected only when
+    the task carries a write to it — the ledger under a ledger payload, the board
+    under a recorded `board_advance_intended`."""
+    ledger_rel = _commit_ledger_and_sprint(project, {"1-1-a": "ready-for-dev"})
+    board_rel = project.sprint_status.relative_to(project.project).as_posix()
+    engine, _ = make_engine(project, [])
+    task = StoryTask("1-1-a", 1, **obligation)
+
+    rels = engine._worktree_flow._carried_artifact_rels(project.project, task)
+
+    expected = ((board_rel,) if board else ()) + ((ledger_rel,) if ledger else ())
+    assert rels == expected
+
+
+def _main_src_edit_dev_effect(project, story_key, *, marker):
+    """`wt_dev_effect` (no follow-up review) that then appends `marker` UNSTAGED to
+    `src.txt` in the MAIN checkout — a file the branch also changes, so the edit
+    lies INSIDE the incoming set and the pre-flight cleans it."""
+    base = wt_dev_effect(project, story_key, followup_review=False)
+
+    def effect(spec):
+        result = base(spec)
+        src = project.project / "src.txt"
+        src.write_text(src.read_text(encoding="utf-8") + marker, encoding="utf-8")
+        return result
+
+    return effect
+
+
+def test_merge_preflight_parks_an_operator_edit_to_an_incoming_tracked_path(project):
+    """DW-356. `src.txt` is tracked on the target AND changed by the branch, so an
+    operator's uncommitted edit to it in the main checkout lies inside the incoming
+    set and the pre-flight restores it with `checkout --`. Those bytes used to be
+    gone — never committed, no ref. Now they are parked first under a
+    `refs/merge-preflight-preserve/*` ref, journaled as `merge-target-preserved`,
+    and the merge still flows.
+
+    Ablation: drop the snapshot call in `apply_incoming_collision_plan` and the
+    event and the ref are both absent."""
+    marker = "operator's uncommitted src edit\n"
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [_main_src_edit_dev_effect(project, "1-1-a", marker=marker)])
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused and summary.escalated == 0
+    assert engine.state.tasks["1-1-a"].phase == Phase.DONE
+    entries = engine.journal.entries()
+    kinds = [e["kind"] for e in entries]
+    assert kinds.index("merge-target-preserved") < kinds.index("merge-target-cleaned")
+    preserved = next(e for e in entries if e["kind"] == "merge-target-preserved")
+    assert preserved["paths"] == ["src.txt"]
+    assert preserved["story_key"] == "1-1-a"
+    assert preserved["branch"] == "bmad-loop/test-run/1-1-a"
+    ref = preserved["ref"]
+    assert ref.startswith("refs/merge-preflight-preserve/")
+    assert marker.strip() in git(project.project, "show", f"{ref}:src.txt")
+    # the merged branch content, not the operator's edit, is on the target
+    src = (project.project / "src.txt").read_text(encoding="utf-8")
+    assert marker.strip() not in src and "change for 1-1-a" in src
+
+
+def test_merge_preflight_snapshot_fault_escalates_naming_the_preservation(project, monkeypatch):
+    """DW-356's failure arm on the no-receipt leg: when the operator's bytes cannot
+    be parked, nothing is cleaned and the unit escalates with a reason that names the
+    failed preservation and the path — never the stray-dirt guard's "Commit, stash or
+    revert" wording (these paths lie INSIDE the incoming set) nor the env-fault text.
+
+    Ablation: drop the `MergePreflightPreserveError` arm in `merge_local` and the
+    generic GitError arm words it as the guard refusal."""
+    marker = "operator's uncommitted src edit\n"
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+
+    def refuse(_repo, _paths):
+        raise verify.GitError("simulated snapshot fault")
+
+    monkeypatch.setattr(verify, "_preserve_collision_paths", refuse)
+    engine, _ = make_engine(project, [_main_src_edit_dev_effect(project, "1-1-a", marker=marker)])
+
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.done == 0
+    assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
+    reason = engine.state.paused_reason or ""
+    assert "could not park" in reason and "src.txt" in reason
+    assert "simulated snapshot fault" in reason
+    # only the leg-specific reason says these two; the generic arms never do
+    assert "nothing was cleaned" in reason
+    assert "save or discard your uncommitted edits to those paths" in reason
+    assert reason.count("could not park") == 1  # the exception says it, once
+    # git's detail precedes the remedy; the resume hint is escalate_unit's alone
+    assert reason.index("simulated snapshot fault") < reason.index("save or discard")
+    assert "bmad-loop resume" not in reason
+    assert "Commit, stash or revert" not in reason
+    assert "could not reconcile the target checkout" not in reason
+    # nothing was cleaned: the operator's bytes are still on disk
+    assert (project.project / "src.txt").read_text(encoding="utf-8").endswith(marker)
+    kinds = journal_kinds(engine)
+    assert "merge-target-cleaned" not in kinds and "merge-target-preserved" not in kinds
+    assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")
+
+
 @pytest.mark.parametrize(
     "make_exc",
     [

@@ -2251,7 +2251,7 @@ class WorktreeFlow:
                 patch=str(patch) if patch else None,
             )
 
-    def _carried_artifact_rels(self, repo: Path) -> tuple[str, ...]:
+    def _carried_artifact_rels(self, repo: Path, task: StoryTask) -> tuple[str, ...]:
         """The repo-relative posix paths the RUN commits for itself after the merge —
         ``clean_incoming_collisions``' ``protected`` operand (#618).
 
@@ -2266,6 +2266,28 @@ class WorktreeFlow:
         own bytes to commit under a `chore(...)` message. The blast radius is strictly
         same-path (`git commit -- <pathspec>` is implicitly `--only`), which is why
         this is an exact path set and not a policy.
+
+        OBLIGATION-GATED, one rule for both artifacts (DW-354): a path is protected
+        only when ``task`` actually carries a write to it, because a carry that never
+        runs never stages the path and an operator's unstaged edit there is then as
+        inert as any other stray — refusing the merge over it paused unattended runs
+        with no hazard to point at.
+
+        * The ledger is carried when the task holds a payload for it:
+          ``harvested_deferrals``, ``story_closes_intended``, or the sweep's
+          ``bundle_closes_intended`` — the operands ``_carry_isolated_ledger_writes``
+          and the ``SweepEngine`` override commit to ``paths.deferred_work``. NOT
+          ``harvest_carry_commit_pending``: that latch can outlive its payload (the
+          fresh-attempt reset clears ``harvested_deferrals`` without clearing it, and
+          ``_carry_harvested_deferrals`` returns early on an empty list), so it would
+          protect the ledger with nothing to carry. NOT refiles either: they are
+          written to the worktree ledger before the unit's commit and ride the branch
+          into the incoming set, never a post-merge carry.
+        * The board is carried when ``task.board_advance_intended`` is set — the only
+          guard ``_carry_board_advance`` checks ("the record IS the carry's guard").
+          ``SweepEngine`` and ``StoriesEngine`` never record one, nor does a generic
+          task with no recorded advance, so their merges tolerate an unrelated
+          operator board edit.
 
         ``self.paths``, not ``self.workspace.paths``: the carries read the MAIN
         checkout's copies (their docstrings say so explicitly), and this is the
@@ -2308,8 +2330,13 @@ class WorktreeFlow:
         being wrong that way is a refusal the operator can act on; the other way it is
         silent.
         """
+        artifacts: list[Path] = []
+        if task.board_advance_intended:
+            artifacts.append(self.paths.sprint_status)
+        if task.harvested_deferrals or task.story_closes_intended or task.bundle_closes_intended:
+            artifacts.append(self.paths.deferred_work)
         rels: list[str] = []
-        for artifact in (self.paths.sprint_status, self.paths.deferred_work):
+        for artifact in artifacts:
             try:
                 rel = artifact.resolve().relative_to(repo.resolve()).as_posix()
             except (OSError, RuntimeError, ValueError):
@@ -2786,8 +2813,9 @@ class WorktreeFlow:
         # inert and is tolerated and journaled while a staged one escalates. What the RUN
         # can commit is the second question, and `protected` is what asks it: the
         # post-merge carry stages the board and the ledger BY PATHSPEC, so any dirt on
-        # them — staged or not, whoever wrote it — would ride the run's own bookkeeping
-        # commit. Inert-under-merge and safe-to-proceed are not the same predicate.
+        # one this task carries into (`_carried_artifact_rels`, DW-354) — staged or not,
+        # whoever wrote it — would ride the run's own bookkeeping commit.
+        # Inert-under-merge and safe-to-proceed are not the same predicate.
         target_ref = f"refs/heads/{target}" if receipt_required else ""
         landed = False
         update: verify.IntegrationRefUpdate | None = None
@@ -2900,6 +2928,50 @@ class WorktreeFlow:
                 paths=paths,
             )
 
+        def note_preserved(ref: str, paths: list[str]) -> None:
+            """Journal the recovery ref parking operator bytes the cleanup restores.
+
+            A dirty TRACKED path in the incoming set is restored to the target's
+            committed version before the merge, and it may be an operator's own
+            uncommitted edit rather than an Editor leak — the ref is the only place
+            those bytes survive (DW-356), so the journal names it and the paths. The
+            event claims only that the bytes were parked; restoration is
+            ``merge-target-cleaned``'s claim."""
+            self.journal.append(
+                "merge-target-preserved",
+                story_key=task.story_key,
+                branch=unit.branch,
+                ref=ref,
+                paths=paths,
+            )
+
+        def preserve_failed_reason(*, receipt: bool) -> str:
+            """What a snapshot failure's ``str(exc)`` does not say — the merge, that
+            nothing was cleaned, and (receipt leg) the remedy — for the arms to join
+            with ``: <exc>`` (the no-receipt arm directly, then its own remedy; the
+            receipt arm through ``_pause_integration_evidence``'s ``prefix``). The
+            exception carries the paths, the ref family and git's detail once.
+
+            The remedies differ. Without a receipt the unit escalates and the
+            operator's edit is theirs to save or discard; ``escalate_unit`` already
+            appends the resume instruction. With one the receipt stays
+            ``cleanup-pending``: committing moves the target ref (the replay then
+            refuses the epoch) and discarding is undone by the replay's restore of
+            the captured pre-clean bytes, so the paths must be left as they are and
+            only the fault fixed — the resume replays the receipt and parks them
+            again."""
+            head = (
+                f"merge of {unit.branch} into {target} blocked before its pre-flight "
+                "cleanup, nothing was cleaned"
+            )
+            if not receipt:
+                return head
+            return (
+                f"{head}; leave those paths exactly as they are, fix the underlying "
+                f"fault, then `bmad-loop resume {self.state.run_id}` — the resume "
+                "replays the integration receipt and parks them again"
+            )
+
         try:
             if landed:
                 collision_plan = verify.IncomingCollisionPlan((), (), ())
@@ -2909,7 +2981,7 @@ class WorktreeFlow:
                     repo,
                     planned_target_revision,
                     merge_ref,
-                    protected=self._carried_artifact_rels(repo),
+                    protected=self._carried_artifact_rels(repo, task),
                     on_tolerated=note_tolerated,
                 )
                 cleaned_without_receipt = None
@@ -2918,10 +2990,22 @@ class WorktreeFlow:
                     repo,
                     target,
                     merge_ref,
-                    protected=self._carried_artifact_rels(repo),
+                    protected=self._carried_artifact_rels(repo, task),
                     on_tolerated=note_tolerated,
+                    on_preserved=note_preserved,
                 )
                 collision_plan = verify.IncomingCollisionPlan((), (), ())
+        except verify.MergePreflightPreserveError as e:
+            # Ahead of the generic arm, which would word this as the stray-dirt
+            # guard's refusal: these paths lie INSIDE the incoming set, and nothing
+            # was mutated — the snapshot failed before the first restore (DW-356).
+            self.keep_branch_and_escalate(
+                task,
+                unit,
+                f"{preserve_failed_reason(receipt=False)}: {e}; save or discard your "
+                "uncommitted edits to those paths (or fix the underlying fault)",
+            )
+            return
         except (verify.GitError, OSError, RuntimeError) as e:
             # OSError/RuntimeError join GitError because clean_incoming_collisions
             # mutates the checkout directly (resolve/unlink/iterdir/rmdir) — non-spawn
@@ -3215,10 +3299,16 @@ class WorktreeFlow:
                     collision_plan,
                     before_mutate=cleanup_identity_unchanged,
                     progress=progress,
+                    on_preserved=note_preserved,
                 )
                 if cleaned_without_receipt is None
                 else cleaned_without_receipt
             )
+        except verify.MergePreflightPreserveError as e:
+            # Raised before the first mutation (`progress` is empty), so there is
+            # nothing to restore; the receipt stays `cleanup-pending` and the resume
+            # replays it like any other interrupted cleanup (DW-356).
+            self._pause_integration_evidence(task, e, prefix=preserve_failed_reason(receipt=True))
         except (verify.GitError, OSError, RuntimeError) as e:
             if receipt_required and attempt is not None:
                 try:

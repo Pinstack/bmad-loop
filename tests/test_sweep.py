@@ -43,6 +43,7 @@ from conftest import (
     write_ledger,
     write_legacy_ledger,
     write_spec,
+    write_sprint,
 )
 
 from bmad_loop import artifact_publication, deferredwork, platform_util, runs
@@ -30429,6 +30430,137 @@ def test_target_hook_writing_into_a_captured_submodules_automator_directory_is_r
         "in a captured submodule checkout after integration (left as found): "
         "module/.bmad-loop/cache/hook.log"
     )
+
+
+def test_receipt_leg_parks_an_operator_edit_to_an_incoming_tracked_path(project):
+    """DW-356 on the receipt leg: a sweep bundle with an integration receipt cleans
+    through `apply_incoming_collision_plan` directly (not the no-receipt wrapper),
+    so the park-then-restore contract has to reach that call too. The operator's
+    uncommitted edit to `src.txt` — a file the branch also changes — is parked under
+    a `refs/merge-preflight-preserve/*` ref and journaled before it is restored,
+    and the bundle still lands.
+
+    Ablation: drop the receipt-path `on_preserved=` kwarg in `merge_local` and no
+    `merge-target-preserved` record appears (the ref alone would still be minted)."""
+    base, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    marker = "operator's uncommitted src edit\n"
+
+    def effect(spec):
+        result = base(spec)
+        src = project.project / "src.txt"
+        src.write_text(src.read_text(encoding="utf-8") + marker, encoding="utf-8")
+        return result
+
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(merge_strategy="merge"),
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused and not summary.crashed
+    assert engine.state.tasks["dw-fix"].phase == Phase.DONE
+    kinds = journal_kinds(engine)
+    assert "unit-merge-started" in kinds and "unit-merged" in kinds
+    assert kinds.index("merge-target-preserved") < kinds.index("merge-target-cleaned")
+    [preserved] = _records(engine, "merge-target-preserved")
+    assert preserved["paths"] == ["src.txt"] and preserved["story_key"] == "dw-fix"
+    ref = preserved["ref"]
+    assert ref.startswith("refs/merge-preflight-preserve/")
+    assert marker.strip() in git(project.project, "show", f"{ref}:src.txt")
+    src = (project.project / "src.txt").read_text(encoding="utf-8")
+    assert marker.strip() not in src and "change for dw-fix" in src
+
+
+def test_receipt_leg_snapshot_fault_pauses_naming_the_preservation(project, monkeypatch):
+    """DW-356's failure arm on the receipt leg: the snapshot fails before any
+    mutation, so the bundle pauses through `_pause_integration_evidence` with a
+    reason naming the failed preservation and the path — not the generic
+    "cleanup failed after receipt capture" wording — and the operator's bytes are
+    still on disk.
+
+    Ablation: drop the receipt-leg `MergePreflightPreserveError` arm and the
+    generic arm's prefix replaces the preservation wording."""
+    base, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    marker = "operator's uncommitted src edit\n"
+
+    def effect(spec):
+        result = base(spec)
+        src = project.project / "src.txt"
+        src.write_text(src.read_text(encoding="utf-8") + marker, encoding="utf-8")
+        return result
+
+    def refuse(_repo, _paths):
+        raise verify.GitError("simulated snapshot fault")
+
+    monkeypatch.setattr(verify, "_preserve_collision_paths", refuse)
+    before_head = verify.rev_parse_head(project.project)
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(merge_strategy="merge"),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    reason = summary.paused_reason or ""
+    assert "could not park" in reason and "src.txt" in reason
+    assert "simulated snapshot fault" in reason
+    # the receipt leg's own remedy: the replay needs the paths untouched
+    assert "leave those paths exactly as they are" in reason
+    assert "replays the integration receipt and parks them again" in reason
+    assert "save or discard" not in reason
+    assert reason.count("could not park") == 1
+    assert "cleanup failed after receipt capture" not in reason
+    assert "Commit, stash or revert" not in reason
+    assert verify.rev_parse_head(project.project) == before_head
+    assert (project.project / "src.txt").read_text(encoding="utf-8").endswith(marker)
+    kinds = journal_kinds(engine)
+    assert "merge-target-cleaned" not in kinds and "merge-target-preserved" not in kinds
+    assert "unit-merged" not in kinds
+
+
+def test_isolated_bundle_tolerates_an_unrelated_operator_board_edit(project):
+    """DW-354's board half: a sweep bundle never records `board_advance_intended`
+    (`SweepEngine._post_dev_state_sync` is a no-op), so `_carry_board_advance` never
+    stages the board and an operator's unstaged edit to a TRACKED board is as inert
+    as any other stray. The bundle lands, the edit is tolerated and journaled, stays
+    on disk, and reaches no commit.
+
+    Ablation: protect the tracked board unconditionally in `_carried_artifact_rels`
+    and this pauses with the bookkeeping clause naming the board."""
+    write_sprint(project, {"1-1-a": "done"})
+    board_rel = project.sprint_status.relative_to(project.project).as_posix()
+    base, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    git(project.project, "ls-files", "--error-unmatch", "--", board_rel)  # really tracked
+    marker = "# operator: local board note\n"
+
+    def effect(spec):
+        result = base(spec)
+        board = project.sprint_status
+        board.write_text(board.read_text(encoding="utf-8") + marker, encoding="utf-8")
+        return result
+
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(merge_strategy="merge"),
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused and not summary.crashed
+    task = engine.state.tasks["dw-fix"]
+    assert task.phase == Phase.DONE and task.board_advance_intended is None
+    assert "unit-merged" in journal_kinds(engine)
+    [tolerated] = _records(engine, "merge-target-tolerated")
+    assert board_rel in tolerated["paths"]
+    assert project.sprint_status.read_text(encoding="utf-8").endswith(marker)
+    shas = git(project.project, "rev-list", "HEAD", "--", board_rel).splitlines()
+    versions = [git(project.project, "show", f"{sha}:{board_rel}") for sha in shas]
+    assert versions and not any(marker.strip() in v for v in versions)
 
 
 @pytest.mark.parametrize("strategy", ["merge", "squash", "ff"])
