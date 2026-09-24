@@ -149,6 +149,10 @@ breaking changes may land in a minor release.
   rival committed content, a replay can no longer report a transition outside HEAD's raw
   history, and a replaced HEAD no longer stalls every replay on "synchronization did not
   match committed content" (DW-398, DW-399, DW-400).
+- Prune the exact-path ledger publication's candidate worktree entry after a failed or
+  timed-out `worktree add`, keep the typed cleanup error when the candidate temporary
+  directory cannot be removed and name the leftover on it, and create missing candidate
+  parents without following a redirected ancestor (DW-402, DW-403, DW-404).
 
 - Refuse, before any ref moves, an exact-path ledger publication whose live exec bit
   disagrees with the committed mode where Git honours `core.fileMode` — chmod the

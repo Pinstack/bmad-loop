@@ -5,6 +5,7 @@ import inspect
 import io
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -10072,6 +10073,221 @@ def test_commit_path_bound_raises_and_prunes_a_cleanup_only_fault(project, monke
 
     assert verify.rev_parse_head(repo) != original
     assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+# DW-402/403/404: candidate worktree cleanup and confined parent creation.
+
+
+@pytest.mark.parametrize("fault", ["rc", "timeout"])
+def test_commit_path_bound_prunes_a_candidate_add_that_fails_after_registering(
+    project, monkeypatch, fault
+):
+    """DW-402: a `worktree add` that registers its entry and then exits non-zero
+    or times out still has that entry pruned. Ablation: stop setting
+    `cleanup_fault` on an add failure and the stale entry stays listed."""
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    real_git_env = verify._git_env
+
+    def failing_add(git_repo, *args, **kwargs):
+        result = real_git_env(git_repo, *args, **kwargs)
+        if "worktree" in args and "add" in args:
+            assert result[0] == 0  # the entry really is registered
+            if fault == "timeout":
+                raise verify.GitTimeoutError("injected candidate add timeout")
+            return 1, "injected"
+        return result
+
+    monkeypatch.setattr(verify, "_git_env", failing_add)
+    expected = verify.GitTimeoutError if fault == "timeout" else verify.GitError
+    match = "injected candidate add timeout" if fault == "timeout" else "candidate checkout failed"
+    with pytest.raises(expected, match=match) as raised:
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    notes = getattr(raised.value, "__notes__", [])
+    assert not any("temporary directory was left" in note for note in notes)
+    assert verify.rev_parse_head(repo) == original
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+def _stick_candidate_temp_rmtree(monkeypatch):
+    """Make `TemporaryDirectory`'s rmtree of the candidate temp directory (the
+    one holding `no-hooks`) fail with a non-permission `OSError`, reported to
+    the handler it passes exactly as a real rmtree would: from inside an
+    `except` block, through `onexc` (3.12+) or `onerror` (3.11). Returns the
+    list the stuck directories are appended to."""
+    real_rmtree = shutil.rmtree
+    stuck: list[Path] = []
+
+    def stuck_rmtree(target, *args, **kwargs):
+        if not (Path(target) / "no-hooks").is_dir():
+            return real_rmtree(target, *args, **kwargs)
+        stuck.append(Path(target))
+        fault = OSError(errno.EBUSY, "injected busy temp directory", str(target))
+        try:
+            raise fault
+        except OSError:
+            if kwargs.get("onexc") is not None:
+                kwargs["onexc"](os.rmdir, target, fault)
+            elif kwargs.get("onerror") is not None:
+                kwargs["onerror"](os.rmdir, target, sys.exc_info())
+            else:
+                raise
+        return None
+
+    monkeypatch.setattr(shutil, "rmtree", stuck_rmtree)
+    return stuck
+
+
+def test_commit_path_bound_keeps_the_cleanup_error_when_the_temp_dir_sticks(project, monkeypatch):
+    """DW-403: a failed `worktree remove` whose checkout then cannot be deleted
+    still raises the typed cleanup `GitError`, with a note naming the surviving
+    temporary directory. Ablation: drop `ignore_cleanup_errors=True` and the
+    rmtree `OSError` replaces the `GitError`; drop the note arm and the leftover
+    goes unnamed."""
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    _fail_candidate_cleanup(monkeypatch, "rc")
+    stuck: list[Path] = []
+
+    try:
+        with monkeypatch.context() as m:
+            stuck = _stick_candidate_temp_rmtree(m)
+            with pytest.raises(
+                verify.GitError, match="detached candidate cleanup failed"
+            ) as raised:
+                verify.commit_path_bound(
+                    repo,
+                    "chore: bound ledger",
+                    path,
+                    accepted_text=accepted,
+                    baseline_text=baseline,
+                )
+        assert len(stuck) == 1
+        notes = getattr(raised.value, "__notes__", [])
+        assert any(
+            "temporary directory was left" in note and str(stuck[0]) in note for note in notes
+        )
+    finally:
+        for leftover in stuck:
+            shutil.rmtree(leftover, ignore_errors=True)
+        git(repo, "worktree", "prune")
+
+
+def test_commit_path_bound_tolerates_a_stuck_temp_dir_after_publishing(project, monkeypatch):
+    """DW-403: once the candidate is published and its worktree removed, a temp
+    directory that cannot be deleted is tolerated — the published commit is
+    truthful. Ablation: drop `ignore_cleanup_errors=True` and the rmtree
+    `OSError` fails a successful publication."""
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    stuck: list[Path] = []
+
+    try:
+        with monkeypatch.context() as m:
+            stuck = _stick_candidate_temp_rmtree(m)
+            published = verify.commit_path_bound(
+                repo,
+                "chore: bound ledger",
+                path,
+                accepted_text=accepted,
+                baseline_text=baseline,
+            )
+        assert len(stuck) == 1
+    finally:
+        for leftover in stuck:
+            shutil.rmtree(leftover, ignore_errors=True)
+
+    assert published == verify.rev_parse_head(repo)
+    assert git(repo, "show", f"{published}:src.txt") == accepted.rstrip("\n")
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+def _nested_bound_publish_inputs(project, rel):
+    """A tracked ledger at nested `rel`, committed, with the accepted text live."""
+    repo = project.project
+    path = repo / rel
+    path.parent.mkdir(parents=True)
+    baseline = "legacy migration ledger\n"
+    path.write_text(baseline, encoding="utf-8")
+    git(repo, "add", "--", rel)
+    git(repo, "commit", "-q", "-m", "track nested ledger")
+    original = verify.rev_parse_head(repo)
+    accepted = "accepted migration ledger\n"
+    path.write_text(accepted, encoding="utf-8")
+    return repo, path, baseline, accepted, original
+
+
+def _select_candidate_parent_arm(monkeypatch, arm):
+    if arm == "fallback":
+        monkeypatch.setattr(verify, "DIR_FD_ANCHORED_WRITES", False)
+    elif not verify.DIR_FD_ANCHORED_WRITES:
+        pytest.skip("host has no descriptor-anchored writes")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("arm", ["anchored", "fallback"])
+def test_commit_path_bound_creates_no_parent_through_a_redirected_ancestor(
+    project, tmp_path_factory, monkeypatch, arm
+):
+    """DW-404: a candidate ancestor swapped for a link to an outside directory
+    refuses before any missing parent is created through it. Ablation: restore
+    `candidate_path.parent.mkdir(parents=True, exist_ok=True)` and `inner` is
+    created inside the outside directory."""
+    repo, path, baseline, accepted, original = _nested_bound_publish_inputs(
+        project, "outer/inner/ledger.md"
+    )
+    outside = tmp_path_factory.mktemp("outside-dir")
+    _select_candidate_parent_arm(monkeypatch, arm)
+
+    def swap_ancestor(candidate_root):
+        outer = candidate_root / "outer"
+        shutil.rmtree(outer)
+        outer.symlink_to(outside, target_is_directory=True)
+
+    _intercept_candidate_checkout(monkeypatch, swap_ancestor)
+    with pytest.raises(verify.GitError, match="candidate content could not be written"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+            baseline_commit=original,
+        )
+
+    assert list(outside.iterdir()) == []
+    assert verify.rev_parse_head(repo) == original
+
+
+@pytest.mark.parametrize("arm", ["anchored", "fallback"])
+def test_commit_path_bound_recreates_a_missing_candidate_parent(project, monkeypatch, arm):
+    """DW-404: the confined parent creation still recreates a plain missing
+    candidate parent, so publication succeeds."""
+    repo, path, baseline, accepted, original = _nested_bound_publish_inputs(
+        project, "ledger-dir/ledger.md"
+    )
+    _select_candidate_parent_arm(monkeypatch, arm)
+    _intercept_candidate_checkout(
+        monkeypatch, lambda candidate_root: shutil.rmtree(candidate_root / "ledger-dir")
+    )
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+        baseline_commit=original,
+    )
+
+    assert published == verify.rev_parse_head(repo)
+    assert git(repo, "show", "--format=", "--name-only", published) == "ledger-dir/ledger.md"
+    assert git(repo, "show", f"{published}:ledger-dir/ledger.md") == accepted.rstrip("\n")
 
 
 def test_prepared_ref_timeout_before_commit_is_not_indeterminate(project):

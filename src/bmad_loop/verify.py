@@ -48,6 +48,7 @@ from .frontmatter import (
 from .model import StoryTask, VerifyOutcome, result_mapping
 from .platform_util import (
     DIR_FD_ANCHORED_WRITES,
+    UnconfinedWriteError,
     atomic_replace,
     atomic_write_bytes,
     atomic_write_bytes_confined,
@@ -55,6 +56,7 @@ from .platform_util import (
     names_tree_root,
     names_win32_alias,
     open_dir_confined,
+    path_is_confined,
 )
 from .policy import POLICY_FILE, Policy
 from .sprintstatus import STATUS_ORDER, story_status
@@ -10871,6 +10873,52 @@ def _publish_bound_candidate(
         raise GitError("captured branch changed during exact-path publication") from exc
 
 
+def _make_candidate_parents(root: Path, parent: Path) -> None:
+    """Create the missing directories from `root` down to `parent`, confined.
+
+    `parent.mkdir(parents=True)` follows a redirected ancestor and would create
+    empty directories outside `root` before the confined write refuses (DW-404).
+    With descriptor-anchored writes each component is created and then opened
+    `O_NOFOLLOW` relative to the one above it, so a link below `root` refuses
+    before anything is created through it. Hosts without `dir_fd` (win32) check
+    each component's ancestry with `path_is_confined` before creating it, which
+    keeps a check-then-act residual: a link planted between check and create
+    still redirects it. That is narrower than the confined writer, which is
+    handle-anchored there too wherever `HANDLE_ANCHORED_WRITES` holds. `root`
+    itself may be reached through a link, as `open_dir_confined` allows.
+
+    Raises `OSError` on failure. A refused redirect surfaces as the kernel's
+    `OSError` (ELOOP/ENOTDIR from the `O_NOFOLLOW` open) on the anchored arm and
+    as `UnconfinedWriteError` on the path-based arm.
+    """
+    try:
+        relative = parent.relative_to(root)
+    except ValueError as exc:
+        raise UnconfinedWriteError(f"{parent} is not under {root}") from exc
+    if not DIR_FD_ANCHORED_WRITES:
+        current = root
+        for part in relative.parts:
+            current = current / part
+            if not path_is_confined(root, current.parent):
+                raise UnconfinedWriteError(f"{current.parent} is redirected below {root}")
+            current.mkdir(exist_ok=True)
+        return
+    fd = open_dir_confined(root, root)
+    if fd is None:
+        raise OSError(f"candidate root {root} could not be opened")
+    try:
+        for part in relative.parts:
+            try:
+                os.mkdir(part, 0o777, dir_fd=fd)
+            except FileExistsError:
+                pass
+            nested = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            fd, previous = nested, fd
+            os.close(previous)
+    finally:
+        os.close(fd)
+
+
 def commit_path_bound(
     repo: Path,
     message: str,
@@ -10931,7 +10979,15 @@ def commit_path_bound(
     `worktree remove` that exits non-zero or raises is raised as `GitError` when
     nothing else is propagating, and otherwise attached as a note to the error
     that is. Either way, once the temporary directory is gone, a best-effort
-    `worktree prune` drops the stale administrative entry.
+    `worktree prune` drops the stale administrative entry — also after a
+    `worktree add` that exits non-zero or raises (a timeout included), since it
+    may already have registered one (DW-402). The temporary directory's own
+    removal never replaces the propagating error: a directory that survives it
+    is named in a note on that error, and tolerated silently on success because
+    the published commit is truthful (DW-403). Missing candidate parents are
+    created component by component beneath the candidate root without following
+    a redirected ancestor, so a swapped-in link refuses before any directory is
+    created outside it (DW-404).
 
     Every success return is closed by a final observation. Where Git honours
     `core.fileMode` the live exec bit must match the committed mode, refused
@@ -11039,26 +11095,37 @@ def commit_path_bound(
     if has_non_tree_parent:
         raise GitError("candidate publication path has a non-directory committed parent")
     cleanup_fault = False
+    temp_dir: str | None = None
     try:
-        with tempfile.TemporaryDirectory() as td:
+        # A failed rmtree must not replace the typed error propagating out of
+        # the block (DW-403); a leftover is named on that error below.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            temp_dir = td
             candidate_root = Path(td) / "candidate"
             hooks_dir = Path(td) / "no-hooks"
             try:
                 hooks_dir.mkdir()
             except OSError as exc:
                 raise GitError("detached candidate hook isolation could not be prepared") from exc
-            rc, _out = _git_env(
-                repo_root,
-                "-c",
-                f"core.hooksPath={hooks_dir}",
-                "worktree",
-                "add",
-                "--detach",
-                str(candidate_root),
-                captured.oid,
-                env=_bound_git_env(),
-            )
+            # An add can register `.git/worktrees/<name>` and still fail or time
+            # out, so any failure marks the fault the outer prune clears (DW-402).
+            try:
+                rc, _out = _git_env(
+                    repo_root,
+                    "-c",
+                    f"core.hooksPath={hooks_dir}",
+                    "worktree",
+                    "add",
+                    "--detach",
+                    str(candidate_root),
+                    captured.oid,
+                    env=_bound_git_env(),
+                )
+            except BaseException:
+                cleanup_fault = True
+                raise
             if rc != 0:
+                cleanup_fault = True
                 raise GitError(f"git detached candidate checkout failed in {repo_root}")
             try:
                 candidate_path = candidate_root / rel
@@ -11073,7 +11140,7 @@ def commit_path_bound(
                     os.fchmod(fd, (os.fstat(fd).st_mode & 0o777) | 0o100)
 
                 try:
-                    candidate_path.parent.mkdir(parents=True, exist_ok=True)
+                    _make_candidate_parents(candidate_root, candidate_path.parent)
                     atomic_write_bytes_confined(
                         candidate_path,
                         accepted_bytes,
@@ -11151,6 +11218,16 @@ def commit_path_bound(
                         f"git detached candidate cleanup also failed in {repo_root}: "
                         f"{cleanup_detail}"
                     )
+    except BaseException as exc:
+        # Only a failing publication names the leftover; a published commit is
+        # truthful, so the success path tolerates it silently.
+        if temp_dir is not None and os.path.lexists(temp_dir):
+            exc.add_note(
+                f"detached candidate temporary directory was left at {temp_dir}; "
+                "its candidate worktree registration may also remain — remove the "
+                "directory, then run `git worktree prune`"
+            )
+        raise
     finally:
         # `worktree prune` only drops entries whose directory is gone, so it
         # runs here, after `TemporaryDirectory` has deleted the checkout.
