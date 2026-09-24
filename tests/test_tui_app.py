@@ -29,7 +29,7 @@ from conftest import (
 from rich.console import Console
 from rich.text import Text
 from textual.events import MouseMove
-from textual.geometry import Offset, Size
+from textual.geometry import Offset, Region, Size
 from textual.selection import Selection
 from textual.widgets import (
     Button,
@@ -1896,35 +1896,101 @@ async def test_tall_terminal_dialog_height_unchanged(project):
 # published figure honest: it is asserted for every dialog it covers, so a modal
 # cannot quietly stop meeting the size the guide says it was measured at.
 #
-# What was measured is a dialog's own CHROME, not the text it is handed, and the
-# cases below are parametrised with short titles for exactly that reason.
-# Titles, headers, warnings and paths dock OUTSIDE the scrolling body, so every
-# line they wrap to costs a row the body cannot give back — it floors at 1 — and
-# the `-short`/`-narrow` rules cannot shrink content the way they shrink padding.
-# Nothing bounds that caller-supplied text, so a dialog handed a long enough
-# value has no floor to state at all. Measured at 39 columns: a ~150-character
-# deferred-work heading still fits 9 rows, ~300 characters wraps to 9 rows of
-# title and clips the close button; the validate header grows with its
-# document's spec folder; the spec viewer's `copy path` plus its action verbs
-# overflow 39 columns outright. That is one family with three faces, not three
-# defects — tracked in #628 (row too wide) and #629 (docked wrapping text steals
-# rows). The tests below pin the bounded case here, each unbounded case at a
-# size measured to work, and 80x24 as a size that was sufficient for the
-# examples measured — not one an unbounded value cannot overrun.
+# Caller text cannot move the pair. Titles, headers, subtitles and paths dock
+# OUTSIDE the scrolling body, and each of their lines is held to one row with an
+# ellipsis (BaseDialog `.title`; the SpecReviewModal and PauseReasonModal
+# subtitles; `_TailPath`), so a docked block costs its LINE count in rows, never
+# its length (DW-358). Docked warnings and hints are module text and are NOT so
+# held. The spec viewer's action row wraps into a two-column grid below 80
+# columns instead of clipping its right-most buttons (DW-359). The rows below
+# pin each face:
+#
+# - every covered dialog at 39x9, including the spec viewer (long subtitle and
+#   path), the pause-reason viewer (long subtitle) and the validate viewer:
+#   title, one body row and every docked control visible — two recorded
+#   exceptions, EscalationModal and ConfirmResumeModal's real warning, each a
+#   strict xfail below;
+# - a 300- and 2000-character ledger heading at 39x9: a one-row `.title`, and
+#   the done/legacy markers on lines of their own;
+# - a 63- and 300-character validate spec folder at 39x9: a three-row header
+#   that still holds the full folder;
+# - the spec viewer at 39/43/59/60/79 columns (grid, whole 3-row buttons) and at
+#   80 (one row, no `-narrow`), with a 300-character path;
+# - `_TailPath` keeping the file name when the path is cut, and the whole path
+#   when it fits.
+#
+# Visibility is asserted with `_fully_visible`, which reads the compositor's
+# clip: a widget cut by `#dialog` is still inside the SCREEN, so `_on_screen`
+# alone passes for a button the dialog has already clipped away.
 
 _MIN_COLS, _MIN_ROWS = 39, 9
+
+
+def _fully_visible(app, w) -> bool:
+    """A widget's region is non-empty and entirely visible — the compositor's
+    clipped region (screen AND every ancestor container, `#dialog` included)
+    equals its laid-out region, so nothing of it is cut off."""
+    r = w.region
+    return r.width > 0 and r.height > 0 and app.screen.find_widget(w).visible_region == r
+
+
+_LONG_SPEC_PATH = "/" + "/".join(["a-long-directory-name"] * 13) + "/spec-epic-1-story-2.md"
+assert len(_LONG_SPEC_PATH) > 290
+
+_PLAN_CHECKPOINT_ACTIONS = [
+    ("approve", "Approve & resume", "primary"),
+    ("replan", "Request replan", "warning"),
+]
+
+_LONG_SUBTITLE = ("a long stories.yaml story title " * 10).strip()
+assert len(_LONG_SUBTITLE) > 290
 
 _MIN_SIZE_CASES = (
     "confirm",
     "confirm-warning",
+    # The second known defect: `confirm-warning` passes a one-character warning,
+    # so it cannot see that ConfirmResumeModal's real double-drive warning —
+    # module text, not held to one row — wraps to three rows at 39 columns and
+    # clips `#ok`, `#cancel` and `#warning` itself. Out of scope for DW-358/359
+    # (another modal's layout); strict, so the fix has to remove this mark.
+    pytest.param(
+        "confirm-resume-warning",
+        marks=pytest.mark.xfail(
+            strict=True,
+            raises=AssertionError,
+            reason="ConfirmResumeModal's double-drive warning wraps past a 39x9 dialog",
+        ),
+    ),
     "start-run",
     "start-sweep",
     "decision",
     "deferred-entry",
     "story-checkpoint",
-    "escalation",
+    # A known defect, pinned rather than hidden: EscalationModal does not fit the
+    # pair, twice over. At 39 columns its three-button row (9 + 17 + 7 plus three
+    # 1-column margins = 36) is one column wider than the dialog's 35-column
+    # content region, so `close` loses its right edge at ANY height. And the
+    # restore-patch hint — module-owned safety text docked above the buttons —
+    # wraps to five rows: 2 border + title + 1 body row + 5 hint + 1 button = 10
+    # rows against a 90%-of-9 = 8-row dialog, so `#dialog` clips the whole button
+    # row; it needs a larger terminal. The screen-containment check this test
+    # used before could see neither clip, which is how 39x9 came to be recorded
+    # as this dialog's size. Out of scope
+    # for DW-358/359 (not caller text; another modal's layout); strict, so the
+    # fix has to remove this mark.
+    pytest.param(
+        "escalation",
+        marks=pytest.mark.xfail(
+            strict=True,
+            raises=AssertionError,
+            reason="EscalationModal clips at 39x9: button row 1 column too wide, "
+            "restore hint wraps past the dialog",
+        ),
+    ),
     "pause-reason",
     "text-output",
+    "spec-review",
+    "validate-findings",
 )
 
 
@@ -1943,6 +2009,14 @@ def _minimum_size_case(name: str, project):
         # inherits it), so losing it off-screen is a safety defect, not cosmetic
         return (
             ConfirmModal("t", "line\n" * 80, warning="w"),
+            ("#ok", "#cancel", "#warning"),
+            "#body",
+        )
+    if name == "confirm-resume-warning":
+        # the real modal, so a fix that rewords its warning lifts the xfail
+        state = RunState(run_id="r1", project=str(project.project), started_at="now")
+        return (
+            ConfirmResumeModal("r1", state, engine_alive=True),
             ("#ok", "#cancel", "#warning"),
             "#body",
         )
@@ -1987,9 +2061,32 @@ def _minimum_size_case(name: str, project):
         )
     if name == "pause-reason":
         return (
-            PauseReasonModal(title="t", subtitle="s", reason="line\n" * 80),
+            PauseReasonModal(title="t", subtitle=_LONG_SUBTITLE, reason="line\n" * 80),
             ("#act-resume", "#cancel"),
             "#reason",
+        )
+    if name == "spec-review":
+        # the widest action set the modal is given, and a path far longer than
+        # the row: both faces of this dialog's floor at once
+        return (
+            SpecReviewModal(
+                title="review the spec",
+                # a multi-line stories.yaml title: two lines, one row
+                subtitle=_LONG_SUBTITLE + "\nsecond line",
+                spec_path=Path(_LONG_SPEC_PATH),
+                spec_text="line\n" * 40,
+                actions=_PLAN_CHECKPOINT_ACTIONS,
+            ),
+            ("#copy-path", "#act-approve", "#act-replan", "#cancel"),
+            "#spec",
+        )
+    if name == "validate-findings":
+        return (
+            ValidateFindingsModal(
+                make_validate_document([("bmad-config", "problem", "a finding", None)])
+            ),
+            ("#ok",),
+            "#findings",
         )
     assert name == "text-output", name
     return TextOutputModal("validate", 0, "out\n" * 40), ("#ok",), "#output"
@@ -1998,8 +2095,9 @@ def _minimum_size_case(name: str, project):
 @pytest.mark.parametrize("case", _MIN_SIZE_CASES)
 async def test_measured_terminal_size_keeps_dialogs_operable(project, case):
     """At the 39x9 pair the guide records as measured, every covered dialog still
-    shows its title, a row of body and all of its docked controls (#281). Short
-    titles, so this pins the chrome; caller text is unbounded and has no floor.
+    shows its title, a row of body and all of its docked controls, fully — not
+    merely inside the screen but unclipped by `#dialog` too (#281, DW-358,
+    DW-359).
 
     Both breakpoint classes are asserted present first, so the test fails loudly
     if a future threshold change means this size no longer exercises the compact
@@ -2014,13 +2112,16 @@ async def test_measured_terminal_size_keeps_dialogs_operable(project, case):
         await ready(pilot, body)
         assert "-narrow" in app.screen.classes, case
         assert "-short" in app.screen.classes, case
-        assert _on_screen(app, app.screen.query(".title").first()), case
-        assert app.screen.query_one(body).region.height >= 1, case
+        assert _fully_visible(app, app.screen.query(".title").first()), case
+        body_widget = app.screen.query_one(body)
+        assert app.screen.find_widget(body_widget).visible_region.height >= 1, case
+        # inside any frame too: a bordered body can fill its slot with border alone
+        assert body_widget.content_size.height >= 1, case
         for selector in controls:
-            assert _on_screen(app, app.screen.query_one(selector)), f"{case} {selector}"
+            assert _fully_visible(app, app.screen.query_one(selector)), f"{case} {selector}"
 
 
-@pytest.mark.parametrize(
+_SPEC_REVIEW_ACTION_SETS = pytest.mark.parametrize(
     ("actions", "controls"),
     [
         (
@@ -2028,118 +2129,191 @@ async def test_measured_terminal_size_keeps_dialogs_operable(project, case):
             ("#copy-path", "#act-resume", "#cancel"),
         ),
         (
-            [
-                ("approve", "Approve & resume", "primary"),
-                ("replan", "Request replan", "warning"),
-            ],
+            _PLAN_CHECKPOINT_ACTIONS,
             ("#copy-path", "#act-approve", "#act-replan", "#cancel"),
         ),
     ],
     ids=["gate", "plan-checkpoint"],
 )
+
+
+def _spec_review_modal(actions, spec_path=_LONG_SPEC_PATH) -> SpecReviewModal:
+    return SpecReviewModal(
+        title="review the spec",
+        # a long, multi-line stories.yaml title: `.subtitle` must still be 1 row
+        subtitle=_LONG_SUBTITLE + "\nsecond line",
+        spec_path=Path(spec_path),
+        spec_text="line\n" * 40,
+        actions=actions,
+    )
+
+
+@_SPEC_REVIEW_ACTION_SETS
 async def test_spec_review_modal_operable_on_a_standard_terminal(project, actions, controls):
-    """The spec viewer is the one dialog outside the measured 39x9 pair, so pin
-    what WAS measured: a standard 80x24 terminal shows either action row in full
-    at the path length used here. That is sufficiency for this case, not a size
-    the dialog will meet for every spec path — nothing bounds one (#629).
-
-    It has no single floor to pin instead. Two things push it around, and one of
-    them is not a width at all: the docked `copy path` button plus the caller's
-    action verbs overflow a 39-column dialog horizontally, AND the full spec path
-    printed above the body wraps, so a long path costs rows and can drop the
-    action row off the bottom of a 9-row screen (measured: a 59-character path
-    puts the row at y=9 on a 9-row screen, while a short one leaves it at y=8).
-    Its floor is therefore a function of the path and the verbs, which is why
-    docs/tui-guide.md quotes this size rather than a minimum, and why wrapping
-    the row is tracked in #628 instead of being pinned here.
-
-    Asserting a size that WORKS, rather than that a narrower one fails, keeps the
-    contract pinned without freezing the defect: fixing #628 cannot redden it."""
+    """At 80 columns the widest action row — copy path + Approve & resume +
+    Request replan + close, 74 columns with margins — exactly fills the dialog's
+    content region (80 - 2 border - 4 padding), so the modal keeps its one-row
+    layout: no `-narrow`, every button on the same row, all fully visible, with
+    a 300-character spec path held to one row above the body (DW-358, DW-359).
+    One column less and the row would clip, which is what the narrow-width test
+    below pins."""
     app = BmadLoopApp(project.project)
     async with app.run_test(size=(80, 24)) as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
-        modal = SpecReviewModal(
-            title="review the spec",
-            subtitle="epic-1 story-2",
-            spec_path=project.project / "spec.md",
-            spec_text="line\n" * 40,
-            actions=actions,
-        )
+        modal = _spec_review_modal(actions)
         app.push_screen(modal)
         await until(pilot, lambda: app.screen is modal)
         await ready(pilot, "#spec")
+        assert "-narrow" not in app.screen.classes
+        assert app.screen.query_one(".path").region.height == 1
+        rows = {app.screen.query_one(selector).region.y for selector in controls}
+        assert len(rows) == 1, rows
         for selector in controls:
-            assert _on_screen(app, app.screen.query_one(selector)), selector
+            assert _fully_visible(app, app.screen.query_one(selector)), selector
 
 
-_LONG_SPEC_FOLDER = "docs/specs/epics/epic-1/stories/generated/very-long-folder-name"
+@_SPEC_REVIEW_ACTION_SETS
+@pytest.mark.parametrize("rows", [20, 24])
+@pytest.mark.parametrize("cols", [_MIN_COLS, 43, 59, 60, 79])
+async def test_spec_review_modal_action_row_wraps_below_80_columns(
+    project, actions, controls, cols, rows
+):
+    """Below 80 columns the one-row action row cannot fit (see the 80x24 test),
+    so the modal's own `-narrow` turns `.buttons` into a two-column grid (DW-359).
+    43 is where the longest label first fits a half-width cell; 59 and 60
+    straddle BaseDialog's threshold, which this modal overrides; 79 is one column
+    under its own.
 
+    The buttons must actually sit in two rows of at most two — a one-row
+    `1fr` strip would also keep every button visible, just too narrow to read.
+    Each button must keep its full 3-row height: a label that wrapped would make
+    its grid row taller and push the next row off the dialog, so the height is
+    the check that the labels stay on one line. From 43 columns a half-width
+    cell holds the longest label whole, so there every label is asserted
+    unclipped; below it "Approve & resume" may lose its tail to `…`, which is
+    accepted — the button stays whole and operable.
 
-@pytest.mark.parametrize(
-    ("kwargs", "size"),
-    [
-        ({}, (_MIN_COLS, _MIN_ROWS + 1)),
-        ({"stories_on": True, "spec_folder": _LONG_SPEC_FOLDER}, (_MIN_COLS, _MIN_ROWS + 3)),
-        ({"stories_on": True, "spec_folder": _LONG_SPEC_FOLDER}, (80, 24)),
-    ],
-    ids=["plain-39x10", "long-spec-folder-39x12", "long-spec-folder-80x24"],
-)
-async def test_validate_findings_modal_floor_moves_with_its_header(project, kwargs, size):
-    """The other documented exception, and its floor is content-dependent (#629).
+    20 rows is the shortest terminal without `-short`: the grid's second row of
+    3-row buttons must still fit, with a row of spec showing.
 
-    `.title` is `widgets.validate_header(doc)`, docked outside the scrolling
-    `#findings` body, so every line it wraps to costs the button row a row that
-    `-short` cannot buy back — collapsing padding and margins does not shrink
-    content. At 39 columns a plain document's header wraps to 5 rows and puts
-    the button row at y=9 on a screen whose rows are 0-8, so it needs 10.
-
-    But the header also carries `spec: <spec_folder>`, and that path is
-    user-controlled (widgets.py:582-585). A 63-character folder takes the header
-    to 7 rows and the floor with it: `#ok` is still clipped at BOTH 39x10 and
-    39x11, and only clears at 39x12. So the three cases here pin the dependence
-    itself rather than a single minimum — which is why docs/tui-guide.md
-    describes this floor as content-dependent and quotes the standard 80x24
-    terminal, the last case, which absorbed both headers measured here. A longer
-    folder would move it again; nothing bounds one (#629)."""
-    cols, rows = size
+    Ablations: delete the `SpecReviewModal.-narrow .buttons` grid rule and every
+    row here fails on the two-row assertion; drop `.subtitle` from the modal's
+    one-row selector, or that rule's `max-height: 1`, and rows fail on the
+    subtitle height; drop `-narrow` from the modal's `height: 100%` selector and
+    the 20-row cases fail."""
     app = BmadLoopApp(project.project)
     async with app.run_test(size=(cols, rows)) as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        modal = _spec_review_modal(actions)
+        app.push_screen(modal)
+        await until(pilot, lambda: app.screen is modal)
+        await ready(pilot, "#spec")
+        assert "-narrow" in app.screen.classes
+        assert "-short" not in app.screen.classes
+        for selector in (".title", ".subtitle", ".path"):
+            widget = app.screen.query_one(selector)
+            assert widget.region.height == 1, selector
+            assert _fully_visible(app, widget), selector
+        assert app.screen.query_one("#spec").content_size.height >= 1, (cols, rows)
+        buttons = [app.screen.query_one(selector, Button) for selector in controls]
+        rows = sorted({button.region.y for button in buttons})
+        assert len(rows) == 2, (cols, rows)
+        for row in rows:
+            assert sum(button.region.y == row for button in buttons) <= 2, (cols, row)
+        for selector, button in zip(controls, buttons):
+            assert _fully_visible(app, button), f"{cols} {selector}"
+            assert button.region.height == 3, f"{cols} {selector}"
+            if cols >= 43:
+                label = str(button.label)
+                assert button.content_size.width >= len(label), f"{cols} {selector}"
+
+
+@pytest.mark.parametrize(
+    ("cols", "path"),
+    [(_MIN_COLS, _LONG_SPEC_PATH), (80, "/specs/spec-epic-1-story-2.md")],
+    ids=["cut-keeps-file-name", "fits-whole"],
+)
+async def test_spec_review_path_keeps_its_file_name(project, cols, path):
+    """`text-overflow: ellipsis` cuts a path's END, which is its file name — the
+    part that says which spec this is. `_TailPath` cuts the head instead: a path
+    wider than its row renders as `…` plus a tail that fills the row exactly and
+    ends in the file name, and a path that fits renders whole (DW-358).
+
+    Ablation: make `_TailPath.render` return the whole path unconditionally and
+    the cut row fails on the missing leading `…`."""
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(cols, 24)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        modal = _spec_review_modal([("resume", "Approve & resume", "primary")], path)
+        app.push_screen(modal)
+        await until(pilot, lambda: app.screen is modal)
+        await ready(pilot, "#spec")
+        widget = app.screen.query_one(".path")
+        assert str(widget.content) == path  # the cut is render-only
+        rendered = str(widget.render())
+        width = widget.content_size.width
+        if len(path) > width:
+            assert rendered.startswith("…"), rendered
+            assert rendered.endswith("/spec-epic-1-story-2.md"), rendered
+            assert len(rendered) == width, (rendered, width)
+            assert path.endswith(rendered[1:])
+        else:
+            assert rendered == path
+
+
+@pytest.mark.parametrize("chars", [63, 300])
+async def test_validate_findings_modal_fixed_floor_with_long_spec_folder(project, chars):
+    """`.title` is `widgets.validate_header(doc)`: a verdict line, a meta line
+    carrying the user-controlled `spec: <spec_folder>`, and — a problem being
+    present — the dim gates footer. Each line is held to one row, so the header
+    is three rows whatever the folder's length and the dialog meets the 39x9 pair
+    like every other (DW-358). The ellipsis is render-only: the widget's content
+    still holds the whole folder.
+
+    Ablations: delete BaseDialog `.title`'s `text-wrap: nowrap` and both rows fail
+    on the header height; delete `ValidateFindingsModal.-short #dialog`'s
+    `height: 100%` and both fail on `#ok`, clipped by the 7-row dialog."""
+    folder = ("docs/specs/epics/epic-1/stories/generated/" * 10)[: chars - 1] + "x"
+    assert len(folder) == chars
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(_MIN_COLS, _MIN_ROWS)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         modal = ValidateFindingsModal(
-            make_validate_document([("bmad-config", "problem", "a finding", None)], **kwargs)
+            make_validate_document(
+                [("bmad-config", "problem", "a finding", None)],
+                stories_on=True,
+                spec_folder=folder,
+            )
         )
         app.push_screen(modal)
         await until(pilot, lambda: app.screen is modal)
         await ready(pilot, "#findings")
-        # the header is the thing that moves this floor, so assert it too: a
-        # regression that clipped it would otherwise leave #ok reachable and
-        # pass
-        assert _on_screen(app, app.screen.query(".title").first())
-        assert _on_screen(app, app.screen.query_one("#ok"))
+        header = app.screen.query(".title").first()
+        assert header.region.height == 3
+        assert _fully_visible(app, header)
+        assert _fully_visible(app, app.screen.query_one("#ok"))
+        assert folder in str(header.content)
 
 
-@pytest.mark.parametrize("chars", [150, 300], ids=["fits-the-floor", "overflows-the-floor"])
-async def test_long_docked_title_still_fits_a_standard_terminal(project, chars):
-    """The third face of the same family, and the size the guide falls back on:
-    80x24 absorbed a docked title no 39-column screen could — at these lengths.
-
-    `DeferredEntryModal` renders the ledger heading as the docked `.title`,
+@pytest.mark.parametrize("chars", [300, 2000])
+async def test_long_docked_title_holds_one_row(project, chars):
+    """`DeferredEntryModal` renders the ledger heading as the docked `.title`,
     outside the scrolling `#entry`, and `parse_ledger` does not bound that text.
-    At 39 columns a ~150-character heading still clears the floor, but ~300
-    characters wraps to nine rows of title and pushes `#ok` off a nine-row
-    screen — `#entry` is already at its one-row minimum and has nothing left to
-    give. Both lengths are asserted at 80x24 rather than at 39 columns, because
-    the point is the fallback size, not another content-specific minimum that a
-    longer heading would falsify (#629). A longer heading falsifies 80x24 too —
-    `parse_ledger` bounds nothing — which is why the guide states 80x24 as
-    sufficient for the lengths measured here rather than as a size to rely on."""
+    Unbounded, a ~300-character heading wrapped to nine rows at 39 columns and
+    pushed `#ok` off a nine-row screen. Held to one row it cannot: the title is
+    one row and fully visible, `#ok` too, at the 39x9 pair (DW-358). The full
+    heading stays in the widget, and the scrolling body repeats it.
+
+    Ablation: delete BaseDialog `.title`'s `text-wrap: nowrap` and both rows fail
+    on the title height."""
+    title = ("word " * 500)[:chars].strip()
     app = BmadLoopApp(project.project)
-    async with app.run_test(size=(80, 24)) as pilot:
+    async with app.run_test(size=(_MIN_COLS, _MIN_ROWS)) as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         modal = DeferredEntryModal(
             data.DeferredItem(
                 id="DW-1",
-                title=("word " * 200)[:chars].strip(),
+                title=title,
                 status="open",
                 done=False,
                 severity="high",
@@ -2149,10 +2323,47 @@ async def test_long_docked_title_still_fits_a_standard_terminal(project, chars):
         app.push_screen(modal)
         await until(pilot, lambda: app.screen is modal)
         await ready(pilot, "#entry")
-        # the wrapped heading is what costs the rows here, so a clipped title is
-        # the regression this test exists to catch, not just an unreachable #ok
-        assert _on_screen(app, app.screen.query(".title").first())
-        assert _on_screen(app, app.screen.query_one("#ok"))
+        heading = app.screen.query(".title").first()
+        assert heading.region.height == 1
+        assert _fully_visible(app, heading)
+        assert _fully_visible(app, app.screen.query_one("#ok"))
+        assert title in str(heading.content)
+
+
+async def test_long_docked_title_keeps_its_markers(project):
+    """The `✓ done` and legacy markers used to follow the heading on its line, so
+    a heading long enough to ellipsize cut them away — and they appear nowhere
+    else. Each now opens a line of its own in the title, so at 39x9 the rendered
+    title rows show both (DW-358). Read off the rendered strips, not `.content`:
+    the content always held them; the question is whether they reach the screen.
+
+    Ablation: append the markers after the heading on its line again and this
+    test fails on the missing `✓ done`."""
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(_MIN_COLS, _MIN_ROWS)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        modal = DeferredEntryModal(
+            data.DeferredItem(
+                id="DW-1",
+                title=("word " * 60).strip(),
+                status="done",
+                done=True,
+                severity="high",
+                body="line\n" * 40,
+                legacy=True,
+            )
+        )
+        app.push_screen(modal)
+        await until(pilot, lambda: app.screen is modal)
+        await ready(pilot, "#entry")
+        heading = app.screen.query(".title").first()
+        assert heading.region.height == 3
+        assert _fully_visible(app, heading)
+        assert _fully_visible(app, app.screen.query_one("#ok"))
+        size = heading.size
+        rows = [strip.text for strip in heading.render_lines(Region(0, 0, size.width, size.height))]
+        assert any("✓ done" in row for row in rows), rows
+        assert any("· legacy" in row for row in rows), rows
 
 
 # ------------------------------------------------------------- run control

@@ -23,36 +23,40 @@ Linux, so tmux works there unchanged; native Windows awaits a Windows-capable ba
 `mux.backend` (or the `BMAD_LOOP_MUX_BACKEND` env var) forces the choice per machine.
 
 **Terminal sizes, as measured.** The modal dialogs — confirmations, the
-start/sweep option forms, the escalation and checkpoint viewers — are the
-tightest thing the TUI draws. The figures below describe those **dialogs**, not
-the dashboard behind them, which simply shows fewer rows as the window shrinks.
-**39 columns × 9 rows** is the size at which a dialog's own chrome was measured
-to fit: its border, padding, title line and margins, a row of body, and the
-whole docked button row. `EscalationModal` is what sets it, and its height is
-width-dependent because its docked warning wraps — 9 rows at 39 columns but only
-6 at 80 — so a roomier window buys height as well as width.
+start/sweep option forms, the escalation, checkpoint, spec and validate viewers
+— are the tightest thing the TUI draws. The figures below describe those
+**dialogs**, not the dashboard behind them, which simply shows fewer rows as the
+window shrinks. **39 columns × 9 rows** is the size at which a dialog shows its
+title, a row of body and all of its docked buttons, fully visible — the spec
+viewer and the validate viewer included. Two dialogs are recorded exceptions
+and need a larger terminal: the **escalation viewer**, whose button row is one
+column wider than a 39-column dialog and whose hints (a restore-patch warning,
+an unreadable-spec notice) wrap above the buttons, and the **resume
+confirmation** when it shows its double-drive warning, which wraps above the
+buttons too.
 
-That is a measurement of the chrome, not of the text a dialog is handed, and it
-is not a size you can rely on. Titles, headers, warnings and file paths are
-docked _outside_ the scrolling body, so each line they wrap to costs a row the
-body cannot give back, the body having floored at one row. That text comes from
-the caller and **nothing bounds its length** — a deferred-work ledger title, a
-`spec:` folder, a spec path. A long enough value therefore consumes the frame
-and clips the docked controls at **any** fixed size, so no figure here — 39 × 9,
-80 × 24, or larger — is a minimum these dialogs will always meet. Bounding that
-text is tracked in #629, and the spec viewer's over-wide action row in #628.
+Caller-supplied text cannot move that size. Titles, headers, subtitles and file
+paths are docked _outside_ the scrolling body, and their length comes from the
+caller — a deferred-work ledger heading, a story title, a `spec:` folder, a
+spec path. Each of their lines is held to **one row**, ending in `…` when it is
+too long, so a dialog's height depends on how many lines it docks, never on how
+long they are. Docked warnings and hints are the TUI's own text and are not
+held this way — that is what the two exceptions above run into.
 
-What the figures do say is that these sizes were sufficient for the dialogs as
-measured, at the content lengths the test suite exercises. Measured at 39
-columns: a deferred-work heading of about 150 characters still fits, while about
-300 characters wraps to nine rows of title and pushes the close button off; the
-validate-findings viewer needs one extra row for a plain result and three when
-the document carries a long spec folder; and the spec viewer's `copy path`
-button alongside its action verbs is wider than a 39-column dialog can hold
-whatever the button metrics do, over and above a spec path that wraps. A
-standard **80 × 24** terminal was sufficient for every one of those measured
-examples, which is why it is the size quoted wherever the content is unbounded —
-as one that worked for what was measured, not as one that cannot be overrun.
+What the `…` cuts is not always shown anywhere else. Some of it is: the spec
+path is cut from the front so it keeps its file name, and `copy path` copies the
+whole path; the deferred-work viewer's scrolling body repeats the full heading,
+and its done and legacy markers sit on lines of their own. At narrow widths,
+though, a long story title, the end of the validate header's lines — including
+its severity tallies and the note that the gates are chained — and the end of a
+long dialog title can be cut with no other copy on screen; widen the terminal
+to read them.
+
+Below **80 columns** the spec viewer's action row — `copy path`, the action
+verbs and `close` — wraps into two columns instead of clipping its right-most
+buttons, and the viewer takes the terminal's full height to fit the second
+row. Below about 43 columns the longest label (`Approve & resume`) may lose
+its tail to `…`; the button stays whole and still works.
 
 Below **60 columns or 20 rows** the dialogs degrade to a compact layout rather
 than clipping: the dialog clamps to the screen width, the action buttons shrink

@@ -35,8 +35,8 @@ arguments: --dist`, naming neither xdist nor this setting — but xdist is alrea
   runners. CI passes `-n logical` in both test jobs for that reason. A test that fails only
   under xdist load is a flake, which is a bug. Live/E2E modules skip themselves when their
   host requirements are absent — selection is in-file, never in config.
-- Only builtin pytest marks appear — `parametrize`, `skipif`, `usefixtures`, and exactly one
-  `xfail(strict=True)` (a pinned known defect, see [Ablation records](#ablation-records)) —
+- Only builtin pytest marks appear — `parametrize`, `skipif`, `usefixtures`, and exactly two
+  `xfail(strict=True)` (pinned known defects, see [Ablation records](#ablation-records)) —
   plus `xdist_group`, which pytest-xdist registers itself. **No custom markers, deliberately**:
   a marker registry is a second selection mechanism that can drift from the tests it
   classifies. The filename suffix and the module-level `skipif` encode the same fact where the
@@ -284,9 +284,11 @@ Two disciplines around the grammar:
   envvars work proved its rejection gates hold disjoint row sets by ablating them one at a
   time — three gates today, four ablations counting the `raw is None` early-out.
 
-A close cousin: a **known defect is pinned with `@pytest.mark.xfail(strict=True)`** naming the
-issue (`test_env_fault_patterns.py`, #194). `strict=True` is the point — the day the defect is
-fixed, the test fails and forces the debt note to be removed with it.
+A close cousin: a **known defect is pinned with `xfail(strict=True)`**, its reason naming the
+defect — today the EscalationModal and ConfirmResumeModal-warning rows of `test_tui_app.py`'s
+39×9 dialog matrix, which do not fit that size (`test_env_fault_patterns.py`'s #194 corpus,
+the first, was promoted to live assertions when its fix landed). `strict=True` is the point —
+the day the defect is fixed, the test fails and forces the debt note to be removed with it.
 
 ## Typing and lint
 
