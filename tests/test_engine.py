@@ -15963,7 +15963,7 @@ def test_harvest_dedupes_a_cross_spec_twin_that_lands_after_the_snapshot(project
 
     entries = _harvest_entries(project)
     assert [entry.id for entry in entries] == ["DW-1"]
-    assert deferredwork.field_line_present(entries[0].body, "source_spec", "spec-9-9-z.md")
+    assert deferredwork.field_line_present(entries[0], "source_spec", "spec-9-9-z.md")
     (event,) = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
     assert event["dw_ids"] == [] and event["deduped"] == 1
 

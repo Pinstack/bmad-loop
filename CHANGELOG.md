@@ -249,6 +249,12 @@ breaking changes may land in a minor release.
 - Key the `run --dry-run` launch preview on the adapter kind, not `profile.hookless`:
   an `opencode-http` profile with a hook dialect shows the server/prompt_async line,
   a hookless profile of another kind shows the argv line.
+- Restore severity when reopening an archive stub written before severity preservation:
+  the stamp-matching archive block's severity/priority lines come back, so a
+  `min_severity` sweep still selects the entry; an unreadable archive refuses the
+  reopen (DW-334/DW-394).
+- Skip fenced examples in `field_line_present`: a quoted `origin:`/`source_spec:`
+  line no longer suppresses an append or a harvest filing (DW-408).
 
 ### Security
 

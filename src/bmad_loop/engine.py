@@ -716,8 +716,8 @@ def _harvested_carry_specs(task: StoryTask, text: str) -> list[deferredwork.Entr
         origin = str(item["origin"])
         source_spec = str(item["source_spec"])
         if any(
-            deferredwork.field_line_present(entry.body, "origin", origin)
-            and deferredwork.field_line_present(entry.body, "source_spec", source_spec)
+            deferredwork.field_line_present(entry, "origin", origin)
+            and deferredwork.field_line_present(entry, "source_spec", source_spec)
             for entry in seen
         ):
             continue
@@ -4772,8 +4772,8 @@ class Engine:
         for finding in findings:
             origin = f"{HARVEST_ORIGIN} {finding.fingerprint}"
             if any(
-                deferredwork.field_line_present(entry.body, "origin", origin)
-                and deferredwork.field_line_present(entry.body, "source_spec", spec_name)
+                deferredwork.field_line_present(entry, "origin", origin)
+                and deferredwork.field_line_present(entry, "source_spec", spec_name)
                 for entry in seen
             ):
                 harvestable.append(finding)  # this spec's own replay: dedupe below
@@ -4784,7 +4784,7 @@ class Engine:
                     for entry in seen
                     if entry.open
                     and (
-                        deferredwork.field_line_present(entry.body, "origin", origin)
+                        deferredwork.field_line_present(entry, "origin", origin)
                         or finding.summary.startswith(f"{entry.id}:")
                     )
                 ),
@@ -4896,8 +4896,8 @@ class Engine:
         deduped = 0
         for origin, title, reason, location, severity in pending:
             if any(
-                deferredwork.field_line_present(entry.body, "origin", origin)
-                and deferredwork.field_line_present(entry.body, "source_spec", spec_name)
+                deferredwork.field_line_present(entry, "origin", origin)
+                and deferredwork.field_line_present(entry, "source_spec", spec_name)
                 for entry in seen
             ):
                 deduped += 1
@@ -7647,9 +7647,7 @@ class Engine:
             entries = {e.id: e for e in deferredwork.parse_ledger(text)}
             re_review = any(
                 i in entries
-                and deferredwork.field_line_present(
-                    entries[i].body, "origin", "review-budget-followup"
-                )
+                and deferredwork.field_line_present(entries[i], "origin", "review-budget-followup")
                 for i in task.dw_ids
             )
         if damped:

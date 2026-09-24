@@ -2396,7 +2396,7 @@ def test_carry_harvest_files_fresh_against_a_cross_spec_closed_twin(project):
     entries = _main_harvest_entries(project)
     assert [entry.id for entry in entries] == ["DW-1", "DW-2"]
     assert not entries[0].open and entries[1].open
-    assert deferredwork.field_line_present(entries[1].body, "source_spec", record["source_spec"])
+    assert deferredwork.field_line_present(entries[1], "source_spec", record["source_spec"])
     (carried,) = _harvest_carry_events(engine)
     assert carried["dw_ids"] == ["DW-2"]
 
