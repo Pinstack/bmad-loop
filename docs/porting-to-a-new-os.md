@@ -314,7 +314,8 @@ A new OS overrides the quoting behavior on its `ProcessHost` as needed.
 
 ## Seam 4 — validate preflight
 
-`_platform_preflight(project)` (`src/bmad_loop/cli.py`, called from `cmd_validate`)
+`platform_preflight(project)` (`src/bmad_loop/runsetup.py`, imported into `cli.py` as
+`_platform_preflight` and called from `cmd_validate`)
 asks the selected multiplexer for its `available()` / `version()` and names the
 selected process host. A new OS therefore surfaces its readiness in `bmad-loop
 validate` **by registering** (seams 1–2) — not by adding a `win32` block to

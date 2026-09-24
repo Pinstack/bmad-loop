@@ -115,12 +115,12 @@ def worktree_isolation_conflict(paths: ProjectPaths, isolation: str) -> str | No
 
     Worktree provisioning reads ``repo_root`` for every surface it seeds *off disk*
     — the upstream skill trees, `_bmad/` and the `_bmad/custom/` overrides inside
-    it, and each `seed_files`/`seed_globs` entry — and bakes the absolute hook-relay
-    path from it into the worktree's hook config, while `init`, `validate` and the
-    run preflight write and probe those same surfaces under ``project``. (The relay
-    itself is pointed at, never copied. The `MODULE_SKILLS` this wheel bundles are
-    seeded from package data and are unaffected by either root; nothing is seeded
-    from ``project``, which `provision_worktree` is never even passed.)
+    it, and each `seed_files`/`seed_globs` entry — while `init`, `validate` and the
+    run preflight write and probe those same surfaces under ``project``. (The hook
+    relay depends on neither root: every hook config registers this installation's
+    own `bmad-loop relay <Event>` executable. The `MODULE_SKILLS` this wheel bundles
+    are seeded from package data and are unaffected by either root too; nothing is
+    seeded from ``project``, which `provision_worktree` is never even passed.)
     `load_paths` *requires* its config under `project/_bmad/`, so `_bmad/` is under
     `project` by definition and `repo_root/_bmad/` generally does not exist. When
     the two diverge the preflight therefore approves a surface the isolated run
@@ -128,17 +128,17 @@ def worktree_isolation_conflict(paths: ProjectPaths, isolation: str) -> str | No
     isolated session dispatches into a worktree with no dev primitive and no
     renderer, and stops with no result and nothing journaled naming the cause.
 
-    **This function exists to be deleted.** The real fix is #443 — plumb ``project``
-    through provisioning for the non-git reads — and landing it removes this
+    **This function exists to be deleted.** The real fix is DW-379 — plumb
+    ``project`` through provisioning for the non-git reads — and landing it removes this
     function, all five of its call sites, the `policy.isolation-repo-root` id and
     both doc sentences. It is a refusal rather than the fix because "which root
-    wins" is a separate decision per seeded surface (the relay only exists under
+    wins" is a separate decision per seeded surface (`_bmad/` only exists under
     `project`; operator-configured `seed_files` may legitimately name a path outside
     it), and `ProjectPaths.rebased` encodes `project == repo_root` besides. So the
     message names only remediations that exist today. Both are named because either
     alone is sufficient and which one is right is the operator's call: the override
     buys a decoupled git root, the isolation mode buys per-unit worktrees, and until
-    #443 lands the orchestrator cannot give both.
+    DW-379 lands the orchestrator cannot give both.
 
     Sole producer of the text, shared by `cmd_validate`, the run/sweep preflight,
     the dry-run honesty banner and the TUI's pre-launch guard, so the four cannot

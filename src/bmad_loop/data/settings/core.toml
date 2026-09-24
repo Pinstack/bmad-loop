@@ -28,6 +28,10 @@ key = "retrospective"
 kind = "select"
 options_ref = "RETRO_MODES"
 default_ref = "GatesPolicy.retrospective"
+# `on_escalation` is reserved and deliberately has no field here (HIDDEN in
+# tests/test_settings_schema.py): `pause` is its only documented value and the
+# default. policy.py parses it, but nothing reads it — CRITICAL escalations
+# always pause, whatever it is set to (DW-376).
 
 [[section]]
 name = "review"

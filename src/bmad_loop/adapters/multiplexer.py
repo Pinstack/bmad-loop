@@ -871,9 +871,15 @@ def detect_multiplexers() -> list[MuxBackendInfo]:
     """Probe every registered backend: availability, version, platform match,
     and which one :func:`_select` would pick (with its reason).
 
-    Never raises — this feeds diagnostics, which must work on a misconfigured
-    host: a forced unknown name yields rows with no selected mark, and a
-    backend whose factory or probes blow up reads as unavailable. Constructs
+    Every per-backend probe in the row loop is guarded — this feeds diagnostics,
+    which must work on a misconfigured host: a forced unknown name yields rows
+    with no selected mark, and a backend whose factory or probes blow up there
+    reads as unavailable. Two steps ahead of that loop are NOT fully guarded, so
+    this function can raise: the registry loads (a broken third-party entry point
+    is recorded, not raised — :func:`_load_external_backends` — but a failed
+    import of a bundled backend, i.e. a broken install, propagates), and the
+    :func:`_select` call, which catches only :class:`MultiplexerError` — a factory
+    or platform predicate that raises while selection runs it propagates. Constructs
     every registered backend, so factories must stay cheap, side-effect-free
     constructors (true of the tmux family)."""
     _load_builtin_backends()
@@ -910,7 +916,7 @@ def detect_multiplexers() -> list[MuxBackendInfo]:
             if version is None:
                 # Read only after version(), which is what it describes, and
                 # only when there is a None to explain. Guarded like every other
-                # probe here — this function never raises.
+                # probe in this loop — none of them may raise out of it.
                 try:
                     version_error = backend.version_error()
                 except Exception:

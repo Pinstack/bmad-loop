@@ -49,7 +49,8 @@ from bmad_loop.adapters.profile import get_profile
 # `opencode` because the file it scans (`<task_id>.server.out`) is the serve
 # process's own stdout, which the model cannot write to at all; `claude` because
 # its log IS model-written (a tmux pane capture) and each of its patterns instead
-# reproduces one complete captured CLI sentence, which a paraphrase cannot reach.
+# reproduces the whole first sentence of a captured CLI error (a prefix match),
+# which a paraphrase cannot reach.
 # Both are held to the full BAIT corpus.
 SEEDED_PROFILES = ("opencode", "claude")
 # The seeded profiles whose scanned log is a tmux PANE CAPTURE — bytes the model
@@ -85,8 +86,9 @@ OPENCODE_REAL = [
 ]
 
 # Claude Code surfaces provider failures behind its own "API Error" prefix, and
-# claude.toml reproduces each of these sentences WHOLE rather than pairing the
-# prefix with a loose cause — that completeness is the only thing separating an
+# claude.toml reproduces each message's first sentence WHOLE (as a prefix match —
+# the rest of the message is not required) rather than pairing the prefix with a
+# loose cause — that completeness is the only thing separating an
 # emitted line from a story writing about one, because this profile's log is a
 # pane capture of the model's own output (#507).
 #
@@ -159,13 +161,13 @@ ANCHOR_REACHING_BAIT = [
     # patterns matched none of BAIT and none of the nine lines above even
     # BEFORE the fix, so promoting claude into SEEDED_PROFILES proves nothing on
     # its own. Do not "simplify" them back out of the corpus: they are the
-    # paraphrases the complete-sentence patterns exist to reject.
+    # paraphrases the first-sentence patterns exist to reject.
     '  assert log == "API Error: Connection refused"',
     'docs: explain the "API Error: Unable to connect" retry path',
     "- [ ] AC-5: show a banner on API Error: Connection timed out",
     'expect(msg).toBe("API Error: Connection error")',
     "// handle API Error: ECONNREFUSED by retrying with backoff",
-    # The 5xx half of the same rule, and the one place a COMPLETE sentence is
+    # The 5xx half of the same rule, and the one place a whole first sentence is
     # still not enough on its own: the status is a field, so ranging over it
     # (`5[0-9][0-9]`) re-admits the paraphrase the sentence was meant to exclude.
     # Only two pairings were ever captured (`529 Overloaded`, `500 Internal

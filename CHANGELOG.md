@@ -46,6 +46,15 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Correct stale docs and docstrings, behavior unchanged: `detect_multiplexers` no longer
+  claims it never raises (a failed bundled-backend import propagates), the bug-report
+  template notes `diagnose` needs a run, `platform_preflight` is located in `runsetup.py`,
+  the repo-root/worktree refusal cites DW-379 (not the closed #443) and the installed hook
+  relay, and claude `env_fault_patterns` are described as first-sentence prefix matches
+  (DW-372, DW-397, DW-362).
+- Document why `resume` tolerates a dirty git tree while `run`/`sweep` refuse one (DW-360),
+  and `gates.on_escalation` as reserved — `pause` is its only documented value, and no
+  value has an effect (DW-376).
 - Shape every notice at `gates.notify`: control characters (ESC, BEL, NUL, C1, …) reach
   `ATTENTION` and the desktop toast as visible `\xNN` escapes, and a multi-line message
   (a verify reason's output tail on a retry, defer or escalation) folds onto its one

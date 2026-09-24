@@ -3479,6 +3479,15 @@ def cmd_resume(args: argparse.Namespace) -> int:
     if (refusal := runs.unreadable_sweep_ledger(project, run_dir)) is not None:
         print(refusal, file=sys.stderr)
         return ExitCode.FAILURE
+    # No `verify.worktree_clean` gate here, unlike cmd_run / cmd_sweep — on purpose
+    # (DW-360). Those gates prove a run LAUNCHES from a clean tree; resume continues
+    # a run that already passed one. A dirty tree at resume is often the
+    # sanctioned recovery itself: when a CRITICAL resolution's `redrive_base_ref`
+    # is `HEAD`, the operator re-applies the corrected spec in the main checkout
+    # UNCOMMITTED, because the re-drive reads that working tree as-is (see the
+    # bmad-loop-resolve skill). A clean-tree gate would refuse exactly that resume.
+    # Anything else the operator changed while the run sat paused is theirs to
+    # commit or stash first.
     return _resume_paused_run(project, run_dir)
 
 
