@@ -34,8 +34,13 @@ from .engine import (
     _publication_refusal,
     _session_task_id,
 )
-from .escalation import critical_session_reason, env_fault_pause_reason, session_failure_reason
-from .model import PAUSE_STORY_GATE, Phase, StoryTask, result_mapping
+from .escalation import (
+    critical_session_reason,
+    display_critical_reason,
+    env_fault_pause_reason,
+    session_failure_reason,
+)
+from .model import PAUSE_ESCALATION, PAUSE_STORY_GATE, Phase, StoryTask, result_mapping
 from .platform_util import (
     DIR_FD_ANCHORED_WRITES,
     atomic_write_text,
@@ -2006,15 +2011,35 @@ class SweepEngine(Engine):
                         migrate_task.phase == Phase.TRIAGE_VERIFY
                         and migrate_task.migration_recovery_format != 0
                     )
+                    or (
+                        # DW-314: a marked TRIAGE_RUNNING recovery redispatches,
+                        # which publishes, so an inherited doubt leaves it to the
+                        # cycle arm's own doubt stop below.
+                        migrate_task.phase == Phase.TRIAGE_RUNNING
+                        and migrate_task.migration_recovery_format != 0
+                        and not self._ledger_unfit_to_publish()
+                    )
                 )
             ):
                 # Recovery evidence, not the generic cycle reader, owns faults at
                 # these durable boundaries, including unknown marker formats. A
                 # cycle-reader return would let the outer engine stamp the run
                 # finished and make the public resume command refuse it. Format 0
-                # TRIAGE_VERIFY is the one pre-upgrade path that still needs the
-                # cycle reader's live text for its legacy restart.
+                # TRIAGE_VERIFY/TRIAGE_RUNNING are the pre-upgrade paths that
+                # still need the cycle reader's live text for their legacy restart.
                 self._ensure_migration("")
+            elif (
+                cycle == 1
+                and migrate_task is not None
+                and migrate_task.phase == Phase.ESCALATED
+                and migrate_task.migration_commit_escalated
+            ):
+                # DW-405/407: a migration ESCALATED from COMMITTING is outside
+                # `migration_resume` below, and its migrated ledger no longer
+                # `has_legacy`, so the cycle reader would triage over an
+                # uncommitted rewrite. Retry the idempotent tail on intact
+                # evidence, or keep the escalation paused.
+                self._resume_escalated_migration_commit(migrate_task)
             if (
                 cycle == 1
                 and migrate_task is not None
@@ -3293,6 +3318,84 @@ class SweepEngine(Engine):
         self._escalate(task, f"migration recovery evidence is invalid: {detail}")
         raise AssertionError("migration escalation returned")
 
+    def _escalate(self, task: StoryTask, reason: str) -> None:
+        """Escalate the migrate task along legal edges only (DW-405/407/314).
+
+        Every other task takes ``Engine._escalate`` unchanged. The migrate task
+        can refuse from two boundaries the phase graph gives no ESCALATED edge:
+        a marked ``TRIAGE_RUNNING`` recovery walks through ``TRIAGE_VERIFY``
+        first, and a refusal while already ESCALATED (the escalated commit-tail
+        arm) re-pauses without any transition. ``migration_commit_escalated`` is
+        re-stamped on every real escalation, so a stale value can never grant a
+        commit-tail retry.
+        """
+        if task.story_key != MIGRATE_KEY:
+            super()._escalate(task, reason)
+            return
+        if task.phase == Phase.ESCALATED:
+            if "delete the migrate-*" not in reason:
+                reason = (
+                    f"{reason}; restore the pre-migration ledger, delete the migrate-* "
+                    f"records in {self.run_dir}, then resume"
+                )
+            gates.notify(
+                self.policy,
+                self.run_dir,
+                f"CRITICAL escalation: {task.story_key}",
+                f"{display_critical_reason(reason, task.spec_file)} — resolve, then "
+                f"`bmad-loop resume {self.state.run_id}`",
+            )
+            self._save()
+            raise RunPaused(reason, PAUSE_ESCALATION, MIGRATE_KEY)
+        if task.phase == Phase.TRIAGE_RUNNING:
+            advance(task, Phase.TRIAGE_VERIFY)
+        task.migration_commit_escalated = task.phase == Phase.COMMITTING
+        super()._escalate(task, reason)
+
+    def _resume_escalated_migration_commit(self, task: StoryTask) -> None:
+        """Retry the idempotent commit tail of a migration ESCALATED from COMMITTING.
+
+        DW-405/407: ESCALATED is outside ``migration_resume`` and the migrated
+        ledger no longer ``has_legacy``, so without this arm a plain resume
+        triages over an uncommitted migrated ledger, and a commit that landed
+        before the fault never earns DONE, ``sweep-migrated`` or
+        ``post_migrate``. Only intact durable evidence re-enters the tail;
+        anything else keeps the escalation and pauses (``_escalate``'s
+        already-ESCALATED arm). A live ``has_legacy`` ledger is the operator
+        remedy in progress, so it returns and the existing restart path owns it;
+        refusing it here would loop the fallback-host remedy forever.
+        """
+        ledger = self.workspace.paths.deferred_work
+        try:
+            live = deferredwork.read_for_write(ledger)
+        except (deferredwork.LedgerReadError, OSError):
+            self._migration_evidence_failure(
+                task, "live ledger cannot be read for commit-tail recovery"
+            )
+        if live is not None and deferredwork.has_legacy(live):
+            return
+        if task.migration_recovery_format == 0:
+            # A pre-upgrade commit tail has no records to trust; keep it paused.
+            self._migration_evidence_failure(task, "commit tail has no recovery marker")
+        if task.migration_recovery_format != _MIGRATION_RECOVERY_FORMAT:
+            self._migration_evidence_failure(task, "unknown migration recovery marker")
+        baseline, manifest = self._migration_baseline_and_manifest(task)
+        rewrite = self._migration_record_text(
+            task, self.run_dir / _MIGRATE_REWRITE_RECORD, "rewrite"
+        )
+        assert rewrite is not None
+        self._migration_result_evidence(task, baseline, manifest, rewrite)
+        if live != rewrite:
+            self._migration_evidence_failure(task, "live ledger differs from accepted rewrite")
+        self.journal.append("resume-restart", story_key=MIGRATE_KEY, phase=str(task.phase))
+        # Leaving ESCALATED is a deliberate direct assignment, as the restart
+        # branch in `_ensure_migration` does; a refusal inside the tail escalates
+        # from COMMITTING again and re-stamps the flag.
+        task.phase = Phase.COMMITTING
+        task.migration_commit_escalated = False
+        self._save()
+        self._finish_migration_commit(task, baseline, manifest, rewrite)
+
     def _migration_record_text(
         self, task: StoryTask, path: Path, label: str, *, optional: bool = False
     ) -> str | None:
@@ -3459,6 +3562,68 @@ class SweepEngine(Engine):
                 task,
                 "the ledger changed underneath the failed migration attempt — re-run the sweep",
             )
+
+    def _restore_running_migration_baseline(self, task: StoryTask) -> str:
+        """Put the durable baseline back under an interrupted marked session (DW-314).
+
+        Durable ``TRIAGE_RUNNING`` gives the interrupted session ownership of the
+        live residue, so the snapshot may replace bytes equal to the pre-reset
+        observation (or to the text the reset itself republished). Git
+        cleanliness decides nothing here: an ignored or baseline-untracked
+        ledger holding the session's partial bytes leaves the tree clean. Only a
+        value that changed after the observation is a rival, which escalates
+        rather than being overwritten. Idempotent across a crash before the
+        caller's ``PENDING`` save: the next pass finds live == baseline and
+        writes nothing. Returns the baseline text the replacement session grades.
+        """
+        if task.migration_recovery_format != _MIGRATION_RECOVERY_FORMAT:
+            self._migration_evidence_failure(task, "unknown migration recovery marker")
+        baseline, _manifest = self._migration_baseline_and_manifest(task)
+        ledger = self.workspace.paths.deferred_work
+        try:
+            observed = deferredwork.read_for_write(ledger)
+        except (deferredwork.LedgerReadError, OSError):
+            self._migration_evidence_failure(
+                task, "live ledger cannot be read for interrupted-session recovery"
+            )
+        self.journal.append("resume-restart", story_key=MIGRATE_KEY, phase=str(task.phase))
+        anchor: _LedgerAnchor = _LedgerAnchor.NONE
+        committed: str | None = None
+        if task.baseline_commit and not verify.worktree_clean(self.workspace.root):
+            # Non-ledger residue of the dead session; the ledger itself is
+            # decided below against the snapshot, never re-baselined.
+            self._safe_reset(task)
+            # Probed BEFORE the lock: it spawns git (#286, #735).
+            anchor, committed = self._ledger_baseline_text(task)
+        diverged = False
+        with deferredwork.ledger_lock(ledger):
+            # PURE TEXT ONLY under the hold.
+            try:
+                current = deferredwork.read_for_write(ledger)
+            except (deferredwork.LedgerReadError, OSError):
+                current = None
+                diverged = True
+            if diverged:
+                pass
+            elif current == baseline:
+                pass
+            elif current == observed or (anchor is _LedgerAnchor.BASELINE and current == committed):
+                ledger.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write_text(ledger, baseline)
+            else:
+                diverged = True
+        if diverged:
+            self.journal.append(
+                "sweep-migration-restore-diverged",
+                story_key=MIGRATE_KEY,
+                ledger=str(ledger),
+            )
+            self._escalate(
+                task,
+                "the ledger changed underneath the interrupted migration session — "
+                "re-run the sweep",
+            )
+        return baseline
 
     def _finish_migration_commit(
         self,
@@ -3691,12 +3856,16 @@ class SweepEngine(Engine):
                 # crash before that record as corruption; only an unmarked
                 # pre-upgrade task may use reset-and-reread recovery.
                 self._migration_evidence_failure(task, "missing accepted rewrite record")
+        elif task.phase == Phase.TRIAGE_RUNNING and task.migration_recovery_format != 0:
+            text = self._restore_running_migration_baseline(task)
+            task.phase = Phase.PENDING  # deliberate reset, not a normal transition
         elif task.phase != Phase.PENDING:
             # resumed mid-migration or retrying after an escalation: restart
             self.journal.append("resume-restart", story_key=MIGRATE_KEY, phase=str(task.phase))
             if task.phase == Phase.ESCALATED:
                 task.attempt = 0  # the human resumed deliberately; fresh budget
                 _rearm_generation(task)  # ...and into a fresh session-id namespace
+                task.migration_commit_escalated = False
             if task.baseline_commit and not verify.worktree_clean(self.workspace.root):
                 self._safe_reset(task)  # a session died mid-rewrite; restore our ledger
                 # REPAIR/WRITE (DW-146): the restored text this migration grades.

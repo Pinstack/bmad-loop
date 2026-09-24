@@ -293,6 +293,13 @@ class StoryTask:
     # doubt. A later successful idempotent replay may release that doubt, but
     # must never release one inherited from another sweep phase.
     migration_ledger_doubt_owned: bool = False
+    # DW-405/407: whether the migrate task's latest escalation left from
+    # COMMITTING. ESCALATED erases the prior phase, and TRIAGE_VERIFY
+    # escalations carry the same marker and records, so this durable fact, read
+    # together with phase ESCALATED, grants a cycle-one resume the idempotent
+    # commit-tail retry. Re-stamped on every migrate escalation (a re-arm to
+    # PENDING may leave it set until then); pre-upgrade tasks default to no retry.
+    migration_commit_escalated: bool = False
     # DW-317: stable identity of one migration completion, minted fresh in the
     # same save that records DONE (a re-migration mints a new one). Hooks see it
     # as ``ctx.delivery_id`` / ``BMAD_LOOP_DELIVERY_ID`` to deduplicate the
@@ -562,6 +569,7 @@ class StoryTask:
             "salvage_refile_pending": self.salvage_refile_pending,
             "migration_recovery_format": self.migration_recovery_format,
             "migration_ledger_doubt_owned": self.migration_ledger_doubt_owned,
+            "migration_commit_escalated": self.migration_commit_escalated,
             "migration_delivery_id": self.migration_delivery_id,
             "migration_delivery_pending": self.migration_delivery_pending,
             "migration_delivery_counts": (
@@ -789,6 +797,7 @@ class StoryTask:
             salvage_refile_pending=bool(d.get("salvage_refile_pending", False)),
             migration_recovery_format=int(d.get("migration_recovery_format", 0)),
             migration_ledger_doubt_owned=bool(d.get("migration_ledger_doubt_owned", False)),
+            migration_commit_escalated=bool(d.get("migration_commit_escalated", False)),
             migration_delivery_id=(
                 str(d["migration_delivery_id"])
                 if d.get("migration_delivery_id") is not None

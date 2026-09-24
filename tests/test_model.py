@@ -374,6 +374,19 @@ def test_migration_delivery_fields_default_for_pre_upgrade_state():
     assert back.migration_delivery_counts is None
 
 
+def test_migration_commit_escalated_round_trips():
+    """DW-405/407: the escalated-from-COMMITTING fact survives state.json."""
+    task = StoryTask(story_key="sweep-migrate", epic=0, migration_commit_escalated=True)
+    back = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+    assert back.migration_commit_escalated is True
+
+
+def test_migration_commit_escalated_defaults_false_for_pre_upgrade_state():
+    doc = StoryTask(story_key="sweep-migrate", epic=0).to_dict()
+    del doc["migration_commit_escalated"]
+    assert StoryTask.from_dict(doc).migration_commit_escalated is False
+
+
 def test_legacy_park_eligible_state_loads_but_is_not_persisted():
     """Retired authorization state is tolerated but cannot influence new runs."""
     doc = StoryTask(story_key="1-1-a", epic=1).to_dict()

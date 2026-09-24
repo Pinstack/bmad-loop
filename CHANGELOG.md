@@ -48,6 +48,17 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Retry a sweep migration ESCALATED from `committing` on cycle-one resume: intact
+  baseline/manifest/rewrite/result records and a live ledger equal to the accepted rewrite
+  re-enter the idempotent commit tail (DONE, one `sweep-migrated` row, `post_migrate`);
+  anything else, and every no-dir-fd host, stays escalated and paused instead of triaging
+  over an uncommitted migrated ledger. A restored legacy ledger still takes the
+  restore-delete-resume remedy, as does an escalation recorded before this upgrade, which
+  is not retried (DW-405, DW-407).
+- Restore a marked migration interrupted in `triage-running` from its durable baseline
+  snapshot, not Git cleanliness, so an ignored or untracked ledger's partial session bytes
+  are never re-baselined; a rival write, an unreadable ledger, an unknown marker, or a
+  no-dir-fd host escalates the task instead of stopping on the cycle reader (DW-314).
 - Hold the real index's `index.lock` across the bound publication's target compare and
   `reset`, running both against a side index and renaming it into place: a cooperating Git
   writer staging the target in between is refused instead of silently overwritten (DW-327).
