@@ -1274,13 +1274,14 @@ def _make_flow(
     ``.calls`` namespace tallying the injected callbacks for assertions. ``paths``
     defaults to the workspace root (so the flow reads as "main checkout"); pass a
     different ``repo_root`` to simulate a mounted unit worktree."""
-    calls = SimpleNamespace(saves=0, emits=[], pauses=[], escalates=[])
+    calls = SimpleNamespace(saves=0, emits=[], emit_fields=[], pauses=[], escalates=[])
 
     def _save() -> None:
         calls.saves += 1
 
     def _emit(stage, task=None, **fields):
         calls.emits.append(stage)
+        calls.emit_fields.append((stage, dict(fields)))
         return None
 
     def _escalate(task, reason) -> None:
@@ -1335,6 +1336,33 @@ def _status(spec: Path) -> str:
     return verify.status_of(verify.read_frontmatter(spec))
 
 
+def _assert_owned_spec_notice_contract(notice: str, task: StoryTask, flow: RecoveryFlow) -> None:
+    """DW-321: the owned-spec notice names the attempt baseline and the convergent
+    step for the task's shape — a plain attempt resets to baseline and loses
+    differing tracked spec edits; a latched re-drive that resume rolls back
+    automatically keeps the approved spec under the artifact folders and resets
+    only the other residue. A re-drive with rollback off (and not armed) gets the
+    plain step: keeping a dirty spec there would only pause again. The notice never
+    names `task.preserve_ref`: an early pause can still hold an earlier attempt's
+    ref. (Every spec these tests bind lives under the artifact folders.)"""
+    assert task.baseline_commit is not None
+    short = task.baseline_commit[:12]
+    assert f"the attempt baseline `{short}`" in notice
+    assert "branch my-rescue HEAD" in notice
+    assert "review/remove leftover untracked files" in notice
+    assert "already parked" not in notice
+    if task.resolved_redrive and (task.rearmed or flow.policy.scm.rollback_on_failure):
+        assert "survives resume's reset" in notice
+        assert "pauses again" not in notice
+        assert "reset --hard" not in notice
+        assert "Resume will not adopt them." not in notice
+    else:
+        assert f"reset --hard {short}`" in notice
+        assert "Resume will not adopt them." in notice
+        assert "resume cannot carry the kept edits" in notice
+        assert "survives resume's reset" not in notice
+
+
 def _assert_owned_spec_manual_adoption_pause(
     flow: RecoveryFlow,
     task: StoryTask,
@@ -1348,6 +1376,7 @@ def _assert_owned_spec_manual_adoption_pause(
     assert flow.calls.saves == 1
     assert len(flow.calls.pauses) == 1
     assert "manual adoption is required" in flow.calls.pauses[0][0]
+    _assert_owned_spec_notice_contract(flow.calls.pauses[0][0], task, flow)
     assert flow.journal.events().count("rollback-owned-spec-manual-required") == 1
     assert_multiline_notice_keeps_its_lines(
         flow.run_dir,
@@ -1368,6 +1397,14 @@ def _assert_owned_spec_manual_adoption_pause(
             f"{status_guidance}; manual adoption is required"
         ),
     }
+
+
+# DW-322: a rollback that paused after `pre_rollback` still delivers exactly one
+# paired `post_rollback`, labelled with how it ended.
+_PAUSED_ROLLBACK_EMITS = [
+    ("pre_rollback", {}),
+    ("post_rollback", {"rollback_outcome": "paused"}),
+]
 
 
 # --------------------------------------------------------------- protected paths
@@ -1430,9 +1467,120 @@ def test_rollback_auto_resets_when_flag_on(project):
     flow.rollback_or_pause(task)  # must NOT raise
 
     assert rev_parse_head(repo) == task.baseline_commit  # reset to baseline
-    assert flow.calls.emits == ["pre_rollback", "post_rollback"]
+    assert flow.calls.emit_fields == [
+        ("pre_rollback", {}),
+        ("post_rollback", {"rollback_outcome": "completed"}),
+    ]
     assert flow.calls.pauses == []
     assert "rollback-auto" in flow.journal.events()
+
+
+def test_rollback_preserve_failure_pause_still_emits_post_rollback(project, monkeypatch):
+    """DW-322: a preservation-failure pause raised after `pre_rollback` still
+    delivers the paired `post_rollback`, labelled "paused", and the pause itself
+    propagates unchanged. Ablation: delete the `finally` emit and the emit list
+    loses its post_rollback."""
+    repo = project.project
+    ws = Workspace.default(project)
+    flow = _make_flow(workspace=ws, policy=_policy(rollback_on_failure=True))
+    task = _task(repo)
+    _commit_something(repo)
+
+    def no_ref(*a, **k):
+        raise GitError("branch creation failed")
+
+    monkeypatch.setattr(verify, "preserve_commits", no_ref)
+
+    with pytest.raises(_Pause, match="could not be auto-preserved"):
+        flow.rollback_or_pause(task)
+
+    assert len(flow.calls.pauses) == 1
+    assert flow.calls.emit_fields == _PAUSED_ROLLBACK_EMITS
+    assert rev_parse_head(repo) != task.baseline_commit  # reset refused
+
+
+def test_owned_spec_pause_notice_without_recorded_baseline(project):
+    """DW-321 fallback: with no recorded `baseline_commit` the notice still gives
+    the return-to-baseline step, in words rather than a (missing) sha."""
+    repo = project.project
+    ws = Workspace.default(project)
+    flow = _make_flow(workspace=ws)
+    task = _task(repo)
+    task.baseline_commit = None
+
+    with pytest.raises(_Pause):
+        flow.pause_for_owned_spec_recovery(task, str(repo / "spec.md"), "boom")
+
+    notice = flow.calls.pauses[0][0]
+    assert "the commit the attempt started from (not recorded)" in notice
+    assert "reset --hard" not in notice
+    assert "Resume will not adopt them." in notice
+    assert flow.calls.emits == []  # the pause itself emits no rollback stage
+
+
+@pytest.mark.parametrize(
+    ("rearmed", "rollback_on", "under_artifacts", "keeps"),
+    [
+        (False, True, True, True),
+        (True, False, True, True),
+        (False, False, True, False),
+        (False, True, False, False),
+    ],
+    ids=["rollback-on", "armed-unwind", "rollback-off", "outside-artifacts"],
+)
+def test_redrive_owned_spec_notice_keeps_spec_only_when_resume_reset_preserves_it(
+    project, rearmed, rollback_on, under_artifacts, keeps
+):
+    """DW-321: a re-drive's notice says to keep the approved spec in place only
+    when resume will auto-recover (armed unwind or rollback on) and the spec lies
+    under the artifact folders that reset preserves. Otherwise keeping it would
+    either pause again (rollback off) or be reset anyway (outside the folders), so
+    the notice falls back to the plain reset-to-baseline step."""
+    repo = project.project
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=rollback_on)
+    )
+    task = _task(repo)
+    task.resolved_redrive = True
+    task.rearmed = rearmed
+    task.preserve_ref = "refs/bmad-loop/preserve/earlier-attempt"
+    folder = project.implementation_artifacts if under_artifacts else repo / "specs"
+    spec = str(folder / "spec-1-1-a.md")
+
+    with pytest.raises(_Pause):
+        flow.pause_for_owned_spec_recovery(task, spec, "boom")
+
+    notice = flow.calls.pauses[0][0]
+    assert ("survives resume's reset" in notice) is keeps
+    assert ("Resume will not adopt them." in notice) is not keeps
+    assert "earlier-attempt" not in notice  # never names a possibly stale ref
+
+
+def test_rollback_unexpected_error_emits_failed_post_rollback(project, monkeypatch):
+    """DW-322: an unexpected error escaping the reset after `pre_rollback` still
+    delivers `post_rollback` labelled "failed" (not "paused": no pause was
+    raised), and the original exception propagates as the very same object."""
+    repo = project.project
+    ws = Workspace.default(project)
+    flow = _make_flow(workspace=ws, policy=_policy(rollback_on_failure=True))
+    task = _task(repo)
+    (repo / "src.txt").write_text("uncommitted attempt\n")
+    boom = OSError(28, "No space left on device")
+
+    def exploding_rollback(*a, **k):
+        raise boom
+
+    monkeypatch.setattr(verify, "safe_rollback", exploding_rollback)
+
+    with pytest.raises(OSError) as excinfo:
+        flow.rollback_or_pause(task)
+
+    assert excinfo.value is boom
+    assert flow.calls.pauses == []
+    assert flow.calls.emit_fields == [
+        ("pre_rollback", {}),
+        ("post_rollback", {"rollback_outcome": "failed"}),
+    ]
 
 
 def test_rollback_off_pauses_and_leaves_tree(project):
@@ -1919,13 +2067,90 @@ def test_plain_forced_fallback_pauses_after_completed_baseline_reset(project, mo
     assert source.read_text() == "original\n"
     assert spec.read_bytes() == baseline
     assert "rollback-auto" in flow.journal.events()
-    assert flow.calls.emits == ["pre_rollback"]
+    assert flow.calls.emit_fields == _PAUSED_ROLLBACK_EMITS
     _assert_owned_spec_manual_adoption_pause(
         flow,
         task,
         spec,
         stage="after the baseline reset",
     )
+
+
+@pytest.mark.parametrize("rollback_on_resume", [True, False], ids=["rollback-on", "rollback-off"])
+def test_plain_owned_spec_pause_resume_does_not_adopt_differing_tracked_spec(
+    project, monkeypatch, rollback_on_resume
+):
+    """DW-321 behaviour behind the notice: after an owned-spec pause on a plain
+    attempt, an approved edit to the tracked spec that differs from the baseline
+    is attempt residue on resume — reset to baseline with rollback on, a fresh
+    manual-rollback pause with it off. Never adopted."""
+    repo = project.project
+    spec = _tracked_spec(project)
+    baseline = spec.read_bytes()
+    operator = baseline.replace(b"baseline intent", b"operator input outside HEAD")
+    spec.write_bytes(operator)
+    task = _task(repo)
+    task.dispatched_spec_file = str(spec)
+    task.dispatched_spec_snapshot = operator
+    (repo / "src.txt").write_text("failed child sibling\n")
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=True)
+    )
+    monkeypatch.setattr(recovery_flow, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+
+    with pytest.raises(_Pause, match="needs manual recovery"):
+        flow.rollback_or_pause(task)
+    _assert_owned_spec_notice_contract(flow.calls.pauses[0][0], task, flow)
+
+    approved = baseline.replace(b"baseline intent", b"operator-approved edit")
+    spec.write_bytes(approved)
+    flow.policy = _policy(rollback_on_failure=rollback_on_resume)
+    auto_before = flow.journal.events().count("rollback-auto")
+
+    if rollback_on_resume:
+        flow.rollback_or_pause(task)
+        assert spec.read_bytes() == baseline
+        assert flow.journal.events().count("rollback-auto") == auto_before + 1
+        assert len(flow.calls.pauses) == 1
+    else:
+        with pytest.raises(_Pause, match="manual rollback"):
+            flow.rollback_or_pause(task)
+        assert spec.read_bytes() == approved  # left for the operator, not adopted
+        assert "rollback-manual-required" in flow.journal.events()
+        assert flow.journal.events().count("rollback-auto") == auto_before
+        assert len(flow.calls.pauses) == 2
+
+
+def test_post_rollback_emit_failure_cannot_mask_a_propagating_pause(project, monkeypatch):
+    """DW-322: while a pause propagates, a failing `post_rollback` emit (context
+    build, journal write) is suppressed so the pause itself still reaches the
+    caller. Ablation: drop the suppression and the emit's OSError replaces it."""
+    repo = project.project
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=True)
+    )
+    task = _task(repo)
+    _commit_something(repo)
+    recorded = flow._emit
+
+    def failing_emit(stage, task=None, **fields):
+        recorded(stage, task, **fields)
+        if stage == "post_rollback":
+            raise OSError(28, "No space left on device")
+
+    flow._emit = failing_emit
+
+    def no_ref(*a, **k):
+        raise GitError("branch creation failed")
+
+    monkeypatch.setattr(verify, "preserve_commits", no_ref)
+
+    with pytest.raises(_Pause, match="could not be auto-preserved"):
+        flow.rollback_or_pause(task)
+
+    assert flow.calls.emit_fields == _PAUSED_ROLLBACK_EMITS
 
 
 @requires_descriptor_restoration
@@ -2143,7 +2368,7 @@ def test_latched_redrive_forced_fallback_pauses_after_preservation(project, monk
     assert git(repo, "show", f"{task.preserve_ref}:{rel}").encode() == child.rstrip(b"\n")
     assert "attempt-worktree-preserved" in flow.journal.events()
     assert "rollback-owned-spec-restored" not in flow.journal.events()
-    assert "post_rollback" not in flow.calls.emits
+    assert flow.calls.emit_fields == _PAUSED_ROLLBACK_EMITS
     _assert_owned_spec_manual_adoption_pause(
         flow,
         task,
@@ -2185,7 +2410,7 @@ def test_latched_redrive_forced_fallback_pauses_after_completed_baseline_reset(
     # newline-normalized rather than raw.
     assert spec.read_bytes().replace(b"\r\n", b"\n") == corrected
     assert "rollback-auto" in flow.journal.events()
-    assert flow.calls.emits == ["pre_rollback"]
+    assert flow.calls.emit_fields == _PAUSED_ROLLBACK_EMITS
     _assert_owned_spec_manual_adoption_pause(
         flow,
         task,
@@ -2305,7 +2530,7 @@ def test_plain_git_invisible_snapshot_forced_fallback_pauses_before_reset(
     assert task.preserve_ref is not None
     assert git(repo, "show", f"{task.preserve_ref}:{rel}").encode() == child.rstrip(b"\n")
     assert "rollback-owned-spec-restored" not in flow.journal.events()
-    assert "post_rollback" not in flow.calls.emits
+    assert flow.calls.emit_fields == _PAUSED_ROLLBACK_EMITS
     _assert_owned_spec_manual_adoption_pause(
         flow,
         task,
@@ -2397,7 +2622,7 @@ def test_latched_redrive_index_only_forced_fallback_pauses_after_preservation(
         assert task.preserve_ref is not None
         assert "attempt-worktree-preserved" in flow.journal.events()
     assert "rollback-owned-spec-restored" not in flow.journal.events()
-    assert "post_rollback" not in flow.calls.emits
+    assert flow.calls.emit_fields == _PAUSED_ROLLBACK_EMITS
     _assert_owned_spec_manual_adoption_pause(
         flow,
         task,
@@ -2672,7 +2897,7 @@ def test_resolved_cause_forced_fallback_pauses_after_completed_reset(project, mo
     # only its line endings may differ under `core.autocrlf=true`.
     assert spec.read_bytes().replace(b"\r\n", b"\n") == remaining
     assert "rollback-auto" in flow.journal.events()
-    assert flow.calls.emits == ["pre_rollback"]
+    assert flow.calls.emit_fields == _PAUSED_ROLLBACK_EMITS
     _assert_owned_spec_manual_adoption_pause(
         flow,
         task,
@@ -2816,10 +3041,12 @@ def test_latched_redrive_without_snapshot_refuses_reset_of_sibling_residue(proje
     assert "rollback-auto" not in flow.journal.events()
     assert task.dispatched_spec_file is None
     assert task.dispatched_spec_snapshot is None
+    _assert_owned_spec_notice_contract(flow.calls.pauses[0][0], task, flow)
 
-    # The notice tells the operator to restore/verify the approved spec. Because
-    # the unusable pair was cleared before the pause, that remedy converges rather
-    # than hitting the same legacy-snapshot guard forever on resume.
+    # The notice tells the operator to keep the approved spec in place and reset
+    # the other residue. Because the unusable pair was cleared before the pause,
+    # that remedy converges rather than hitting the same legacy-snapshot guard
+    # forever on resume.
     corrected = b"---\nstatus: ready-for-dev\n---\n\noperator restored intent\n"
     spec.write_bytes(corrected)
     flow.rollback_or_pause(task)
@@ -3180,7 +3407,7 @@ def test_patch_restore_redrive_forced_fallback_requires_in_review_adoption(proje
 
     assert spec.read_text() == "---\nstatus: in-progress\n---\n\nrestored human correction\n"
     assert "rollback-owned-spec-normalized" not in flow.journal.events()
-    assert "post_rollback" not in flow.calls.emits
+    assert flow.calls.emit_fields == _PAUSED_ROLLBACK_EMITS
     _assert_owned_spec_manual_adoption_pause(
         flow,
         task,
@@ -3746,7 +3973,7 @@ def test_changed_owned_snapshot_capture_failure_pauses_latched_redrive(project, 
 
     assert spec.read_bytes() == child
     assert "attempt-worktree-preserve-failed" in flow.journal.events()
-    assert "post_rollback" not in flow.calls.emits
+    assert flow.calls.emit_fields == _PAUSED_ROLLBACK_EMITS
 
 
 def test_snapshot_failure_leaves_a_commits_only_ref_flagged_partial(project, monkeypatch):
@@ -4141,12 +4368,15 @@ def test_safe_reset_reverts_tracked_and_keeps_baseline(project):
 
 def test_safe_reset_preflight_failure_journals_and_pauses_redrive(project, monkeypatch):
     """A typed cleanup-preflight refusal is journaled and passed to the injected
-    pause as its exact cause; the resolved re-drive stops before post-rollback or
-    any destructive reset can run.
+    pause as its exact cause; the resolved re-drive stops before any destructive
+    reset or post-reset continuation can run, and the paired `post_rollback`
+    still fires once, labelled "paused" (DW-322).
 
     Ablation target: delete the `except RollbackPreflightError` journal/pause block
-    and this test fails on the uncaught typed error; delete only `_pause` and it
-    fails because `post_rollback` continues and the expected pause is absent.
+    and this test fails on the uncaught typed error (post_rollback then reads
+    "failed"); delete only `_pause` and it fails because the rollback completes
+    and the expected pause is absent; delete the `finally` emit and it fails on
+    the missing post_rollback.
     """
     repo = project.project
     ws = Workspace.default(project)
@@ -4171,7 +4401,8 @@ def test_safe_reset_preflight_failure_journals_and_pauses_redrive(project, monke
     assert isinstance(cause, verify.RollbackPreflightError)
     assert cause is not None and cause.__cause__ is not None
     assert str(cause) in reason
-    assert flow.calls.emits == ["pre_rollback"]  # no post-reset re-drive continuation
+    # Paired post_rollback labelled "paused"; no post-reset re-drive continuation.
+    assert flow.calls.emit_fields == _PAUSED_ROLLBACK_EMITS
     assert (repo / "src.txt").read_text() == "tracked attempt\n"
     assert created.read_text() == "run-created\n"
 

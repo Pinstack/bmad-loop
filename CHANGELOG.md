@@ -24,6 +24,8 @@ breaking changes may land in a minor release.
   `--dry-run` prints a stderr `warning:` per affected role; replace semantics unchanged (DW-349).
 - Expose a read-only `ctx.delivery_id` (declarative: `BMAD_LOOP_DELIVERY_ID`) on
   `post_migrate`, which may repeat per completion — deduplicate on it (DW-317).
+- Expose a read-only `ctx.rollback_outcome` (declarative: `BMAD_LOOP_ROLLBACK_OUTCOME`) on
+  `post_rollback`: `completed`, `paused`, or `failed` (DW-322).
 - Warn in `validate` (`deferred.ledger-untracked`) when the deferred-work ledger exists but
   is neither committed nor gitignored, since bmad-loop's own commits would otherwise take it
   in at the first isolated merge or story commit (DW-361).
@@ -46,6 +48,13 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Name the convergent step in the attempt-owned spec recovery notice: return the checkout
+  to the recorded attempt baseline before `resume`; on a plain attempt, approved tracked-spec
+  edits that differ from it are attempt residue and are not adopted (a latched re-drive that
+  resume rolls back automatically keeps the spec under the artifact folders). Behavior
+  unchanged (DW-321).
+- Fire `post_rollback` once for every emitted `pre_rollback`, also when the rollback pauses
+  for manual recovery or an error escapes it (DW-322).
 - Correct stale docs and docstrings, behavior unchanged: `detect_multiplexers` no longer
   claims it never raises (a failed bundled-backend import propagates), the bug-report
   template notes `diagnose` needs a run, `platform_preflight` is located in `runsetup.py`,

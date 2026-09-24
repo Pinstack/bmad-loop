@@ -170,7 +170,7 @@ def _fake_script(scripts_dir, name, rc):
     (scripts_dir / name).write_text(f"import sys\nsys.exit({rc})\n", encoding="utf-8")
 
 
-def _ctx(stage, scripts_dir, *, agents=()):
+def _ctx(stage, scripts_dir, *, agents=(), **fields):
     return HookContext(
         stage,
         run_id="r",
@@ -179,6 +179,7 @@ def _ctx(stage, scripts_dir, *, agents=()):
         run_dir=str(scripts_dir),
         worktree=str(scripts_dir),
         agents=tuple(agents),
+        **fields,
     )
 
 
@@ -251,6 +252,25 @@ def test_rollback_hooks_run_quiesce_with_phase_and_timeout(tmp_path, monkeypatch
         ("unity_quiesce.py", 42, {"BMAD_LOOP_QUIESCE_PHASE": "pre"}),
         ("unity_quiesce.py", 42, {"BMAD_LOOP_QUIESCE_PHASE": "post"}),
     ]
+
+
+@pytest.mark.parametrize("outcome", ["paused", "failed"])
+def test_post_rollback_quiesces_after_an_unfinished_rollback(tmp_path, monkeypatch, outcome):
+    """DW-322: post_rollback also fires after a paused/failed rollback; the Unity
+    hook tolerates that context and still runs the post quiesce (re-import)."""
+    inst = _make_unity({}, tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        inst,
+        "_run_script",
+        lambda name, ctx, *, timeout, extra_env=None: (
+            calls.append((name, ctx.rollback_outcome, extra_env)) or (0, "")
+        ),
+    )
+    ctx = _ctx("post_rollback", tmp_path, rollback_outcome=outcome)
+    inst.on_post_rollback(ctx)
+    assert calls == [("unity_quiesce.py", outcome, {"BMAD_LOOP_QUIESCE_PHASE": "post"})]
+    assert not ctx.vetoed
 
 
 def test_rollback_hooks_skipped_when_disabled(tmp_path, monkeypatch):

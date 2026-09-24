@@ -95,6 +95,7 @@ class HookContext:
         verification_sequence: int | None = None,
         decision_action: str | None = None,
         delivery_id: str | None = None,
+        rollback_outcome: str | None = None,
         settings: dict[str, Any] | None = None,
         shared: dict[str, Any] | None = None,
         proposed_prompt: str | None = None,
@@ -142,6 +143,7 @@ class HookContext:
         self._verification_sequence = verification_sequence
         self._decision_action = decision_action
         self._delivery_id = delivery_id
+        self._rollback_outcome = rollback_outcome
         self._settings = dict(settings) if settings is not None else {}
         # free-form, persisted across stages (engine backs it with plugin_shared)
         self.shared: dict[str, Any] = shared if shared is not None else {}
@@ -309,6 +311,25 @@ class HookContext:
         read it as ``BMAD_LOOP_DELIVERY_ID``.
         """
         return self._delivery_id
+
+    @property
+    def rollback_outcome(self) -> str | None:
+        """How the rollback this ``post_rollback`` closes ended, or ``None`` on
+        every other stage (``pre_rollback`` included). Set only on
+        ``post_rollback`` (DW-322), which fires exactly once for every emitted
+        ``pre_rollback`` — even when the rollback does not finish:
+
+        * ``"completed"`` — the rollback ran to its end;
+        * ``"paused"`` — it stopped to pause the run for manual recovery (an
+          owned-spec recovery, a preservation failure, or a refused reset); the
+          tree may be partially reset;
+        * ``"failed"`` — an unexpected error escaped it; the tree may be
+          partially reset and the run's error propagates after this emit.
+
+        Observe-only: the engine never reads a hook's reaction to it. Declarative
+        hooks read it as ``BMAD_LOOP_ROLLBACK_OUTCOME``.
+        """
+        return self._rollback_outcome
 
     @property
     def settings(self) -> dict[str, Any]:

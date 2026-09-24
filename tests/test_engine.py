@@ -9349,6 +9349,60 @@ def test_rollback_emits_pre_and_post_around_reset(project):
     ]
 
 
+class _RollbackCaptureBus:
+    """Hook-bus double recording the real contexts the engine builds for the
+    rollback stages."""
+
+    def __init__(self):
+        self.contexts = []
+
+    def active(self, stage):
+        return stage in ("pre_rollback", "post_rollback")
+
+    def emit(self, stage, ctx):
+        self.contexts.append(ctx)
+        return ctx
+
+
+@pytest.mark.parametrize("pause", [False, True], ids=["completed", "paused"])
+def test_rollback_post_hook_carries_outcome_through_real_engine(project, monkeypatch, pause):
+    """DW-322 end to end: the engine's own `_make_context` accepts the outcome
+    field, `pre_rollback` carries none, and a rollback that pauses after
+    `pre_rollback` (here a commit-preservation failure) still delivers exactly
+    one `post_rollback` labelled "paused" while the run pauses as before."""
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    engine, _ = make_engine(project, [], policy=policy)
+    capture = _RollbackCaptureBus()
+    engine._bus = capture
+    repo = project.project
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = rev_parse_head(repo)
+    task.baseline_untracked = []
+    (repo / "impl.txt").write_text("committed implementation\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "attempt work")
+
+    if pause:
+
+        def no_ref(*a, **k):
+            raise verify.GitError("branch creation failed")
+
+        monkeypatch.setattr(verify, "preserve_commits", no_ref)
+        with pytest.raises(RunPaused, match="could not be auto-preserved"):
+            engine._rollback_or_pause(task)
+    else:
+        engine._rollback_or_pause(task)
+
+    assert [(c.stage, c.rollback_outcome) for c in capture.contexts] == [
+        ("pre_rollback", None),
+        ("post_rollback", "paused" if pause else "completed"),
+    ]
+
+
 def test_rollback_emits_are_observe_only(project):
     """The rollback emits are observe-only, like pre_worktree_teardown: the returned
     ctx is never routed through ``_vetoed``, so a failed Editor quiesce can never

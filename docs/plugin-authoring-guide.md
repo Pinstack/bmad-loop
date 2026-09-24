@@ -268,16 +268,17 @@ A `[hooks.<stage>]` shell command. The bus runs it with:
 - **cwd** = the unit's worktree (or repo root);
 - a `BMAD_LOOP_*` environment describing the run:
 
-  | Var                                                                               | Meaning                                       |
-  | --------------------------------------------------------------------------------- | --------------------------------------------- |
-  | `BMAD_LOOP_STAGE`                                                                 | the stage firing                              |
-  | `BMAD_LOOP_RUN_ID` / `BMAD_LOOP_RUN_DIR`                                          | run identity                                  |
-  | `BMAD_LOOP_REPO_ROOT` / `BMAD_LOOP_WORKTREE`                                      | git roots                                     |
-  | `BMAD_LOOP_STORY_KEY` / `BMAD_LOOP_ROLE` / `BMAD_LOOP_PHASE` / `BMAD_LOOP_BRANCH` | unit context                                  |
-  | `BMAD_LOOP_AGENTS`                                                                | comma-separated CLI agent ids in the worktree |
-  | `BMAD_LOOP_DELIVERY_ID`                                                           | dedup key of an at-least-once stage           |
-  | `BMAD_LOOP_PLUGIN`                                                                | your plugin's name                            |
-  | `BMAD_LOOP_SETTING_<KEY>`                                                         | each resolved setting                         |
+  | Var                                                                               | Meaning                                                 |
+  | --------------------------------------------------------------------------------- | ------------------------------------------------------- |
+  | `BMAD_LOOP_STAGE`                                                                 | the stage firing                                        |
+  | `BMAD_LOOP_RUN_ID` / `BMAD_LOOP_RUN_DIR`                                          | run identity                                            |
+  | `BMAD_LOOP_REPO_ROOT` / `BMAD_LOOP_WORKTREE`                                      | git roots                                               |
+  | `BMAD_LOOP_STORY_KEY` / `BMAD_LOOP_ROLE` / `BMAD_LOOP_PHASE` / `BMAD_LOOP_BRANCH` | unit context                                            |
+  | `BMAD_LOOP_AGENTS`                                                                | comma-separated CLI agent ids in the worktree           |
+  | `BMAD_LOOP_DELIVERY_ID`                                                           | dedup key of an at-least-once stage                     |
+  | `BMAD_LOOP_ROLLBACK_OUTCOME`                                                      | `post_rollback` only: `completed` / `paused` / `failed` |
+  | `BMAD_LOOP_PLUGIN`                                                                | your plugin's name                                      |
+  | `BMAD_LOOP_SETTING_<KEY>`                                                         | each resolved setting                                   |
 
 A **blocking** hook's non-zero exit **vetoes** (defers) the unit. A non-blocking
 hook is advisory (logged `plugin-hook`).
@@ -333,8 +334,8 @@ stage. It carries:
 - **Read-only facts** (properties, no setter): `run_id`, `story_key`, `epic`,
   `phase`, `attempt`, `role`, `worktree`, `branch`, `repo_root`, `run_dir`,
   `agents`, `result_json` (a copy), `session_status`, `verify_reason`,
-  `decision_action`, `delivery_id`, `settings`. Observe these; you can never
-  rewrite history.
+  `decision_action`, `delivery_id`, `rollback_outcome`, `settings`. Observe
+  these; you can never rewrite history.
 - **A mutable whitelist** — assign only these, and only where the stage allows:
   `proposed_prompt`, `proposed_env`, `proposed_feedback`,
   `proposed_commit_message`, `proposed_decision`.
@@ -376,20 +377,35 @@ there.
 
 ### Story / unit
 
-| Stage                                              | When                                                                              | Mutable surface                                       |
-| -------------------------------------------------- | --------------------------------------------------------------------------------- | ----------------------------------------------------- |
-| `pre_story` / `post_story`                         | around one story                                                                  | veto (`pre_`)                                         |
-| `pre_worktree_setup` / `post_worktree_setup`       | around isolated-worktree provisioning                                             | —                                                     |
-| `pre_ready_gate` / `post_ready_gate`               | around the engine-ready gate                                                      | veto (`pre_`)                                         |
-| `pre_worktree_teardown` / `post_worktree_teardown` | around teardown (in a `finally`)                                                  | **observe-only** — a veto here cannot un-tear-down    |
-| `pre_rollback` / `post_rollback`                   | around a failed attempt's `git reset --hard` (only when a rollback actually runs) | **observe-only** — a veto here cannot block the reset |
-| `pre_integrate`                                    | before integrating a finished unit                                                | —                                                     |
-| `pre_merge` / `post_merge`                         | around the local branch merge                                                     | —                                                     |
+| Stage                                              | When                                                                                                                                         | Mutable surface                                       |
+| -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
+| `pre_story` / `post_story`                         | around one story                                                                                                                             | veto (`pre_`)                                         |
+| `pre_worktree_setup` / `post_worktree_setup`       | around isolated-worktree provisioning                                                                                                        | —                                                     |
+| `pre_ready_gate` / `post_ready_gate`               | around the engine-ready gate                                                                                                                 | veto (`pre_`)                                         |
+| `pre_worktree_teardown` / `post_worktree_teardown` | around teardown (in a `finally`)                                                                                                             | **observe-only** — a veto here cannot un-tear-down    |
+| `pre_rollback` / `post_rollback`                   | around a failed attempt's `git reset --hard` (only when a rollback actually runs); `post_` pairs every `pre_`, even a paused/failed rollback | **observe-only** — a veto here cannot block the reset |
+| `pre_integrate`                                    | before integrating a finished unit                                                                                                           | —                                                     |
+| `pre_merge` / `post_merge`                         | around the local branch merge                                                                                                                | —                                                     |
 
 `post_story` fires after an isolated unit's worktree teardown. If the worktree was
 removed, a declarative `post_story` hook runs from the repo root and
 `BMAD_LOOP_WORKTREE` still names the removed worktree; if it was kept (a deferred
 unit under `keep_failed`), the hook runs from that worktree.
+
+`post_rollback` fires exactly once for every emitted `pre_rollback`, including when
+the rollback stops part-way — it pauses the run for manual recovery (an
+attempt-owned spec it cannot safely restore, work it could not park, a refused
+reset) or an unexpected error escapes it. `ctx.rollback_outcome`
+(`BMAD_LOOP_ROLLBACK_OUTCOME` for a declarative hook) says which: `completed`,
+`paused`, or `failed`; after the latter two the tree may be only partially reset.
+It is `None` on every other stage, `pre_rollback` included. A plugin that
+quiesces in `pre_rollback` can therefore always rely on the matching release;
+one that does post-reset work (re-installing dependencies, re-applying state)
+should gate it on `completed`, since `post_rollback` no longer implies the reset
+finished.
+Rollback paths that never emit `pre_rollback` (a clean tree, a policy pause with
+`[scm] rollback_on_failure` off, an owned-spec pause raised before the rollback
+starts) emit neither stage.
 
 ### Dev
 

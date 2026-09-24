@@ -133,6 +133,29 @@ def test_declarative_env_carries_delivery_id_only_when_set():
     assert "BMAD_LOOP_DELIVERY_ID" not in seen[1]
 
 
+def test_rollback_outcome_is_readonly_and_defaults_to_none():
+    assert ctx().rollback_outcome is None
+    assert ctx("pre_rollback").rollback_outcome is None
+    c = ctx("post_rollback", rollback_outcome="paused")
+    assert c.rollback_outcome == "paused"
+    with pytest.raises(AttributeError):
+        c.rollback_outcome = "completed"  # type: ignore[misc]
+
+
+def test_declarative_env_carries_rollback_outcome_only_when_set():
+    seen: list[dict[str, str]] = []
+
+    def runner(cmd, *, cwd, env, timeout):
+        seen.append(dict(env))
+        return 0, ""
+
+    bus = HookBus(registry_of(declarative("post_rollback")), runner=runner)
+    bus.emit("post_rollback", ctx("post_rollback", rollback_outcome="failed"))
+    bus.emit("post_rollback", ctx("post_rollback"))
+    assert seen[0]["BMAD_LOOP_ROLLBACK_OUTCOME"] == "failed"
+    assert "BMAD_LOOP_ROLLBACK_OUTCOME" not in seen[1]
+
+
 def test_a_plugin_cannot_erase_a_critical_escalation_through_result_json():
     """The observe-only claim has to hold at the depth escalations actually live.
 

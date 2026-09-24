@@ -167,7 +167,13 @@ class UnityPlugin(Plugin):
     def on_post_rollback(self, ctx) -> None:
         """After the reset rewrote the tracked tree, tell the Editor to re-import
         so it sees the reverted assets rather than its stale in-memory copies. Best
-        effort — same never-veto contract as ``on_pre_rollback``."""
+        effort — same never-veto contract as ``on_pre_rollback``.
+
+        Fires once for every ``pre_rollback``, including a rollback that paused
+        or failed part-way (``ctx.rollback_outcome`` is ``"paused"``/``"failed"``
+        rather than ``"completed"``). The re-import runs regardless: after a
+        partial or refused reset it is harmless, and it still syncs the Editor
+        with whatever the tree now holds."""
         self._quiesce("post", ctx)
 
     def on_pre_session(self, ctx) -> None:

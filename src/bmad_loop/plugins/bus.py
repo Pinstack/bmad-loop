@@ -100,6 +100,8 @@ def _hook_env(ctx: HookContext, lp: LoadedPlugin) -> dict[str, str]:
         "BMAD_LOOP_AGENTS": ",".join(ctx.agents),
         # at-least-once stages only (post_migrate); the consumer's dedup key
         "BMAD_LOOP_DELIVERY_ID": ctx.delivery_id or "",
+        # post_rollback only (DW-322): completed | paused | failed
+        "BMAD_LOOP_ROLLBACK_OUTCOME": ctx.rollback_outcome or "",
         "BMAD_LOOP_PLUGIN": lp.name,
     }
     env.update({k: v for k, v in fields.items() if v != ""})
