@@ -2091,6 +2091,21 @@ def _apply_appends(text: str, specs: Sequence[EntrySpec]) -> tuple[str, list[str
     return text, minted
 
 
+def appended_text(text: str, specs: Sequence[EntrySpec]) -> str:
+    """The text :func:`append_entries` would publish over `text` for `specs`.
+
+    Pure — text in, text out — and the SAME fold the writer runs
+    (:func:`_apply_appends`), so a caller recomputing what a batch append WROTE
+    cannot drift from what it writes. The ids it would mint are dropped: a caller
+    that needs them is a writer and belongs in :func:`append_entries`. Nothing is
+    validated here, because nothing is written: a spec the writer's up-front
+    status/severity checks would refuse may still fold into text the writer would
+    never publish, or raise from the fold itself — a caller comparing against the
+    result must hand it only specs the writer accepts. The engine's harvested-carry
+    ownership proof (DW-355) recomputes its intended ledger through this."""
+    return _apply_appends(text, specs)[0]
+
+
 def append_entries(path: Path, specs: Sequence[EntrySpec]) -> list[str | None]:
     """Append every entry in `specs` in ONE read and ONE atomic write, returning
     each spec's minted id — or None in its position when that spec deduped

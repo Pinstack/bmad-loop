@@ -737,6 +737,50 @@ def _publication_refusal(path: Path, family: Literal["ledger", "store"]) -> (
     return verify.unpublishable_target(target, family)
 
 
+def _harvested_carry_specs(task: StoryTask, text: str) -> list[deferredwork.EntrySpec]:
+    """The batch `_carry_harvested_deferrals` appends over ledger `text`.
+
+    ONE builder for the carry's write and its replay's ownership proof (DW-355),
+    so what the proof recomputes cannot drift from what the carry wrote: the
+    carry hands it the ledger it just read, the proof hands it HEAD's.
+
+    The provenance skip is status-agnostic, and it has to be: a row this unit's
+    finding already earned and that the sweep has since CLOSED must not be
+    re-filed, and the batch writer's own idempotence scan is open-only by design
+    (a closed entry means the work came back). This one `parse_ledger` read is
+    therefore the whole on-disk guard; the batch's evolving scan covers only twins
+    minted inside the same call, which it does see, every row it appends being
+    open."""
+    seen = deferredwork.parse_ledger(text)
+    specs: list[deferredwork.EntrySpec] = []
+    for item in task.harvested_deferrals:
+        origin = str(item["origin"])
+        source_spec = str(item["source_spec"])
+        if any(
+            deferredwork.field_line_present(entry.body, "origin", origin)
+            and deferredwork.field_line_present(entry.body, "source_spec", source_spec)
+            for entry in seen
+        ):
+            continue
+        location = item.get("location")
+        severity = item.get("severity")
+        specs.append(
+            deferredwork.EntrySpec(
+                title=str(item["title"]),
+                origin=origin,
+                location=str(location) if location else "n/a",
+                source_spec=source_spec,
+                reason=str(item["reason"]),
+                severity=str(severity) if severity else None,
+                # Backstop the lock-free isolation-carry snapshot: its
+                # fingerprint may land under another spec before the
+                # writer's locked re-read (DW-98).
+                cross_spec_dedupe=True,
+            )
+        )
+    return specs
+
+
 class Engine:
     # The engine that installed the process-wide stop handlers. Signal handling is
     # single-owner per process; only this engine reinstalls/restores them. Run
@@ -8079,6 +8123,142 @@ class Engine:
             return False
         return rel not in verify.untracked_files(repo)
 
+    def _harvest_carry_holds_only_this_carry(self, task: StoryTask, ledger: Path) -> bool:
+        """Whether ``ledger`` holds HEAD's blob plus this task's harvested rows and no
+        more (DW-355).
+
+        The discrimination a LATCH-ONLY replay needs. An earlier pass appended the
+        rows and its commit failed, so this pass dedupes to ``carried == []`` and its
+        commit would stage whatever the working-tree ledger holds now (the same shape
+        arises on a FIRST pass whose novel rows the writer's cross-spec dedupe then
+        dropped against a twin already on disk, and is proved the same way) — an operator's
+        edit made while the run was down included, under a
+        ``carry harvested findings`` subject. Refusing on DIRT alone would break the
+        recovery the latch exists for: the crashed pass's own rows ARE uncommitted
+        dirt on exactly this path, and committing them is the point. So the question
+        is whether what is on disk is what this carry intends, recomputed from HEAD's
+        blob through the carry's own spec builder (``_harvested_carry_specs``) and the
+        writer's own fold (``deferredwork.appended_text``). A crashed pass's append
+        matches, the fold being deterministic; an operator's edit does not. The sibling
+        of :meth:`_board_carry_holds_only_this_advance`, and for its reasons.
+
+        HEAD's blob, not a snapshot taken earlier in the run: the baseline has to
+        predate every writer, and only git holds one that does. When the fold adds
+        nothing — HEAD already carries every row, the operator having committed the
+        whole ledger — the intended content IS HEAD's raw blob, so a checkout git
+        calls clean passes whatever its line endings. Otherwise the fold's text is
+        encoded the way the writer's text-mode publish encodes it, off HEAD's text
+        newline-normalized the way the writer's ``read_text`` normalizes it.
+
+        BOTH of the places git holds this path are proved, because ``commit_paths``
+        overwrites both: the working tree it copies into the commit, and the index it
+        stages over. A staged operator edit distinct from HEAD and from the intended
+        ledger survives neither, so proving the working tree alone would authorize
+        destroying it. Sameness is git's question (``file_holds_content``), so a
+        CRLF/LF twin of the intended bytes is not mistaken for foreign content.
+
+        Answers True WITHOUT proving for two shapes, leaving the existing path
+        untouched: a ledger outside the repo, which git cannot commit and
+        ``_harvest_carry_commit_may_degrade`` already degrades; and a path HEAD does
+        not carry, which the carry commits exactly as before — the #460 boundary
+        :meth:`_board_carry_holds_only_this_advance` draws for the board, and drawing
+        it elsewhere here would make the pair unreadable. A ``resolve()`` failure is
+        NOT this proof's to answer either: it falls through to ``commit_paths``, whose
+        own uncertainty raise keeps the latch.
+
+        A git or OS fault, or a HEAD blob that does not decode as UTF-8, RAISES
+        (``GitError``/``OSError``/``RuntimeError``/``ValueError``) rather than
+        answering: the gate in :meth:`_carry_harvested_deferrals` fails closed on it
+        but pauses with the fault named, because "I could not compute the intended
+        content" is neither "the ledger is mine" nor "someone else wrote to it"."""
+        repo = self.paths.repo_root
+        try:
+            resolved_ledger = ledger.resolve()
+            resolved_repo = repo.resolve()
+        except (OSError, RuntimeError, ValueError):
+            return True  # `commit_paths` raises its own uncertainty and keeps the latch
+        try:
+            rel = resolved_ledger.relative_to(resolved_repo).as_posix()
+        except ValueError:
+            return True  # external: git cannot commit it, `may_degrade` owns it
+        head = verify.file_bytes_at_revision(repo, "HEAD", rel)
+        if head is None:
+            return True  # untracked: the #460 boundary, committed as before
+        head_text = head.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+        folded = deferredwork.appended_text(head_text, _harvested_carry_specs(task, head_text))
+        intended = head if folded == head_text else folded.replace("\n", os.linesep).encode("utf-8")
+        if not verify.file_holds_content(repo, rel, ledger, intended):
+            return False
+        # The working tree is only half of what the commit overwrites: it stages
+        # OVER the index, so a staged version distinct from both HEAD and the
+        # intended ledger is destroyed rather than committed.
+        return verify.index_holds_no_foreign_content(repo, rel, intended)
+
+    def _pause_for_harvest_carry_foreign_dirt(
+        self, task: StoryTask, ledger: Path, *, error: str | None = None
+    ) -> NoReturn:
+        """Pause the run over a latch-only harvested carry the ledger's content does
+        not prove is its own (DW-355).
+
+        Mirrors :meth:`_pause_for_ledger_repair`'s shape — journal, ``ACTION REQUIRED``
+        notice, ``_save()``, ``RunPaused`` at ``PAUSE_ESCALATION`` — and leaves the
+        phase and ``harvest_carry_commit_pending`` exactly where they are: the latch is
+        still an obligation, since any rows this carry filed are on disk but in no
+        commit, and a tracked ledger's in-place reset could otherwise drop them. A pause, not the
+        board's best-effort refusal, because this carry holds that durable latch
+        ("repair writes must raise"). Recovery needs no extra code: once the operator
+        commits the whole ledger or moves the other changes out of it (or fixes the
+        probe fault ``error`` names), the next resume re-runs the same carry — the
+        ``defer_reason`` re-entry or ``_replay_unlatched_ledger_carries`` — and the
+        proof accepts HEAD plus the rows (and commits them) or a HEAD that already
+        holds them (a no-op commit). Invariant across call contexts; ``SweepEngine``
+        does not override it, its ``_pause_for_harvest_carry_repair`` route being for
+        read faults.
+
+        ``error`` is set when the proof itself FAULTED rather than failed: the row
+        carries it and the notice asks for the fault to be fixed, not for changes
+        that may not exist to be moved."""
+        # `error` only where the proof HAS fault text to attribute (the DW-237 rule).
+        extra = {} if error is None else {"error": error}
+        self.journal.append(
+            "harvest-carry-foreign-dirt",
+            story_key=task.story_key,
+            ledger=str(ledger),
+            **extra,
+        )
+        resume = f"`bmad-loop resume {self.state.run_id}` to retry the carry commit."
+        if error is not None:
+            notice = (
+                "**ACTION REQUIRED — deferred-work ledger could not be verified**\n"
+                f"Story **{task.story_key}** has harvested findings to commit into "
+                f"`{ledger}`, but the carry could not verify the ledger holds only its "
+                f"own changes: {error}. Any rows this carry filed are on disk but "
+                "uncommitted, and nothing was committed.\n"
+                f"Fix the fault, then run {resume}"
+            )
+        else:
+            notice = (
+                "**ACTION REQUIRED — deferred-work ledger holds changes the carry cannot "
+                "prove are its own**\n"
+                f"Story **{task.story_key}** has harvested findings to commit into "
+                f"`{ledger}`, but the ledger holds changes beyond HEAD plus those findings, "
+                "in the working tree or the index (an operator edit, or a pre-commit hook "
+                "that rewrote the ledger when it rejected the commit). Any rows this carry filed are on disk "
+                "but uncommitted, and nothing was committed: committing now would have "
+                "swept the other changes in the ledger into the carry commit.\n"
+                "Commit the whole ledger (the carried rows included), or move the other "
+                f"changes out of it, then run {resume}"
+            )
+        subject = "could not be verified" if error is not None else "has foreign changes"
+        gates.notify(
+            self.policy,
+            self.run_dir,
+            f"ACTION REQUIRED: deferred-work ledger {subject} for {task.story_key}",
+            notice,
+        )
+        self._save()
+        raise RunPaused(notice, PAUSE_ESCALATION, task.story_key)
+
     def _pause_for_harvest_carry_repair(
         self,
         task: StoryTask,
@@ -8109,6 +8289,13 @@ class Engine:
         :meth:`_carry_isolated_ledger_writes`; direct defer and deferred-replay
         calls leave it false so subclasses cannot mistake a pre-terminal carry
         for the merged-unit recovery path.
+
+        A LATCH-ONLY commit — the latch set and nothing carried by this pass,
+        usually because an earlier pass appended the rows and its commit failed, or
+        because the writer's cross-spec dedupe dropped every novel row — first
+        proves the ledger holds only HEAD plus this task's rows
+        (:meth:`_harvest_carry_holds_only_this_carry`) and otherwise pauses for
+        the operator without committing or clearing the latch (DW-355).
         """
         if not task.harvested_deferrals:
             return
@@ -8130,49 +8317,16 @@ class Engine:
                 site="harvest-carry",
                 terminal_composite=terminal_composite,
             )
-        seen = deferredwork.parse_ledger(text)
-        specs: list[deferredwork.EntrySpec] = []
-        for item in task.harvested_deferrals:
-            origin = str(item["origin"])
-            source_spec = str(item["source_spec"])
-            # Status-agnostic, and it has to be: a row this unit's finding already
-            # earned and that the sweep has since CLOSED must not be re-filed,
-            # and the batch writer's own idempotence scan is open-only by design
-            # (a closed entry means the work came back). This one fresh
-            # `parse_ledger` read is therefore the whole on-disk guard; the
-            # batch's evolving scan covers only twins minted inside this call,
-            # which it does see, every row it appends being open.
-            if any(
-                deferredwork.field_line_present(entry.body, "origin", origin)
-                and deferredwork.field_line_present(entry.body, "source_spec", source_spec)
-                for entry in seen
-            ):
-                continue
+        specs = _harvested_carry_specs(task, text)
+        if specs and not task.harvest_carry_commit_pending:
             # Persist the commit obligation before the filesystem write. A host
             # loss after the append writes the rows but before it returns must
             # still make replay commit the now-deduplicated tracked/untracked row.
             # Latch only once a novel provenance is known: when every row already
             # arrived through the merge, committing here could sweep unrelated
             # operator edits to the same ledger into the carry commit.
-            if not task.harvest_carry_commit_pending:
-                task.harvest_carry_commit_pending = True
-                self._save()
-            location = item.get("location")
-            severity = item.get("severity")
-            specs.append(
-                deferredwork.EntrySpec(
-                    title=str(item["title"]),
-                    origin=origin,
-                    location=str(location) if location else "n/a",
-                    source_spec=source_spec,
-                    reason=str(item["reason"]),
-                    severity=str(severity) if severity else None,
-                    # Backstop the lock-free isolation-carry snapshot: its
-                    # fingerprint may land under another spec before the
-                    # writer's locked re-read (DW-98).
-                    cross_spec_dedupe=True,
-                )
-            )
+            task.harvest_carry_commit_pending = True
+            self._save()
         # The writer's own locked re-read (DW-259): bytes that went bad after the
         # pre-read above raise here, before any write, and take the same repair
         # pause. The commit latch above is already set, which is fine — a replay
@@ -8235,6 +8389,24 @@ class Engine:
                     **extra,
                 )
             else:
+                if not carried and task.harvest_carry_commit_pending:
+                    # DW-355: a LATCH-ONLY commit — an earlier pass appended these
+                    # rows and its commit failed, so this replay deduped to
+                    # `carried == []` (or the writer's cross-spec dedupe dropped
+                    # every novel row of this pass) — stages whatever the
+                    # working-tree ledger holds now. Proved before `may_degrade`, which spawns git of
+                    # its own, and after the refusal above, which spawns none. A
+                    # pass that appends rows is NOT asked and still commits the
+                    # whole working-tree ledger, as before; only this retry is.
+                    # A probe fault fails closed, but pauses with its error named.
+                    try:
+                        owned = self._harvest_carry_holds_only_this_carry(task, ledger)
+                    except (verify.GitError, OSError, RuntimeError, ValueError) as e:
+                        self._pause_for_harvest_carry_foreign_dirt(
+                            task, ledger, error=f"{type(e).__name__}: {e}"
+                        )
+                    if not owned:
+                        self._pause_for_harvest_carry_foreign_dirt(task, ledger)
                 may_degrade = self._harvest_carry_commit_may_degrade(ledger)
                 try:
                     verify.commit_paths(

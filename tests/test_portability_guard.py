@@ -1123,6 +1123,12 @@ JOURNAL_KINDS = frozenset(
         # `story_key`, `dw_ids`, `refuse_cause` and the optional `error` are all
         # already routed or declared.
         "harvest-carry-refused",
+        # DW-355. The ownership-proof pause of a LATCH-ONLY harvested carry: the
+        # working tree or index holds ledger changes beyond HEAD plus this task's
+        # rows, so the commit would sweep an operator's edit in — or the proof
+        # itself faulted, named in the optional `error`. `story_key`, `ledger` and
+        # `error` are already routed or declared.
+        "harvest-carry-foreign-dirt",
         "harvest-carry-uncommitted",
         "isolation-flip-orphaned-worktree",
         "ledger-baseline-probe-failed",

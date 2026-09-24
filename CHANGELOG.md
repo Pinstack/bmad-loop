@@ -40,6 +40,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Prove a latch-only retry of the harvested-deferral carry commit (nothing newly appended)
+  holds only HEAD plus the task's rows in the tracked ledger's working tree and index, else
+  pause (`harvest-carry-foreign-dirt`) with nothing committed and the latch kept (DW-355).
 - Protect the tracked deferred-work ledger and sprint board at the merge pre-flight only
   when the task carries a write to them (a ledger payload; a recorded board advance), so
   an unrelated unstaged operator edit there no longer pauses an isolated run; sweep bundles

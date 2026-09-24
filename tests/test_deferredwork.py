@@ -3800,6 +3800,22 @@ def test_cross_spec_advisory_suppression_is_rechecked_under_the_lock(tmp_path, m
     assert not entries[0].open and entries[1].open
 
 
+def test_appended_text_equals_what_append_entries_publishes(tmp_path):
+    """`appended_text` is the writer's own fold, so a caller recomputing what a batch
+    WROTE (the DW-355 carry proof) lands on exactly the published text — including a
+    batch where one spec dedupes against an already-open entry (`BATCH_SPECS`' second
+    spec, minted None)."""
+    path = write_ledger(tmp_path, BATCH_SEED)
+    specs = [EntrySpec(**spec) for spec in BATCH_SPECS]
+
+    minted, published, _ = deferredwork.append_entries_published(path, specs)
+
+    assert None in minted  # the batch really does carry a deduped spec
+    assert published is not None
+    assert deferredwork.appended_text(BATCH_SEED, specs) == published
+    assert deferredwork.appended_text(BATCH_SEED, []) == BATCH_SEED
+
+
 def test_append_entries_validates_all_specs_before_writing(tmp_path, monkeypatch):
     """A bad spec anywhere in the sequence writes nothing — and is caught before
     the lock is even taken.
