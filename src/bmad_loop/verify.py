@@ -48,6 +48,7 @@ from .frontmatter import (
 from .model import StoryTask, VerifyOutcome, result_mapping
 from .platform_util import (
     DIR_FD_ANCHORED_WRITES,
+    atomic_replace,
     atomic_write_bytes,
     atomic_write_bytes_confined,
     has_parent_ref,
@@ -10403,13 +10404,15 @@ def _bound_git_env() -> dict[str, str]:
     first-parent `rev-list` and the `path_clean` and
     `path_has_non_tree_ancestor_at_revision` probes, so a replaced ancestry
     cannot surface a transition outside HEAD's raw history (DW-399); and
-    `_synchronize_bound_index`'s target `reset`, so the index stages the raw
-    entry the raw comparison expects (DW-400).
+    `_bound_locked_index_reset`'s target `reset`, so the index stages the raw
+    entry the raw comparison expects (DW-400). That helper's compare and verify
+    `ls-files` reads of its side index share the same env plus
+    `GIT_INDEX_FILE` (DW-327).
 
     The other publication calls keep the inherited environment because they
     read no replaceable object content: the ref-name and ref-value probes
     (`symbolic-ref`, `rev-parse`, including `_bound_ref_oid` and
-    `_bound_head_oid`), the index-only reads (`ls-files`, `check-ignore`), blob
+    `_bound_head_oid`), the real-index reads (`ls-files`, `check-ignore`), blob
     hashing, and the `update-ref` transaction. At worst a forced type-changing
     replace makes a `^{commit}` peel refuse loudly."""
     return {**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"}
@@ -10613,9 +10616,15 @@ def _accepted_bound_transition(
     return None
 
 
-def _bound_index_entry(repo: Path, rel: str) -> _BoundGitEntry | None:
+def _bound_index_entry(
+    repo: Path, rel: str, env: dict[str, str] | None = None
+) -> _BoundGitEntry | None:
+    """The target's stage-zero index entry, or `None` when it is not staged.
+
+    `env` points the read at another index (the locked side index of
+    `_bound_locked_index_reset`); omitted, the real index is read."""
     try:
-        proc = git_bytes(repo, "ls-files", "-s", "-z", "--", *_literal_specs([rel]))
+        proc = git_bytes(repo, "ls-files", "-s", "-z", "--", *_literal_specs([rel]), env=env)
     except GitError as exc:
         raise GitError(f"publication target index could not be observed in {repo}") from exc
     if proc.returncode != 0:
@@ -10638,6 +10647,129 @@ def _bound_index_entry(repo: Path, rel: str) -> _BoundGitEntry | None:
     return _BoundGitEntry(mode, kind, oid)
 
 
+def _bound_real_index_path(repo: Path) -> Path:
+    """The real index file, as Git itself resolves it for `repo`.
+
+    `rev-parse --git-path index` honours an inherited `GIT_INDEX_FILE` and
+    names a linked worktree's own index, so the lock taken beside it is the one
+    every cooperating Git writer in this checkout contends for."""
+    try:
+        proc = git_bytes(repo, "rev-parse", "--git-path", "index")
+    except GitError as exc:
+        raise GitError(f"real index path could not be resolved in {repo}") from exc
+    out = proc.stdout
+    if out.endswith(b"\n"):
+        out = out[:-1]
+    if proc.returncode != 0 or not out or b"\n" in out:
+        raise GitError(f"real index path could not be resolved in {repo}")
+    return repo / os.fsdecode(out)
+
+
+def _bound_locked_index_reset(
+    repo: Path,
+    rel: str,
+    expected_entry: _BoundGitEntry | None,
+    oid: str,
+    target_entry: _BoundGitEntry | None,
+) -> None:
+    """Compare the target entry and reset it to `oid` as one step (DW-327).
+
+    A bare compare followed by `git reset <oid> -- <rel>` leaves a window in
+    which a cooperating Git writer can stage the target, and the reset then
+    silently overwrites that stage. This closes the window with Git's own
+    lockfile protocol, the one `git commit -- <paths>` uses:
+
+    1. Create `<index>.lock` with `O_CREAT|O_EXCL`, as every Git index writer
+       does. While it exists, cooperating writers refuse ("Unable to create
+       '…/index.lock': File exists"). A lock that already exists belongs to
+       someone else; refuse and leave it untouched.
+    2. Copy the real index bytes into a throwaway `GIT_INDEX_FILE` (a missing
+       index means no copy), and compare, `reset`, and verify against that
+       copy. `git reset` takes `index.lock` itself, so it must never run
+       against the real index while this lock is held.
+    3. Write the copy's bytes into the held lock, fsync and close it, stamp it
+       with the copy's post-`reset` timestamps, and rename the lock over the
+       index (`atomic_replace`, which retries Windows sharing violations). The
+       real index is only ever replaced whole.
+
+    Every failure path unlinks the lock this call created and leaves the real
+    index as it was. Writers that ignore `index.lock` are out of scope.
+    """
+    index = _bound_real_index_path(repo)
+    lock = index.with_name(index.name + ".lock")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(lock, flags, 0o666)
+    except FileExistsError as exc:
+        raise GitError(
+            f"real index {index} is locked by another git process (lock file {lock})"
+        ) from exc
+    except OSError as exc:
+        raise GitError(f"real index lock could not be taken for {index}: {exc}") from exc
+    committed = False
+    try:
+        with tempfile.TemporaryDirectory(prefix="bmad-loop-bound-index-") as td:
+            side_index = Path(td) / "index"
+            original_stat: os.stat_result | None
+            try:
+                original = index.read_bytes()
+                original_stat = index.stat()
+            except FileNotFoundError:
+                original = None
+                original_stat = None
+            except OSError as exc:
+                raise GitError(f"real index could not be read in {repo}") from exc
+            original_mode = None if original_stat is None else stat.S_IMODE(original_stat.st_mode)
+            if original is not None and original_stat is not None:
+                side_index.write_bytes(original)
+                # Keep the original index timestamps: Git's racy-clean check compares
+                # entry mtimes against the index file's mtime, and a fresh one would
+                # stop `reset` from smudging racily clean entries, hiding worktree edits.
+                os.utime(side_index, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            env = {**_bound_git_env(), "GIT_INDEX_FILE": str(side_index)}
+            if _bound_index_entry(repo, rel, env=env) != expected_entry:
+                raise GitError("real index target changed during exact-path publication")
+            rc, _out = _git_env(repo, "reset", oid, "--", *_literal_specs([rel]), env=env)
+            if rc != 0:
+                raise GitError(f"git target-local index synchronization failed in {repo}")
+            if _bound_index_entry(repo, rel, env=env) != target_entry:
+                raise GitError("real index target synchronization did not match committed content")
+            try:
+                published = side_index.read_bytes()
+                published_stat = side_index.stat()
+            except FileNotFoundError:
+                if original is not None:
+                    raise GitError(
+                        f"git target-local index synchronization failed in {repo}"
+                    ) from None
+                # No index before and none after: nothing to publish.
+                return
+        view = memoryview(published)
+        while view:
+            written = os.write(fd, view)
+            view = view[written:]
+        if original_mode is not None and os.name == "posix":
+            os.fchmod(fd, original_mode)
+        os.fsync(fd)
+        to_close, fd = fd, -1
+        os.close(to_close)
+        # Publish with the mtime `reset` gave the side index, not the later copy
+        # time: racy-clean detection reads the index mtime as Git's write time.
+        os.utime(lock, ns=(published_stat.st_atime_ns, published_stat.st_mtime_ns))
+        atomic_replace(lock, index)
+        committed = True
+    except OSError as exc:
+        raise GitError(f"real index could not be published in {repo}: {exc}") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if not committed:
+            try:
+                lock.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def _synchronize_bound_index(
     repo: Path,
     expected_checkout: _BoundCheckoutIdentity,
@@ -10651,6 +10783,11 @@ def _synchronize_bound_index(
     move is repaired toward the newest observation but still refuses the attempt,
     leaving commit-only replay to decide authority.  The explicit bound prevents
     a hostile ref mover from turning housekeeping into a livelock.
+
+    Each compare-then-reset pair runs under the real index's `index.lock`
+    (`_bound_locked_index_reset`), so it is atomic against cooperating Git
+    writers: one that tries to stage the target between the compare and the
+    reset is refused by the lock instead of being silently overwritten (DW-327).
     """
     expected_index_entry = observed_index_entry
     moved = False
@@ -10659,17 +10796,11 @@ def _synchronize_bound_index(
         moved = True
 
     for _attempt in range(_BOUND_INDEX_RECONCILE_LIMIT):
-        if _bound_index_entry(repo, rel) != expected_index_entry:
-            raise GitError("real index target changed during exact-path publication")
         target = newest
         target_entry = _bound_tree_entry(repo, target.oid, rel)
         if target_entry is not None and target_entry.kind == "tree":
             raise GitError("committed publication target became a directory")
-        rc, _out = _git_env(
-            repo, "reset", target.oid, "--", *_literal_specs([rel]), env=_bound_git_env()
-        )
-        if rc != 0:
-            raise GitError(f"git target-local index synchronization failed in {repo}")
+        _bound_locked_index_reset(repo, rel, expected_index_entry, target.oid, target_entry)
         expected_index_entry = target_entry
         if _bound_index_entry(repo, rel) != target_entry:
             raise GitError("real index target synchronization did not match committed content")
@@ -10682,16 +10813,10 @@ def _synchronize_bound_index(
 
     # One final target-local repair makes the index correspond to the latest
     # observation even when the movement never settled inside the retry bound.
-    if _bound_index_entry(repo, rel) != expected_index_entry:
-        raise GitError("real index target changed during exact-path publication")
     newest_entry = _bound_tree_entry(repo, newest.oid, rel)
     if newest_entry is not None and newest_entry.kind == "tree":
         raise GitError("committed publication target became a directory")
-    rc, _out = _git_env(
-        repo, "reset", newest.oid, "--", *_literal_specs([rel]), env=_bound_git_env()
-    )
-    if rc != 0:
-        raise GitError(f"git target-local index synchronization failed in {repo}")
+    _bound_locked_index_reset(repo, rel, expected_index_entry, newest.oid, newest_entry)
     if _bound_index_entry(repo, rel) != newest_entry:
         raise GitError("real index target synchronization did not match committed content")
     raise GitError("checkout did not stabilize during target index reconciliation")

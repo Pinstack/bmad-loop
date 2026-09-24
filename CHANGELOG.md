@@ -48,6 +48,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Hold the real index's `index.lock` across the bound publication's target compare and
+  `reset`, running both against a side index and renaming it into place: a cooperating Git
+  writer staging the target in between is refused instead of silently overwritten (DW-327).
 - Bind attempt-owned spec normalization to one inode, re-checked from the read until just
   before the replace, in-project and external alike, and carry restoration's published
   identity into it: a spec edited or swapped after restoration is detected and pauses

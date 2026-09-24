@@ -5,6 +5,7 @@ import inspect
 import io
 import json
 import os
+import stat
 import subprocess
 import sys
 import time
@@ -10308,6 +10309,415 @@ def test_bound_index_reconciliation_can_align_a_moved_symlink_entry(project, mon
     entry = verify._bound_index_entry(repo, rel)
     assert entry is not None and entry.mode == "120000"
     assert entry == verify._bound_tree_entry(repo, symlink_commit, rel)
+
+
+# --- DW-327: the bound index compare-then-reset holds index.lock across the pair
+
+
+def _real_index(repo):
+    return repo / git(repo, "rev-parse", "--git-path", "index")
+
+
+def _stage_drift(repo, tmp_path, rel):
+    """Stage worktree drift on `rel` (so the sync has a reset to do), stage an
+    unrelated operator path, and write a rival blob; returns the rival oid."""
+    (repo / rel).write_text("staged drift\n", encoding="utf-8")
+    git(repo, "add", "--", rel)
+    unrelated = repo / "operator.txt"
+    unrelated.write_text("staged operator work\n", encoding="utf-8")
+    git(repo, "add", "--", unrelated.name)
+    rival_file = tmp_path / "rival.txt"
+    rival_file.write_text("rival staged content\n", encoding="utf-8")
+    return git(repo, "hash-object", "-w", str(rival_file))
+
+
+def test_bound_index_sync_refuses_a_rival_stage_between_compare_and_reset(
+    project, tmp_path, monkeypatch
+):
+    """DW-327 headline. A cooperating writer stages the target just before the
+    reset runs. Under the held `index.lock` its write is refused and never
+    lands. Ablation: restore the bare compare-then-reset (or drop the lock) and
+    the rival's `update-index` succeeds, then the reset silently overwrites it."""
+    repo = project.project
+    rel = "src.txt"
+    rival = _stage_drift(repo, tmp_path, rel)
+    observed_index = verify._bound_index_entry(repo, rel)
+    expected = verify._bound_checkout_identity(repo, require_branch=False)
+    real_git_env = verify._git_env
+    rivals = []
+
+    def rival_before_reset(git_repo, *args, env):
+        if "reset" in args:
+            rivals.append(
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(repo),
+                        "update-index",
+                        "--add",
+                        "--cacheinfo",
+                        f"100644,{rival},{rel}",
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+            )
+        return real_git_env(git_repo, *args, env=env)
+
+    monkeypatch.setattr(verify, "_git_env", rival_before_reset)
+    verify._synchronize_bound_index(repo, expected, rel, observed_index)
+
+    assert len(rivals) == 1
+    assert rivals[0].returncode != 0
+    assert "index.lock" in rivals[0].stdout + rivals[0].stderr
+    entry = verify._bound_index_entry(repo, rel)
+    assert entry == verify._bound_tree_entry(repo, expected.oid, rel)
+    assert entry is not None and entry.oid != rival
+    assert git(repo, "diff", "--cached", "--name-only") == "operator.txt"
+    assert not _real_index(repo).with_name("index.lock").exists()
+
+
+def test_bound_index_sync_refuses_a_rival_staged_before_the_lock(project, tmp_path):
+    """DW-327. The rival staged before the lock was taken: the locked compare
+    sees it, refuses, and the rival entry stays staged."""
+    repo = project.project
+    rel = "src.txt"
+    rival = _stage_drift(repo, tmp_path, rel)
+    observed_index = verify._bound_index_entry(repo, rel)
+    expected = verify._bound_checkout_identity(repo, require_branch=False)
+    git(repo, "update-index", "--add", "--cacheinfo", f"100644,{rival},{rel}")
+
+    with pytest.raises(verify.GitError, match="real index target changed"):
+        verify._synchronize_bound_index(repo, expected, rel, observed_index)
+
+    entry = verify._bound_index_entry(repo, rel)
+    assert entry is not None and entry.oid == rival
+    assert not _real_index(repo).with_name("index.lock").exists()
+
+
+def test_bound_index_sync_refuses_a_foreign_index_lock_and_leaves_it(project, tmp_path):
+    """DW-327. A pre-existing `index.lock` belongs to another writer: refuse,
+    keep its bytes, and leave the index untouched. Ablation: drop `O_EXCL` and
+    the call writes into the foreign lock and renames it over the index."""
+    repo = project.project
+    rel = "src.txt"
+    _stage_drift(repo, tmp_path, rel)
+    observed_index = verify._bound_index_entry(repo, rel)
+    expected = verify._bound_checkout_identity(repo, require_branch=False)
+    index = _real_index(repo)
+    lock = index.with_name("index.lock")
+    lock.write_bytes(b"foreign writer in progress")
+    before = index.read_bytes()
+
+    with pytest.raises(verify.GitError, match="locked by another git process"):
+        verify._synchronize_bound_index(repo, expected, rel, observed_index)
+
+    assert lock.read_bytes() == b"foreign writer in progress"
+    assert index.read_bytes() == before
+
+
+def test_bound_index_sync_failed_reset_leaves_index_and_removes_lock(
+    project, tmp_path, monkeypatch
+):
+    """DW-327. A reset failing under the lock refuses with the existing message,
+    removes only its own lock, and never touches the real index."""
+    repo = project.project
+    rel = "src.txt"
+    _stage_drift(repo, tmp_path, rel)
+    observed_index = verify._bound_index_entry(repo, rel)
+    expected = verify._bound_checkout_identity(repo, require_branch=False)
+    index = _real_index(repo)
+    before = index.read_bytes()
+    real_git_env = verify._git_env
+    locked_during_reset = []
+
+    def failing_reset(git_repo, *args, env):
+        if "reset" in args:
+            locked_during_reset.append(index.with_name("index.lock").exists())
+            return 1, "injected reset failure"
+        return real_git_env(git_repo, *args, env=env)
+
+    monkeypatch.setattr(verify, "_git_env", failing_reset)
+    with pytest.raises(verify.GitError, match="target-local index synchronization failed"):
+        verify._synchronize_bound_index(repo, expected, rel, observed_index)
+
+    assert locked_during_reset == [True]
+    assert index.read_bytes() == before
+    assert not index.with_name("index.lock").exists()
+
+
+def test_bound_index_sync_mismatched_side_index_leaves_index_and_removes_lock(
+    project, tmp_path, monkeypatch
+):
+    """DW-327. The side index's verify failing under the lock refuses with the
+    existing message and publishes nothing."""
+    repo = project.project
+    rel = "src.txt"
+    _stage_drift(repo, tmp_path, rel)
+    observed_index = verify._bound_index_entry(repo, rel)
+    expected = verify._bound_checkout_identity(repo, require_branch=False)
+    index = _real_index(repo)
+    before = index.read_bytes()
+    real_tree_entry = verify._bound_tree_entry
+
+    def wrong_target(*args, **kwargs):
+        entry = real_tree_entry(*args, **kwargs)
+        assert entry is not None
+        return dataclasses.replace(entry, oid="0" * len(entry.oid))
+
+    monkeypatch.setattr(verify, "_bound_tree_entry", wrong_target)
+    with pytest.raises(verify.GitError, match="synchronization did not match committed content"):
+        verify._synchronize_bound_index(repo, expected, rel, observed_index)
+
+    assert index.read_bytes() == before
+    assert not index.with_name("index.lock").exists()
+
+
+def test_bound_index_sync_publishes_when_no_index_exists(project):
+    """DW-327. With no index file the side index starts absent, the reset
+    creates it, and the result is published as the real index."""
+    repo = project.project
+    rel = "src.txt"
+    expected = verify._bound_checkout_identity(repo, require_branch=False)
+    index = _real_index(repo)
+    index.unlink()
+
+    verify._synchronize_bound_index(repo, expected, rel, None)
+
+    assert index.exists()
+    assert verify._bound_index_entry(repo, rel) == verify._bound_tree_entry(repo, expected.oid, rel)
+    assert not index.with_name("index.lock").exists()
+
+
+def test_bound_index_sync_keeps_a_racily_clean_edit_visible(project):
+    """DW-327. An unrelated same-size edit whose mtime equals the index's is only
+    caught by Git's racy-clean check against the index file's mtime. Ablation:
+    drop the `os.utime` onto the side index and the fresh mtime stops `reset`
+    smudging the entry, so the published index hides the edit."""
+    repo = project.project
+    rel = "src.txt"
+    git(repo, "config", "core.trustctime", "false")
+    other = repo / "other.txt"
+    other.write_text("aaaa\n", encoding="utf-8")
+    git(repo, "add", "--", other.name)
+    git(repo, "commit", "-q", "-m", "add other")
+    (repo / rel).write_text("staged drift\n", encoding="utf-8")
+    git(repo, "add", "--", rel)
+    index = _real_index(repo)
+    index_stat = index.stat()
+    other.write_text("bbbb\n", encoding="utf-8")
+    os.utime(other, ns=(index_stat.st_mtime_ns, index_stat.st_mtime_ns))
+    time.sleep(1.2)
+    observed_index = verify._bound_index_entry(repo, rel)
+    expected = verify._bound_checkout_identity(repo, require_branch=False)
+
+    verify._synchronize_bound_index(repo, expected, rel, observed_index)
+
+    assert verify._bound_index_entry(repo, rel) == verify._bound_tree_entry(repo, expected.oid, rel)
+    assert other.name in git(repo, "diff", "--name-only").splitlines()
+    assert not index.with_name("index.lock").exists()
+
+
+def test_bound_index_sync_publishes_the_side_index_write_time(project, tmp_path, monkeypatch):
+    """DW-327. The published index carries the mtime `reset` gave the side index,
+    not the later copy-back time, so Git's racy-clean check still compares entry
+    mtimes against Git's own write time. Ablation: drop the `os.utime` onto the
+    lock and the published mtime is the copy time instead."""
+    repo = project.project
+    rel = "src.txt"
+    _stage_drift(repo, tmp_path, rel)
+    observed_index = verify._bound_index_entry(repo, rel)
+    expected = verify._bound_checkout_identity(repo, require_branch=False)
+    real_git_env = verify._git_env
+    written = []
+
+    def record_side_index_mtime(git_repo, *args, env):
+        result = real_git_env(git_repo, *args, env=env)
+        if "reset" in args:
+            written.append(os.stat(env["GIT_INDEX_FILE"]).st_mtime_ns)
+        return result
+
+    monkeypatch.setattr(verify, "_git_env", record_side_index_mtime)
+    verify._synchronize_bound_index(repo, expected, rel, observed_index)
+
+    assert len(written) == 1
+    assert _real_index(repo).stat().st_mtime_ns == written[0]
+
+
+def _keep_moving_checkout(repo, monkeypatch, rel):
+    """Commit `rel` four times and make every checkout observation move, so the
+    sync exhausts its retry loop and reaches the final repair (the 4th reset)."""
+    path = repo / rel
+    commits = []
+    for number in range(4):
+        path.write_text(f"moving target {number}\n", encoding="utf-8")
+        git(repo, "add", "--", rel)
+        git(repo, "commit", "-q", "-m", f"moving target {number}")
+        commits.append(verify.rev_parse_head(repo))
+    branch = git(repo, "symbolic-ref", "HEAD")
+    observations = [verify._BoundCheckoutIdentity(branch, branch, commit) for commit in commits]
+
+    def keep_moving(_repo, *, require_branch=True):
+        assert require_branch is False
+        return observations.pop(0)
+
+    monkeypatch.setattr(verify, "_bound_checkout_identity", keep_moving)
+    return commits, verify._BoundCheckoutIdentity(branch, branch, commits[0])
+
+
+def test_bound_index_sync_final_repair_refuses_a_rival_stage_under_the_lock(
+    project, tmp_path, monkeypatch
+):
+    """DW-327, final-repair site. A cooperating writer stages the target just
+    before the post-loop repair's reset: the held lock refuses it. Ablation:
+    restore a bare `reset` at the final repair and the rival lands."""
+    repo = project.project
+    rel = "src.txt"
+    rival_file = tmp_path / "rival.txt"
+    rival_file.write_text("rival staged content\n", encoding="utf-8")
+    rival = git(repo, "hash-object", "-w", str(rival_file))
+    commits, expected = _keep_moving_checkout(repo, monkeypatch, rel)
+    observed_index = verify._bound_index_entry(repo, rel)
+    real_git_env = verify._git_env
+    resets = []
+    rivals = []
+
+    def rival_before_final_reset(git_repo, *args, env):
+        if "reset" in args:
+            resets.append(args)
+            if len(resets) == 4:
+                rivals.append(
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repo),
+                            "update-index",
+                            "--add",
+                            "--cacheinfo",
+                            f"100644,{rival},{rel}",
+                        ],
+                        capture_output=True,
+                        text=True,
+                    )
+                )
+        return real_git_env(git_repo, *args, env=env)
+
+    monkeypatch.setattr(verify, "_git_env", rival_before_final_reset)
+    with pytest.raises(verify.GitError, match="checkout did not stabilize"):
+        verify._synchronize_bound_index(repo, expected, rel, observed_index)
+
+    assert len(resets) == 4
+    assert len(rivals) == 1
+    assert rivals[0].returncode != 0
+    assert "index.lock" in rivals[0].stdout + rivals[0].stderr
+    entry = verify._bound_index_entry(repo, rel)
+    assert entry == verify._bound_tree_entry(repo, commits[-1], rel)
+    assert entry is not None and entry.oid != rival
+    assert not _real_index(repo).with_name("index.lock").exists()
+
+
+def test_bound_index_sync_final_repair_refuses_a_rival_staged_before_its_lock(
+    project, tmp_path, monkeypatch
+):
+    """DW-327, final-repair site. A rival staged before the post-loop repair
+    takes its lock is caught by the locked compare, and stays staged. Ablation:
+    drop the final repair's compare and its reset overwrites the rival."""
+    repo = project.project
+    rel = "src.txt"
+    rival_file = tmp_path / "rival.txt"
+    rival_file.write_text("rival staged content\n", encoding="utf-8")
+    rival = git(repo, "hash-object", "-w", str(rival_file))
+    _commits, expected = _keep_moving_checkout(repo, monkeypatch, rel)
+    observed_index = verify._bound_index_entry(repo, rel)
+    real_tree_entry = verify._bound_tree_entry
+    lookups = []
+
+    def rival_before_final_lookup(*args, **kwargs):
+        lookups.append(args)
+        if len(lookups) == 4:
+            git(repo, "update-index", "--add", "--cacheinfo", f"100644,{rival},{rel}")
+        return real_tree_entry(*args, **kwargs)
+
+    monkeypatch.setattr(verify, "_bound_tree_entry", rival_before_final_lookup)
+    with pytest.raises(verify.GitError, match="real index target changed"):
+        verify._synchronize_bound_index(repo, expected, rel, observed_index)
+
+    assert len(lookups) == 4
+    entry = verify._bound_index_entry(repo, rel)
+    assert entry is not None and entry.oid == rival
+    assert not _real_index(repo).with_name("index.lock").exists()
+
+
+def test_bound_index_sync_failed_publish_rename_leaves_index_and_removes_lock(
+    project, tmp_path, monkeypatch
+):
+    """DW-327. A failure after the lock is written (the rename) refuses and
+    removes the lock without touching the real index."""
+    repo = project.project
+    rel = "src.txt"
+    _stage_drift(repo, tmp_path, rel)
+    observed_index = verify._bound_index_entry(repo, rel)
+    expected = verify._bound_checkout_identity(repo, require_branch=False)
+    index = _real_index(repo)
+    before = index.read_bytes()
+
+    def failing_replace(_tmp, _target):
+        raise OSError(errno.EIO, "injected rename failure")
+
+    monkeypatch.setattr(verify, "atomic_replace", failing_replace)
+    with pytest.raises(verify.GitError, match="real index could not be published"):
+        verify._synchronize_bound_index(repo, expected, rel, observed_index)
+
+    assert index.read_bytes() == before
+    assert not index.with_name("index.lock").exists()
+
+
+def test_bound_index_sync_locks_and_publishes_a_linked_worktree_index(project, tmp_path):
+    """DW-327. In a linked worktree the lock and publish land on that worktree's
+    own index; the main checkout's index is untouched."""
+    repo = project.project
+    rel = "src.txt"
+    worktree = tmp_path / "linked"
+    git(repo, "worktree", "add", "-q", "-b", "dw327-linked", str(worktree))
+    try:
+        main_index = _real_index(repo)
+        main_before = main_index.read_bytes()
+        _stage_drift(worktree, tmp_path, rel)
+        observed_index = verify._bound_index_entry(worktree, rel)
+        expected = verify._bound_checkout_identity(worktree, require_branch=False)
+        worktree_index = _real_index(worktree)
+        assert worktree_index.parent == repo / ".git" / "worktrees" / worktree.name
+
+        verify._synchronize_bound_index(worktree, expected, rel, observed_index)
+
+        assert verify._bound_index_entry(worktree, rel) == verify._bound_tree_entry(
+            worktree, expected.oid, rel
+        )
+        assert main_index.read_bytes() == main_before
+        assert not worktree_index.with_name("index.lock").exists()
+    finally:
+        git(repo, "worktree", "remove", "--force", str(worktree))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows chmod only toggles the read-only flag")
+def test_bound_index_sync_preserves_the_index_permission_bits(project, tmp_path):
+    """DW-327. The published index keeps the real index's permission bits
+    rather than taking the lock file's umask-derived mode."""
+    repo = project.project
+    rel = "src.txt"
+    _stage_drift(repo, tmp_path, rel)
+    observed_index = verify._bound_index_entry(repo, rel)
+    expected = verify._bound_checkout_identity(repo, require_branch=False)
+    index = _real_index(repo)
+    index.chmod(0o600)
+
+    verify._synchronize_bound_index(repo, expected, rel, observed_index)
+
+    assert stat.S_IMODE(index.stat().st_mode) == 0o600
+    assert verify._bound_index_entry(repo, rel) == verify._bound_tree_entry(repo, expected.oid, rel)
+    assert not index.with_name("index.lock").exists()
 
 
 # --- DW-328/329/330: every success return is closed by a final observation
