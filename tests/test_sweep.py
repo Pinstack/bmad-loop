@@ -33229,7 +33229,6 @@ def test_migration_rival_during_bound_publication_replays_commit_only(project, m
     original_head = verify.rev_parse_head(project.project)
     accepted = migrated_ledger()
     rival = accepted + "\n<!-- publication rival -->\n"
-    real_git = verify._git
     real_git_env = verify._git_env
     landed = []
 
@@ -33239,19 +33238,16 @@ def test_migration_rival_during_bound_publication_replays_commit_only(project, m
             project.deferred_work.write_text(rival, encoding="utf-8")
 
     def inject_rival(git_repo, *args, **kwargs):
-        if window == "after-staging" and args[:1] == ("commit",) and git_repo != project.project:
-            land_rival()
-        return real_git(git_repo, *args, **kwargs)
-
-    def inject_rival_at_checkout(git_repo, *args, **kwargs):
-        # The hook-disabled candidate checkout runs `git -c core.hooksPath=…
-        # worktree add` through `_git_env` (DW-326/331).
+        # The hook-disabled candidate checkout (`git -c core.hooksPath=…
+        # worktree add`) and the candidate commit both run raw through
+        # `_git_env` (DW-326/331).
         if window == "before-staging" and "worktree" in args and "add" in args:
+            land_rival()
+        if window == "after-staging" and args[:1] == ("commit",) and git_repo != project.project:
             land_rival()
         return real_git_env(git_repo, *args, **kwargs)
 
-    monkeypatch.setattr(verify, "_git", inject_rival)
-    monkeypatch.setattr(verify, "_git_env", inject_rival_at_checkout)
+    monkeypatch.setattr(verify, "_git_env", inject_rival)
     first = engine.run()
 
     assert first.crashed and landed == [True] and len(first_adapter.sessions) == 1
@@ -33259,7 +33255,6 @@ def test_migration_rival_during_bound_publication_replays_commit_only(project, m
     assert verify.rev_parse_head(project.project) == original_head
     assert project.deferred_work.read_text(encoding="utf-8") == rival
 
-    monkeypatch.setattr(verify, "_git", real_git)
     monkeypatch.setattr(verify, "_git_env", real_git_env)
     project.deferred_work.write_text(accepted, encoding="utf-8")
     plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "later"}])

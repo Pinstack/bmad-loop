@@ -8711,7 +8711,8 @@ def test_commit_path_bound_propagates_probe_failure_on_a_newer_candidate(project
 def test_commit_path_bound_keeps_published_commit_when_index_sync_faults(project, monkeypatch):
     repo, path, baseline, accepted = _bound_publish_inputs(project)
     original_head = verify.rev_parse_head(repo)
-    real_git = verify._git
+    # The target-local `reset` runs raw through `_git_env` (DW-400).
+    real_git = verify._git_env
     faulted = []
 
     def fail_target_sync(git_repo, *args, **kwargs):
@@ -8720,7 +8721,7 @@ def test_commit_path_bound_keeps_published_commit_when_index_sync_faults(project
             return 1, "injected sync fault"
         return real_git(git_repo, *args, **kwargs)
 
-    monkeypatch.setattr(verify, "_git", fail_target_sync)
+    monkeypatch.setattr(verify, "_git_env", fail_target_sync)
     with pytest.raises(verify.GitError, match="index synchronization"):
         verify.commit_path_bound(
             repo,
@@ -8732,7 +8733,7 @@ def test_commit_path_bound_keeps_published_commit_when_index_sync_faults(project
 
     published = verify.rev_parse_head(repo)
     assert published != original_head
-    monkeypatch.setattr(verify, "_git", real_git)
+    monkeypatch.setattr(verify, "_git_env", real_git)
     assert (
         verify.commit_path_bound(
             repo,
@@ -8789,7 +8790,8 @@ def test_commit_path_bound_rejects_lossy_filter_live_text_drift(project, monkeyp
     accepted = "accepted\n"
     path.write_text(accepted, encoding="utf-8")
     original_head = verify.rev_parse_head(repo)
-    real_git = verify._git
+    # The candidate commit runs raw through `_git_env` (DW-331).
+    real_git = verify._git_env
 
     def rival_after_staging(git_repo, *args, **kwargs):
         if args[:1] == ("commit",) and git_repo != repo:
@@ -8799,7 +8801,7 @@ def test_commit_path_bound_rejects_lossy_filter_live_text_drift(project, monkeyp
     assert verify.git_normalized_blob_oid_for_bytes(
         repo, "src.txt", accepted.encode()
     ) == verify.git_normalized_blob_oid_for_bytes(repo, "src.txt", b"rival\n")
-    monkeypatch.setattr(verify, "_git", rival_after_staging)
+    monkeypatch.setattr(verify, "_git_env", rival_after_staging)
 
     with pytest.raises(verify.GitError, match="target changed"):
         verify.commit_path_bound(
@@ -8819,7 +8821,8 @@ def test_commit_path_bound_rejects_post_staging_symlink_substitution(project, mo
     original_head = verify.rev_parse_head(repo)
     replacement = repo / "replacement.txt"
     replacement.write_text(accepted, encoding="utf-8")
-    real_git = verify._git
+    # The candidate commit runs raw through `_git_env` (DW-331).
+    real_git = verify._git_env
 
     def substitute_after_staging(git_repo, *args, **kwargs):
         if args[:1] == ("commit",) and git_repo != repo:
@@ -8827,7 +8830,7 @@ def test_commit_path_bound_rejects_post_staging_symlink_substitution(project, mo
             path.symlink_to(replacement.name)
         return real_git(git_repo, *args, **kwargs)
 
-    monkeypatch.setattr(verify, "_git", substitute_after_staging)
+    monkeypatch.setattr(verify, "_git_env", substitute_after_staging)
     with pytest.raises(verify.GitError, match="target changed"):
         verify.commit_path_bound(
             repo,
@@ -8935,14 +8938,15 @@ def test_commit_path_bound_refuses_the_same_text_under_other_line_endings(projec
     repo, path, baseline, accepted = _bound_publish_inputs(project)
     original_head = verify.rev_parse_head(repo)
     rival = accepted.replace("\n", "\r\n").encode("utf-8")
-    real_git = verify._git
+    # The candidate commit runs raw through `_git_env` (DW-331).
+    real_git = verify._git_env
 
     def rerender_after_staging(git_repo, *args, **kwargs):
         if args[:1] == ("commit",) and git_repo != repo:
             path.write_bytes(rival)
         return real_git(git_repo, *args, **kwargs)
 
-    monkeypatch.setattr(verify, "_git", rerender_after_staging)
+    monkeypatch.setattr(verify, "_git_env", rerender_after_staging)
     with pytest.raises(verify.GitError, match="target changed during validation"):
         verify.commit_path_bound(
             repo,
@@ -9397,7 +9401,8 @@ def test_commit_path_bound_repairs_index_to_moved_checkout_then_refuses(project,
     unrelated = repo / "operator.txt"
     unrelated.write_text("staged operator work\n", encoding="utf-8")
     git(repo, "add", "--", unrelated.name)
-    real_git = verify._git
+    # The target-local `reset` runs raw through `_git_env` (DW-400).
+    real_git = verify._git_env
     moved = []
 
     def move_head_during_first_reset(git_repo, *args, **kwargs):
@@ -9408,7 +9413,7 @@ def test_commit_path_bound_repairs_index_to_moved_checkout_then_refuses(project,
             moved.append(True)
         return result
 
-    monkeypatch.setattr(verify, "_git", move_head_during_first_reset)
+    monkeypatch.setattr(verify, "_git_env", move_head_during_first_reset)
     with pytest.raises(verify.GitError, match="checkout changed during.*reconciliation"):
         verify.commit_path_bound(
             repo,
@@ -9764,6 +9769,250 @@ def test_bound_candidate_validation_reads_raw_objects_past_a_replace_ref(
         verify._validate_bound_candidate(
             repo, raw, expected_parent, rel, accepted_oid, baseline_oid
         )
+
+
+# DW-398/399/400: every remaining publication read is raw past a replace ref.
+
+
+def _replace_rel_on_head_parent(repo, tmp_path, head, rel, data):
+    """A replacement for `head`: its raw parents, with `rel` rewritten to `data`."""
+    parents = _raw_git(repo, "rev-list", "--parents", "--max-count=1", head).split()[1:]
+    tree = _raw_tree_with(repo, head, tmp_path, {rel: data})
+    return _commit_tree(repo, tree, *parents, message="replacement")
+
+
+def test_commit_path_bound_reads_the_raw_baseline_blob_past_a_replace_ref(project):
+    """DW-398. The baseline commit really holds rival text; a replace ref maps
+    that blob to one reading as `baseline_text`. Ablation: drop the env on the
+    baseline `cat-file` and the substitute vouches for the rival blob, so the
+    publication overwrites it."""
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    path.write_text("rival committed ledger\n", encoding="utf-8")
+    git(repo, "add", "--", path.name)
+    git(repo, "commit", "-q", "-m", "rival ledger")
+    rival_head = verify.rev_parse_head(repo)
+    rival_blob = _raw_git(repo, "rev-parse", f"{rival_head}:src.txt")
+    baseline_blob = _raw_git(
+        repo, "hash-object", "-w", "--stdin", input_bytes=baseline.encode("utf-8")
+    )
+    git(repo, "replace", rival_blob, baseline_blob)
+    path.write_text(accepted, encoding="utf-8")
+
+    with pytest.raises(
+        verify.GitError, match="accepted baseline does not match the committed baseline"
+    ):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+            baseline_commit=rival_head,
+        )
+
+    assert verify.rev_parse_head(repo) == rival_head
+
+
+def test_accepted_bound_transition_walks_raw_first_parent_ancestry(project, tmp_path):
+    """DW-399. Raw HEAD H is a wide commit on P; the exact transition T on P is
+    reachable only through `replace H -> R(parent T)`. Ablation: drop the env on
+    the `rev-list` and the replaced walk surfaces T, which validates in isolation."""
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    parent = verify.rev_parse_head(repo)
+    (repo / "extra.txt").write_text("wide commit\n", encoding="utf-8")
+    git(repo, "add", "--", path.name, "extra.txt")
+    git(repo, "commit", "-q", "-m", "wide accepted ledger")
+    head = verify.rev_parse_head(repo)
+    exact_tree = _raw_tree_with(repo, parent, tmp_path, {"src.txt": accepted.encode("utf-8")})
+    transition = _commit_tree(repo, exact_tree, parent, message="exact transition")
+    replacement = _commit_tree(repo, f"{head}^{{tree}}", transition, message="replacement")
+    git(repo, "replace", head, replacement)
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+        baseline_commit=parent,
+    )
+
+    assert published is None
+    assert verify.rev_parse_head(repo) == head
+
+
+def test_commit_path_bound_replay_stages_the_raw_entry_past_a_replaced_head(project, tmp_path):
+    """DW-400. HEAD is the published transition A, replaced by a same-parent
+    commit holding rival text. Ablation: drop the env on the in-loop index
+    `reset` and it stages the replacement's entry, which the raw comparison
+    refuses on every replay."""
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+    assert published is not None
+    replacement = _replace_rel_on_head_parent(
+        repo, tmp_path, published, "src.txt", b"rival replacement ledger\n"
+    )
+    git(repo, "replace", published, replacement)
+
+    replayed = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert replayed == published
+    raw_blob = _raw_git(repo, "rev-parse", f"{published}:src.txt")
+    assert verify.staged_blob_oid(repo, path.name) == raw_blob
+    assert verify._bound_index_entry(repo, "src.txt") == verify._bound_tree_entry(
+        repo, published, "src.txt"
+    )
+
+
+def test_bound_index_final_repair_stages_the_raw_newest_entry(project, tmp_path, monkeypatch):
+    """DW-400, final repair. With four observations only the post-loop repair
+    targets `commits[-1]`, which a replace ref maps to rival text. Ablation: drop
+    the env on the final `reset` and it stages the rival entry, surfacing
+    `synchronization did not match` instead of the non-stabilizing refusal."""
+    repo = project.project
+    path = repo / "src.txt"
+    rel = path.name
+    commits = []
+    for number in range(4):
+        path.write_text(f"moving target {number}\n", encoding="utf-8")
+        git(repo, "add", "--", rel)
+        git(repo, "commit", "-q", "-m", f"moving target {number}")
+        commits.append(verify.rev_parse_head(repo))
+    replacement = _replace_rel_on_head_parent(
+        repo, tmp_path, commits[-1], rel, b"rival replacement target\n"
+    )
+    git(repo, "replace", commits[-1], replacement)
+    observed_index = verify._bound_index_entry(repo, rel)
+    branch = git(repo, "symbolic-ref", "HEAD")
+    observations = [verify._BoundCheckoutIdentity(branch, branch, commit) for commit in commits]
+
+    def keep_moving(_repo, *, require_branch=True):
+        assert require_branch is False
+        return observations.pop(0)
+
+    monkeypatch.setattr(verify, "_bound_checkout_identity", keep_moving)
+    expected = verify._BoundCheckoutIdentity(branch, branch, commits[0])
+    with pytest.raises(verify.GitError, match="checkout did not stabilize"):
+        verify._synchronize_bound_index(repo, expected, rel, observed_index)
+
+    assert observations == []
+    raw_blob = _raw_git(repo, "rev-parse", f"{commits[-1]}:{rel}")
+    assert verify.staged_blob_oid(repo, rel) == raw_blob
+    assert verify._bound_index_entry(repo, rel) == verify._bound_tree_entry(repo, commits[-1], rel)
+
+
+def test_commit_path_bound_clean_probe_reads_raw_head_past_a_replace_ref(
+    project, tmp_path, monkeypatch
+):
+    """DW-399. Raw HEAD already holds the accepted ledger (no exact transition), and a
+    replace ref maps HEAD to rival text at the target. Ablation: drop the env on
+    `path_clean` and the replaced status answers dirty, reaching the candidate."""
+    repo, path, baseline, accepted = _bound_clean_inputs(project)
+    head = verify.rev_parse_head(repo)
+    replacement = _replace_rel_on_head_parent(
+        repo, tmp_path, head, "src.txt", b"rival replacement ledger\n"
+    )
+    git(repo, "replace", head, replacement)
+    _no_candidate_worktree(monkeypatch)
+
+    assert (
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+        is None
+    )
+    assert verify.rev_parse_head(repo) == head
+
+
+def test_commit_path_bound_non_tree_ancestor_probe_reads_raw_head(project, tmp_path):
+    """DW-399. A replace ref maps HEAD to a commit where the nested ledger's parent
+    directory is a blob. Ablation: drop the env forwarded to
+    `path_has_non_tree_ancestor_at_revision` and the publication refuses with
+    `non-directory committed parent`."""
+    repo = project.project
+    ledger_dir = repo / "ledger-dir"
+    ledger_dir.mkdir()
+    path = ledger_dir / "ledger.md"
+    baseline = "legacy migration ledger\n"
+    path.write_text(baseline, encoding="utf-8")
+    git(repo, "add", "--", "ledger-dir/ledger.md")
+    git(repo, "commit", "-q", "-m", "track nested ledger")
+    original = verify.rev_parse_head(repo)
+    accepted = "accepted migration ledger\n"
+    path.write_text(accepted, encoding="utf-8")
+
+    env = {**os.environ, "GIT_INDEX_FILE": str(tmp_path / "scratch-index")}
+    _raw_git(repo, "read-tree", original, env=env)
+    _raw_git(repo, "update-index", "--force-remove", "--", "ledger-dir/ledger.md", env=env)
+    blob = _raw_git(repo, "hash-object", "-w", "--stdin", input_bytes=b"not a directory\n")
+    _raw_git(repo, "update-index", "--add", "--cacheinfo", f"100644,{blob},ledger-dir", env=env)
+    flattened = _raw_git(repo, "write-tree", env=env)
+    parents = _raw_git(repo, "rev-list", "--parents", "--max-count=1", original).split()[1:]
+    replacement = _commit_tree(repo, flattened, *parents, message="replacement")
+    git(repo, "replace", original, replacement)
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+        baseline_commit=original,
+    )
+
+    assert published is not None
+    assert published == verify.rev_parse_head(repo)
+    assert _raw_git(repo, "rev-list", "--parents", "--max-count=1", published).split() == [
+        published,
+        original,
+    ]
+    assert _raw_git(repo, "show", f"{published}:ledger-dir/ledger.md") == accepted.rstrip("\n")
+
+
+def test_commit_path_bound_candidate_commit_builds_on_raw_head_past_a_replace_ref(
+    project, tmp_path
+):
+    """DW-331, the candidate commit. A replace ref maps the captured HEAD to a
+    same-parent commit whose tree already holds the accepted text. Ablation: drop
+    the env on the candidate `git commit` and it compares the index to the
+    replacement's tree, answers "nothing to commit", and every publication fails
+    with `candidate commit failed`."""
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    head = verify.rev_parse_head(repo)
+    replacement = _replace_rel_on_head_parent(
+        repo, tmp_path, head, "src.txt", accepted.encode("utf-8")
+    )
+    git(repo, "replace", head, replacement)
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert published is not None
+    assert published == verify.rev_parse_head(repo)
+    raw_lineage = _raw_git(repo, "rev-list", "--parents", "--max-count=1", published).split()
+    assert raw_lineage == [published, head]
+    assert _raw_git(repo, "show", f"{published}:src.txt") == accepted.rstrip("\n")
 
 
 def _fail_candidate_cleanup(monkeypatch, fault):
@@ -10305,8 +10554,8 @@ def test_commit_path_bound_refuses_checkout_move_after_the_clean_probe(project, 
     original = verify.rev_parse_head(repo)
     real_clean = verify.path_clean
 
-    def move_after_probe(git_repo, rel):
-        result = real_clean(git_repo, rel)
+    def move_after_probe(git_repo, rel, **kwargs):
+        result = real_clean(git_repo, rel, **kwargs)
         if move == "advance":
             git(repo, "commit", "-q", "--allow-empty", "-m", "rival advance")
         else:
@@ -10344,8 +10593,8 @@ def test_commit_path_bound_refuses_target_stage_after_the_clean_probe(project, m
     probe = "path_clean" if shape == "tracked" else "path_ignored"
     real_probe = getattr(verify, probe)
 
-    def stage_after_probe(*args):
-        result = real_probe(*args)
+    def stage_after_probe(*args, **kwargs):
+        result = real_probe(*args, **kwargs)
         git(repo, "update-index", "--add", "--cacheinfo", "100644", foreign_oid, path.name)
         return result
 

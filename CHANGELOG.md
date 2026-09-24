@@ -140,6 +140,12 @@ breaking changes may land in a minor release.
   hooks, write it through the confined writer, read candidate objects past `git replace`
   refs, and surface and prune candidate-worktree cleanup failures (DW-324, DW-325,
   DW-326, DW-331).
+- Read the exact-path ledger publication's baseline blob, accepted-transition ancestry
+  walk, cleanliness and non-tree-ancestor probes, target index `reset` and candidate commit
+  past `git replace` refs. A replaced baseline blob no longer lets a publication overwrite
+  rival committed content, a replay can no longer report a transition outside HEAD's raw
+  history, and a replaced HEAD no longer stalls every replay on "synchronization did not
+  match committed content" (DW-398, DW-399, DW-400).
 
 - Refuse, before any ref moves, an exact-path ledger publication whose live exec bit
   disagrees with the committed mode where Git honours `core.fileMode` — chmod the

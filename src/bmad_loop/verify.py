@@ -4589,7 +4589,7 @@ def worktree_clean(repo: Path) -> bool:
     return proc.stdout.strip() == ""
 
 
-def path_clean(repo: Path, rel: str) -> bool:
+def path_clean(repo: Path, rel: str, *, env: dict[str, str] | None = None) -> bool:
     """True when nothing under the single pathspec `rel` (relative to `repo`)
     differs from HEAD — the NARROW sibling of :func:`worktree_clean`.
 
@@ -4623,7 +4623,11 @@ def path_clean(repo: Path, rel: str) -> bool:
     '<repo>'`) can forge it. The match is deliberately that narrow: a broken gitfile
     (`not a git repository: <path>`) or a `safe.directory` refusal is a real
     repository's fault, which a caller that degrades on an absent repository must
-    still see."""
+    still see.
+
+    ``env`` is opt-in (default: the inherited environment); the bound
+    publication passes `_bound_git_env()` so the status compares against raw
+    objects rather than `git replace` substitutes (DW-399)."""
     # A resolved symlink target may have any basename, including pathspec magic.
     # Match commit_paths' literal scope and include new publications even when
     # the operator hides untracked files in their interactive status display.
@@ -4639,6 +4643,7 @@ def path_clean(repo: Path, rel: str) -> bool:
             *_literal_specs([rel]),
         ],
         repo,
+        env=env,
     )
     if proc.returncode != 0:
         merged = (proc.stdout + proc.stderr).strip()
@@ -5150,16 +5155,22 @@ def worktree_file_bytes_at_revision(repo: Path, revision: str, rel: str) -> byte
     return proc.stdout
 
 
-def path_has_non_tree_ancestor_at_revision(repo: Path, revision: str, rel: str) -> bool:
+def path_has_non_tree_ancestor_at_revision(
+    repo: Path, revision: str, rel: str, *, env: dict[str, str] | None = None
+) -> bool:
     """Whether a parent of ``rel`` is a tracked non-directory at ``revision``.
 
     Resetting such a baseline can replace a currently real directory with a
     symlink, file, or submodule. A pre-reset canonical child path is therefore no
     longer safe restoration authority after the reset.
+
+    ``env`` is opt-in (default: the inherited environment) and is forwarded to
+    each `_entry_at_revision` read; the bound publication passes
+    `_bound_git_env()` so the probe sees raw objects (DW-399).
     """
     parts = Path(rel).parts
     for end in range(1, len(parts)):
-        entry = _entry_at_revision(repo, revision, Path(*parts[:end]).as_posix())
+        entry = _entry_at_revision(repo, revision, Path(*parts[:end]).as_posix(), env=env)
         if entry is not None and entry[1] != "tree":
             return True
     return False
@@ -10383,12 +10394,24 @@ def _bound_git_env() -> dict[str, str]:
     with them honoured a replaced captured parent checks out, diffs and lists
     as its replacement while the published commit still records the raw
     parent — so unrelated changes would ride into the raw commit with every
-    probe agreeing it is exact. `GIT_NO_REPLACE_OBJECTS` makes the candidate
-    checkout, `_bound_parent`, `_bound_changed_paths` and `_bound_tree_entry`
-    read the raw objects the published commit actually carries; the other
-    publication reads (the baseline `cat-file`, `_accepted_bound_transition`'s
-    `rev-list`, the non-tree-ancestor and cleanliness probes, the index
-    `reset`) still honour replace refs."""
+    probe agreeing it is exact. `GIT_NO_REPLACE_OBJECTS` makes these reads see
+    the raw objects the published commit actually carries: the candidate
+    checkout and candidate `git commit`, `_bound_parent`,
+    `_bound_changed_paths` and `_bound_tree_entry` (DW-331); the baseline blob
+    `cat-file` in `_bound_baseline_blob`, so a replaced baseline blob cannot
+    vouch for rival committed content (DW-398); `_accepted_bound_transition`'s
+    first-parent `rev-list` and the `path_clean` and
+    `path_has_non_tree_ancestor_at_revision` probes, so a replaced ancestry
+    cannot surface a transition outside HEAD's raw history (DW-399); and
+    `_synchronize_bound_index`'s target `reset`, so the index stages the raw
+    entry the raw comparison expects (DW-400).
+
+    The other publication calls keep the inherited environment because they
+    read no replaceable object content: the ref-name and ref-value probes
+    (`symbolic-ref`, `rev-parse`, including `_bound_ref_oid` and
+    `_bound_head_oid`), the index-only reads (`ls-files`, `check-ignore`), blob
+    hashing, and the `update-ref` transaction. At worst a forced type-changing
+    replace makes a `^{commit}` peel refuse loudly."""
     return {**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"}
 
 
@@ -10441,7 +10464,7 @@ def _bound_baseline_blob(
         return None
     if entry.kind != "blob" or entry.mode not in {"100644", "100755"}:
         raise GitError("accepted baseline is not a regular file at its commit")
-    proc = git_bytes(repo, "cat-file", "blob", entry.oid)
+    proc = git_bytes(repo, "cat-file", "blob", entry.oid, env=_bound_git_env())
     if proc.returncode != 0:
         raise GitError(f"accepted baseline blob could not be read in {repo}")
     try:
@@ -10571,6 +10594,7 @@ def _accepted_bound_transition(
         head,
         "--",
         *_literal_specs([rel]),
+        env=_bound_git_env(),
     )
     if rc != 0:
         raise GitError(f"git accepted-transition probe failed in {repo}")
@@ -10641,7 +10665,9 @@ def _synchronize_bound_index(
         target_entry = _bound_tree_entry(repo, target.oid, rel)
         if target_entry is not None and target_entry.kind == "tree":
             raise GitError("committed publication target became a directory")
-        rc, _out = _git(repo, "reset", target.oid, "--", *_literal_specs([rel]))
+        rc, _out = _git_env(
+            repo, "reset", target.oid, "--", *_literal_specs([rel]), env=_bound_git_env()
+        )
         if rc != 0:
             raise GitError(f"git target-local index synchronization failed in {repo}")
         expected_index_entry = target_entry
@@ -10661,7 +10687,9 @@ def _synchronize_bound_index(
     newest_entry = _bound_tree_entry(repo, newest.oid, rel)
     if newest_entry is not None and newest_entry.kind == "tree":
         raise GitError("committed publication target became a directory")
-    rc, _out = _git(repo, "reset", newest.oid, "--", *_literal_specs([rel]))
+    rc, _out = _git_env(
+        repo, "reset", newest.oid, "--", *_literal_specs([rel]), env=_bound_git_env()
+    )
     if rc != 0:
         raise GitError(f"git target-local index synchronization failed in {repo}")
     if _bound_index_entry(repo, rel) != newest_entry:
@@ -10763,11 +10791,16 @@ def commit_path_bound(
     confined writer's documented check-then-write degrade); the staged mode is
     pinned to the captured target's with `git add --chmod`.
 
-    The candidate checkout and the validator's parent, path-scope and tree-entry
-    reads (`_bound_parent`, `_bound_changed_paths`, `_bound_tree_entry`) run
-    under `GIT_NO_REPLACE_OBJECTS=1`, so those decisions are made on the raw
-    objects the published commit carries rather than on `git replace`
-    substitutes (DW-331); the other publication reads still honour replace refs.
+    The object-content reads run under `GIT_NO_REPLACE_OBJECTS=1`
+    (`_bound_git_env`), so those decisions are made on the raw objects the
+    published commit carries rather than on `git replace` substitutes: the
+    candidate checkout and candidate commit, and the validator's parent,
+    path-scope and tree-entry reads (DW-331); the baseline blob read (DW-398);
+    the accepted-transition ancestry walk and the cleanliness and
+    non-tree-ancestor probes (DW-399); and the target-local index `reset`
+    (DW-400). Ref-name/ref-value probes, index-only reads, blob hashing and the
+    `update-ref` transaction keep the inherited environment; `_bound_git_env`
+    says why.
 
     Cleanup of the candidate worktree is never silently dropped (DW-324/325): a
     `worktree remove` that exits non-zero or raises is raised as `GitError` when
@@ -10851,7 +10884,7 @@ def commit_path_bound(
     # Preserve generic clean/ignored behavior when no migration transition needs
     # replay.  In particular, an ignored ledger never earns a synthetic commit.
     try:
-        clean = path_clean(repo_root, rel)
+        clean = path_clean(repo_root, rel, env=_bound_git_env())
         ignored_untracked = clean and head_blob is None and path_ignored(repo_root, target)
     except GitError as exc:
         raise GitError("publication target cleanliness could not be validated") from exc
@@ -10873,7 +10906,9 @@ def commit_path_bound(
     active_error: BaseException | None = None
     candidate: str | None = None
     try:
-        has_non_tree_parent = path_has_non_tree_ancestor_at_revision(repo_root, captured.oid, rel)
+        has_non_tree_parent = path_has_non_tree_ancestor_at_revision(
+            repo_root, captured.oid, rel, env=_bound_git_env()
+        )
     except GitError as exc:
         raise GitError("candidate publication parent shape could not be validated") from exc
     if has_non_tree_parent:
@@ -10937,7 +10972,7 @@ def commit_path_bound(
                 _bound_live_ledger_identity(lexical, target, accepted_text, observed=observed)
                 if _bound_checkout_identity(repo_root) != captured:
                     raise GitError("checkout changed before exact-path candidate hooks")
-                rc, _out = _git(candidate_root, "commit", "-m", message)
+                rc, _out = _git_env(candidate_root, "commit", "-m", message, env=_bound_git_env())
                 if rc != 0:
                     raise GitError(f"git exact-path candidate commit failed in {repo_root}")
                 try:
