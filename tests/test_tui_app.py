@@ -5358,6 +5358,72 @@ async def test_header_counts_parked_stories_only_when_there_are_any(project):
         assert "done 1" in content  # the park did not absorb the done story
 
 
+async def test_header_shows_a_refused_auto_sweep_apart_from_one_that_ran(project):
+    """DW-366: a refused auto-sweep gets its own warning line (reason slug plus the
+    `bmad-loop sweep` hint), and a delivered one gets only a dim `ran` line, so
+    the two never look the same. A run with neither shows no sweep line at all.
+
+    Ablation: drop the `sweeps.refused` branch in `show_run` — the first block's
+    `not run` assert fails while the triggered-only block still passes."""
+
+    def _state(**kw):
+        return RunState(run_id="r1", project=str(project.project), started_at="now", **kw)
+
+    def style_at(content, needle: str) -> str:
+        start = str(content).index(needle)
+        styles = [str(s.style) for s in content.spans if s.start <= start < s.end]
+        assert len(styles) == 1, styles
+        return styles[0]
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test():
+        header = dashboard(app).query_one("#runheader", RunHeader)
+
+        # run-end carries the engine's `failed` shape: latched (child started),
+        # then refused (child failed) — it must read "not run", never "ran".
+        header.show_run(
+            "r1",
+            data.FINISHED,
+            _state(sweeps_triggered=["epic-1", "run-end"], sweeps_refused={"run-end": "failed"}),
+        )
+        content = str(header.content)
+        assert "⚠ auto-sweep not run: run-end (failed) — deferred work is untouched" in content
+        assert "run `bmad-loop sweep` with a clean worktree" in content
+        assert "auto-sweep ran: epic-1\n" in content + "\n"
+        assert "run-end" not in content.split("auto-sweep ran:")[1]  # refused is not "ran"
+        # "differs" is the style too, not just the words: warning vs dim
+        assert style_at(header.content, "⚠ auto-sweep not run") == "bold yellow"
+        assert style_at(header.content, "auto-sweep ran:") == "dim"
+
+        header.show_run("r1", data.FINISHED, _state(sweeps_triggered=["epic-1", "run-end"]))
+        content = str(header.content)
+        assert "auto-sweep ran: epic-1, run-end" in content
+        assert "not run" not in content
+        assert "bmad-loop sweep" not in content
+
+        header.show_run("r1", data.FINISHED, _state())
+        assert "auto-sweep" not in str(header.content)
+
+
+async def test_refused_auto_sweep_reaches_the_dashboard_header(project):
+    # End to end: a refusal in state.json flows RunWatcher -> snapshot -> header.
+    run_dir = make_run(project.project, "20260611-100000-aaaa", finished=True)
+    state = RunState(
+        run_id=run_dir.name,
+        project=str(project.project),
+        started_at="2026-06-11T10:00:00",
+        finished=True,
+        sweeps_refused={"run-end": "dirty"},
+    )
+    save_state(run_dir, state)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        screen = dashboard(app)
+        await until(pilot, lambda: screen.selected_run_id == "20260611-100000-aaaa")
+        header = screen.query_one("#runheader", RunHeader)
+        await until(pilot, lambda: "auto-sweep not run: run-end (dirty)" in str(header.content))
+
+
 async def test_tui_pause_surfaces_bound_critical_reason_and_name_the_spec(project):
     from bmad_loop.escalation import CRITICAL_DISPLAY_MAX, display_pause_reason
 

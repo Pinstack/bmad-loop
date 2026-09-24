@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import builtins
 import importlib
+import json
 import os
 import subprocess
 import sys
@@ -242,6 +243,35 @@ def test_watcher_state_keeps_last_good_parse(tmp_path):
     )
     save_state(run_dir, state)
     assert watcher.state().current_epic == 2
+
+
+def test_sweep_outcomes_reads_both_fields_off_state_json(tmp_path):
+    """DW-366: the TUI reads the auto-sweep ledger off the same parsed state.json
+    `status`/`diagnose` use, in file order, refusals kept apart from deliveries.
+
+    Ablation: drop the `not in state.sweeps_refused` filter — the `triggered`
+    assert fails on epic-2, the latched-then-failed trigger. Return
+    `SweepOutcomes()` instead and both populated-run asserts fail."""
+    from bmad_loop.model import SWEEP_REFUSED_DIRTY, SWEEP_REFUSED_FAILED
+
+    # epic-2 is the engine's real `failed` shape: latched into sweeps_triggered
+    # when the child started, then recorded refused when it failed.
+    run_dir = make_run(
+        tmp_path,
+        "20260611-100000-aaaa",
+        sweeps_triggered=["epic-1", "epic-2"],
+        sweeps_refused={"epic-2": SWEEP_REFUSED_FAILED, "run-end": SWEEP_REFUSED_DIRTY},
+    )
+    outcomes = data.sweep_outcomes(data.RunWatcher(run_dir).state())
+    assert outcomes.triggered == ("epic-1",)  # a failed child was not delivered
+    assert outcomes.refused == (("epic-2", "failed"), ("run-end", "dirty"))
+
+    # A state.json written before #501 carries neither key: empty, not a crash.
+    legacy = make_run(tmp_path, "20260611-100000-bbbb")
+    raw = json.loads((legacy / "state.json").read_text(encoding="utf-8"))
+    del raw["sweeps_triggered"], raw["sweeps_refused"]
+    (legacy / "state.json").write_text(json.dumps(raw), encoding="utf-8")
+    assert data.sweep_outcomes(data.RunWatcher(legacy).state()) == data.SweepOutcomes()
 
 
 def test_watcher_state_none_before_first_write(tmp_path):

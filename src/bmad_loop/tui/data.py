@@ -725,6 +725,28 @@ def active_agent(
         return None
 
 
+@dataclass(frozen=True)
+class SweepOutcomes:
+    """The run's auto-sweep ledger (#501): triggers whose child sweep was
+    delivered, and triggers refused with their closed ``SWEEP_REFUSED_*`` slug.
+    Disjoint here, though not on disk: a child that started then failed is
+    latched into ``sweeps_triggered`` AND recorded ``failed`` (model.py), and
+    that trigger was not delivered — so it lands in ``refused`` only."""
+
+    triggered: tuple[str, ...] = ()
+    refused: tuple[tuple[str, str], ...] = ()
+
+
+def sweep_outcomes(state: RunState) -> SweepOutcomes:
+    """Project ``sweeps_triggered``/``sweeps_refused`` off the parsed state.json —
+    the same RunState ``status``, ``status --json`` and ``diagnose`` read — in
+    file order. A pre-#501 state.json carries neither key and reads empty."""
+    return SweepOutcomes(
+        triggered=tuple(t for t in state.sweeps_triggered if t not in state.sweeps_refused),
+        refused=tuple(state.sweeps_refused.items()),
+    )
+
+
 def pending_decision(journal_entries: list[dict[str, Any]]) -> tuple[str, str] | None:
     """(dw_id, question) when the journal's last entry is a decision-pending
     announcement. The sweep prompter blocks on terminal input right after

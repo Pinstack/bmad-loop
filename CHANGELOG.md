@@ -27,6 +27,9 @@ breaking changes may land in a minor release.
 - Warn in `validate` (`deferred.ledger-untracked`) when the deferred-work ledger exists but
   is neither committed nor gitignored, since bmad-loop's own commits would otherwise take it
   in at the first isolated merge or story commit (DW-361).
+- Show auto-sweep outcomes in the TUI run header: a refused sweep gets a warning line
+  with its trigger and reason (`auto-sweep not run: run-end (dirty)`), a delivered one a
+  dim `auto-sweep ran:` line, both read from state.json like `status` (DW-366).
 
 ### Changed
 

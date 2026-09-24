@@ -234,6 +234,20 @@ class RunHeader(Static):
                     line += f" triage {agent_label(triage.name, triage.model)}"
                 text.append(line, style="dim")
 
+        # Auto-sweep outcome (#603): a refused sweep must not read like one that
+        # ran — the deferred work it would have drained is still sitting there.
+        # Wording mirrors `cmd_status`; the delivered line stays dim.
+        sweeps = data.sweep_outcomes(state)
+        if sweeps.refused:
+            detail = ", ".join(f"{trigger} ({why})" for trigger, why in sweeps.refused)
+            text.append(
+                f"\n⚠ auto-sweep not run: {detail} — deferred work is untouched",
+                style="bold yellow",
+            )
+            text.append("\n  run `bmad-loop sweep` with a clean worktree", style="dim")
+        if sweeps.triggered:
+            text.append(f"\nauto-sweep ran: {', '.join(sweeps.triggered)}", style="dim")
+
         if stopping:
             # A RUNNING or UNKNOWN run with a pending graceful-stop request: it never
             # enters the PAUSED/CRASHED/INTERRUPTED branches below, so this stands on
