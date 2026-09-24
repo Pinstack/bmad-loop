@@ -1606,6 +1606,13 @@ def test_hook_config_is_seeded_for_every_non_hookless_profile(project, monkeypat
     # codex profile: the derivation under test is per-profile, so a profile is the
     # fixture, not a mock of one.
     monkeypatch.setattr(adapter, "profile", codex, raising=False)
+    # A codex stage now meets the DW-341 worktree trust gate; never spawn a real
+    # `codex` here — this test is about seeding, so the worktree reads as trusted.
+    monkeypatch.setattr(
+        worktree_flow.codex_trust,
+        "project_hook_trust",
+        lambda *_a, **_k: worktree_flow.codex_trust.TrustResult("trusted", "stub"),
+    )
     real = worktree_flow.provision_worktree
 
     def spy(worktree, profiles, repo_root, **kwargs):
@@ -1617,6 +1624,285 @@ def test_hook_config_is_seeded_for_every_non_hookless_profile(project, monkeypat
 
     assert summary.done == 1
     assert seen and all(hook_rel in seed_list for seed_list in seen)
+
+
+@pytest.mark.parametrize("status", ["untrusted", "unverifiable"])
+def test_codex_worktree_without_hook_trust_escalates_before_any_session(
+    project, monkeypatch, status
+):
+    """DW-341: Codex silently skips hooks it has not trusted for the exact worktree
+    path, so the session's Stop would never reach the orchestrator. The unit escalates
+    pre-dispatch — no coding session starts — and the worktree stays mounted at its
+    deterministic path so the operator can grant trust there and resume.
+
+    Ablation: delete BOTH gate calls (``gate_codex_hook_trust`` in ``run_isolated`` and
+    in ``Engine._run_session``) and the mock adapter runs both sessions to DONE instead
+    of pausing. Each call alone is pinned by its own test below."""
+    from bmad_loop.adapters.profile import get_profile
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+    )
+    monkeypatch.setattr(adapter, "profile", get_profile("codex"), raising=False)
+    queried: list[Path] = []
+
+    def trust(path, _profile, *, binary=None, marker=None):
+        queried.append(path)
+        return worktree_flow.codex_trust.TrustResult(status, "hook trust is stale for Stop")
+
+    monkeypatch.setattr(worktree_flow.codex_trust, "project_hook_trust", trust)
+
+    summary = engine.run()
+
+    task = engine.state.tasks["1-1-a"]
+    assert summary.paused and adapter.sessions == []
+    assert task.phase == Phase.ESCALATED
+    reason = engine.state.paused_reason or ""
+    assert "Codex hook trust" in reason and status in reason
+    assert task.worktree_path and task.worktree_path in reason
+    assert "hook trust is stale for Stop" in reason
+    assert "Open Codex in that worktree, accept its hook trust prompt" in reason
+    # The recovery command comes only from escalate_unit's own suffix: once.
+    assert "bmad-loop resume" not in reason and "resolve" not in reason
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert attention.count("`bmad-loop resume test-run`") == 1
+    assert queried == [Path(task.worktree_path)]
+    assert Path(task.worktree_path).is_dir()  # kept for the operator to trust
+    kinds = journal_kinds(engine)
+    assert kinds.index("worktree-opened") < kinds.index("story-escalated")
+
+
+def test_codex_worktree_with_hook_trust_queries_worktree_and_launch_binary(project, monkeypatch):
+    """The trusted leg: aimed at the worktree and the binary the adapter launches, with
+    a stage's ``extra_args`` folded into the queried profile as ``bypass_args``. One
+    unit-entry query (dev and review share the mock here, so it is deduped), then one
+    per session from ``Engine._run_session`` (dev, then review)."""
+    from bmad_loop.adapters.profile import get_profile
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+    )
+    monkeypatch.setattr(adapter, "profile", get_profile("codex"), raising=False)
+    monkeypatch.setattr(adapter, "binary", "/opt/codex/bin/codex", raising=False)
+    monkeypatch.setattr(adapter, "extra_args", ("--custom",), raising=False)
+    queried: list[tuple[Path, str | None, tuple[str, ...]]] = []
+
+    def trust(path, profile, *, binary=None, marker=None):
+        queried.append((path, binary, profile.bypass_args))
+        return worktree_flow.codex_trust.TrustResult("trusted", "stub")
+
+    monkeypatch.setattr(worktree_flow.codex_trust, "project_hook_trust", trust)
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    wt = Path(engine.state.tasks["1-1-a"].worktree_path or "")
+    assert wt.parent.name == "worktrees" and wt.name == "1-1-a"
+    assert queried == [(wt, "/opt/codex/bin/codex", ("--custom",))] * 3
+
+
+def test_codex_reviewer_untrusted_escalates_at_unit_entry_before_the_dev_session(
+    project, monkeypatch
+):
+    """Dev on a non-Codex CLI, review on Codex: the unit-entry gate checks every
+    dev/review role, so an untrusted Codex reviewer escalates the unit before the dev
+    session spends any work — not after it, at the review session's launch.
+
+    Ablation: delete the ``gate_codex_hook_trust(task, unit.path)`` call in
+    ``run_isolated`` and the dev session runs; only the per-session gate then stops
+    the review launch."""
+    from bmad_loop.adapters.profile import get_profile
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    reviewer = MockAdapter([wt_review_effect(project, "1-1-a", clean=True)])
+    monkeypatch.setattr(reviewer, "profile", get_profile("codex"), raising=False)
+    engine, dev = make_engine(project, [wt_dev_effect(project, "1-1-a")], review_adapter=reviewer)
+    monkeypatch.setattr(
+        worktree_flow.codex_trust,
+        "project_hook_trust",
+        lambda *_a, **_k: worktree_flow.codex_trust.TrustResult("untrusted", "stub"),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and dev.sessions == [] and reviewer.sessions == []
+    assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
+    assert "for the review session's worktree" in (engine.state.paused_reason or "")
+
+
+@pytest.mark.parametrize("resume_isolation", ["worktree", "none"])
+def test_resume_arm_into_an_untrusted_codex_review_session_escalates_without_launch(
+    project, monkeypatch, resume_isolation
+):
+    """A resume arm reopens a mounted unit and drives sessions WITHOUT passing through
+    ``run_isolated``'s unit-entry gate: here the host died in the dev session's
+    post-session window, so resume replays the recorded dev result (``resume-verify``)
+    and continues into a review session. Trust for the worktree is gone by then (e.g. the
+    Codex config was reset), so the per-session gate escalates before the review
+    session starts, and the worktree stays mounted for the operator.
+
+    The ``none`` row resumes under a live ``isolation = "none"`` edit:
+    ``_finish_inflight`` still reopens the recorded mount, so the gate must key on
+    the session's path, never on live policy.
+
+    Ablation: delete the ``gate_codex_hook_trust`` call in ``Engine._run_session`` and
+    the review session launches and the unit reaches DONE; gate it on
+    ``self._worktree_flow.isolated`` as well and the ``none`` row launches."""
+    from bmad_loop.adapters.profile import get_profile
+
+    codex = get_profile("codex")
+    verdict = {"status": "trusted"}
+    queried: list[Path] = []
+
+    def trust(path, _profile, *, binary=None, marker=None):
+        queried.append(path)
+        return worktree_flow.codex_trust.TrustResult(verdict["status"], "stub reason")
+
+    monkeypatch.setattr(worktree_flow.codex_trust, "project_hook_trust", trust)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(project, [wt_dev_effect(project, "1-1-a")])
+    monkeypatch.setattr(adapter, "profile", codex, raising=False)
+    original_emit = engine._emit
+
+    def crashing_emit(stage, *args, **kwargs):
+        if stage == "post_session":
+            raise RuntimeError("host died in the post-session window")
+        return original_emit(stage, *args, **kwargs)
+
+    engine._emit = crashing_emit
+    assert engine.run().crashed
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed.phase == Phase.DEV_RUNNING and crashed.worktree_path
+    wt = Path(crashed.worktree_path)
+    assert wt.is_dir()
+
+    verdict["status"] = "untrusted"
+    queried.clear()
+    resumed, resumed_adapter = resume_engine(
+        project,
+        engine,
+        [wt_review_effect(project, "1-1-a", clean=True)],
+        policy=_in_place_policy() if resume_isolation == "none" else None,
+    )
+    assert resumed._worktree_flow.isolated is (resume_isolation == "worktree")
+    monkeypatch.setattr(resumed_adapter, "profile", codex, raising=False)
+    summary = resumed.run()
+
+    assert summary.paused and resumed_adapter.sessions == []
+    task = resumed.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED
+    kinds = journal_kinds(resumed)
+    assert "resume-verify" in kinds and "resume-restart" not in kinds
+    # The gate sits before the session-start journal: a refused launch leaves none.
+    assert "session-start" not in kinds[kinds.index("resume-verify") :]
+    reason = resumed.state.paused_reason or ""
+    assert f"Codex hook trust is untrusted for the review session's worktree {wt}" in reason
+    assert queried == [wt]
+    assert wt.is_dir()  # kept for the operator to trust, re-arm, and resume
+
+
+def test_codex_gate_reads_the_provisioned_worktree_hook_config(project, monkeypatch):
+    """Gate-after-provisioning, with the REAL trust oracle: only the Codex app-server
+    query (``_hooks_list``) and the binary lookup are stubbed, so
+    ``project_hook_trust`` reads the worktree's own ``.codex/hooks.json`` and joins
+    its relay commands to the (stubbed) Codex answer. The stub answers from the config
+    it finds at the queried cwd — so a gate that ran before provisioning wrote that
+    config would read nothing and escalate. Zero tokens; no real ``codex`` spawns."""
+    import json
+
+    from bmad_loop.adapters.profile import get_profile
+
+    codex = get_profile("codex")
+    trust_mod = worktree_flow.codex_trust
+    listed: list[Path] = []
+
+    def hooks_list(_binary, cwd, _env):
+        config_path = (cwd / codex.hooks.config_path).resolve()
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        hooks = [
+            {
+                "sourcePath": str(config_path),
+                "eventName": trust_mod._EVENTS[canonical],
+                "handlerType": "command",
+                "command": hook["command"],
+                "trustStatus": "trusted",
+                "enabled": True,
+            }
+            for canonical, groups in config["hooks"].items()
+            if canonical in trust_mod._EVENTS
+            for group in groups
+            for hook in group["hooks"]
+        ]
+        listed.append(cwd)
+        return {"data": [{"cwd": str(cwd.resolve()), "hooks": hooks, "errors": [], "warnings": []}]}
+
+    monkeypatch.setattr(trust_mod, "_hooks_list", hooks_list)
+    monkeypatch.setattr(trust_mod, "resolved_codex_binary", lambda *_a, **_k: "/fake/codex")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+    )
+    monkeypatch.setattr(adapter, "profile", codex, raising=False)
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused, engine.state.paused_reason
+    wt = Path(engine.state.tasks["1-1-a"].worktree_path or "")
+    assert listed and all(cwd == wt for cwd in listed)
+
+
+def test_main_checkout_codex_session_in_an_isolated_run_never_queries_trust(project, monkeypatch):
+    """A session in the main checkout during an isolated run (a sweep/triage or
+    migration-triage session: ``workspace.root == repo_root``) is outside the gate —
+    the main checkout's trust is the operator's own, and ``validate`` covers it.
+
+    Ablation: replace the ``workspace.root != repo_root`` condition in
+    ``Engine._run_session`` with ``True`` and the stubbed oracle fails the test."""
+    from bmad_loop.adapters.profile import get_profile
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(project, [SessionResult(status="completed")])
+    engine.adapters["triage"] = adapter  # SweepEngine registers this; wire it here
+    monkeypatch.setattr(adapter, "profile", get_profile("codex"), raising=False)
+    monkeypatch.setattr(
+        worktree_flow.codex_trust,
+        "project_hook_trust",
+        lambda *_a, **_k: pytest.fail("main-checkout session must not query Codex trust"),
+    )
+    assert engine._worktree_flow.isolated  # MEASURED: the run is isolated
+    assert engine.workspace.root == engine.paths.repo_root
+    task = StoryTask(story_key="1-1-a", epic=1)
+    engine.state.tasks[task.story_key] = task
+    engine._save()
+
+    result = engine._run_session(task, role="triage", prompt="p", seq=1)
+
+    assert result.status == "completed" and len(adapter.sessions) == 1
+    assert task.phase != Phase.ESCALATED
+
+
+def test_non_codex_worktree_never_queries_codex_trust(project, monkeypatch):
+    """Claude (and profile-less fakes) are outside the gate entirely."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+    )
+    attach_profile(adapter)
+    monkeypatch.setattr(
+        worktree_flow.codex_trust,
+        "project_hook_trust",
+        lambda *_a, **_k: pytest.fail("non-Codex worktree must not query Codex trust"),
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
 
 
 @pytest.mark.parametrize("merge_strategy", ["merge", "ff"])

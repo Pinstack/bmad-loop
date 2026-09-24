@@ -21,6 +21,7 @@ it lazily for its own tests.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import secrets
 from collections import Counter
@@ -30,7 +31,7 @@ from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, NoReturn
 
-from . import artifact_publication, deferredwork, gates, verify
+from . import artifact_publication, codex_trust, deferredwork, gates, verify
 from .adapters.profile import ProfileError
 from .install import (
     _REVIEW_LAYER_SKILLS,
@@ -1514,6 +1515,89 @@ class WorktreeFlow:
                 seen[profile.name] = profile
         return list(seen.values())
 
+    def gate_codex_hook_trust(
+        self,
+        task: StoryTask,
+        worktree: Path,
+        *,
+        roles: tuple[str, ...] = DEV_PRIMITIVE_ROLES,
+    ) -> None:
+        """Escalate the unit unless Codex trusts its hooks in ``worktree`` (DW-341).
+
+        Provisioning writes a fresh ``.codex/hooks.json`` per worktree path, and
+        Codex silently skips hooks without a trust grant for that path — the
+        session's Stop would never arrive. So each Codex-dialect adapter among
+        ``roles`` is checked through the one trust oracle
+        (:func:`codex_trust.project_hook_trust`) with the binary it will launch.
+        Two callers: :meth:`run_isolated` checks every dev/review role at unit
+        entry, before any dev work is spent; ``Engine._run_session`` checks the
+        launching role before every worktree session, which covers the resume
+        arms that reopen a mounted unit without passing through unit entry.
+
+        A stage's ``extra_args`` replace the profile's ``bypass_args`` at launch,
+        so they are folded into the queried profile: args that may move hook
+        discovery come back ``unverifiable``. A failed ``hooks/list`` query
+        (:data:`codex_trust.QUERY_FAILED_REASON` — spawn error, timeout) is
+        retried exactly once; a real verdict never is. Fail closed — anything but
+        ``trusted`` escalates, leaving the worktree mounted at its deterministic
+        path so the operator can grant trust there, re-arm, and resume. Codex's
+        own trust state is never written. Adapters without a profile (test fakes)
+        and non-Codex dialects are skipped; main-checkout sessions never reach here.
+        """
+        adapters = self._adapters_get()
+        seen: set[tuple[str, str, tuple[str, ...] | None]] = set()
+        for role in roles:
+            adapter = adapters[role]
+            profile = getattr(adapter, "profile", None)
+            hooks = getattr(profile, "hooks", None)
+            if profile is None or getattr(hooks, "dialect", None) != "codex-hooks-json":
+                continue
+            binary = getattr(adapter, "binary", None) or profile.binary
+            extra_args = getattr(adapter, "extra_args", None)
+            key = (profile.name, binary, extra_args)
+            if key in seen:
+                continue
+            seen.add(key)
+            queried = (
+                profile
+                if extra_args is None
+                else dataclasses.replace(profile, bypass_args=extra_args)
+            )
+            trust = codex_trust.project_hook_trust(worktree, queried, binary=binary)
+            if trust.status == "unverifiable" and trust.reason == codex_trust.QUERY_FAILED_REASON:
+                # The query itself failed, not Codex's verdict: one retry absorbs a
+                # transient app-server spawn failure or timeout before escalating.
+                trust = codex_trust.project_hook_trust(worktree, queried, binary=binary)
+            if trust.status == "trusted":
+                continue
+            self.escalate_unit(  # always raises RunPaused
+                task, self._codex_trust_reason(role, worktree, trust.status, trust.reason)
+            )
+
+    def _codex_trust_reason(self, role: str, worktree: Path, status: str, reason: str) -> str:
+        """The operator-facing escalation text for a failed worktree trust query.
+
+        Status-specific: accepting a trust prompt clears ``untrusted``, but an
+        ``unverifiable`` verdict usually has a cause a prompt cannot fix, so that
+        text names the likely fixes first. Both end with the remediation and leave
+        out the recovery command: :meth:`escalate_unit` appends its own
+        "resolve, then resume" suffix, and docs/FEATURES.md spells out the exact
+        ``resolve --no-interactive`` + ``resume`` sequence.
+        """
+        head = (
+            f"Codex hook trust is {status} for the {role} session's worktree {worktree} "
+            f"({reason}) — Codex would skip its hooks and the session's Stop would never "
+            "reach the orchestrator. "
+        )
+        if status == "unverifiable":
+            head += (
+                "bmad-loop could not verify Codex's hook trust for that worktree. Likely "
+                "fixes: remove stage `extra_args` or profile `launch_args` that may move "
+                "Codex hook discovery, make sure the Codex binary is on PATH, and make "
+                "sure the worktree's hook config is readable. "
+            )
+        return head + "Open Codex in that worktree, accept its hook trust prompt"
+
     def engine_agent_ids(self) -> list[str]:
         """The Unity-MCP `setup-mcp` agent ids for every CLI that runs in a
         worktree (dev + review). A worktree can host more than one agent — e.g.
@@ -2237,6 +2321,11 @@ class WorktreeFlow:
             )
             self.escalate_unit(task, reason)  # always raises RunPaused
 
+        # Codex skips hooks it has not trusted for this exact worktree path, with no
+        # message, so its Stop would never reach the orchestrator. Escalating gate,
+        # so it sits above the advisory warnings below (DW-341).
+        self.gate_codex_hook_trust(task, unit.path)
+
         # The residue the delivery probe above cannot see, stated as a warning rather
         # than a write: a spec the mount DID deliver, whose bytes are the committed
         # ones rather than the operator's uncommitted corrections (DW-101). Ungated by
@@ -2244,7 +2333,7 @@ class WorktreeFlow:
         # escalated above, and a spec the task already spelled project-relative
         # reaches exactly the same loss without ever passing through the normalizer.
         #
-        # LAST, below every gate that escalates: each of the three above always raises,
+        # LAST, below every gate that escalates: each of the four above always raises,
         # so a call placed among them would record "the mount superseded your spec" for
         # a unit that then never got near a session. Here the only things left are the
         # ready gate's veto and drive() itself.
@@ -4255,8 +4344,10 @@ class WorktreeFlow:
     def escalate_unit(self, task: StoryTask, reason: str) -> None:
         """Mark a unit ESCALATED, notify, and pause the run.
 
-        Callers escalate outside a legal transition, before dispatch or after a
-        completed merge attempt, so the phase is set directly rather than advanced.
+        Callers escalate outside a legal transition, so the phase is set directly
+        rather than advanced: before dispatch, after a completed merge attempt, at a
+        session launch (the Codex hook-trust gate, :meth:`gate_codex_hook_trust`,
+        which can fire mid-drive), and from :meth:`reopen_unit` for in-flight units.
         """
         task.phase = Phase.ESCALATED
         self.journal.append("story-escalated", story_key=task.story_key, reason=reason)

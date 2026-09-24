@@ -26,6 +26,10 @@ _RELAY_MARKER = "bmad-loop"
 _PROBE_MARKER = "bmad_loop_probe_hook.py"
 _TIMEOUT_S = 5.0
 _SAFE_BYPASS_ARG = "--dangerously-bypass-approvals-and-sandbox"
+# The ``unverifiable`` reason when the ``hooks/list`` query itself failed (spawn
+# error, timeout, protocol breakage) rather than Codex returning a verdict.
+# Exported so callers can tell a transient query failure from a real answer.
+QUERY_FAILED_REASON = "hook trust could not be queried from Codex"
 
 
 @dataclass(frozen=True)
@@ -219,7 +223,7 @@ def project_hook_trust(
     try:
         result = _hooks_list(resolved_binary, project, profile.env)
     except (OSError, ValueError, TimeoutError, subprocess.SubprocessError):
-        return TrustResult("unverifiable", "hook trust could not be queried from Codex")
+        return TrustResult("unverifiable", QUERY_FAILED_REASON)
     if not isinstance(result, dict) or not isinstance(result.get("data"), list):
         return TrustResult("unverifiable", "hook trust response has an unfamiliar shape")
     entries = result["data"]

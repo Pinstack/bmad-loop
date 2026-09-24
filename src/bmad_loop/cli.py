@@ -800,7 +800,8 @@ def cmd_validate(args: argparse.Namespace) -> int:
             elif pol is not None and pol.scm.isolation == "worktree":
                 trust_message = (
                     "hook trust unverifiable for future worktree sessions: each isolated "
-                    "directory needs its own Codex trust grant"
+                    "directory needs its own Codex trust grant (a run escalates an "
+                    "untrusted worktree before launching Codex there)"
                 )
             elif not hooks_ok:
                 trust_message = "hook trust cannot pass: Codex relay hooks are not registered"

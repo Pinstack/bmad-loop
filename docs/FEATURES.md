@@ -716,9 +716,27 @@ For Codex, `validate` and `probe-adapter` ask Codex's read-only `hooks/list` API
 whether the configured SessionStart and Stop relays are enabled and trusted.
 Stale, missing, or unverifiable hook trust is a failing result. A worktree run
 uses a different directory, so `validate` cannot certify its future trust from
-the main checkout. A live probe checks its temporary hook directory before
-launch; a fresh directory without a Codex trust grant stops with a hook-trust
-diagnostic.
+the main checkout. Instead, an isolated run queries Codex's trust for the exact
+worktree before any Codex session starts there, using the binary and stage
+`extra_args` that session will launch with: once for every Codex dev or review
+stage when a unit is dispatched, and again before each Codex session in a
+worktree, including the sessions a resumed run drives in an already-mounted unit
+(whatever isolation policy the resumed run loaded). Sessions in the main checkout
+are not queried. A failed `hooks/list` query (Codex could not be spawned, or timed
+out) is retried once; a real verdict is not. Anything but trusted escalates the
+unit (CRITICAL, run paused) before the session starts, and the worktree stays
+mounted at its deterministic path. Each worktree path needs its own Codex grant,
+so Codex with `isolation = "worktree"` pauses once per unit. To recover: open
+Codex in that worktree, accept its hook trust prompt, then run
+`bmad-loop resolve <run-id> --no-interactive` to re-arm the escalated unit and
+`bmad-loop resume <run-id>` to drive it (a bare `resume` leaves an escalated unit
+escalated). The re-arm restarts the unit from its baseline, so work done before a
+mid-drive escalation (e.g. a finished dev session ahead of a review launch) is
+redone. An `unverifiable` verdict usually needs a fix first: stage
+`extra_args` or profile `launch_args` that may move hook discovery, a Codex binary
+missing from PATH, or an unreadable hook config. bmad-loop never writes Codex's
+own trust state. A live probe checks its temporary hook directory before launch;
+a fresh directory without a Codex trust grant stops with a hook-trust diagnostic.
 Profile or stage arguments that can change Codex hook discovery make the trust
 verdict unverifiable rather than certifying a different launch configuration.
 

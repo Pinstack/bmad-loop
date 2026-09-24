@@ -6564,6 +6564,17 @@ class Engine:
         # its task_id stays distinct from the role's own dev/review attempts.
         task_id = _session_task_id(task.story_key, label if label else role, seq, task.generation)
         adapter = self.adapters[role]
+        if self.workspace.root != self.paths.repo_root:
+            # DW-341: Codex silently skips hooks it has not trusted for this exact
+            # worktree path, so the session's Stop would never arrive. Checked here,
+            # per session, because the `_finish_inflight` resume arms reopen a mounted
+            # unit and drive sessions without passing through `run_isolated`'s
+            # unit-entry gate. Path-based only, never live isolation policy: a run
+            # paused under `worktree` and resumed under `none` still reopens its
+            # mounted unit. Raises RunPaused (unit ESCALATED, worktree kept) before
+            # env building, plugin gates, and the session-start journal; a no-op for
+            # non-Codex adapters, and main-checkout sessions never reach it.
+            self._worktree_flow.gate_codex_hook_trust(task, self.workspace.root, roles=(role,))
         cfg = self.policy.adapter.resolved(role)
         env = {
             # The state root this process settled on, handed over rather than left

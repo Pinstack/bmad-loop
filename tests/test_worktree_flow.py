@@ -710,6 +710,266 @@ def test_engine_agent_ids_maps_and_dedups(tmp_path):
     assert _make_flow(tmp_path).engine_agent_ids() == []
 
 
+# --------------------------------------------------------- codex hook trust gate
+
+
+def _codex_adapter(binary: str = "codex", extra_args: tuple[str, ...] | None = None):
+    from bmad_loop.adapters.profile import get_profile
+
+    return SimpleNamespace(profile=get_profile("codex"), binary=binary, extra_args=extra_args)
+
+
+def _claude_adapter():
+    from bmad_loop.adapters.profile import get_profile
+
+    return SimpleNamespace(profile=get_profile("claude"), binary="claude", extra_args=None)
+
+
+def _record_trust(monkeypatch, verdicts: dict[str, str]):
+    """Stub the one trust oracle; ``verdicts`` maps a queried binary to its status."""
+    from bmad_loop import codex_trust
+
+    calls: list[tuple[Path, str | None, tuple[str, ...]]] = []
+
+    def trust(path, profile, *, binary=None, marker=None):
+        calls.append((path, binary, profile.bypass_args))
+        return codex_trust.TrustResult(verdicts.get(binary or "", "trusted"), f"reason-{binary}")
+
+    monkeypatch.setattr(codex_trust, "project_hook_trust", trust)
+    return calls
+
+
+def test_codex_trust_gate_checks_a_codex_review_stage_behind_a_claude_dev(tmp_path, monkeypatch):
+    """The gate walks every dev-primitive role, not just dev: a claude dev with a
+    Codex reviewer still queries (and escalates on) the review stage's worktree trust.
+
+    Ablation: iterate only ``dev`` in ``gate_codex_hook_trust`` and nothing is queried."""
+    calls = _record_trust(monkeypatch, {"codex-review": "untrusted"})
+    flow = _make_flow(
+        tmp_path,
+        adapters_get=lambda: {"dev": _claude_adapter(), "review": _codex_adapter("codex-review")},
+    )
+    task = StoryTask(story_key="1-1", epic=1)
+    wt = tmp_path / "worktrees" / "1-1"
+
+    with pytest.raises(_Pause) as excinfo:
+        flow.gate_codex_hook_trust(task, wt)
+
+    assert calls == [(wt, "codex-review", ("--dangerously-bypass-approvals-and-sandbox",))]
+    assert task.phase == Phase.ESCALATED
+    reason = excinfo.value.reason
+    assert "Codex hook trust is untrusted for the review session's worktree" in reason
+    assert str(wt) in reason and "reason-codex-review" in reason
+    assert flow.journal.events() == ["story-escalated"]
+    assert "CRITICAL escalation: 1-1" in (tmp_path / ATTENTION_FILE).read_text()
+
+
+def test_codex_trust_gate_dedupes_identical_adapters_and_folds_extra_args(tmp_path, monkeypatch):
+    """Identical (profile, binary, extra_args) launches are queried once; a stage's
+    ``extra_args`` replace ``bypass_args`` in the queried profile, as at launch."""
+    calls = _record_trust(monkeypatch, {})
+    shared = _codex_adapter()
+    flow = _make_flow(tmp_path, adapters_get=lambda: {"dev": shared, "review": _codex_adapter()})
+    task = StoryTask(story_key="1-1", epic=1)
+    flow.gate_codex_hook_trust(task, tmp_path)
+    assert len(calls) == 1 and task.phase == Phase.PENDING
+
+    calls.clear()
+    flow = _make_flow(
+        tmp_path,
+        adapters_get=lambda: {
+            "dev": _codex_adapter(),
+            "review": _codex_adapter(extra_args=("-x",)),
+        },
+    )
+    flow.gate_codex_hook_trust(task, tmp_path)
+    assert [c[2] for c in calls] == [("--dangerously-bypass-approvals-and-sandbox",), ("-x",)]
+
+
+def test_codex_trust_gate_skips_fakes_and_non_codex_dialects(tmp_path, monkeypatch):
+    from bmad_loop import codex_trust
+
+    monkeypatch.setattr(
+        codex_trust,
+        "project_hook_trust",
+        lambda *_a, **_k: pytest.fail("non-Codex adapters must not query Codex trust"),
+    )
+    for adapters in (
+        {"dev": _FakeAdapter(), "review": _FakeAdapter()},
+        {"dev": _FakeAdapter("claude"), "review": _FakeAdapter("codex")},  # name-only fakes
+        {"dev": _claude_adapter(), "review": _claude_adapter()},
+    ):
+        flow = _make_flow(tmp_path, adapters_get=lambda a=adapters: a)
+        flow.gate_codex_hook_trust(StoryTask(story_key="1-1", epic=1), tmp_path)
+    assert (tmp_path / ATTENTION_FILE).exists() is False
+
+
+def test_codex_trust_gate_untrusted_text_names_the_prompt(tmp_path, monkeypatch):
+    """``untrusted`` is cleared by Codex's own prompt: the text says to accept it in
+    that worktree — and none of the ``unverifiable`` fixes, which would send the
+    operator the wrong way. The recovery command is NOT in the reason:
+    ``escalate_unit`` appends its own resolve/resume suffix to the notification, so
+    repeating it here would print it twice."""
+    _record_trust(monkeypatch, {"codex": "untrusted"})
+    flow = _make_flow(tmp_path, adapters_get=lambda: {"dev": _codex_adapter(), "review": None})
+    wt = tmp_path / "worktrees" / "1-1"
+
+    with pytest.raises(_Pause) as excinfo:
+        flow.gate_codex_hook_trust(StoryTask(story_key="1-1", epic=1), wt, roles=("dev",))
+
+    reason = excinfo.value.reason
+    assert f"Codex hook trust is untrusted for the dev session's worktree {wt}" in reason
+    assert "(reason-codex)" in reason
+    assert reason.endswith("Open Codex in that worktree, accept its hook trust prompt")
+    assert "bmad-loop resume" not in reason and "resolve" not in reason
+    assert "could not verify" not in reason and "extra_args" not in reason
+    # The recovery command appears exactly once — from escalate_unit's suffix.
+    attention = (tmp_path / ATTENTION_FILE).read_text()
+    assert attention.count("bmad-loop resume") == 1
+
+
+def test_codex_trust_gate_unverifiable_text_names_the_likely_fixes(tmp_path, monkeypatch):
+    """``unverifiable`` usually has a cause a trust prompt cannot clear (stage
+    ``extra_args`` / profile ``launch_args`` that move hook discovery, the binary, an
+    unreadable config), so the text says trust could not be verified and names those
+    fixes before the prompt and the same recovery command.
+
+    Ablation: drop the ``status == "unverifiable"`` branch in ``_codex_trust_reason``
+    and the fix list disappears."""
+    _record_trust(monkeypatch, {"codex": "unverifiable"})
+    flow = _make_flow(tmp_path, adapters_get=lambda: {"dev": None, "review": _codex_adapter()})
+    wt = tmp_path / "worktrees" / "1-1"
+
+    with pytest.raises(_Pause) as excinfo:
+        flow.gate_codex_hook_trust(StoryTask(story_key="1-1", epic=1), wt, roles=("review",))
+
+    reason = excinfo.value.reason
+    assert f"Codex hook trust is unverifiable for the review session's worktree {wt}" in reason
+    assert "(reason-codex)" in reason
+    assert "bmad-loop could not verify Codex's hook trust for that worktree" in reason
+    assert "stage `extra_args`" in reason and "profile `launch_args`" in reason
+    assert "Codex binary is on PATH" in reason and "hook config is readable" in reason
+    fixes, prompt = reason.index("Likely fixes"), reason.index("Open Codex in that worktree")
+    assert fixes < prompt
+    assert reason.endswith("Open Codex in that worktree, accept its hook trust prompt")
+    assert "bmad-loop resume" not in reason and "resolve" not in reason
+
+
+def test_codex_trust_gate_roles_limits_the_checked_adapters(tmp_path, monkeypatch):
+    """``roles`` scopes the check to the launching session: the per-session gate in
+    ``Engine._run_session`` passes ``(role,)``, so an untrusted Codex reviewer does not
+    block a trusted dev session — it escalates when the review session launches."""
+    calls = _record_trust(monkeypatch, {"codex-review": "untrusted"})
+    flow = _make_flow(
+        tmp_path,
+        adapters_get=lambda: {
+            "dev": _codex_adapter("codex-dev"),
+            "review": _codex_adapter("codex-review"),
+        },
+    )
+    task = StoryTask(story_key="1-1", epic=1)
+
+    flow.gate_codex_hook_trust(task, tmp_path, roles=("dev",))
+    assert [c[1] for c in calls] == ["codex-dev"] and task.phase == Phase.PENDING
+
+    with pytest.raises(_Pause):
+        flow.gate_codex_hook_trust(task, tmp_path, roles=("review",))
+    assert [c[1] for c in calls] == ["codex-dev", "codex-review"]
+    assert task.phase == Phase.ESCALATED
+
+
+def _sequenced_trust(monkeypatch, results):
+    """Stub the trust oracle to answer ``results`` in order; returns the call log."""
+    from bmad_loop import codex_trust
+
+    answers = list(results)
+    calls: list[Path] = []
+
+    def trust(path, _profile, *, binary=None, marker=None):
+        calls.append(path)
+        return answers.pop(0)
+
+    monkeypatch.setattr(codex_trust, "project_hook_trust", trust)
+    return calls
+
+
+def test_codex_trust_gate_retries_a_failed_query_once_then_drives(tmp_path, monkeypatch):
+    """A ``hooks/list`` query failure (spawn error / timeout) is not Codex's verdict:
+    one retry absorbs it, and a trusted second answer lets the unit through.
+
+    Ablation: drop the retry in ``gate_codex_hook_trust`` and the first
+    query-failure escalates."""
+    from bmad_loop import codex_trust
+
+    calls = _sequenced_trust(
+        monkeypatch,
+        [
+            codex_trust.TrustResult("unverifiable", codex_trust.QUERY_FAILED_REASON),
+            codex_trust.TrustResult("trusted", "ok"),
+        ],
+    )
+    flow = _make_flow(tmp_path, adapters_get=lambda: {"dev": _codex_adapter(), "review": None})
+    task = StoryTask(story_key="1-1", epic=1)
+    wt = tmp_path / "worktrees" / "1-1"
+
+    flow.gate_codex_hook_trust(task, wt, roles=("dev",))
+
+    assert calls == [wt, wt]
+    assert task.phase == Phase.PENDING and flow.calls.pauses == []
+
+
+def test_codex_trust_gate_escalates_after_two_failed_queries(tmp_path, monkeypatch):
+    """The retry is exactly one: a second query failure escalates with the
+    ``unverifiable`` text, after exactly two queries."""
+    from bmad_loop import codex_trust
+
+    failed = codex_trust.TrustResult("unverifiable", codex_trust.QUERY_FAILED_REASON)
+    calls = _sequenced_trust(monkeypatch, [failed, failed, failed])
+    flow = _make_flow(tmp_path, adapters_get=lambda: {"dev": _codex_adapter(), "review": None})
+    task = StoryTask(story_key="1-1", epic=1)
+    wt = tmp_path / "worktrees" / "1-1"
+
+    with pytest.raises(_Pause) as excinfo:
+        flow.gate_codex_hook_trust(task, wt, roles=("dev",))
+
+    assert calls == [wt, wt]
+    assert task.phase == Phase.ESCALATED
+    reason = excinfo.value.reason
+    assert "Codex hook trust is unverifiable" in reason
+    assert codex_trust.QUERY_FAILED_REASON in reason
+    assert "bmad-loop could not verify Codex's hook trust" in reason
+
+
+@pytest.mark.parametrize(
+    ("status", "why"),
+    [
+        ("unverifiable", "hook trust cannot verify profile launch arguments"),
+        ("unverifiable", "hook trust Codex binary is unavailable"),
+        ("untrusted", "hook trust is stale for Stop; accept hooks in Codex"),
+    ],
+)
+def test_codex_trust_gate_never_retries_a_real_verdict(tmp_path, monkeypatch, status, why):
+    """Only the query-failure reason is retried: any other ``unverifiable`` reason
+    and every ``untrusted`` verdict escalate on the first answer.
+
+    Ablation: retry every ``unverifiable`` (or every non-trusted) result and the
+    call count becomes two."""
+    from bmad_loop import codex_trust
+
+    calls = _sequenced_trust(
+        monkeypatch,
+        [codex_trust.TrustResult(status, why), codex_trust.TrustResult("trusted", "ok")],
+    )
+    flow = _make_flow(tmp_path, adapters_get=lambda: {"dev": _codex_adapter(), "review": None})
+    task = StoryTask(story_key="1-1", epic=1)
+
+    with pytest.raises(_Pause):
+        flow.gate_codex_hook_trust(task, tmp_path, roles=("dev",))
+
+    assert calls == [tmp_path]
+    assert task.phase == Phase.ESCALATED
+
+
 # --------------------------------------------------------------- target branch
 
 

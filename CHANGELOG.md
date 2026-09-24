@@ -52,6 +52,13 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Escalate an isolated unit before a Codex session starts in a worktree Codex does not
+  trust (queried per worktree, launch binary, and stage `extra_args`; at unit dispatch and
+  before every worktree session, resume arms included), instead of starting a session
+  whose Stop hook Codex silently skips. A failed `hooks/list` query is retried once. Each
+  worktree path needs its own grant, so Codex + `isolation = "worktree"` pauses once per
+  unit; trust it, then `bmad-loop resolve <run-id> --no-interactive` and
+  `bmad-loop resume <run-id>` (DW-341).
 - Seed a leaf-symlinked ledger or board at its configured path instead of the link target's,
   so an isolated unit's gates read the seeded copy and no longer hit the #426 defer loop;
   the target is seeded only behind a tracked dangling link (DW-377, was #462).

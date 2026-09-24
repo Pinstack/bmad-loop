@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 
@@ -161,6 +162,29 @@ def test_trust_resolves_codex_cmd_shim_before_spawning(tmp_path, monkeypatch):
 
     monkeypatch.setattr(codex_trust, "_hooks_list", hooks_list)
     assert codex_trust.project_hook_trust(tmp_path, profile).status == "trusted"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [OSError("spawn"), ValueError("closed"), TimeoutError("slow"), subprocess.SubprocessError()],
+)
+def test_failed_hooks_list_query_reports_the_exported_query_failure_reason(
+    tmp_path, monkeypatch, error
+):
+    """The worktree gate retries a failed query once by matching this exported
+    constant (DW-341), so the except arm must return exactly it.
+
+    Ablation: return a different string literal from the except arm and this fails
+    (and the gate's retry silently stops firing)."""
+    _config(tmp_path)
+    monkeypatch.setattr(codex_trust, "resolved_codex_binary", lambda *_a, **_k: "/fake/codex")
+
+    def hooks_list(*_a):
+        raise error
+
+    monkeypatch.setattr(codex_trust, "_hooks_list", hooks_list)
+    result = codex_trust.project_hook_trust(tmp_path, get_profile("codex"))
+    assert result == codex_trust.TrustResult("unverifiable", codex_trust.QUERY_FAILED_REASON)
 
 
 @pytest.mark.parametrize(
