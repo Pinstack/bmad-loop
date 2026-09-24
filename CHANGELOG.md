@@ -43,6 +43,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Decode the unity plugin scripts' child output as UTF-8 with `errors="replace"` (and pin
+  the helper scripts' stdio to UTF-8), so non-UTF-8 output on a legacy Windows codepage
+  such as cp932 no longer raises `UnicodeDecodeError`; an unlaunchable CLI now fails
+  `setup-mcp` with a non-zero rc instead of a traceback (DW-365).
 - Hold docked dialog titles, validate headers, the spec viewer's and pause-reason
   viewer's story subtitles, and spec paths to one row per line with `…` (the spec path
   keeps its file name; the deferred-work viewer's done/legacy markers move to lines of

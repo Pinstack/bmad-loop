@@ -111,6 +111,8 @@ def _wait_for_ready(cli: str, remaining: float) -> tuple[int, str]:
             timeout=remaining + 5,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
     except subprocess.TimeoutExpired:
         return 1, "wait-for-ready process timed out"
@@ -127,6 +129,8 @@ def _run_tool_probe(cli: str, tool: str, remaining: float) -> tuple[int, str]:
             timeout=remaining + 5,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
     except subprocess.TimeoutExpired:
         return 1, f"run-tool {tool} timed out"

@@ -307,6 +307,8 @@ def _close_ivanmurzak(worktree: Path) -> int:
         [cli, "close", str(worktree), "--timeout", timeout, "--force"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if proc.returncode != 0:
         sys.stderr.write(proc.stdout + proc.stderr)

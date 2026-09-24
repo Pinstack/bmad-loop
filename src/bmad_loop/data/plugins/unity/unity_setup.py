@@ -180,6 +180,8 @@ def _cp_library_tree(src: Path, dest: Path, *, reflink: bool) -> bool:
         ["cp", "-a", reflink_arg, f"{src}/.", str(dest)],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if proc.returncode != 0:
         sys.stderr.write(proc.stdout + proc.stderr)
@@ -322,6 +324,8 @@ def _bootstrap_local(cli: str, worktree: Path, url: str) -> int:
         [cli, "bootstrap-local", str(worktree), "--url", url, "--token", token],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if proc.returncode != 0:
         sys.stderr.write(proc.stdout + proc.stderr)
@@ -399,7 +403,13 @@ def _run_setup_mcp(cli: str, agent: str, worktree: Path, url: str | None = None)
     cmd = [cli, "setup-mcp", agent, str(worktree)]
     if url is not None:
         cmd += ["--url", url]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace"
+        )
+    except OSError as exc:
+        print(f"unity_setup: setup-mcp {agent} could not run: {exc}", file=sys.stderr)
+        return 1
     if proc.returncode != 0:
         sys.stderr.write(proc.stdout + proc.stderr)
         print(f"unity_setup: setup-mcp {agent} failed", file=sys.stderr)

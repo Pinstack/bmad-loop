@@ -395,6 +395,9 @@ class UnityPlugin(Plugin):
         env = self.engine_env(ctx)
         if extra_env:
             env.update(extra_env)
+        # the helper's stdio must match the utf-8 decode below — a pipe otherwise
+        # takes the locale encoding (e.g. cp932), mangling non-ASCII diagnostics.
+        env["PYTHONIOENCODING"] = "utf-8"
         cwd = ctx.worktree or ctx.repo_root or None
         try:
             proc = subprocess.run(  # nosec B603 - operator-enabled engine plugin script
@@ -406,6 +409,8 @@ class UnityPlugin(Plugin):
                 env=env,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout,
             )
         except subprocess.TimeoutExpired:

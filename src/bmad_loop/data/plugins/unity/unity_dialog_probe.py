@@ -106,7 +106,14 @@ def _interval() -> float:
 
 
 def _run_xdotool(args: list[str], timeout: float = 10.0) -> subprocess.CompletedProcess:
-    return subprocess.run(["xdotool", *args], capture_output=True, text=True, timeout=timeout)
+    return subprocess.run(
+        ["xdotool", *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+    )
 
 
 def _unity_window_ids(run) -> list[str]:
