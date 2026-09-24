@@ -12,15 +12,17 @@ from enum import StrEnum
 from typing import Any
 
 from .adapters.base import SessionResult
+from .gates import NOTICE_FULL_DETAIL_SOURCE, NOTICE_TRUNCATION_MARKER
 from .model import PAUSE_ESCALATION, RunState, StoryTask, VerifyOutcome
 from .policy import Policy
 
 SEVERITY_CRITICAL = "CRITICAL"
 SEVERITY_PREFERENCE = "PREFERENCE"
 CRITICAL_DISPLAY_MAX = 2000
-CRITICAL_FALLBACK_SOURCE = "journal.jsonl"
+# One marker/source definition, shared with `gates.notify`'s backstop cap.
+CRITICAL_FALLBACK_SOURCE = NOTICE_FULL_DETAIL_SOURCE
 CRITICAL_SOURCE_DISPLAY_MAX = 400
-_CRITICAL_TRUNCATION_MARKER = f" [… truncated; full detail in {CRITICAL_FALLBACK_SOURCE}]"
+_CRITICAL_TRUNCATION_MARKER = NOTICE_TRUNCATION_MARKER
 
 
 class Action(StrEnum):

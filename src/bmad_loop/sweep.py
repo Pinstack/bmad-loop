@@ -7297,6 +7297,7 @@ class SweepEngine(Engine):
             f"ACTION REQUIRED: repair the deferred-work ledger for {task.story_key}",
             f"{notice} — then `bmad-loop resume {self.state.run_id}`, which re-drives "
             f"{resume_detail}",
+            multiline=True,
         )
         self._save()
         # The persisted reason (`state.paused_reason`, `run-paused`, the status

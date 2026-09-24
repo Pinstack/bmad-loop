@@ -497,6 +497,19 @@ def _file_exists_cmd(path) -> str:
     return f'test -f "{path}"'
 
 
+def assert_multiline_notice_keeps_its_lines(run_dir: Path, title: str, notice: str) -> None:
+    """A `gates.notify(..., multiline=True)` notice in ATTENTION: its header record
+    (the one carrying ``title``) holds the notice's first line unfolded (no
+    ` ⏎ `), and the next ATTENTION line is the notice's second line. Ablation:
+    drop the site's `multiline=True` and the notice folds onto the header line."""
+    lines = (run_dir / "ATTENTION").read_text(encoding="utf-8").splitlines()
+    (header,) = [i for i, ln in enumerate(lines) if title in ln]
+    first, second = notice.splitlines()[:2]
+    assert " ⏎ " not in lines[header]
+    assert lines[header].endswith(first)
+    assert lines[header + 1] == second
+
+
 def scripted_verify_runner(expected_root: Path, next_results):
     """Return a scripted ``run_verify_commands`` double that pins its cwd.
 

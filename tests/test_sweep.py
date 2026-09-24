@@ -4695,6 +4695,17 @@ def _assert_bundle_close_pause(
     assert ("harvested-deferral append" if not dw_ids else "bundle close") in attention
     assert f"then `bmad-loop resume {engine.state.run_id}`" in attention
     assert "re-run `bmad-loop sweep`" not in attention  # the fresh-sweep route is wrong here
+    # `multiline=True`: the notice keeps its lines — the bold headline closes the
+    # header record and the next ATTENTION line is the notice's second line.
+    # Ablation: drop the site's `multiline=True` and both fold onto one line.
+    lines = attention.splitlines()
+    (header,) = [
+        i
+        for i, ln in enumerate(lines)
+        if f"ACTION REQUIRED: repair the deferred-work ledger for {task_key}" in ln
+    ]
+    assert " ⏎ " not in lines[header] and lines[header].endswith("**")
+    assert lines[header + 1].startswith(f"Bundle **{task_key}** was about to ")
     return refused
 
 

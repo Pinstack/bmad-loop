@@ -46,6 +46,13 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Shape every notice at `gates.notify`: control characters (ESC, BEL, NUL, C1, …) reach
+  `ATTENTION` and the desktop toast as visible `\xNN` escapes, and a multi-line message
+  (a verify reason's output tail on a retry, defer or escalation) folds onto its one
+  `[stamp] title: message` line with `⏎` instead of spilling loose lines into the file.
+  A 4000-character backstop cap ends in `[… truncated; full detail in journal.jsonl]`.
+  Operator action lists and the run summary keep their lines; the journal stays raw
+  (DW-13, DW-332).
 - Give the seven older portability tripwires (tmux, path, sigkill, killprobe, oskill,
   detach, shell) probe rows, and resolve non-literal heads: the tmux guard now catches a
   name or attribute bound to `"tmux"` (the backend's own `[self._BINARY, ...]`), and the

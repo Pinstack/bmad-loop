@@ -24,6 +24,7 @@ from conftest import (
     _seeded_then_touch,
     _spec_baseline,
     _touch_run,
+    assert_multiline_notice_keeps_its_lines,
     attach_profile,
     crash_at_merge_back,
     fault_locked_ledger_read,
@@ -3457,6 +3458,11 @@ def test_harvest_carry_replay_pauses_over_an_operator_ledger_edit(project):
     assert dirt["ledger"] == str(project.deferred_work)
     assert "error" not in dirt  # real dirt, not a probe fault
     assert _rows(paused_engine, "harvest-carried") == []
+    assert_multiline_notice_keeps_its_lines(
+        paused_engine.run_dir,
+        "ACTION REQUIRED: deferred-work ledger has foreign changes for 1-1-a",
+        paused_engine.state.paused_reason,
+    )
     paused = load_state(paused_engine.run_dir).tasks["1-1-a"]
     assert paused.harvest_carry_commit_pending is True
     assert paused.phase != Phase.DEFERRED

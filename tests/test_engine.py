@@ -27,6 +27,7 @@ from conftest import (
     _self_disarming_cmd,
     _spec_baseline,
     _write_check_script,
+    assert_multiline_notice_keeps_its_lines,
     committing_crash_state,
     dev_effect,
     fault_locked_ledger_read,
@@ -48,18 +49,16 @@ from conftest import (
     write_sprint,
 )
 
-from bmad_loop import deferredwork, devcontract, platform_util, runs, verify
+from bmad_loop import deferredwork, devcontract, gates, platform_util, runs, verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import (
     _UNREADABLE_LEDGER_DIGEST,
-    NOTICE_REASON_MAX,
     Engine,
     RunPaused,
     RunStopped,
     _digest_of,
     _LedgerAnchor,
-    _notice_reason,
     _run_depth,
     _session_task_id,
     _UndecodableLedger,
@@ -2623,56 +2622,22 @@ def test_current_dev_session_index_follows_the_generation(project):
     assert engine._current_dev_session_index(task) == 1
 
 
-def test_notice_reason_caps_a_long_single_line_and_marks_the_trim():
-    """The LENGTH half of `_notice_reason`'s contract, which no engine-level row
-    reaches.
-
-    `test_dev_retry_notice_collapses_a_multiline_reason` grades only the first-line
-    collapse: its long run sits on the third line, so `first` never exceeds the cap
-    and its `len(retry) < 300` bound passes for any cap value — including none. A
-    single-line reason is the shape that actually crosses it: a `[verify] commands`
-    entry whose invocation carries many paths makes `verify command failed (rc=N):
-    <command>` one line well past the cap, and with the cap gone that whole line
-    lands verbatim in ATTENTION and in the toast payload.
-
-    Pinned as a direct unit row rather than through the engine because the cap is a
-    property of the helper, and routing a 500-char command through a dev session to
-    observe it would grade the plumbing instead.
-
-    Ablation: delete the `if len(first) > NOTICE_REASON_MAX:` block and this reddens
-    on the length assertion; the sibling engine row stays green.
-    """
-    capped = _notice_reason("z" * 500)
-    assert capped == "z" * NOTICE_REASON_MAX + " […]"
-    assert len(capped) == NOTICE_REASON_MAX + len(" […]")
-
-    # exactly at the cap is not a trim — the marker would otherwise claim a cut that
-    # did not happen, which is the ambiguity the marker exists to remove
-    assert _notice_reason("z" * NOTICE_REASON_MAX) == "z" * NOTICE_REASON_MAX
-
-    # the reasonless RETRY: the helper returns "" so the call site's `or` fallback
-    # ("dev attempt rejected with no reason recorded") is what reaches the operator
-    assert _notice_reason("") == ""
-    assert _notice_reason("   \n\n  ") == ""
-
-
-def test_dev_retry_notice_collapses_a_multiline_reason(project, monkeypatch):
+def test_dev_retry_notice_folds_a_multiline_reason(project, monkeypatch):
     """The FIXABLE leg, which is where a `Decision.reason` is routinely multi-line:
     `verify.verify_command_results_outcome` appends the captured output tail below
     the command line on purpose, because the repair session reads that tail as its
     feedback.
 
-    `gates.notify` writes exactly one `[stamp] title: message` line and hands the
-    same string to a desktop toast, so a raw reason spills a whole build log into
-    ATTENTION as many un-prefixed lines — breaking the file's own grammar for every
-    later reader — and into a notification bubble. The sibling row above passes
-    without this only because a baseline mismatch happens to be single-line.
+    ATTENTION is one `[stamp] title: message` record per line, so a raw reason
+    spills a whole build log into it as many un-prefixed lines — breaking the file's
+    own grammar for every later reader. `gates.notify` FOLDS the reason instead
+    (DW-13/DW-332): every line survives, joined by ` ⏎ ` on the notice's one line.
 
     Nothing is lost: the untruncated reason is in the `dev-decision` journal entry,
-    which this asserts explicitly so the trim can never be mistaken for a drop.
+    which this asserts explicitly so the fold can never be mistaken for a drop.
 
-    Ablation: pass `decision.reason` raw and the one-line assertion reddens with the
-    tail's lines loose in the file.
+    Ablation: make `gates.notify` write the raw message and the one-line assertion
+    reddens with the tail's lines loose in the file.
     """
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     engine, _ = make_engine(
@@ -2712,9 +2677,10 @@ def test_dev_retry_notice_collapses_a_multiline_reason(project, monkeypatch):
     assert all(ln.startswith("[") for ln in lines), attention
     (retry,) = [ln for ln in lines if "dev retry: 1-1-a" in ln]
     assert "verify command failed (rc=1): pytest -q" in retry
-    assert retry.endswith("[…]")  # the trim is marked, not silent
-    assert "FAILED tests/test_a.py" not in attention  # the tail stayed out
-    assert len(retry) < 300
+    # the tail is folded onto the same line, not dropped and not loose
+    assert "pytest -q ⏎ FAILED tests/test_a.py::test_one ⏎ FAILED tests/test_b.py" in retry
+    assert retry.endswith("x" * 400)
+    assert not any(ln.startswith("FAILED") for ln in attention.splitlines())
 
     # ... and the whole reason is still on the record a maintainer reads
     (decision,) = [
@@ -2723,6 +2689,71 @@ def test_dev_retry_notice_collapses_a_multiline_reason(project, monkeypatch):
         if e["kind"] == "dev-decision" and e["action"] == "retry"
     ]
     assert "FAILED tests/test_b.py::test_two" in decision["reason"]
+
+
+def test_exhaustion_defer_folds_a_multiline_verify_reason_into_one_attention_line(
+    project, monkeypatch
+):
+    """DW-13: the exhaustion DEFER carries the same multi-line verify reason the
+    retry notice does (`rc=…: cmd` plus the captured output tail), and it reached
+    `gates.notify` raw — through `_record_defer`, with no first-line cap at all —
+    so one failing verify command spilled its whole tail into ATTENTION as loose,
+    un-prefixed lines, terminal control bytes included.
+
+    Every non-blank ATTENTION line must keep the `[stamp] title: message` shape;
+    the `story deferred` line carries both the `verify command failed (rc=1)` head
+    and the tail, folded onto it; and the journal keeps the raw multi-line reason.
+
+    Ablation: make `gates.notify` write the raw `message` (skip `notice_line`) and
+    this reddens on the all-lines-start-with-`[` assertion, with the tail loose.
+    """
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False)],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            review=ReviewPolicy(enabled=False),
+            limits=LimitsPolicy(max_dev_attempts=1),
+            verify=VerifyPolicy(commands=["pytest -q"]),
+            # auto-rollback ON: the defer path must not pause for a manual rollback,
+            # whose (deliberately multi-line) ACTION REQUIRED notice is not this row
+            scm=ScmPolicy(rollback_on_failure=True),
+        ),
+    )
+    tail = "FAILED tests/test_a.py::test_one\n\n  \x1b[31mFAILED tests/test_b.py::test_two\x1b[0m\n"
+    monkeypatch.setattr(
+        verify,
+        "run_verify_commands",
+        scripted_verify_runner(
+            project.repo_root, lambda: [verify.CommandResult("pytest -q", 1, tail)]
+        ),
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 0
+    assert engine.state.tasks["1-1-a"].phase == Phase.DEFERRED
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    lines = [ln for ln in attention.splitlines() if ln.strip()]
+    assert all(ln.startswith("[") for ln in lines), attention
+    (deferred,) = [ln for ln in lines if "story deferred: 1-1-a" in ln]
+    assert "verify command failed (rc=1): pytest -q" in deferred
+    assert " ⏎ FAILED tests/test_a.py::test_one ⏎ " in deferred
+    assert "\\x1b[31mFAILED tests/test_b.py::test_two\\x1b[0m" in deferred
+    assert "\x1b" not in attention  # no raw ESC reaches the file
+
+    # the journal stays raw: the whole multi-line reason is on the durable record
+    decisions = [
+        e
+        for e in engine.journal.entries()
+        if e["kind"] == "dev-decision" and "FAILED tests/test_a.py" in e.get("reason", "")
+    ]
+    assert decisions
+    assert "\n" in decisions[-1]["reason"] and "\x1b[31m" in decisions[-1]["reason"]
+    (story_deferred,) = [e for e in engine.journal.entries() if e["kind"] == "story-deferred"]
+    assert "FAILED tests/test_a.py::test_one\n" in story_deferred["reason"]
 
 
 def test_harvest_gate_exclude_is_rooted_on_the_code_tree(project, tmp_path):
@@ -3373,11 +3404,11 @@ def test_dev_retry_notifies_the_operator_with_the_reason(project):
         for e in engine.journal.entries()
         if e["kind"] == "dev-decision" and e["action"] == "retry"
     ]
-    # the notice carries the reason's FIRST LINE, which is what `_notice_reason`
-    # promises — asserting the whole untrimmed reason passes only while that reason
-    # happens to stay single-line and under `NOTICE_REASON_MAX`, so it would go green
-    # for the wrong reason the moment a producer appended an evidence tail.
-    assert decision["reason"].splitlines()[0].strip() in retries[0]
+    # the notice carries the reason as `gates.notice_line` shapes it — asserting the
+    # raw reason passes only while that reason happens to stay single-line and
+    # control-free, so it would go green for the wrong reason the moment a producer
+    # appended an evidence tail.
+    assert gates.notice_line(decision["reason"]) in retries[0]
 
 
 def test_token_budget_discounts_cache_reads(project):
@@ -4591,6 +4622,34 @@ def test_park_notifies_with_the_actions_and_the_confirm_command(project):
     assert "CRITICAL" not in attention
 
 
+def test_park_notice_keeps_its_numbered_action_list_on_separate_lines(project):
+    """`_notify_park` is multi-line BY DESIGN (`multiline=True`): the numbered
+    operator action list must stay one action per line in ATTENTION, not fold onto
+    the header line the way a reason-carrying notice does.
+
+    Ablation: drop `multiline=True` from `_notify_park` and the actions fold onto
+    the header line with ` ⏎ `, so the per-line assertions redden."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            generic_dev_effect(
+                project, "1-1-a", final_status="awaiting-operator", operator_actions=ACTIONS
+            )
+        ],
+        policy=_park_policy(),
+    )
+
+    engine.run()
+
+    lines = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8").splitlines()
+    (header,) = [i for i, ln in enumerate(lines) if "story awaiting operator: 1-1-a" in ln]
+    assert " ⏎ " not in lines[header]
+    for n, action in enumerate(ACTIONS, 1):
+        assert lines[header + n] == f"  {n}. {action}"
+    assert lines[header + len(ACTIONS) + 1].startswith("run `bmad-loop confirm 1-1-a`")
+
+
 def test_run_summary_render_labels_both_units(project):
     """render() feeds stdout, the ATTENTION file and the desktop notification
     from one place, so this covers all three."""
@@ -4607,6 +4666,31 @@ def test_run_summary_render_labels_both_units(project):
     assert "1,320 weighted tokens (2,320 raw incl. cache reads)" in rendered
     # the bare, unlabeled figure the issue reported must be gone
     assert "2,320 tokens" not in rendered
+
+
+def test_run_summary_render_folds_a_multiline_crash_error():
+    """A crash_error is `f"{type}: {str(exc)}"`, and git/subprocess text is routinely
+    multi-line; render() feeds the multiline run-finished notice and stdout, so the
+    CRASHED: reason is folded onto its own line with controls escaped. Ablation:
+    rendering `CRASHED: {self.crash_error}` raw fails this test."""
+    from bmad_loop.engine import RunSummary
+
+    summary = RunSummary(
+        run_id="r1",
+        done=0,
+        deferred=0,
+        escalated=0,
+        paused=False,
+        paused_reason="",
+        total_tokens=0,
+        weighted_tokens=0,
+        crashed=True,
+        crash_error="GitError: x\nstderr tail\n\x1b[31m",
+    )
+    lines = summary.render().splitlines()
+
+    assert "CRASHED: GitError: x ⏎ stderr tail ⏎ \\x1b[31m" in lines
+    assert not any(ln in ("stderr tail", "\x1b[31m") for ln in lines)
 
 
 def test_run_summary_render_untracked_usage_stays_one_plain_zero(project):
@@ -6126,9 +6210,10 @@ def test_closes_deferred_over_a_looped_ledger_with_no_findings_completes_and_jou
     reds with `run-crash` (`OSError`) at the baseline digest. Remove only the
     `gates.notify` call in `_journal_ledger_unavailable` and this fails on the
     missing outage notice, while the lifecycle and journal checks still pass."""
-    # Exceed the fault-prose cap so truncating the whole notice drops declared IDs.
+    # Exceed the retired 200-char fault-prose cap so truncating the whole notice
+    # would drop declared IDs.
     ids = [f"DW-{number}" for number in range(1, 41)]
-    assert len(", ".join(ids)) > NOTICE_REASON_MAX
+    assert len(", ".join(ids)) > 200
     engine = _closes_deferred_run(project, ids, ledger=dict.fromkeys(ids, "open"))
     ledger = project.deferred_work
     _loop_the_ledger_past_the_gate(project, engine)
@@ -11098,6 +11183,51 @@ def test_critical_escalation_pauses_and_resume_continues(project):
     assert resumed.state.finished
 
 
+def test_critical_escalation_with_a_multiline_detail_keeps_attention_one_record_per_line(
+    project,
+):
+    """DW-332's headline surface: `_escalate` hands a CRITICAL reason (routinely a
+    verify tail or a session's multi-line detail) to `gates.notify`, and the run
+    summary then repeats it as `PAUSED: <reason>` inside the deliberately
+    multi-line run-finished notice. Both must stay one ATTENTION record per line:
+    the escalation notice folds on the default path, and `RunSummary.render`
+    folds the embedded reason onto its own `PAUSED:` line.
+
+    Ablation: skip `notice_line` in `gates.notify` and the `CRITICAL escalation:`
+    line loses its fold, with the tail loose; render `PAUSED: {paused_reason}` raw
+    and the tail lines after `PAUSED:` redden the all-lines-start-with-`[` check.
+    """
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    detail = "config key missing\nFAILED tests/test_a.py::test_one\n\n  FAILED tests/test_b.py"
+    escalating = SessionResult(
+        status="completed",
+        result_json={
+            "workflow": "auto-dev",
+            "escalations": [{"type": "missing-config", "severity": "CRITICAL", "detail": detail}],
+        },
+    )
+    engine, _ = make_engine(project, [escalating])
+
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1
+    text = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    lines = text.splitlines()
+    (critical,) = [ln for ln in lines if "CRITICAL escalation: 1-1-a" in ln]
+    assert "config key missing ⏎ FAILED tests/test_a.py::test_one ⏎ FAILED tests/test_b.py" in (
+        critical
+    )
+    (finished,) = [i for i, ln in enumerate(lines) if "bmad-loop run finished" in ln]
+    paused = lines[finished + 1]
+    assert paused.startswith("PAUSED: ") and " ⏎ FAILED tests/test_b.py" in paused
+    # the PAUSED line is the notice's continuation; nothing else is loose
+    loose = [ln for ln in lines if ln.strip() and not ln.startswith("[")]
+    assert loose == [paused], text
+    assert not any(ln.lstrip().startswith("FAILED") for ln in lines)
+    # the state keeps the raw reason
+    assert "\n" in load_state(engine.run_dir).paused_reason
+
+
 def test_dispatch_refuses_a_story_an_unlanded_entry_gates(project):
     """The enforcing half of `gate:`. Before this, `_pick_next` read the board
     alone: the ledger could say a story was blocked and `run` drove it anyway, and
@@ -12662,7 +12792,7 @@ def test_auto_sweep_not_started_still_notifies_with_its_own_wording(project, mon
     notes = []
     monkeypatch.setattr(
         "bmad_loop.gates.notify",
-        lambda policy, rd, title, message: notes.append((title, message)),
+        lambda policy, rd, title, message, **_kw: notes.append((title, message)),
     )
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     policy = Policy(gates=GatesPolicy(mode="none"), notify=QUIET, sweep=SweepPolicy(auto="run-end"))
@@ -13590,7 +13720,7 @@ def test_graceful_stop_runs_clean_finalization_and_notifies(project, monkeypatch
     notes = []
     monkeypatch.setattr(
         "bmad_loop.gates.notify",
-        lambda policy, rd, title, message: notes.append((title, message)),
+        lambda policy, rd, title, message, **kw: notes.append((title, message, kw)),
     )
     write_sprint(project, {"1-1-a": "ready-for-dev", "1-2-b": "ready-for-dev"})
     run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
@@ -13625,6 +13755,9 @@ def test_graceful_stop_runs_clean_finalization_and_notifies(project, monkeypatch
     assert notes and notes[-1][0] == "bmad-loop run stopped gracefully"
     assert "bmad-loop resume test-run" in notes[-1][1]
     assert "1 story remaining" in notes[-1][1]
+    # the body is a deliberate multi-line list (summary, remaining, resume hint);
+    # ablation: drop `multiline=True` from the graceful-stop notify and this reddens
+    assert notes[-1][2] == {"multiline": True}
 
 
 def test_epic_boundary_auto_sweep_suppressed_by_graceful_stop(project, monkeypatch):
@@ -16584,6 +16717,11 @@ def test_harvest_over_undecodable_ledger_pauses_and_resume_replays_the_session(p
     assert "ACTION REQUIRED" in attention
     assert str(ledger) in attention and "`bmad-loop resume test-run`" in attention
     assert ledger.read_bytes() == UNDECODABLE_LEDGER_BYTES  # nothing written over them
+    assert_multiline_notice_keeps_its_lines(
+        engine.run_dir,
+        "ACTION REQUIRED: repair the deferred-work ledger for 1-1-a",
+        engine.state.paused_reason,
+    )
     # The snapshot was left UNARMED over the typed answer, so no later restore
     # can put back "text" nobody could read.
     assert task.pre_harvest_ledger_captured is False and task.post_engine_ledger_digest is None
@@ -16930,7 +17068,6 @@ def test_pending_salvage_refile_survives_interrupted_commit_handoff(
     persists an unresumable timeout. Remove the pending-latch exception from the
     recommendation shortcut and replay bypasses salvage verification.
     """
-    from bmad_loop import gates
 
     class PowerLoss(BaseException):
         pass
@@ -17032,7 +17169,6 @@ def test_first_salvage_latches_before_its_handoff_save(
     Ablation: drop the `task.salvage_refile_pending = True` ahead of the salvage's
     handoff save and every row reds on `resume-restart` (rollback rows also on
     the two re-driven sessions; no-rollback rows on the pause)."""
-    from bmad_loop import gates
 
     class PowerLoss(BaseException):
         pass
@@ -19573,36 +19709,6 @@ def test_a_park_record_rollback_refused_as_unconfined_is_journaled(project):
     assert "UnconfinedWriteError" in journal  # journaled by NAME, not a bare errno
     escaped = _json.loads((outside / record.name).read_text(encoding="utf-8"))
     assert escaped["actions"] == ACTIONS  # this run's record, NOT the prior put back
-
-
-def test_notice_reason_bound_is_an_upper_bound_not_an_equality():
-    """`NOTICE_REASON_MAX + len(" […]")` is a ceiling the return need not attain.
-
-    The sibling row pins it with `"z" * 500` — whitespace-free, so the slice never
-    rstrips and the equality holds. Two shapes make it strictly less, and the comment
-    on the constant used to state the bound as though neither existed:
-
-    * a cut landing on whitespace, since the slice is `.rstrip()`ed;
-    * ANY multi-line reason, since `trimmed` is set by the line collapse regardless of
-      length — which is the common case, `verify.verify_command_results_outcome`
-      putting its output tail under a short classification line.
-
-    Behaviour is correct in every case; what was wrong was the claim about it, and a
-    test that pins one whitespace-free instance cannot tell the claim from the truth.
-
-    Ablation: this row grades the COMMENT, so the meaningful ablation is textual —
-    restore "runs to NOTICE_REASON_MAX + len(...)" without "AT MOST" and the assertions
-    below contradict it. For the code half, delete the `.rstrip()` and the
-    whitespace-boundary assertion reddens on `len(capped) == 204`.
-    """
-    capped = _notice_reason("a" * (NOTICE_REASON_MAX - 1) + " " + "b" * 300)
-    assert capped.endswith(" […]")  # a trim happened, and is marked
-    assert len(capped) < NOTICE_REASON_MAX + len(" […]")  # yet lands BELOW the bound
-    assert not capped.startswith("a" * NOTICE_REASON_MAX)  # because the slice rstripped
-
-    short = _notice_reason("short first line\nthe evidence lives here")
-    assert short == "short first line […]"  # marked well under the cap
-    assert len(short) < NOTICE_REASON_MAX
 
 
 def test_llm_authored_preference_keys_cannot_hijack_journal_reserved_names(project):

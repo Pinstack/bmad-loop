@@ -372,10 +372,14 @@ class RunSummary:
             f"run {self.run_id}: {self.done} done, {self.deferred} deferred, "
             f"{self.escalated} escalated{parked}, {tokens}"
         ]
+        # The two embedded reasons are routinely multi-line (a CRITICAL carrying a
+        # verify tail, a crash traceback tail): fold each onto its own line, so the
+        # multiline run-finished / graceful-stop notice keeps one line per record.
         if self.crashed:
-            lines.append(f"CRASHED: {self.crash_error}")
+            crash = self.crash_error
+            lines.append(f"CRASHED: {gates.notice_line(crash) if crash is not None else crash}")
         if self.paused:
-            lines.append(f"PAUSED: {self.paused_reason}")
+            lines.append(f"PAUSED: {gates.notice_line(self.paused_reason)}")
         # Appended only when it fired, like `parked` above. Under
         # `[sweep] auto = "run-end"` there is exactly one trigger per run and it
         # is never re-asked once the run finishes (see `_maybe_auto_sweep`), so
@@ -482,51 +486,6 @@ def _session_task_id(story_key: str, part: str, seq: int, generation: int) -> st
     across this upgrade still finds its ``tasks/`` directories."""
     gen = f"-g{generation}" if generation > 0 else ""
     return safe_segment(f"{story_key}-{part}-{seq}{gen}")
-
-
-# Longest single-line `reason` a notification channel carries — the returned string
-# runs to AT MOST NOTICE_REASON_MAX + len(" […]"), the bound
-# `test_notice_reason_caps_a_long_single_line_and_marks_the_trim` pins. At most, not
-# exactly, in two ways: the slice is `.rstrip()`ed, so a cut landing on whitespace
-# returns less; and `trimmed` is set for ANY multi-line reason regardless of length, so
-# a short first line followed by evidence is marked far below the cap. Not a display
-# preference: `gates.notify` normally writes one `[stamp] title: message` line into
-# ATTENTION and hands the same string to a desktop toast, while a `Decision.reason`
-# is routinely MULTI-line — `verify.verify_command_results_outcome` appends the
-# captured output tail below the command line on purpose, because a repair session
-# reads that tail as its feedback. Pasted through verbatim, one failing verify
-# command spills a whole build log into ATTENTION as many un-prefixed lines (the
-# file's own `[stamp] title:` grammar breaks with it) and into a notification bubble.
-#
-# "Normally" is exact, not hedging: `_notify_park` deliberately writes a newline-joined
-# numbered action list through the same call, so one-line-per-notice is a property of
-# the reason-carrying notices, NOT of the ATTENTION file. Any test asserting the shape
-# over the whole file is really asserting that no park fired in that run.
-NOTICE_REASON_MAX = 200
-
-
-def _notice_reason(reason: str) -> str:
-    """``reason`` as ONE bounded line, for a notification channel.
-
-    Keeps the first non-empty line and caps it. Every producer front-loads the
-    classification there — ``verify command failed (rc=1): pytest -q``, ``spec
-    baseline … does not match orchestrator-recorded baseline …`` — and puts the
-    evidence underneath, so the first line is exactly the part a human deciding
-    whether to intervene needs. Nothing is lost: the untruncated reason is already
-    in the ``dev-decision`` journal entry every caller writes before notifying,
-    which is where a maintainer reads it.
-
-    A trim is MARKED (``[…]``) rather than silent, so a reader can tell a reason
-    that ended there from one that was cut — a bare truncation reads as the whole
-    story and is how a "no changes since baseline" gets mistaken for the complete
-    diagnosis.
-    """
-    first = next((line.strip() for line in reason.splitlines() if line.strip()), "")
-    trimmed = first != reason.strip()
-    if len(first) > NOTICE_REASON_MAX:
-        first = first[:NOTICE_REASON_MAX].rstrip()
-        trimmed = True
-    return f"{first} […]" if trimmed else first
 
 
 def _at_or_past(landed: str | None, target: str) -> bool:
@@ -1177,9 +1136,16 @@ class Engine:
                 self.run_dir,
                 "bmad-loop run stopped gracefully",
                 "\n".join(body),
+                multiline=True,
             )
         else:
-            gates.notify(self.policy, self.run_dir, "bmad-loop run finished", summary.render())
+            gates.notify(
+                self.policy,
+                self.run_dir,
+                "bmad-loop run finished",
+                summary.render(),
+                multiline=True,
+            )
         return summary
 
     # ---------------------------------------------------------- stop signals
@@ -3018,8 +2984,7 @@ class Engine:
                     self.policy,
                     self.run_dir,
                     f"dev retry: {task.story_key} (attempt {task.attempt})",
-                    _notice_reason(decision.reason)
-                    or "dev attempt rejected with no reason recorded",
+                    decision.reason.strip() or "dev attempt rejected with no reason recorded",
                 )
                 if outcome is not None and outcome.fixable:
                     # work exists and the failure is concrete: keep the tree,
@@ -4065,6 +4030,7 @@ class Engine:
             f"committed, but {len(task.operator_actions)} action(s) are owed outside the repo:\n"
             f"{actions}\n"
             f"run `bmad-loop confirm {task.story_key}` once they are done.",
+            multiline=True,
         )
 
     # ----------------------------------------------------- override seams
@@ -5275,7 +5241,7 @@ class Engine:
             self.run_dir,
             f"declared deferred closes unapplied: {task.story_key}",
             f"Could not read the deferred-work ledger {ledger}; declared closes were not applied: "
-            f"{', '.join(ids)}. Fault: {_notice_reason(error)}. "
+            f"{', '.join(ids)}. Fault: {error}. "
             "The story continues without these ledger updates. Restore ledger readability, "
             "then run a sweep to reconcile the still-open entries against the completed "
             "story's commit.",
@@ -5841,6 +5807,7 @@ class Engine:
             self.run_dir,
             f"ACTION REQUIRED: repair the deferred-work ledger for {task.story_key}",
             notice,
+            multiline=True,
         )
         self._save()
         raise RunPaused(notice, PAUSE_ESCALATION, task.story_key)
@@ -8255,6 +8222,7 @@ class Engine:
             self.run_dir,
             f"ACTION REQUIRED: deferred-work ledger {subject} for {task.story_key}",
             notice,
+            multiline=True,
         )
         self._save()
         raise RunPaused(notice, PAUSE_ESCALATION, task.story_key)

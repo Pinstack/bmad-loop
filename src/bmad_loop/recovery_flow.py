@@ -754,6 +754,7 @@ class RecoveryFlow:
             self.run_dir,
             f"ACTION REQUIRED: recover attempt-owned spec for {task.story_key}",
             notice,
+            multiline=True,
         )
         self._save()
         self._pause(notice, task.story_key)
@@ -2014,6 +2015,7 @@ class RecoveryFlow:
             self.run_dir,
             f"ACTION REQUIRED: manual rollback for {task.story_key}",
             notice,
+            multiline=True,
         )
         self._save()
         self._pause(notice, task.story_key)

@@ -17,7 +17,12 @@ from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 
 import pytest
-from conftest import NUL_PATH_RESOLVE_FAULTS, git, refuse_to_resolve
+from conftest import (
+    NUL_PATH_RESOLVE_FAULTS,
+    assert_multiline_notice_keeps_its_lines,
+    git,
+    refuse_to_resolve,
+)
 
 from bmad_loop import platform_util, recovery_flow, verify
 from bmad_loop.bmadconfig import ProjectPaths
@@ -1344,6 +1349,11 @@ def _assert_owned_spec_manual_adoption_pause(
     assert len(flow.calls.pauses) == 1
     assert "manual adoption is required" in flow.calls.pauses[0][0]
     assert flow.journal.events().count("rollback-owned-spec-manual-required") == 1
+    assert_multiline_notice_keeps_its_lines(
+        flow.run_dir,
+        f"ACTION REQUIRED: recover attempt-owned spec for {task.story_key}",
+        flow.calls.pauses[0][0],
+    )
     status_guidance = (
         f"; the adopted spec must have lifecycle status {expected_status!r}"
         if expected_status is not None
@@ -4261,6 +4271,9 @@ def test_pause_stopped_wording_no_commits(project, tmp_path):
     assert "rollback-manual-required" in flow.journal.events()
     # notify wrote a line to the run dir's attention file (QUIET file=True)
     assert "manual rollback for 1-1-a" in (tmp_path / ATTENTION_FILE).read_text()
+    assert_multiline_notice_keeps_its_lines(
+        tmp_path, "ACTION REQUIRED: manual rollback for 1-1-a", reason
+    )
 
 
 def test_pause_committed_wording_names_at_risk_commits(project, tmp_path):
