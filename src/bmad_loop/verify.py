@@ -31,8 +31,12 @@ import yaml
 
 from . import deferredwork
 from .bmadconfig import ProjectPaths
+from .frontmatter import FileIdentity  # noqa: F401 — re-export
+from .frontmatter import FrontmatterTargetChangedError  # noqa: F401 — re-export
 from .frontmatter import FrontmatterWriteError  # noqa: F401 — re-export
+from .frontmatter import parse_frontmatter  # noqa: F401 — re-export
 from .frontmatter import set_frontmatter_status  # noqa: F401 — re-export
+from .frontmatter import set_frontmatter_status_anchored  # noqa: F401 — re-export
 from .frontmatter import (
     _edit_frontmatter_block,
     _split_frontmatter,

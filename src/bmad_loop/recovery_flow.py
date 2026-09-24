@@ -311,7 +311,11 @@ class RecoveryFlow:
 
     @staticmethod
     def _normalize_attempt_owned_spec(
-        spec_path: Path, target_status: str, *, confine_root: Path
+        spec_path: Path,
+        target_status: str,
+        *,
+        confine_root: Path,
+        expected: verify.FileIdentity | None = None,
     ) -> None:
         """Write and verify the lifecycle route recovery promises to dispatch.
 
@@ -324,10 +328,24 @@ class RecoveryFlow:
         ``workspace.root``: under the `repo_root` override that is the separate
         code repo, an in-project spec fails its `is_relative_to` test, and the
         chokepoint silently takes the plain arm — dropping the parent walk the
-        confinement exists for. It reaches the spec-writer chokepoint rule
-        stated in `frontmatter.set_frontmatter_status` — an artifacts folder
-        configured outside the project is a trusted repair target here
-        (`_attempt_owned_spec`) when handle-anchored writes are available."""
+        confinement exists for. An artifacts folder configured outside the
+        project is a trusted repair target here (`_attempt_owned_spec`) when
+        handle-anchored writes are available.
+
+        The write is `frontmatter.set_frontmatter_status_anchored` (DW-323), the
+        fifth spec writer: the confinement rule stated in
+        `frontmatter.set_frontmatter_status` in-project, a canonical
+        filesystem-root walk (not the plain path write) for an external target,
+        and one bound target identity checked at the read, before staging and
+        immediately before the replace. ``expected`` is the identity
+        `_restore_attempt_owned_spec_bytes` just published (DW-319); when the
+        file no longer matches it — an operator edit or swap landed between
+        restoration and this normalization — nothing is written and the refusal
+        becomes `_OwnedSpecAuthorityError`, so the ``*_or_pause`` wrappers clear
+        the authority pair and pause with the operator's bytes untouched. The
+        final check is not a compare-and-swap: an in-place edit of the old inode
+        in the instant between it and the replace is not detected. Acceptance
+        reads the returned identity's bytes, never the path again."""
         # A path-based fallback cannot retain publication authority across the
         # final replace. Refuse before any repair write so a substituted parent
         # or target cannot redirect staging, publication, or cleanup. Both the
@@ -341,15 +359,31 @@ class RecoveryFlow:
                 f"{spec_path}",
                 safe_restoration_unavailable=True,
             )
-        verify.set_frontmatter_status(spec_path, target_status, confine_root=confine_root)
-        if verify.status_of(verify.read_frontmatter(spec_path)) != target_status:
+        try:
+            published = verify.set_frontmatter_status_anchored(
+                spec_path,
+                target_status,
+                confine_root=confine_root,
+                expected=expected,
+            )
+        except verify.FrontmatterTargetChangedError as exc:
+            raise _OwnedSpecAuthorityError(
+                f"attempt-owned spec target changed during normalization ({exc}): {spec_path}"
+            ) from exc
+        text = published.data.decode("utf-8")  # the writer already decoded it
+        if verify.status_of(verify.parse_frontmatter(text)) != target_status:
             raise verify.FrontmatterWriteError(
                 f"could not normalize attempt-owned spec {spec_path} to status {target_status!r}"
             )
 
     @staticmethod
-    def _restore_attempt_owned_spec_bytes(spec_path: Path, snapshot: bytes) -> None:
-        """Restore and verify the byte-exact pre-attempt input."""
+    def _restore_attempt_owned_spec_bytes(spec_path: Path, snapshot: bytes) -> verify.FileIdentity:
+        """Restore and verify the byte-exact pre-attempt input.
+
+        Returns the published inode's identity — a stable anchored read taken
+        after the writer released it, required to be that same inode holding
+        exactly ``snapshot`` — so a following normalization can require the
+        file it rewrites to be the one restored here (DW-319)."""
         parent = spec_path.parent
         try:
             # Validate the full spelling before creating any missing component.
@@ -598,6 +632,7 @@ class RecoveryFlow:
             raise _OwnedSpecAuthorityError(
                 f"attempt-owned spec target could not be revalidated: {spec_path}"
             )
+        published: list[os.stat_result] = []
         try:
             expected = read_target_at(parent_fd)
 
@@ -606,6 +641,7 @@ class RecoveryFlow:
 
             def verify_published(published_fd: int) -> None:
                 verify_published_inode(parent_fd, published_fd)
+                published.append(os.fstat(published_fd))
 
             atomic_write_bytes_at(
                 parent_fd,
@@ -616,8 +652,22 @@ class RecoveryFlow:
                 _before_replace=validate_target,
                 _after_replace=verify_published,
             )
+            # The identity handed to normalization is read back only now, after
+            # the writer released the published inode, through the same
+            # anchored read normalization will bind with — so it compares like
+            # with like even if a host settles timestamps when the writing
+            # handle closes. It must still be the published inode holding
+            # exactly the snapshot.
+            settled = read_target_at(parent_fd)
+            if (
+                settled is None
+                or not os.path.samestat(settled[0], published[0])
+                or settled[1] != snapshot
+            ):
+                raise _OwnedSpecAuthorityError(authority_message)
         finally:
             os.close(parent_fd)
+        return verify.FileIdentity(*settled)
 
     @classmethod
     def _restore_attempt_owned_spec(
@@ -629,11 +679,19 @@ class RecoveryFlow:
         confine_root: Path,
     ) -> None:
         """Restore exact pre-attempt bytes, then verify the promised route."""
-        cls._restore_attempt_owned_spec_bytes(spec_path, snapshot)
+        restored = cls._restore_attempt_owned_spec_bytes(spec_path, snapshot)
         # The durable snapshot should already carry this route. Keep the status
         # repair as a fail-safe for a legacy or externally edited state record;
-        # it is the only permitted difference from the exact snapshot.
-        cls._normalize_attempt_owned_spec(spec_path, target_status, confine_root=confine_root)
+        # it is the only permitted difference from the exact snapshot. The
+        # restored identity rides along (DW-319): an edit landing between the
+        # two transactions is the operator's, and it pauses rather than being
+        # overwritten by a normalization that never saw it.
+        cls._normalize_attempt_owned_spec(
+            spec_path,
+            target_status,
+            confine_root=confine_root,
+            expected=restored,
+        )
 
     @staticmethod
     def _owned_spec_restore_problem(

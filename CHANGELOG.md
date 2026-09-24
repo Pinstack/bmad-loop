@@ -48,6 +48,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Bind attempt-owned spec normalization to one inode, re-checked from the read until just
+  before the replace, in-project and external alike, and carry restoration's published
+  identity into it: a spec edited or swapped after restoration is detected and pauses
+  instead of being overwritten (DW-319, DW-323).
 - Name the convergent step in the attempt-owned spec recovery notice: return the checkout
   to the recorded attempt baseline before `resume`; on a plain attempt, approved tracked-spec
   edits that differ from it are attempt residue and are not adopted (a latched re-drive that

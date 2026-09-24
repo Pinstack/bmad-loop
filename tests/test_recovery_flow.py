@@ -187,6 +187,12 @@ def test_owned_spec_normalization_forced_fallback_refuses_before_writer(tmp_path
         "set_frontmatter_status",
         lambda *args, **kwargs: writer_calls.append((args, kwargs)),
     )
+    anchored_calls: list[tuple] = []
+    monkeypatch.setattr(
+        verify,
+        "set_frontmatter_status_anchored",
+        lambda *args, **kwargs: anchored_calls.append((args, kwargs)),
+    )
 
     with pytest.raises(_OwnedSpecAuthorityError, match="restoration is unavailable") as excinfo:
         RecoveryFlow._normalize_attempt_owned_spec(
@@ -197,6 +203,7 @@ def test_owned_spec_normalization_forced_fallback_refuses_before_writer(tmp_path
 
     assert excinfo.value.safe_restoration_unavailable is True
     assert writer_calls == []
+    assert anchored_calls == []  # the refusal precedes the anchored writer too
     assert spec.read_bytes() == original
 
 
@@ -3011,6 +3018,122 @@ def test_latched_redrive_reset_normalizes_preserved_spec_after_sibling_residue(p
     }
     assert "rollback-auto" in flow.journal.events()
     assert flow.calls.emits == ["pre_rollback", "post_rollback"]
+
+
+@requires_descriptor_restoration
+def test_owned_spec_restore_returns_the_published_identity(tmp_path):
+    """DW-319: restoration hands back what it published — the live inode and the
+    snapshot bytes — and that identity is one the anchored normalizer accepts
+    as ``expected`` for the untouched file.
+
+    Deliberately not a field-by-field comparison with a path ``os.stat``: under
+    Wine a renamed file's path stat reports a different ``st_ctime_ns`` than
+    its handle stats do; the binding that matters is handle against handle."""
+    spec = tmp_path.resolve() / "owned.md"
+    spec.write_bytes(b"failed child bytes\n")
+    snapshot = b"---\nstatus: done\n---\n\noperator input\n"
+
+    identity = RecoveryFlow._restore_attempt_owned_spec_bytes(spec, snapshot)
+
+    assert identity.data == snapshot
+    assert os.path.samestat(identity.stat, os.stat(spec))
+    verify.set_frontmatter_status_anchored(
+        spec, "ready-for-dev", confine_root=tmp_path.resolve(), expected=identity
+    )
+    assert spec.read_bytes() == snapshot.replace(b"status: done", b"status: ready-for-dev")
+
+
+@requires_descriptor_restoration
+@pytest.mark.parametrize("swapped", ["snapshot-bytes", "other-bytes"])
+def test_owned_spec_restore_settled_readback_refuses_a_swapped_inode(
+    tmp_path, monkeypatch, swapped
+):
+    """The identity restoration returns is read back after the writer releases
+    the published inode, and it must still BE that inode holding the snapshot. A
+    name swapped to a new inode in that window — even one carrying the snapshot
+    bytes — is refused rather than handed to normalization as ``expected``.
+
+    Ablation: drop the samestat/bytes conditions of the settled read-back and
+    both cases return an identity for a file restoration never published."""
+    spec = tmp_path.resolve() / "owned.md"
+    spec.write_bytes(b"failed child bytes\n")
+    snapshot = b"---\nstatus: ready-for-dev\n---\n\noperator input\n"
+    replacement = snapshot if swapped == "snapshot-bytes" else b"swapped operator bytes\n"
+    real_writer = recovery_flow.atomic_write_bytes_at
+
+    def write_then_swap(*args, **kwargs):
+        real_writer(*args, **kwargs)
+        staged = spec.with_name("owned.md.swap")
+        staged.write_bytes(replacement)
+        os.replace(staged, spec)
+
+    monkeypatch.setattr(recovery_flow, "atomic_write_bytes_at", write_then_swap)
+
+    with pytest.raises(_OwnedSpecAuthorityError):
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, snapshot)
+
+    assert spec.read_bytes() == replacement
+
+
+@requires_descriptor_restoration
+@pytest.mark.parametrize("edit", ["in-place", "new-inode"])
+def test_redrive_restore_then_operator_edit_pauses_and_keeps_operator_bytes(
+    project, monkeypatch, edit
+):
+    """DW-319: an operator edit landing between byte restoration and lifecycle
+    normalization is never overwritten. Restore-then-normalize carries the
+    restored identity, the anchored writer refuses the changed target, and the
+    refusal reaches the owned-spec pause wrapper — authority cleared, operator
+    bytes intact.
+
+    Ablation: drop ``expected=restored`` in `_restore_attempt_owned_spec` and
+    this fails `DID NOT RAISE`, with the operator's ``status: done`` rewritten
+    to ``ready-for-dev``."""
+    repo = project.project
+    source = repo / "redrive-source.txt"
+    source.write_text("baseline source\n")
+    spec = _tracked_spec(project)
+    task = _task(repo)
+    task.dispatched_spec_file = str(spec)
+    task.resolved_redrive = True
+    corrected = b"---\nstatus: ready-for-dev\n---\n\nhuman corrected intent\n"
+    task.dispatched_spec_snapshot = corrected
+    source.write_text("rejected implementation\n")
+    spec.write_text("---\nstatus: done\n---\n\nfailed child body edit\n")
+    operator = b"---\nstatus: done\n---\n\noperator edit after restore\n"
+    real_restore = RecoveryFlow._restore_attempt_owned_spec_bytes
+    restores: list[Path] = []
+
+    def restore_then_operator_edits(spec_path, snapshot):
+        identity = real_restore(spec_path, snapshot)
+        restores.append(spec_path)
+        if edit == "in-place":
+            with open(spec_path, "r+b") as fh:
+                fh.write(operator)
+                fh.truncate()
+        else:
+            staged = spec_path.with_name(spec_path.name + ".save")
+            staged.write_bytes(operator)
+            os.replace(staged, spec_path)
+        return identity
+
+    monkeypatch.setattr(
+        RecoveryFlow,
+        "_restore_attempt_owned_spec_bytes",
+        staticmethod(restore_then_operator_edits),
+    )
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=True)
+    )
+
+    with pytest.raises(_Pause, match="changed during normalization"):
+        flow.rollback_or_pause(task)
+
+    assert restores == [spec.resolve()]
+    assert spec.read_bytes() == operator
+    assert task.dispatched_spec_file is None
+    assert task.dispatched_spec_snapshot is None
+    assert "rollback-owned-spec-normalized" not in flow.journal.events()
 
 
 def test_latched_redrive_without_snapshot_refuses_reset_of_sibling_residue(project):
