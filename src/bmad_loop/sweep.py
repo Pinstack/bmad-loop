@@ -38,6 +38,7 @@ from .escalation import (
     critical_session_reason,
     display_critical_reason,
     env_fault_pause_reason,
+    parked_pause_reason,
     session_failure_reason,
 )
 from .model import PAUSE_ESCALATION, PAUSE_STORY_GATE, Phase, StoryTask, result_mapping
@@ -4036,6 +4037,7 @@ class SweepEngine(Engine):
                 ok=not errors,
                 errors=errors,
                 env_fault=result.env_fault,
+                parked=result.parked,
                 diagnostic=diagnostic,
             )
             if result.status != "completed" and result.env_fault:
@@ -4047,6 +4049,14 @@ class SweepEngine(Engine):
                 self._escalate(
                     task,
                     env_fault_pause_reason("migration", result) + _diagnostic_suffix(diagnostic),
+                )
+            if result.status != "completed" and result.parked:
+                # Parked on a human prompt (DW-348/DW-350): the stall nudge was
+                # withheld, so no rewrite ran — pause (fresh budget on resume)
+                # rather than charge a migration attempt, like the env-fault arm.
+                self._escalate(
+                    task,
+                    parked_pause_reason("migration", result) + _diagnostic_suffix(diagnostic),
                 )
             if not errors:
                 # This record is the durable proof that validation accepted the
@@ -4396,6 +4406,7 @@ class SweepEngine(Engine):
                 ok=plan is not None,
                 errors=errors,
                 env_fault=result.env_fault,
+                parked=result.parked,
                 diagnostic=diagnostic,
             )
             if result.status != "completed" and result.env_fault:
@@ -4405,6 +4416,14 @@ class SweepEngine(Engine):
                 self._escalate(
                     task,
                     env_fault_pause_reason("triage", result) + _diagnostic_suffix(diagnostic),
+                )
+            if result.status != "completed" and result.parked:
+                # Parked on a human prompt (DW-348/DW-350): pause rather than charge
+                # a triage attempt the adapter would not type into (fresh budget on
+                # resume, as for env_fault).
+                self._escalate(
+                    task,
+                    parked_pause_reason("triage", result) + _diagnostic_suffix(diagnostic),
                 )
             if plan is not None:
                 advance(task, Phase.DONE)

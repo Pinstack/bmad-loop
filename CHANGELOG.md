@@ -42,9 +42,20 @@ breaking changes may land in a minor release.
 - Show auto-sweep outcomes in the TUI run header: a refused sweep gets a warning line
   with its trigger and reason (`auto-sweep not run: run-end (dirty)`), a delivered one a
   dim `auto-sweep ran:` line, both read from state.json like `status` (DW-366).
+- Add parked-session signals: canonical `Notification` carrier plus parked kinds
+  `PermissionPrompt`/`IdlePrompt`/`QuotaPrompt`, a `[hooks.notification_types]` profile
+  table (the relay forwards `notification_type`), a `parked_prompt_patterns` profile list
+  matched against the visible pane, a non-abstract `TerminalMultiplexer.capture_pane`, and
+  `SessionResult.parked`/`parked_evidence`. The claude profile relays `Notification` and
+  maps its permission, idle and stale/disabled quota subtypes; re-run `bmad-loop init` to
+  register the relay (DW-348, DW-350).
 
 ### Changed
 
+- For the claude profile, a dev, review or workflow session that ends a turn without a result and
+  then sits idle now pauses as parked at stall-grace expiry instead of receiving the
+  stall wake nudge (claude's `idle_prompt` is mapped to `IdlePrompt`); opt out with a
+  project overlay that drops `idle_prompt` from `[hooks.notification_types]` (DW-348).
 - Register hooks through the installed `bmad-loop relay <Event>` command. Upgrading
   invalidates Codex hook trust: Codex re-prompts at the next launch, and hooks silently
   do not fire until the new commands are accepted. Re-run `bmad-loop init` to migrate
@@ -58,6 +69,13 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Stop the stall wake nudge from answering a parked CLI's prompt (#727): at stall-grace
+  expiry, a latched parked hook signal or a `parked_prompt_patterns` pane match withholds
+  the nudge and ends the session `stalled` + `parked`, which every dev, review, fix,
+  blocking-workflow, migration and triage site PAUSEs (after `env_fault`) instead of
+  retrying into the same prompt (DW-348, DW-350). Detection needs an armed stall grace:
+  dev/review/fix/workflow sessions with `dev_stall_grace_s > 0`, not sweep triage or
+  migration sessions.
 - Escalate an isolated unit before a Codex session starts in a worktree Codex does not
   trust (queried per worktree, launch binary, and stage `extra_args`; at unit dispatch and
   before every worktree session, resume arms included), instead of starting a session

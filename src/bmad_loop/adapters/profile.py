@@ -61,7 +61,17 @@ HOOK_DIALECTS = {
     # no hook config is ever written, so config_path/events must stay empty.
     "none",
 }
-CANONICAL_EVENTS = {"SessionStart", "Stop", "SessionEnd", "PreCompact"}
+# Parked-session kinds (DW-348): the CLI is waiting on a human — a permission,
+# idle or quota prompt. A parked event never completes a session; the generic
+# adapter latches it and, only where the stall logic would otherwise type a wake
+# nudge into the pane, withholds the nudge and ends the session as parked
+# (`SessionResult.parked`). A profile reaches these either by mapping a native
+# event straight to one, or through the `Notification` carrier plus
+# `hooks.notification_types` (native subtype -> parked kind).
+PARKED_EVENTS = frozenset({"PermissionPrompt", "IdlePrompt", "QuotaPrompt"})
+CANONICAL_EVENTS = {"SessionStart", "Stop", "SessionEnd", "PreCompact", "Notification"} | set(
+    PARKED_EVENTS
+)
 USER_PROFILES_REL = Path(".bmad-loop") / "profiles"
 
 # Legacy adapter names from older policy.toml files, plus friendly short names.
@@ -92,6 +102,13 @@ class HookSpec:
     dialect: str
     config_path: str  # project-relative, e.g. ".claude/settings.json"
     events: dict[str, str]  # native event name -> canonical event name
+    # Subtypes of the canonical `Notification` carrier that mean "parked on a
+    # human" (DW-348): the relay forwards the payload's `notification_type`, and
+    # this table maps it onto a PARKED_EVENTS kind — e.g. claude's
+    # `permission_prompt` -> `PermissionPrompt`. An unmapped subtype is ignored.
+    # Non-empty requires some native event mapped to `Notification`. APPENDED
+    # with a default so every positional HookSpec construction stays valid.
+    notification_types: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -173,6 +190,16 @@ class CLIProfile:
     # across every tracked file. Override/extend via a project profile in
     # .bmad-loop/profiles/.
     env_fault_patterns: tuple[str, ...] = ()
+    # Patterns matched line-by-line against the ANSI-stripped VISIBLE pane
+    # (`mux.capture_pane`), only at the moment a stall wake nudge is about to be
+    # typed into it (DW-350). A match means the CLI is parked on a prompt only a
+    # human should answer — the nudge's trailing Enter could confirm it (#727:
+    # Enter chose "No, exit" on Claude Code's Bypass Permissions dialog) — so the
+    # nudge is withheld and the session ends as parked instead. Same evidentiary
+    # bar as env_fault_patterns: seed only lines captured from the CLI's own
+    # screen, with single-character classes so the profile line does not match
+    # itself. Compiled and validated at parse time; empty = inert.
+    parked_prompt_patterns: tuple[str, ...] = ()
     # Did this profile ship INSIDE the package (bmad_loop/data/profiles/*.toml)?
     # Provenance, not configuration: it is stamped by `load_profiles` at the one
     # place that knows which directory a file came from, and no TOML key sets it —
@@ -259,8 +286,11 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
     if hooks.dialect == "none":
         # hookless: nothing is ever registered, so a config_path or events map
         # is a contradiction — reject rather than silently ignore.
-        if hooks.config_path or hooks.events:
-            raise fail('hookless profiles (dialect = "none") must not set hooks.config_path/events')
+        if hooks.config_path or hooks.events or hooks.notification_types:
+            raise fail(
+                'hookless profiles (dialect = "none") must not set '
+                "hooks.config_path/events/notification_types"
+            )
     else:
         if (
             names_tree_root(hooks.config_path)
@@ -282,6 +312,18 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
             raise fail(
                 f"hooks.events values must be canonical {sorted(CANONICAL_EVENTS)}: got {bad}"
             )
+        if hooks.notification_types:
+            bad_kinds = sorted(set(hooks.notification_types.values()) - PARKED_EVENTS)
+            if bad_kinds:
+                raise fail(
+                    "hooks.notification_types values must be parked kinds "
+                    f"{sorted(PARKED_EVENTS)}: got {bad_kinds}"
+                )
+            if "Notification" not in hooks.events.values():
+                raise fail(
+                    "hooks.notification_types needs a native event mapped to the "
+                    "canonical 'Notification' carrier in hooks.events"
+                )
 
     # Shape only — membership against the registered kinds is deliberately NOT
     # checked here (see the module docstring): that set is open-ended and lives in
@@ -390,6 +432,14 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
         except regex.error as e:
             raise fail(f"env_fault_patterns entry is not a valid regex: {pattern!r} ({e})") from e
 
+    for pattern in profile.parked_prompt_patterns:
+        try:
+            regex.compile(pattern)  # same engine the stall gate matches with (timeout-guarded)
+        except regex.error as e:
+            raise fail(
+                f"parked_prompt_patterns entry is not a valid regex: {pattern!r} ({e})"
+            ) from e
+
 
 def _legacy_adapter_default(dialect: str) -> str:
     """The adapter kind a TOML profile that predates the ``adapter`` field meant.
@@ -442,6 +492,11 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
     events_d = hooks_d.get("events", {})
     if not isinstance(events_d, dict):
         raise fail("hooks.events must map native event names to canonical ones")
+    notification_d = hooks_d.get("notification_types", {})
+    if not isinstance(notification_d, dict) or not all(
+        isinstance(v, str) for v in notification_d.values()
+    ):
+        raise fail("hooks.notification_types must map notification subtypes to parked kinds")
 
     # A dedicated shape check rather than the `str()` coercion the neighbouring
     # scalars get, because `adapter` has no parse-time membership test to land in
@@ -462,6 +517,7 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
             dialect=str(hooks_d.get("dialect", "")),
             config_path=str(hooks_d.get("config_path", "")),
             events={str(k): str(v) for k, v in events_d.items()},
+            notification_types={str(k): v for k, v in notification_d.items()},
         ),
         adapter=raw_adapter.strip(),
         skill_tree=str(doc.get("skill_tree", ".claude/skills")),
@@ -482,6 +538,7 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         first_run_note=str(doc.get("first_run_note", "")),
         seed_files=str_list("seed_files"),
         env_fault_patterns=str_list("env_fault_patterns"),
+        parked_prompt_patterns=str_list("parked_prompt_patterns"),
     )
     _validate_profile(profile, source)
     return profile

@@ -491,6 +491,12 @@ class BaseTmuxBackend(TerminalMultiplexer):
                 file=sys.stderr,
             )
 
+    def capture_pane(self, window_id: str) -> str:
+        # `-p` prints the visible screen (no `-S`/`-E`, so no scrollback) to
+        # stdout; a dead window or a transport fault raises TmuxError, which the
+        # caller reads as "no match" (DW-350).
+        return self._tmux("capture-pane", "-p", "-t", window_id)
+
     def send_text(self, window_id: str, text: str) -> None:
         self._tmux("send-keys", "-t", window_id, "-l", text)
         time.sleep(0.3)  # let the TUI ingest the paste before submitting

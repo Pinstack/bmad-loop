@@ -62,6 +62,24 @@ env_fault_patterns = [
   "API Error: (5[2]9 Overloaded|5[0]0 Internal server error)",
 ]
 
+# Parked-prompt patterns (DW-350): regexes matched line-by-line against the
+# ANSI-stripped VISIBLE pane (`capture-pane -p`), consulted only at the instant a
+# stall wake nudge is about to be typed. A match withholds the nudge — its
+# trailing Enter can ANSWER the prompt (#727: it confirmed "No, exit" on the
+# Bypass Permissions dialog) — and ends the session as parked, which pauses the
+# run for a human instead of retrying.
+#
+# Same evidentiary bar as env_fault_patterns above: seed only lines captured from
+# the CLI's own screen. Both entries are from #727's captured pane (Claude Code
+# 2.1.246, run 20260826-114252-3da1) — the dialog's heading and its footer. The
+# single-character classes (`mod[e]`, `t[o]`) keep each pattern from matching its
+# own line here, so a session that prints or diffs this profile does not read as
+# parked; pinned by the parked-pattern tests in tests/test_profile.py.
+parked_prompt_patterns = [
+  "WARNING: Claude Code running in Bypass Permissions mod[e]",
+  "Enter to confirm · Esc t[o] cancel",
+]
+
 # Force Claude Code's classic (inline/scrollback) renderer. The fullscreen TUI
 # (research preview, alt-screen ?1049h like vim/htop) repaints in place, so the
 # tmux pane capture only ever holds the final frame and the Log tab shows a single
@@ -85,4 +103,26 @@ CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = "1"
 [hooks]
 dialect = "claude-settings-json"
 config_path = ".claude/settings.json"
-events = { SessionStart = "SessionStart", Stop = "Stop", SessionEnd = "SessionEnd", PreCompact = "PreCompact" }
+events = { SessionStart = "SessionStart", Stop = "Stop", SessionEnd = "SessionEnd", PreCompact = "PreCompact", Notification = "Notification" }
+
+# Parked-session signals (DW-348): the relay forwards each Notification payload's
+# `notification_type`, and these subtypes mean the CLI is waiting on a human. The
+# adapter latches one and, where the stall logic would otherwise type a wake
+# nudge, withholds it and ends the session as parked (a Stop clears the latch).
+#
+# `idle_prompt` fires ~60 s after EVERY finished turn, so a dev/review/workflow session
+# that ends a turn without a result and then sits idle re-latches after its Stop
+# and PAUSES as parked at stall-grace expiry instead of receiving the stall wake
+# nudge. That is intended. To restore the wake nudge, copy this profile into
+# .bmad-loop/profiles/ and drop the `idle_prompt` line below.
+#
+# Subtypes verified 2026-09-24 against code.claude.com/docs/en/hooks (12
+# documented); `quota_auto_resume_fired` means the CLI already resumed. The
+# auth, elicitation and agent subtypes are outside this mapping's scope
+# (permission/idle/quota) and stay unmapped (ignored); an overlay may map them
+# to a parked kind.
+[hooks.notification_types]
+permission_prompt = "PermissionPrompt"
+idle_prompt = "IdlePrompt"
+quota_auto_resume_stale = "QuotaPrompt"
+quota_auto_resume_disabled = "QuotaPrompt"

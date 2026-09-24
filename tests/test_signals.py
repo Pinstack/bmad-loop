@@ -11,6 +11,23 @@ def write_event(events_dir, ts, task_id, event, **extra):
     (events_dir / f"{ts}-{task_id}-{event}.json").write_text(json.dumps(payload))
 
 
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        ({"notification_type": "permission_prompt"}, "permission_prompt"),
+        ({"notification_type": 3}, None),  # a non-string is dropped, not coerced
+        ({}, None),  # an older relay forwards no subtype at all
+    ],
+)
+def test_parse_event_reads_the_notification_type(tmp_path, extra, expected):
+    """DW-348: the relay's forwarded subtype lands on the HookEvent (str only)."""
+    watcher = SignalWatcher(tmp_path / "events")
+    write_event(watcher.events_dir, 1, "t1", "Notification", **extra)
+    (event,) = watcher.poll()
+    assert event.event == "Notification"
+    assert event.notification_type == expected
+
+
 def test_poll_returns_new_events_once(tmp_path):
     watcher = SignalWatcher(tmp_path / "events")
     write_event(watcher.events_dir, 2, "t1", "Stop")

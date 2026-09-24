@@ -58,6 +58,14 @@ def _first_workspace(payload):
     return None
 
 
+def _notification_type(payload):
+    # A Notification payload's subtype (DW-348), snake_case (claude) or camelCase.
+    # Only a string is forwarded: anything else would reach the orchestrator as a
+    # value no profile table can key on.
+    value = payload.get("notification_type") or payload.get("notificationType")
+    return value if isinstance(value, str) else None
+
+
 def _is_link_like(path):
     """True when `path` redirects elsewhere: a POSIX symlink, or a Windows
     symlink OR DIRECTORY JUNCTION.
@@ -208,6 +216,10 @@ def main() -> int:
         "transcript_path": payload.get("transcript_path") or payload.get("transcriptPath"),
         # agy sends no cwd — it sends workspacePaths, a list of workspace roots.
         "cwd": payload.get("cwd") or _first_workspace(payload),
+        # A Notification payload's subtype (DW-348): claude sends
+        # `notification_type` (e.g. "permission_prompt"); the profile maps it onto
+        # a parked kind. Kept only when it is a string; absent everywhere else.
+        "notification_type": _notification_type(payload),
     }
     # The orchestrator's own events dir when it named one, else the legacy
     # in-tree location this file's older selves are still installed at (see the

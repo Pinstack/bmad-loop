@@ -392,6 +392,37 @@ def test_relay_registered_accepts_command_stop(name):
     assert _registered(profile, config)
 
 
+def test_fresh_claude_init_registers_the_notification_relay(tmp_path):
+    """DW-348: claude's parked-session signals ride one unfiltered `Notification`
+    relay reporting the canonical carrier; the subtype is forwarded in the
+    payload, so no per-subtype registration exists."""
+    assert install_into(tmp_path, clis=("claude",), skills=False) == 0
+    config = json.loads((tmp_path / ".claude/settings.json").read_text())
+    (handler,) = config["hooks"]["Notification"]
+    (item,) = handler["hooks"]
+    assert item["command"].endswith(" relay Notification")
+
+
+def test_relay_registered_without_the_notification_relay(tmp_path):
+    """An install that predates DW-348 has no `Notification` relay; registration
+    still holds ("other events need not be present") and the project simply runs
+    without hook-reported parked signals until it is re-initialized."""
+    profile = get_profile("claude")
+    assert install_into(tmp_path, clis=("claude",), skills=False) == 0
+    config = json.loads((tmp_path / profile.hooks.config_path).read_text())
+    del config["hooks"]["Notification"]
+    assert _registered(profile, config)
+
+
+@pytest.mark.parametrize("kind", ["Notification", "PermissionPrompt", "IdlePrompt", "QuotaPrompt"])
+def test_parked_kind_relay_commands_are_managed(kind):
+    """A profile may map a native event straight to a parked kind (DW-348); its
+    `relay <kind>` command must read as managed so init dedups and strips it like
+    every other relay rather than piling up a second copy per re-init."""
+    assert install_mod._relay_canonical_event(f"{_RELAY_EXE} relay {kind}") == kind
+    assert install_mod._relay_command(f"{_RELAY_EXE} relay {kind}")
+
+
 @pytest.mark.parametrize("name", ["claude", "copilot"])
 def test_relay_registered_refuses_session_start_only(name):
     profile = get_profile(name)

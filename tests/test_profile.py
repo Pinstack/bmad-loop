@@ -154,6 +154,87 @@ def test_env_fault_patterns_parse_from_overlay(tmp_path):
     assert prof.env_fault_patterns == ("API Error.*refused", "socket hang up")
 
 
+def test_parked_signal_fields_default_empty_when_unset(tmp_path):
+    # MINIMAL_PROFILE declares neither -> both inert (DW-348/DW-350)
+    (tmp_path / ".bmad-loop" / "profiles").mkdir(parents=True)
+    (tmp_path / ".bmad-loop" / "profiles" / "mycli.toml").write_text(MINIMAL_PROFILE)
+    prof = load_profiles(tmp_path)["mycli"]
+    assert prof.hooks.notification_types == {}
+    assert prof.parked_prompt_patterns == ()
+
+
+def test_parked_signal_fields_parse_from_overlay(tmp_path):
+    (tmp_path / ".bmad-loop" / "profiles").mkdir(parents=True)
+    (tmp_path / ".bmad-loop" / "profiles" / "mycli.toml").write_text(
+        MINIMAL_PROFILE.replace(
+            "[hooks]", 'parked_prompt_patterns = ["Allow t[o] run"]\n[hooks]'
+        ).replace(
+            'Stop = "Stop" }', 'Stop = "Stop", Ask = "PermissionPrompt", Note = "Notification" }'
+        )
+        + '[hooks.notification_types]\nquota_wait = "QuotaPrompt"\n'
+    )
+    prof = load_profiles(tmp_path)["mycli"]
+    assert prof.parked_prompt_patterns == ("Allow t[o] run",)
+    assert prof.hooks.notification_types == {"quota_wait": "QuotaPrompt"}
+    # a native event may map STRAIGHT to a parked kind: canonical, so accepted
+    assert prof.hooks.events["Ask"] == "PermissionPrompt"
+
+
+def test_claude_maps_its_parked_notification_subtypes():
+    """The claude profile relays `Notification` and maps exactly the subtypes that
+    mean "waiting on a human" (verified against code.claude.com/docs/en/hooks):
+    `quota_auto_resume_fired` means it already resumed, so it stays unmapped."""
+    claude = get_profile("claude")
+    assert claude.hooks.events["Notification"] == "Notification"
+    assert claude.hooks.notification_types == {
+        "permission_prompt": "PermissionPrompt",
+        "idle_prompt": "IdlePrompt",
+        "quota_auto_resume_stale": "QuotaPrompt",
+        "quota_auto_resume_disabled": "QuotaPrompt",
+    }
+    # the other hook-driven built-ins opt in on their own evidence; none has yet
+    for name, prof in load_profiles().items():
+        if name != "claude":
+            assert prof.hooks.notification_types == {}, name
+            assert prof.parked_prompt_patterns == (), name
+
+
+# The #727 captured pane lines (Claude Code 2.1.246, run 20260826-114252-3da1),
+# concatenated so this file holds no line the shipped patterns match.
+_CAPTURED_BYPASS_LINES = (
+    "WARNING: Claude Code running in Bypass Permissions " + "mode",
+    "Enter to confirm · Esc " + "to cancel",
+)
+
+
+def test_shipped_claude_parked_patterns_match_the_captured_727_lines():
+    """Each seeded pattern matches the captured line it was seeded from — the
+    evidentiary bar: seed only lines captured off the CLI's own screen."""
+    import regex
+
+    patterns = [regex.compile(p) for p in get_profile("claude").parked_prompt_patterns]
+    assert len(patterns) == len(_CAPTURED_BYPASS_LINES)
+    for pattern, line in zip(patterns, _CAPTURED_BYPASS_LINES):
+        assert pattern.search(f"  {line}  "), (pattern.pattern, line)
+
+
+def test_shipped_claude_parked_patterns_do_not_match_their_own_profile_line():
+    """A session that prints or diffs claude.toml must not read as parked: the
+    single-character classes (`mod[e]`, `t[o]`) exist for this. Do not "clean"
+    them up."""
+    import regex
+
+    patterns = [regex.compile(p) for p in get_profile("claude").parked_prompt_patterns]
+    text = (
+        resources.files("bmad_loop.data")
+        .joinpath("profiles")
+        .joinpath("claude.toml")
+        .read_text(encoding="utf-8")
+    )
+    hits = [line for line in text.splitlines() if any(p.search(line) for p in patterns)]
+    assert hits == []
+
+
 def test_skill_tree_defaults_when_unset():
     # MINIMAL_PROFILE omits skill_tree -> defaults to .claude/skills
     assert get_profile("claude").skill_tree == ".claude/skills"
@@ -536,6 +617,48 @@ def test_user_profile_overlay(tmp_path):
         (
             MINIMAL_PROFILE.replace('dialect = "claude-settings-json"', 'dialect = "none"'),
             "hookless",
+        ),
+        # parked-session signals (DW-348/DW-350): a notification subtype must map
+        # onto a PARKED kind, not any canonical event (a `Stop` here would never
+        # complete anything, but would read as a signal it is not)...
+        (
+            MINIMAL_PROFILE.replace(
+                'Stop = "Stop" }', 'Stop = "Stop", Notification = "Notification" }'
+            )
+            + '[hooks.notification_types]\npermission_prompt = "Stop"\n',
+            "parked kinds",
+        ),
+        # ...needs the Notification carrier the subtype rides on...
+        (
+            MINIMAL_PROFILE
+            + '[hooks.notification_types]\npermission_prompt = "PermissionPrompt"\n',
+            "'Notification' carrier",
+        ),
+        # ...is hook plumbing a hookless profile must not carry...
+        (
+            HOOKLESS_PROFILE
+            + '[hooks.notification_types]\npermission_prompt = "PermissionPrompt"\n',
+            "hookless",
+        ),
+        # ...and must be a table of strings, funnelled rather than coerced.
+        (
+            MINIMAL_PROFILE.replace("[hooks]", "[hooks]\nnotification_types = 5"),
+            "notification_types must map",
+        ),
+        (
+            MINIMAL_PROFILE + "[hooks.notification_types]\npermission_prompt = 1\n",
+            "notification_types must map",
+        ),
+        # a parked_prompt_patterns entry that is not a valid regex fails fast at parse
+        (
+            MINIMAL_PROFILE.replace(
+                "[hooks]", 'parked_prompt_patterns = ["Enter(unbalanced"]\n[hooks]'
+            ),
+            "parked_prompt_patterns entry is not a valid regex",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'parked_prompt_patterns = "Enter"\n[hooks]'),
+            "parked_prompt_patterns must be a list of strings",
         ),
     ],
 )
@@ -955,6 +1078,33 @@ def test_profile_scan_failure_degrades(profile_scan):
         ({"hooks": HookSpec("claude-settings-json", "", {"Stop": "Stop"})}, "config_path"),
         # hookless carrying hook plumbing is a contradiction either way in
         ({"hooks": HookSpec("none", ".m/s.json", {})}, "hookless"),
+        # parked-session signals (DW-348/DW-350), the same four refusals the TOML
+        # route makes: a non-parked kind, no Notification carrier, a hookless
+        # table, an invalid pane pattern
+        (
+            {
+                "hooks": HookSpec(
+                    "claude-settings-json",
+                    ".m/s.json",
+                    {"Stop": "Stop", "Notification": "Notification"},
+                    {"permission_prompt": "Stop"},
+                )
+            },
+            "parked kinds",
+        ),
+        (
+            {
+                "hooks": HookSpec(
+                    "claude-settings-json",
+                    ".m/s.json",
+                    {"Stop": "Stop"},
+                    {"permission_prompt": "PermissionPrompt"},
+                )
+            },
+            "'Notification' carrier",
+        ),
+        ({"hooks": HookSpec("none", "", {}, {"x": "PermissionPrompt"})}, "hookless"),
+        ({"parked_prompt_patterns": ("Enter(unbalanced",)}, "not a valid regex"),
         # the remaining value-level knobs
         ({"usage_parser": "magic"}, "usage_parser"),
         ({"usage_grace_s": -1.0}, "usage_grace_s"),

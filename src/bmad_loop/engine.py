@@ -46,6 +46,7 @@ from .escalation import (
     display_critical_reason,
     display_pause_reason,
     env_fault_pause_reason,
+    parked_pause_reason,
     preference_escalations,
     review_exhausted,
     review_retry_or_exhaust,
@@ -2425,6 +2426,10 @@ class Engine:
             wf_extras: dict = {"env_fault": result.env_fault}
             if result.env_fault_evidence:
                 wf_extras["env_fault_evidence"] = result.env_fault_evidence
+            if result.parked:
+                wf_extras["parked"] = True
+                if result.parked_evidence:
+                    wf_extras["parked_evidence"] = result.parked_evidence
             self.journal.append(
                 "workflow-end",
                 plugin=lp.name,
@@ -2445,6 +2450,14 @@ class Engine:
                         env_fault_pause_reason(
                             f"blocking workflow {wf.name!r} ({lp.name})", result
                         ),
+                    )
+                if result.parked:
+                    # Parked on a human prompt (DW-348/DW-350): the adapter withheld
+                    # the stall nudge, so the workflow never got a chance to run —
+                    # escalate (re-arm restores the budget) instead of deferring.
+                    self._escalate(
+                        task,
+                        parked_pause_reason(f"blocking workflow {wf.name!r} ({lp.name})", result),
                     )
                 self._defer(
                     task,
@@ -2949,6 +2962,10 @@ class Engine:
                 # Whether the session did anything before it ended (#727); False
                 # is what routed a non-completed result to the no-work PAUSE.
                 produced_work=result.produced_work,
+                # Parked on a human prompt (DW-348/DW-350); True is what routed a
+                # non-completed result to the parked PAUSE.
+                parked=result.parked,
+                parked_evidence=result.parked_evidence,
             )
             if decision.action == Action.PROCEED:
                 # DEV_VERIFY + spec_file is not itself proof of acceptance: this
@@ -6533,6 +6550,13 @@ class Engine:
         # first frame, so a grep for the field finds exactly the parked sessions.
         if not result.produced_work:
             extras["produced_work"] = False
+        # parked-session diagnosis (DW-348/DW-350): same present-only convention,
+        # so a grep for the field finds exactly the sessions whose stall nudge
+        # was withheld because the CLI was waiting on a human.
+        if result.parked:
+            extras["parked"] = True
+            if result.parked_evidence:
+                extras["parked_evidence"] = result.parked_evidence
         return extras
 
     @staticmethod
@@ -7547,6 +7571,10 @@ class Engine:
                 # parity with `dev-decision`: pair the diagnosis with the routing
                 # it fed, so the fix path is greppable the same way (#489).
                 session_vanished=result.session_vanished,
+                # Parked on a human prompt (DW-348/DW-350): what routed a
+                # non-completed fix result to the parked escalate below.
+                parked=result.parked,
+                parked_evidence=result.parked_evidence,
             )
             # CRITICAL routing, deliberately AFTER the emit and the journal record
             # above, and deliberately AHEAD of the env-fault/retryable arms below.
@@ -7574,6 +7602,11 @@ class Engine:
                     task,
                     env_fault_pause_reason("fix", result),
                 )
+            if result.status != "completed" and result.parked:
+                # Parked on a human prompt (DW-348/DW-350): the adapter withheld the
+                # stall nudge, so the repair never ran — another attempt would
+                # relaunch into the same prompt. Pause (re-arm restores the budget).
+                self._escalate(task, parked_pause_reason("fix", result))
             if outcome is not None and not outcome.ok and not outcome.retryable:
                 # escalate-grade failure (environment fault): another repair
                 # session cannot fix the run environment — stop spending the

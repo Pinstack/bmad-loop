@@ -25,6 +25,7 @@ fallback.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import enum
 import hashlib
 import json
@@ -33,8 +34,11 @@ import stat
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
+
+import regex
 
 from .. import devcontract, gates, runs
 from ..bmadconfig import ProjectPaths
@@ -74,9 +78,9 @@ from .env_fault import ENV_FAULT_EVIDENCE_MAX as ENV_FAULT_EVIDENCE_MAX
 from .env_fault import ENV_FAULT_MATCH_TIMEOUT_S as ENV_FAULT_MATCH_TIMEOUT_S
 from .env_fault import ENV_FAULT_STATUSES as ENV_FAULT_STATUSES
 from .env_fault import ENV_FAULT_TAIL_BYTES as ENV_FAULT_TAIL_BYTES
-from .env_fault import EnvFaultMixin
+from .env_fault import EnvFaultMixin, _excerpt
 from .multiplexer import MultiplexerError, TerminalMultiplexer, get_multiplexer
-from .profile import CLIProfile
+from .profile import PARKED_EVENTS, CLIProfile
 
 if TYPE_CHECKING:
     from ..process_host import ProcessHost
@@ -178,7 +182,17 @@ HEARTBEAT_INTERVAL_S = 30.0
 # Not a policy knob: the value separates two regimes an order of magnitude apart,
 # so its exact position is not load-bearing.
 FIRST_FRAME_S = 30.0
-EVENT_KINDS = {"SessionStart", "Stop", "SessionEnd"}
+# `Notification` and the parked kinds (DW-348) never complete a session: the wait
+# loop only LATCHES them, and the one place the latch acts is the stall-grace
+# expiry, where it withholds the wake nudge and ends the session parked (see
+# `_parked_hook_evidence`). With claude's `idle_prompt` mapped, that is the usual
+# end of a result-less turn: the wake nudge is replaced by a pause.
+EVENT_KINDS = {"SessionStart", "Stop", "SessionEnd", "Notification"} | set(PARKED_EVENTS)
+# Wall-clock bound on EACH `parked_prompt_patterns` search over a captured pane
+# line (DW-350) — the `regex` module's per-search timeout, the env-fault
+# classifier's doctrine (`env_fault.ENV_FAULT_MATCH_TIMEOUT_S`). A pattern that
+# blows it declines the match, so the nudge goes out exactly as it would have.
+PARKED_PROMPT_MATCH_TIMEOUT_S = 2.0
 NUDGE_TEXT = (
     "You are running in bmad-loop automation mode. Finish the workflow now: "
     "complete any remaining steps and write the result JSON file to "
@@ -874,6 +888,15 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # without doing any work. Rides out on every exit (see SessionResult.stop_seen)
         # so `_post_kill_reconcile` reads the same signal after run() kills the window.
         stop_seen = False
+        # Parked-session latch (DW-348): the evidence string of the latest hook
+        # event saying the CLI is waiting on a human (a permission/idle/quota
+        # prompt), or None. Set by a parked kind — directly, or a `Notification`
+        # whose subtype the profile maps — and cleared by a `Stop`, since a turn
+        # that ended proves the prompt was answered. It completes nothing and
+        # re-arms nothing: it is consulted only where the grace expiry would type
+        # the stall wake nudge, which it withholds (the nudge's Enter can answer
+        # the prompt, #727), ending the session `stalled` + `parked`.
+        parked_evidence: str | None = None
         # internal observability counter: counts ticks where the liveness probe
         # raised a transport error (e.g. a 30s tmux hang). It deliberately does
         # NOT escalate to "crashed" — a transient transport hiccup is not proof
@@ -1250,9 +1273,26 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         stall_deadline = time.monotonic() + self._stall_grace_s
                         continue
                 if stall_deadline is not None and time.monotonic() >= stall_deadline:
-                    if stall_nudges_left > 0 and (
+                    nudge_due = stall_nudges_left > 0 and (
                         spec.stall_nudges_cap is None or stall_nudges_sent < spec.stall_nudges_cap
-                    ):
+                    )
+                    # Parked gate (DW-348/DW-350), the one decision point: a CLI
+                    # waiting on a human must not be typed at, because the nudge's
+                    # trailing Enter can ANSWER its prompt (#727). The hook latch
+                    # first; failing that, and only when a nudge would actually go
+                    # out, one look at the visible screen. Either way the nudge is
+                    # withheld and the session ends through the tail below.
+                    parked_now = parked_evidence
+                    if parked_now is None and nudge_due:
+                        parked_now = self._pane_parked_evidence(handle)
+                    if parked_now is not None:
+                        self._note_lifecycle(
+                            handle.task_id,
+                            "stall-nudge-withheld",
+                            evidence=parked_now,
+                            nudge_due=nudge_due,
+                        )
+                    elif nudge_due:
                         # The wake nudge IS the re-invocation bmad-loop otherwise
                         # lacks: prod the idle session and re-arm. Budget is
                         # restored only by a fresh Stop (a real turn-end), so the
@@ -1278,7 +1318,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     # instead of a stall that discards a just-flushed result. A
                     # transport error is not proof of death (as at the top of the
                     # tick); fall through to the stall — spec.timeout_s bounds a
-                    # persistent failure.
+                    # persistent failure. A dead window is never labelled parked:
+                    # nothing is waiting on a human once the CLI is gone.
                     try:
                         if not self._window_alive(handle):
                             return self._final(
@@ -1296,7 +1337,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     # Still alive: an artifact on disk cannot upgrade the stall to
                     # completed — it may be stale or mid-write; only a Stop or
                     # window death vouches for it.
-                    return self._final(
+                    stalled = self._final(
                         handle,
                         spec,
                         "stalled",
@@ -1307,6 +1348,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         stop_seen=stop_seen,
                         produced_work=produced_work(),
                     )
+                    if parked_now is not None:
+                        return dataclasses.replace(stalled, parked=True, parked_evidence=parked_now)
+                    return stalled
                 continue
             if (
                 event.event == "Stop"
@@ -1331,7 +1375,26 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
 
             if event.event == "SessionStart":
                 continue
+            if event.event == "Notification" or event.event in PARKED_EVENTS:
+                # Parked-session signal (DW-348): latch it, never act on it here.
+                # The stall-grace expiry is the one decision point, so the grace
+                # keeps its timing (pane growth still re-arms it). What changes
+                # is the expiry: claude sends `idle_prompt` ~60 s after every
+                # finished turn, so a result-less Stop followed by idle silence
+                # re-latches and the session ends PARKED (a pause) instead of
+                # receiving the stall wake nudge — the intended DW-348 decision.
+                # A project overlay that drops `idle_prompt` from
+                # `[hooks.notification_types]` restores the nudge. An unmapped
+                # Notification subtype is ignored.
+                evidence = self._parked_hook_evidence(event.event, event.notification_type)
+                if evidence is not None:
+                    parked_evidence = evidence
+                    self._note_lifecycle(handle.task_id, "parked-signal", evidence=evidence)
+                continue
             if event.event == "Stop":
+                # A completed turn proves any prompt the CLI was parked on got
+                # answered: drop the parked latch before anything else (DW-348).
+                parked_evidence = None
                 # A turn ENDED — the one canonical event that proves the CLI did
                 # something, and so the hook half of the #261 proof-of-work gate.
                 # Latched after the subagent filter above, which rejects a stop that
@@ -1530,6 +1593,65 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
 
     def _window_alive(self, handle: SessionHandle) -> bool:
         return handle.native_id in self.mux.list_window_ids(self.session_name)
+
+    def _parked_hook_evidence(self, kind: str, notification_type: str | None) -> str | None:
+        """The parked-signal evidence a hook event carries, or None (DW-348).
+
+        A canonical parked kind (a profile mapped its CLI's native event straight
+        to one) is its own evidence. The ``Notification`` carrier is parked only
+        when the profile's ``hooks.notification_types`` maps its forwarded
+        subtype — anything else (``auth_success``, a missing or non-string
+        subtype, an older relay that forwards none) is not a wait on a human."""
+        if kind in PARKED_EVENTS:
+            return kind
+        if kind != "Notification" or notification_type is None:
+            return None
+        mapped = self.profile.hooks.notification_types.get(notification_type)
+        if mapped is None:
+            return None
+        return f"Notification({notification_type}) -> {mapped}"
+
+    @cached_property
+    def _parked_prompt_patterns(self) -> tuple[regex.Pattern[str], ...]:
+        """``profile.parked_prompt_patterns``, compiled once per adapter on first
+        use. The profile validated each with this same engine at parse time, so
+        compiling cannot raise here. Same caching CONSTRAINT as
+        ``EnvFaultMixin._env_fault_patterns``: swap ``self.profile`` before the
+        first stall-expiry, or assign this attribute directly."""
+        return tuple(regex.compile(p) for p in self.profile.parked_prompt_patterns)
+
+    def _pane_parked_evidence(self, handle: SessionHandle) -> str | None:
+        """Whether the VISIBLE pane shows a prompt only a human should answer
+        (DW-350): the evidence (pattern plus quoted line) of the first
+        ``parked_prompt_patterns`` match, else None.
+
+        Read only at the instant a stall wake nudge is due. Observation that
+        degrades: no patterns, a backend that cannot capture (the seam default
+        raises ``MultiplexerError``; a duck-typed backend may lack the method),
+        a capture fault, or a search that blows ``PARKED_PROMPT_MATCH_TIMEOUT_S``
+        all read as "no match", and the nudge goes out exactly as before."""
+        patterns = self._parked_prompt_patterns
+        if not patterns:
+            return None
+        capture = getattr(self.mux, "capture_pane", None)
+        if capture is None:
+            return None
+        try:
+            screen = capture(handle.native_id)
+        except MultiplexerError:
+            return None
+        if not isinstance(screen, str):
+            return None
+        text = _ANSI_RE.sub("", screen.replace("\r", "\n"))
+        try:
+            for line in text.split("\n"):
+                for pat in patterns:
+                    hit = pat.search(line, timeout=PARKED_PROMPT_MATCH_TIMEOUT_S)
+                    if hit is not None:
+                        return f"pane matched {pat.pattern!r}: {_excerpt(line, hit.start())}"
+        except TimeoutError:
+            return None
+        return None
 
     def _session_vanished(self) -> bool:
         # The disambiguating probe (#489): `list_window_ids` returns [] for a

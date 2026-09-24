@@ -281,6 +281,17 @@ class SessionResult:
     # byte floor, which a rendered dialog clears). Default `True` so every
     # positional construction keeps today's routing. APPENDED, never inserted.
     produced_work: bool = True
+    # Parked-session signal (DW-348/DW-350): the CLI was waiting on a human — a
+    # permission, idle or quota prompt — when the stall grace expired, so the
+    # wait loop WITHHELD the stall wake nudge (its Enter could answer the prompt,
+    # #727) and ended the session `stalled`. Set only on that `stalled` exit,
+    # from a latched parked hook event or a `parked_prompt_patterns` match on the
+    # visible pane; never on a `crashed` (window death outranks it) or completed
+    # result. Every engine/sweep site PAUSEs on it like `env_fault` (which
+    # outranks it), so re-arm restores the attempt instead of a retry relaunching
+    # into the same prompt. `parked_evidence` names what matched. APPENDED.
+    parked: bool = False
+    parked_evidence: str | None = None
 
 
 class CodingCLIAdapter(ABC):

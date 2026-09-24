@@ -12245,6 +12245,56 @@ def test_session_with_no_work_pauses_dev_without_burning_budget(project):
     assert load_state(engine.run_dir).tasks["1-1-a"].attempt == 0
 
 
+def test_parked_session_pauses_dev_without_burning_budget(project):
+    """DW-348/DW-350 acceptance: a dev session the adapter ended parked — the CLI
+    was waiting on a human, so the stall nudge was withheld — pauses the run at
+    the first story with budget left, instead of retrying into the same prompt;
+    `dev-decision` and `session-end` carry the flag and the evidence, and re-arm
+    restores the budget (attempt -> 0).
+
+    ABLATION: delete the `parked` arm in `decide_dev` and this RETRYs — a second
+    dev session is launched and the story ends deferred, not paused."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    evidence = "Notification(permission_prompt) -> PermissionPrompt"
+    engine, adapter = make_engine(
+        project,
+        [SessionResult(status="stalled", parked=True, parked_evidence=evidence)],
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev"]  # no retry session burned
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED
+    assert task.attempt == 1
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    assert engine.state.paused_reason.startswith("parked: dev session stalled")
+    assert evidence in engine.state.paused_reason
+
+    dec = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"][-1]
+    assert dec["action"] == "pause"
+    assert dec["parked"] is True
+    assert dec["parked_evidence"] == evidence
+    end = [e for e in engine.journal.entries() if e["kind"] == "session-end"][-1]
+    assert end["parked"] is True
+    assert end["parked_evidence"] == evidence
+
+    rearm_escalation(engine.run_dir, isolated_redrive=False, resolution_recorded=True)
+    assert load_state(engine.run_dir).tasks["1-1-a"].attempt == 0
+
+
+def test_unparked_session_end_carries_no_parked_key(project):
+    """`parked` is present-only on session-end (the `produced_work` convention), so
+    a grep for it finds exactly the sessions whose nudge was withheld."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [SessionResult(status="timeout")])
+    engine.run()
+    ends = [e for e in engine.journal.entries() if e["kind"] == "session-end"]
+    assert ends and all("parked" not in e for e in ends)
+    dec = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert dec and all(d["parked"] is False for d in dec)
+
+
 def test_engine_attaches_its_journal_to_every_adapter(project):
     """The engine hands its `Journal` to the adapters it owns (#680), so an
     adapter-side `session-idle` lands in the same file with the same
@@ -12401,6 +12451,46 @@ def test_fix_phase_session_env_fault_escalates(project):
     assert evidence in engine.state.paused_reason
     fix = [e for e in engine.journal.entries() if e["kind"] == "fix-decision"][-1]
     assert fix["env_fault"] is True
+
+
+def test_fix_phase_parked_session_escalates(project):
+    """DW-348/DW-350: a fix session the adapter ended parked (stall nudge withheld
+    on a human-only prompt) escalates like an env-fault one, instead of spending
+    the remaining dev budget relaunching repair sessions into the same prompt.
+
+    ABLATION: delete the fix site's `parked` escalate arm and a second fix session
+    is launched."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    marker = project.project / "fixed.marker"
+
+    def dev_with_marker(spec):
+        marker.write_text("ok\n")
+        return dev_effect(project, "1-1-a")(spec)
+
+    def breaking_review(spec):
+        marker.unlink()  # ordinary fixable failure -> routes to a fix session
+        return review_effect(project, "1-1-a", clean=True)(spec)
+
+    evidence = "pane matched 'Enter to confirm': …"
+    parked_fix = SessionResult(status="stalled", parked=True, parked_evidence=evidence)
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker), _OK)),
+        limits=LimitsPolicy(max_dev_attempts=3),  # budget left -> must not be spent
+    )
+    engine, adapter = make_engine(
+        project, [dev_with_marker, breaking_review, parked_fix, parked_fix], policy=policy
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev", "review", "dev"]  # one fix, then stop
+    assert engine.state.paused_reason.startswith("parked: fix session stalled")
+    assert evidence in engine.state.paused_reason
+    fix = [e for e in engine.journal.entries() if e["kind"] == "fix-decision"][-1]
+    assert fix["parked"] is True
+    assert fix["parked_evidence"] == evidence
 
 
 def test_max_stories_limit(project):

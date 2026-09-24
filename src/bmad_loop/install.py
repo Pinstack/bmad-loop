@@ -31,7 +31,7 @@ from importlib.resources.abc import Traversable
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, NamedTuple
 
-from .adapters.profile import ALIASES, CLIProfile, ProfileError, load_profiles
+from .adapters.profile import ALIASES, CANONICAL_EVENTS, CLIProfile, ProfileError, load_profiles
 from .checks import Finding
 from .platform_util import atomic_write_bytes, atomic_write_text, file_lock
 from .policy import POLICY_TEMPLATE
@@ -1139,6 +1139,13 @@ def relay_executable_text(command: str) -> str | None:
     return parts[0] if parts is not None else None
 
 
+# Canonical events an installed `bmad-loop relay <kind>` command may report — a
+# command naming one of these is managed (deduped, stripped, replaced by init).
+# Every canonical event, so the parked kinds (DW-348) a profile may map a native
+# event straight to stay managed too; claude reaches them through `Notification`.
+_RELAY_CANONICAL_EVENTS = frozenset(CANONICAL_EVENTS)
+
+
 def _installed_relay_parts(command: str) -> tuple[str, str] | None:
     """`(executable text, canonical event)` of an installed console relay command."""
     for posix in (os.name != "nt", os.name == "nt"):
@@ -1146,11 +1153,7 @@ def _installed_relay_parts(command: str) -> tuple[str, str] | None:
             parts = shlex.split(command, posix=posix)
         except ValueError:
             continue
-        if (
-            len(parts) != 3
-            or parts[1] != "relay"
-            or parts[2] not in {"SessionStart", "Stop", "SessionEnd", "Notification", "PreCompact"}
-        ):
+        if len(parts) != 3 or parts[1] != "relay" or parts[2] not in _RELAY_CANONICAL_EVENTS:
             continue
         raw = parts[0].strip('"')
         for flavor in (PurePosixPath, PureWindowsPath):

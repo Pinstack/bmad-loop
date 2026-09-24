@@ -5639,6 +5639,52 @@ def test_migration_session_env_fault_escalates_without_consuming_attempts(projec
     assert worktree_clean(project.project)
 
 
+def test_triage_session_parked_escalates_without_consuming_attempts(project):
+    """DW-348/DW-350: a triage session the adapter ended parked (stall nudge
+    withheld on a human-only prompt) escalates on the first attempt instead of
+    feeding a retry into the same prompt; triage-decision carries `parked`.
+
+    ABLATION: delete the triage site's `parked` escalate arm and a second
+    (feedback-retry) triage session is launched."""
+    write_ledger(project, {"DW-1": "open"})
+    evidence = "Notification(permission_prompt) -> PermissionPrompt"
+    engine, adapter = make_sweep(
+        project,
+        [SessionResult(status="stalled", parked=True, parked_evidence=evidence)] * 2,
+    )
+    summary = engine.run()
+
+    assert summary.paused
+    task = engine.state.tasks["sweep-triage"]
+    assert task.phase == Phase.ESCALATED
+    assert task.attempt == 1
+    assert engine.state.paused_reason.startswith("parked: triage session stalled")
+    assert evidence in engine.state.paused_reason
+    assert "[result.json: missing; hook events: none]" in engine.state.paused_reason  # #752
+    assert len(adapter.sessions) == 1
+    dec = [e for e in engine.journal.entries() if e["kind"] == "triage-decision"][-1]
+    assert dec["parked"] is True
+    assert dec["env_fault"] is False
+
+
+def test_migration_session_parked_escalates_without_consuming_attempts(project):
+    """The migration site's sibling arm: parked escalates on the first attempt
+    and leaves the legacy ledger untouched."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, adapter = make_sweep(
+        project, [SessionResult(status="stalled", parked=True, parked_evidence="IdlePrompt")] * 2
+    )
+    summary = engine.run()
+
+    assert summary.paused
+    assert engine.state.tasks["sweep-migrate"].attempt == 1
+    assert engine.state.paused_reason.startswith("parked: migration session stalled")
+    assert len(adapter.sessions) == 1
+    dec = [e for e in engine.journal.entries() if e["kind"] == "migrate-decision"][-1]
+    assert dec["parked"] is True
+    assert project.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
+
+
 def test_triage_escalation_resume_retries_triage(project):
     write_ledger(project, {"DW-1": "open"})
     bad = triage_result(["DW-1"])

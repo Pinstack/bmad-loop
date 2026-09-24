@@ -262,6 +262,81 @@ def test_no_work_reason_keeps_the_lost_session_suffix():
     assert "no work produced" not in review.reason
 
 
+_PARKED_EVIDENCE = "Notification(permission_prompt) -> PermissionPrompt"
+
+
+@pytest.mark.parametrize("attempt", [1, 2])  # budget left, then spent
+def test_dev_parked_session_pauses_whatever_the_budget(attempt):
+    """DW-348/DW-350: a session the adapter ended parked (the CLI was waiting on a
+    human, so the stall nudge was withheld) PAUSEs instead of RETRYing into the
+    same prompt — with budget left, and ahead of exhaustion.
+
+    ABLATION: delete the `parked` arm in `decide_dev` and the budget-left row
+    RETRYs, the spent row DEFERs."""
+    parked = SessionResult(status="stalled", parked=True, parked_evidence=_PARKED_EVIDENCE)
+    decision = decide_dev(_task(attempt=attempt), parked, None, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("parked: dev session stalled (")
+    assert _PARKED_EVIDENCE in decision.reason
+    assert "the stall nudge was withheld" in decision.reason
+
+
+def test_dev_env_fault_outranks_parked():
+    both = SessionResult(
+        status="stalled",
+        env_fault=True,
+        env_fault_evidence="API Error: ETIMEDOUT",
+        parked=True,
+        parked_evidence=_PARKED_EVIDENCE,
+    )
+    decision = decide_dev(_task(attempt=1), both, None, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("environment fault: dev session stalled")
+
+
+def test_dev_parked_outranks_no_work():
+    """A named prompt explains the silence better than the silence does: the
+    parked arm is tested before the #727 `produced_work=False` arm."""
+    both = SessionResult(
+        status="stalled", parked=True, parked_evidence=_PARKED_EVIDENCE, produced_work=False
+    )
+    decision = decide_dev(_task(attempt=1), both, None, POLICY)
+    assert decision.reason.startswith("parked: dev session stalled")
+    assert "no work produced" not in decision.reason
+
+
+def test_parked_reason_keeps_the_lost_session_suffix_and_has_a_fallback():
+    """Composed over `session_failure_reason` (#489), and never an empty
+    parenthetical when the adapter kept no evidence string."""
+    result = SessionResult(status="stalled", parked=True)
+    assert escalation.parked_pause_reason("fix", result) == (
+        "parked: fix session stalled (parked-session signal; the CLI was waiting on "
+        "a human — the stall nudge was withheld so it could not answer the prompt)"
+    )
+    vanished = SessionResult(status="crashed", parked=True, session_vanished=True)
+    assert "multiplexer no longer reports the session" in escalation.parked_pause_reason(
+        "dev", vanished
+    )
+
+
+def test_review_parked_session_pauses_instead_of_charging_a_cycle():
+    """ABLATION: delete the `parked` arm in `decide_review_session` and this
+    RETRYs a review cycle."""
+    parked = SessionResult(status="stalled", parked=True, parked_evidence=_PARKED_EVIDENCE)
+    decision = decide_review_session(_task(attempt=1), parked, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("parked: review session stalled")
+
+
+def test_review_env_fault_outranks_parked():
+    both = SessionResult(
+        status="stalled", env_fault=True, parked=True, parked_evidence=_PARKED_EVIDENCE
+    )
+    decision = decide_review_session(_task(attempt=1), both, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("environment fault: review session stalled")
+
+
 def test_dev_plain_noncompleted_still_retries_with_budget():
     """Guard pin: a NON-env-fault timeout with budget left still RETRYs — the
     env-fault branch must not swallow ordinary transient failures."""

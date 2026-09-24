@@ -5,9 +5,10 @@ CLI's process under whatever interpreter the host has, so it is stdlib-only by
 contract (its docstring says so) and cannot import ``bmad_loop`` to reach this
 module — and this module cannot import it back, since it ships as package DATA
 rather than as an importable module. Hence a twin rather than shared code:
-``_LINK_REPARSE_TAGS``, ``_first_workspace``, ``_is_link_like``, ``_write_all``
-and ``_write_event`` below are byte-identical copies of the hook's, pinned that
-way by ``tests/test_events.py::test_the_twinned_source_is_identical`` — which
+``_LINK_REPARSE_TAGS``, ``_first_workspace``, ``_notification_type``,
+``_is_link_like``, ``_write_all`` and ``_write_event`` below are byte-identical
+copies of the hook's, pinned that way by
+``tests/test_events.py::test_the_twinned_source_is_identical`` — which
 AST-extracts both sides and compares the source segments, so a fix applied to one
 writer of the events control plane and not the other cannot pass review silently.
 
@@ -53,6 +54,14 @@ def _first_workspace(payload):
     if isinstance(paths, list) and paths and isinstance(paths[0], str):
         return paths[0]
     return None
+
+
+def _notification_type(payload):
+    # A Notification payload's subtype (DW-348), snake_case (claude) or camelCase.
+    # Only a string is forwarded: anything else would reach the orchestrator as a
+    # value no profile table can key on.
+    value = payload.get("notification_type") or payload.get("notificationType")
+    return value if isinstance(value, str) else None
 
 
 def _is_link_like(path):
@@ -205,6 +214,10 @@ def shape_event(ts: int, event_name: str, task_id: str, payload: dict[str, Any])
         "transcript_path": payload.get("transcript_path") or payload.get("transcriptPath"),
         # agy sends no cwd — it sends workspacePaths, a list of workspace roots.
         "cwd": payload.get("cwd") or _first_workspace(payload),
+        # A Notification payload's subtype (DW-348): claude sends
+        # `notification_type` (e.g. "permission_prompt"); the profile maps it onto
+        # a parked kind. Kept only when it is a string; absent everywhere else.
+        "notification_type": _notification_type(payload),
     }
 
 

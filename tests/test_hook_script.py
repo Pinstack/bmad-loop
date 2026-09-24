@@ -63,6 +63,25 @@ def test_writes_event_file(tmp_path):
     assert not list((tmp_path / "events").glob("*.tmp"))
 
 
+def test_notification_payload_carries_its_subtype(tmp_path):
+    """DW-348: a claude Notification's `notification_type` rides the event file,
+    so the adapter can tell a permission prompt from an auth success."""
+    env = {"BMAD_LOOP_RUN_DIR": str(tmp_path), "BMAD_LOOP_TASK_ID": "t1"}
+    proc = run_hook(
+        "Notification",
+        env,
+        {"session_id": "s1", "notification_type": "permission_prompt", "message": "Allow?"},
+    )
+    assert proc.returncode == 0
+    event = json.loads(next((tmp_path / "events").glob("*.json")).read_text())
+    assert event["event"] == "Notification"
+    assert event["notification_type"] == "permission_prompt"
+    # every other event carries the key as null
+    assert run_hook("Stop", env, {"session_id": "s1"}).returncode == 0
+    stop = next(f for f in (tmp_path / "events").glob("*-Stop.json"))
+    assert json.loads(stop.read_text())["notification_type"] is None
+
+
 def test_conversation_id_fallback(tmp_path):
     """Cursor-style payloads carry conversation_id instead of session_id."""
     env = {"BMAD_LOOP_RUN_DIR": str(tmp_path), "BMAD_LOOP_TASK_ID": "t1"}

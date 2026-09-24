@@ -646,6 +646,15 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "option_effect",
         "original",
         "owed_after_implement",
+        # Parked-session diagnosis (DW-348/DW-350) on `dev-decision`, `session-end`,
+        # `workflow-end`, `migrate-decision` and `triage-decision`: whether the
+        # adapter withheld the stall nudge because the CLI was waiting on a human
+        # (a bare boolean), and the evidence that said so — a hook signal label
+        # (`Notification(permission_prompt) -> PermissionPrompt`) or the matched
+        # profile pattern plus the quoted pane line, the same class of excerpt
+        # `env_fault_evidence` carries.
+        "parked",
+        "parked_evidence",
         "phase",
         "pid",
         "platform",
@@ -936,6 +945,8 @@ JOURNAL_SPLAT_FIELDS = {
             "env_fault",
             "env_fault_evidence",
             "session_vanished",
+            "parked",
+            "parked_evidence",
         }
     ),
     # The plugin bus's `_log` forwards its OWN `**fields` parameter, so the keys

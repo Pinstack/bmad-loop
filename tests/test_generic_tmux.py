@@ -36,7 +36,7 @@ from bmad_loop.adapters.base import (
 )
 from bmad_loop.adapters.generic import GenericDevAdapter, GenericTmuxAdapter
 from bmad_loop.adapters.multiplexer import MultiplexerError
-from bmad_loop.adapters.profile import get_profile
+from bmad_loop.adapters.profile import PARKED_EVENTS, get_profile
 from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.journal import TASK_CYCLE_ARTIFACTS, Journal
 from bmad_loop.model import TokenUsage
@@ -659,8 +659,12 @@ class _UnitMux:
     the side of the distinction it was written for: the CLI exited.
     """
 
-    def __init__(self):
+    def __init__(self, screen=""):
         self.sent: list[tuple[str, str]] = []
+        # What `capture_pane` reports as the visible screen (DW-350). Clean by
+        # default, so every stall test not about parked prompts nudges as before.
+        self.screen = screen
+        self.captures: list[str] = []
 
     def has_session(self, name):
         return True
@@ -669,6 +673,12 @@ class _UnitMux:
         # The contract/stall nudges reach the mux too; recording them keeps that
         # off the host binary as well, which is the same promise as has_session.
         self.sent.append((window_id, text))
+
+    def capture_pane(self, window_id):
+        # The stall gate's pre-nudge screen read (DW-350), kept off the host
+        # binary like the two above.
+        self.captures.append(window_id)
+        return self.screen
 
 
 def make_dev_adapter(tmp_path, profile_name="claude", policy=None, mux=None):
@@ -7627,3 +7637,342 @@ def test_idle_journal_retries_transient_event_failures(tmp_path, monkeypatch):
     clock["t"] += 30.0
     adapter._sample_transcript_idle("3-1-dev-1", str(transcript), idle, clock["t"])
     assert [entry["kind"] for entry in journal.entries] == ["session-idle", "session-active"]
+
+
+# ------------------------------------ parked-session signals (DW-348/DW-350)
+#
+# A CLI parked on a permission / idle / quota prompt looks exactly like a stalled
+# one, and the stall wake nudge's trailing Enter can ANSWER the prompt (#727). The
+# wait loop latches parked hook events and, at the stall-grace expiry — the one
+# decision point — withholds the nudge (hook latch first, then one look at the
+# visible pane) and ends the session `stalled` + `parked`. These drive the real
+# loop over a scripted watcher, a `_UnitMux` whose screen is stubbed, and a frozen
+# clock; the nudge is recorded at the MUX so "no nudge" means none left the
+# adapter.
+
+# The #727 captured lines (Claude Code 2.1.246, run 20260826-114252-3da1), built
+# by concatenation so this file carries no line the shipped patterns match.
+BYPASS_HEADING = "WARNING: Claude Code running in Bypass Permissions " + "mode"
+BYPASS_FOOTER = "Enter to confirm · Esc " + "to cancel"
+
+
+def _hook_event(kind, notification_type=None):
+    return HookEvent(
+        ts=1,
+        event=kind,
+        task_id="3-1-dev-1",
+        session_id="sess",
+        transcript_path=None,
+        path=Path("x"),
+        notification_type=notification_type,
+    )
+
+
+def _parked_adapter(tmp_path, monkeypatch, events, *, screen="", nudges=2, alive=None):
+    """A claude dev adapter over a `_UnitMux` (screen stubbed), a 10 s grace with
+    `nudges` wake nudges, and a frozen clock the scripted watcher pushes past the
+    grace on every idle tick (a None from the script, or the script exhausted)."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    mux = _UnitMux(screen=screen)
+    adapter, _ = make_dev_adapter(tmp_path, mux=mux)
+    adapter._stall_grace_s = 10.0
+    adapter._stall_nudges = nudges
+    adapter._window_alive = alive or (lambda handle: True)
+    clock = _frozen_stall_clock(monkeypatch)
+    script = list(events)
+
+    class _Watcher:
+        def wait_for(self, task_id, kinds, timeout_s, since_ns=0):
+            event = script.pop(0) if script else None
+            if event is None:
+                clock["t"] += 11.0  # an idle tick: past the grace
+            return event
+
+    adapter.watcher = _Watcher()
+    return adapter, mux
+
+
+def _stall_nudges(mux):
+    return [text for _, text in mux.sent if text == generic.STALL_NUDGE_TEXT]
+
+
+@pytest.mark.parametrize(
+    ("subtype", "kind"),
+    [
+        ("permission_prompt", "PermissionPrompt"),
+        ("idle_prompt", "IdlePrompt"),
+        ("quota_auto_resume_stale", "QuotaPrompt"),
+        ("quota_auto_resume_disabled", "QuotaPrompt"),
+    ],
+)
+def test_parked_notification_withholds_the_stall_nudge(tmp_path, monkeypatch, subtype, kind):
+    """A claude `Notification` whose subtype the profile maps to a parked kind is
+    latched; when the stall grace expires the wake nudge is WITHHELD and the
+    session ends `stalled` + `parked`, naming the signal.
+
+    Ablation: drop `parked_now = parked_evidence` (seed it with None) in the stall
+    branch and this fails on the two STALL_NUDGE_TEXTs the mux then records."""
+    adapter, mux = _parked_adapter(tmp_path, monkeypatch, [_hook_event("Notification", subtype)])
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert result.status == "stalled"
+    assert result.parked is True
+    assert result.parked_evidence == f"Notification({subtype}) -> {kind}"
+    assert _stall_nudges(mux) == []
+    # The hook latch decides alone: the screen is never read.
+    assert mux.captures == []
+    # ...and the engine's dev decider pauses it with budget left (DW-348 AC).
+    from bmad_loop.escalation import Action, decide_dev
+    from bmad_loop.model import StoryTask
+
+    decision = decide_dev(
+        StoryTask(story_key="3-1", epic=3, attempt=1), result, None, Policy(limits=LimitsPolicy())
+    )
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("parked: dev session stalled")
+
+
+def test_idle_prompt_after_a_resultless_stop_parks_instead_of_nudging(tmp_path, monkeypatch):
+    """The real claude order: a turn ends without a result (Stop clears any latch
+    and arms the grace), `idle_prompt` follows ~60 s later and re-latches, and the
+    grace then expires in silence. The wake nudge is withheld and the session ends
+    parked — the intended DW-348 consequence of mapping `idle_prompt`.
+
+    Ablation: delete `idle_prompt` from claude's `[hooks.notification_types]` and
+    this fails on the two STALL_NUDGE_TEXTs the mux then records."""
+    adapter, mux = _parked_adapter(
+        tmp_path,
+        monkeypatch,
+        [_hook_event("Stop"), _hook_event("Notification", "idle_prompt")],
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.parked_evidence == "Notification(idle_prompt) -> IdlePrompt"
+    assert _stall_nudges(mux) == []
+
+
+def test_the_wait_loop_asks_the_watcher_for_parked_kinds(tmp_path, monkeypatch):
+    """The production kind filter handed to `watcher.wait_for` must admit the
+    `Notification` carrier and every parked kind — the scripted watchers above
+    ignore `kinds`, so without this the latch could be unreachable in production
+    while every test stays green.
+
+    Ablation: drop "Notification" from `generic.EVENT_KINDS` and this fails."""
+    adapter, _ = _parked_adapter(tmp_path, monkeypatch, [], nudges=0)
+    seen: list[set] = []
+    inner = adapter.watcher  # advances the frozen clock past the grace
+
+    class _Recording:
+        def wait_for(self, task_id, kinds, timeout_s, since_ns=0):
+            seen.append(set(kinds))
+            return inner.wait_for(task_id, kinds, timeout_s, since_ns)
+
+    adapter.watcher = _Recording()
+    adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert seen
+    assert {"Notification", *PARKED_EVENTS} <= seen[0]
+
+
+@pytest.mark.parametrize("subtype", ["auth_success", "quota_auto_resume_fired", None])
+def test_unmapped_notification_is_ignored(tmp_path, monkeypatch, subtype):
+    """A subtype the profile does not map — or none at all (an older relay) — is
+    not a wait on a human: the grace expiry nudges exactly as today."""
+    adapter, mux = _parked_adapter(tmp_path, monkeypatch, [_hook_event("Notification", subtype)])
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert result.status == "stalled"
+    assert result.parked is False
+    assert result.parked_evidence is None
+    assert _stall_nudges(mux) == [generic.STALL_NUDGE_TEXT] * 2
+
+
+def test_a_stop_clears_the_parked_latch(tmp_path, monkeypatch):
+    """A completed turn proves the prompt was answered: a (result-less) Stop after
+    the parked event drops the latch, and the grace expiry nudges as today.
+
+    Ablation: delete `parked_evidence = None` from the Stop branch and this fails
+    on a parked result with no nudges sent."""
+    adapter, mux = _parked_adapter(
+        tmp_path,
+        monkeypatch,
+        [_hook_event("Notification", "permission_prompt"), _hook_event("Stop")],
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert result.status == "stalled"
+    assert result.parked is False
+    assert _stall_nudges(mux) == [generic.STALL_NUDGE_TEXT] * 2
+
+
+def test_a_direct_parked_kind_latches_like_the_notification_route(tmp_path, monkeypatch):
+    """A profile whose CLI has a dedicated native event maps it straight to a
+    canonical parked kind; the adapter latches that just the same."""
+    adapter, mux = _parked_adapter(tmp_path, monkeypatch, [_hook_event("PermissionPrompt")])
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert (result.status, result.parked, result.parked_evidence) == (
+        "stalled",
+        True,
+        "PermissionPrompt",
+    )
+    assert _stall_nudges(mux) == []
+
+
+def test_parked_latch_marks_the_final_stall_when_nudges_are_spent(tmp_path, monkeypatch):
+    """No wake nudges left: the grace expiry was going to stall anyway, and the
+    latch still labels that stall parked so the engine pauses instead of retrying."""
+    adapter, mux = _parked_adapter(
+        tmp_path, monkeypatch, [_hook_event("Notification", "idle_prompt")], nudges=0
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert (result.status, result.parked) == ("stalled", True)
+    assert mux.sent == []
+
+
+def test_parked_latch_after_the_nudges_ran_out_marks_the_stall(tmp_path, monkeypatch):
+    """The latch arriving after the one wake nudge was spent still labels the
+    final stall — and the nudge that went out BEFORE it is not retracted."""
+    adapter, mux = _parked_adapter(
+        tmp_path,
+        monkeypatch,
+        [None, _hook_event("Notification", "permission_prompt")],
+        nudges=1,
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert (result.status, result.parked) == ("stalled", True)
+    assert _stall_nudges(mux) == [generic.STALL_NUDGE_TEXT]
+
+
+def test_a_dead_window_is_crashed_not_parked(tmp_path, monkeypatch):
+    """Window death outranks the latch: the re-probe before the stall finds the
+    window gone, and a CLI that is gone is not waiting on anyone."""
+    answers = iter([True, False])
+    adapter, mux = _parked_adapter(
+        tmp_path,
+        monkeypatch,
+        [_hook_event("Notification", "permission_prompt")],
+        alive=lambda handle: next(answers),
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert result.status == "crashed"
+    assert result.parked is False
+    assert result.parked_evidence is None
+
+
+@pytest.mark.parametrize("line", [BYPASS_HEADING, BYPASS_FOOTER])
+def test_pane_matched_prompt_withholds_the_stall_nudge(tmp_path, monkeypatch, line):
+    """No hook signal, but the visible pane shows a prompt a shipped claude
+    `parked_prompt_patterns` entry matches (#727's captured dialog): the nudge due
+    at grace expiry is withheld and the evidence quotes pattern and line. The
+    screen carries ANSI styling and CR line ends, as a real capture can.
+
+    Ablation: delete `parked_now = self._pane_parked_evidence(handle)` and this
+    fails on the STALL_NUDGE_TEXT the mux then records."""
+    screen = f"\x1b[1m  {line}\x1b[0m\r\n\r\n❯ 1. No, exit\r\n  2. Yes, I accept\r\n"
+    adapter, mux = _parked_adapter(tmp_path, monkeypatch, [], screen=screen)
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.parked_evidence is not None
+    assert result.parked_evidence.startswith("pane matched ")
+    assert result.parked_evidence.endswith(line)
+    assert mux.sent == []
+    assert mux.captures == ["@1"]
+
+
+def test_clean_pane_nudges_exactly_as_today(tmp_path, monkeypatch):
+    """A screen with nothing parked-shaped on it changes nothing: both wake nudges
+    go out (one capture before each), then the ordinary stall."""
+    adapter, mux = _parked_adapter(
+        tmp_path, monkeypatch, [], screen="Running the test suite…\n❯ \n"
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert (result.status, result.parked) == ("stalled", False)
+    assert _stall_nudges(mux) == [generic.STALL_NUDGE_TEXT] * 2
+    # No capture once the nudges are spent: the gate only reads the screen when a
+    # nudge is actually due.
+    assert mux.captures == ["@1", "@1"]
+
+
+def test_failed_pane_capture_degrades_to_the_nudge(tmp_path, monkeypatch):
+    """Observation that degrades: a capture the backend cannot make reads as a
+    clean screen, never as a crash or a parked verdict."""
+    adapter, mux = _parked_adapter(tmp_path, monkeypatch, [], screen=BYPASS_FOOTER)
+
+    def fail(window_id):
+        raise MultiplexerError("capture-pane: can't find window")
+
+    mux.capture_pane = fail
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert (result.status, result.parked) == ("stalled", False)
+    assert _stall_nudges(mux) == [generic.STALL_NUDGE_TEXT] * 2
+
+
+def test_backend_without_capture_pane_degrades_to_the_nudge(tmp_path, monkeypatch):
+    """A duck-typed out-of-tree backend predating the method is read as a clean
+    screen too."""
+    adapter, _ = _parked_adapter(tmp_path, monkeypatch, [])
+
+    class _OldMux:
+        def __init__(self):
+            self.sent = []
+
+        def has_session(self, name):
+            return True
+
+        def send_text(self, window_id, text):
+            self.sent.append((window_id, text))
+
+    old = _OldMux()
+    adapter.mux = old
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert (result.status, result.parked) == ("stalled", False)
+    assert _stall_nudges(old) == [generic.STALL_NUDGE_TEXT] * 2
+
+
+def test_the_seam_default_capture_pane_raises_the_seam_error():
+    """`TerminalMultiplexer.capture_pane` is non-abstract so released backends keep
+    loading; its default is the "cannot capture" the stall gate degrades on."""
+    from bmad_loop.adapters.multiplexer import TerminalMultiplexer
+
+    with pytest.raises(MultiplexerError, match="cannot capture"):
+        TerminalMultiplexer.capture_pane(object(), "@1")  # type: ignore[arg-type]
+
+
+def test_runaway_parked_pattern_degrades_to_the_nudge(tmp_path, monkeypatch):
+    """A pattern that blows the per-search timeout declines the match (the
+    env-fault doctrine), so the nudge goes out."""
+    adapter, mux = _parked_adapter(tmp_path, monkeypatch, [], screen=BYPASS_FOOTER, nudges=1)
+
+    class _Runaway:
+        pattern = "runaway"
+
+        def search(self, line, timeout=None):
+            assert timeout == generic.PARKED_PROMPT_MATCH_TIMEOUT_S
+            raise TimeoutError
+
+    adapter._parked_prompt_patterns = (_Runaway(),)
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert (result.status, result.parked) == ("stalled", False)
+    assert _stall_nudges(mux) == [generic.STALL_NUDGE_TEXT]
+
+
+def test_profile_without_parked_patterns_never_captures(tmp_path, monkeypatch):
+    """Inert for a profile that declares no patterns: the screen is not read."""
+    adapter, mux = _parked_adapter(tmp_path, monkeypatch, [], screen=BYPASS_FOOTER, nudges=1)
+    adapter._parked_prompt_patterns = ()
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert (result.status, result.parked) == ("stalled", False)
+    assert mux.captures == []
+
+
+def test_capture_pane_argv_reads_the_visible_screen(monkeypatch, force_tmux_backend):
+    """`capture-pane -p -t <window>`: the visible screen to stdout, no `-S`/`-E`
+    scrollback range — the question is what is on screen NOW (DW-350)."""
+    from bmad_loop.adapters.multiplexer import get_multiplexer
+
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, stdout=f"{BYPASS_FOOTER}\n", stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake_run)
+    assert get_multiplexer().capture_pane("@7") == BYPASS_FOOTER
+    assert calls == [["tmux", "capture-pane", "-p", "-t", "@7"]]

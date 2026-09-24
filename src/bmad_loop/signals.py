@@ -28,11 +28,16 @@ from typing import Callable
 @dataclass(frozen=True)
 class HookEvent:
     ts: int
-    event: str  # Stop | SessionStart | SessionEnd | PreCompact
+    event: str  # Stop | SessionStart | SessionEnd | PreCompact | Notification | parked kinds
     task_id: str
     session_id: str | None
     transcript_path: str | None
     path: Path
+    # A Notification event's subtype, forwarded by the relay (DW-348) — e.g.
+    # claude's "permission_prompt". None on every other event, on an older
+    # relay that predates the field, and for a non-string value. APPENDED with a
+    # default so every positional construction stays valid.
+    notification_type: str | None = None
 
 
 def _event_dirs(events_dir: Path, legacy_dir: Path | None) -> list[Path]:
@@ -54,6 +59,7 @@ def _parse_event(entry: Path) -> HookEvent | None:
         return None
     if not isinstance(data, dict) or "event" not in data or "task_id" not in data:
         return None
+    notification_type = data.get("notification_type")
     return HookEvent(
         ts=int(data.get("ts", 0)),
         event=str(data["event"]),
@@ -61,6 +67,7 @@ def _parse_event(entry: Path) -> HookEvent | None:
         session_id=data.get("session_id"),
         transcript_path=data.get("transcript_path"),
         path=entry,
+        notification_type=notification_type if isinstance(notification_type, str) else None,
     )
 
 

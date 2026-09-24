@@ -201,6 +201,23 @@ def env_fault_pause_reason(role: str, result: SessionResult) -> str:
     return f"environment fault: {session_failure_reason(role, result)} ({env_fault_detail(result)})"
 
 
+def parked_pause_reason(role: str, result: SessionResult) -> str:
+    """The pause reason for a session parked on a human prompt (DW-348/DW-350):
+    ``parked: <role> session <status> (<evidence>; ...)``.
+
+    Composed over `session_failure_reason`, like its siblings, so the #489
+    lost-session suffix survives. The evidence names what the adapter saw — a
+    hook signal (``Notification(permission_prompt) -> PermissionPrompt``) or a
+    ``parked_prompt_patterns`` match on the visible pane — and the tail says why
+    the session ended `stalled` without the usual wake nudge."""
+    evidence = result.parked_evidence or "parked-session signal"
+    return (
+        f"parked: {session_failure_reason(role, result)} ({evidence}; the CLI was "
+        "waiting on a human — the stall nudge was withheld so it could not answer "
+        "the prompt)"
+    )
+
+
 def no_work_pause_reason(role: str, result: SessionResult) -> str:
     """The pause reason for a non-completed session that never did anything (#727):
     ``no work produced: <role> session <status> (...)``.
@@ -271,6 +288,16 @@ def decide_dev(
                 Action.PAUSE,
                 env_fault_pause_reason("dev", result),
             )
+        if result.parked:
+            # The CLI was parked on a prompt only a human should answer (DW-348/
+            # DW-350) — a permission, idle or quota prompt, from a hook signal or
+            # the visible pane — and the adapter withheld the stall nudge rather
+            # than type into it. A RETRY would relaunch into the same prompt, so
+            # pause ahead of the budget; re-arm resets the attempt. After
+            # `env_fault` (a transport failure outranks it), ahead of the #727
+            # no-work arm: a named prompt explains the silence better than the
+            # silence does.
+            return Decision(Action.PAUSE, parked_pause_reason("dev", result))
         if not result.produced_work:
             # The session never did anything (#727): no turn ended and the pane
             # never changed after its first frame — a CLI parked on a permission
@@ -315,6 +342,11 @@ def decide_review_session(task: StoryTask, result: SessionResult, policy: Policy
                 Action.PAUSE,
                 env_fault_pause_reason("review", result),
             )
+        if result.parked:
+            # parked on a human prompt (DW-348/DW-350): pause rather than charge a
+            # review cycle for a session the adapter would not type into (see
+            # decide_dev). After env_fault, which outranks it.
+            return Decision(Action.PAUSE, parked_pause_reason("review", result))
         reason = session_failure_reason("review", result)
         if result.status in REVIEW_TIMEOUT_STATUSES:
             mode = policy.review.on_timeout

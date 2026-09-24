@@ -10982,6 +10982,30 @@ def test_validate_refuses_relay_registered_only_on_session_start(project, capsys
     )
 
 
+def test_validate_passes_hooks_registered_without_the_notification_relay(project, capsys):
+    """DW-348 acceptance: an existing project whose `.claude/settings.json` lacks
+    the `Notification` relay (initialized before it existed) still passes
+    `hooks.registered` — the parked-signal relay is optional, Stop is not."""
+    from bmad_loop.install import install_into
+
+    install_bmad_config(project)
+    _write_policy(project.project)
+    assert install_into(project.project, clis=("claude",), skills=False) == 0
+    config = project.project / ".claude/settings.json"
+    data = json.loads(config.read_text())
+    del data["hooks"]["Notification"]
+    config.write_text(json.dumps(data))
+    capsys.readouterr()
+
+    _rc, doc = _validate_json(project.project, capsys)
+    registered = [
+        f
+        for f in doc["findings"]
+        if f["check"] == "hooks.registered" and f["detail"]["profile"] == "claude"
+    ]
+    assert [f["severity"] for f in registered] == ["ok"]
+
+
 def test_validate_ignores_unused_legacy_copy(project, capsys):
     from bmad_loop.install import install_into
 

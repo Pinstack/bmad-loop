@@ -308,6 +308,22 @@ class TerminalMultiplexer(ABC):
     def send_text(self, window_id: str, text: str) -> None:
         """Send ``text`` literally to the window, then submit it (Enter)."""
 
+    def capture_pane(self, window_id: str) -> str:
+        """The window's VISIBLE screen as plain text, one line per row — what an
+        operator attached to it would see right now, not its scrollback.
+
+        Read by the generic adapter only at the instant a stall wake nudge is
+        about to be typed (DW-350): a screen showing a prompt only a human should
+        answer withholds the nudge, whose trailing Enter could confirm it. Pure
+        observation — any failure there degrades to "no match" and the nudge
+        goes out as it always did.
+
+        NON-abstract so released out-of-tree backends keep working unchanged:
+        the default raises :class:`MultiplexerError` ("cannot capture"), which
+        the caller treats exactly like a clean screen. A backend that can read
+        its pane overrides this."""
+        raise MultiplexerError(f"{type(self).__name__} cannot capture a pane's visible screen")
+
     # ----------------------------------------------------- client / attach
 
     @abstractmethod
