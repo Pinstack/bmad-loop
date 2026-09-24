@@ -239,6 +239,15 @@ breaking changes may land in a minor release.
   an `opencode-http` profile with a hook dialect shows the server/prompt_async line,
   a hookless profile of another kind shows the argv line.
 
+### Security
+
+- Pin the artifact publication directory, the run dir under a verify-stream write, the
+  exact-path candidate worktree and the integration snapshot directory to the identity
+  their check accepted: one replaced by a symlink before the root open is refused instead
+  of followed outside the repository. A run dir that is already a link now fails
+  verify-stream writes (the journal records `capture_error`). Operator-chosen roots may
+  still be links; worktree-mount spec-writer roots are not yet pinned (DW-338).
+
 ## [0.12.0] — 2026-09-20
 
 ### Added

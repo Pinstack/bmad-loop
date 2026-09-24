@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import stat
 import sys
 import time
 import tracemalloc
@@ -13,6 +14,7 @@ import pytest
 from conftest import git
 
 from bmad_loop import artifact_publication as publication
+from bmad_loop import platform_util
 from bmad_loop.journal import save_state
 from bmad_loop.model import RunState, StoryTask
 
@@ -907,7 +909,14 @@ def test_destination_streaming_rejects_indeterminate_inode(
             if inode_available:
                 self.st_ino = 0
 
-    monkeypatch.setattr(os, "fstat", lambda fd: IndeterminateInode(real_fstat(fd)))
+    def indeterminate_leaf(fd):
+        # Only the destination leaf is indeterminate: a directory fstat is the
+        # confined walk's root pin (DW-338), which refuses an identity-less root
+        # outright rather than reporting an incomplete observation.
+        metadata = real_fstat(fd)
+        return IndeterminateInode(metadata) if stat.S_ISREG(metadata.st_mode) else metadata
+
+    monkeypatch.setattr(os, "fstat", indeterminate_leaf)
     monkeypatch.setattr(
         publication,
         "_destination_path_identity",
@@ -1948,15 +1957,212 @@ def test_source_swap_between_check_and_read_is_refused(publication_case, monkeyp
     else:
         opener = publication.open_dir_confined
 
-        def swap_parent(root, parent):
+        def swap_parent(root, parent, **kwargs):
             report.parent.rename(report.parent.with_name("original"))
             report.parent.symlink_to(outside, target_is_directory=True)
-            return opener(root, parent)
+            return opener(root, parent, **kwargs)
 
         monkeypatch.setattr(publication, "open_dir_confined", swap_parent)
     with pytest.raises((OSError, publication.PublicationError)):
         publication._contents(source.project, report)
     assert (outside / report.name).read_bytes() == b"outside secrets"
+
+
+def _swap_publication_root(root, outside):
+    """Replace the in-checkout artifact root with a link to ``outside`` (DW-338)."""
+    root.rename(root.with_name(root.name + "-aside"))
+    root.symlink_to(outside, target_is_directory=True)
+
+
+@pytest.mark.skipif(not publication.DIR_FD_ANCHORED_WRITES, reason="POSIX descriptor reads")
+def test_root_swapped_between_confined_and_open_is_not_read(publication_case, monkeypatch):
+    """DW-338, read side: `implementation_artifacts` replaced by a link after
+    `_confined` accepted it but before the root open. The pinned walk refuses, so
+    the outside tree's bytes are never read.
+
+    Ablation: stop passing `_confined`'s identity as `root_identity` in
+    `_open_regular` (or remove the compare in `open_dir_confined`) and this fails
+    `DID NOT RAISE` — `_contents` returns `outside secrets`."""
+    _task, paths, _source = publication_case
+    root = paths.implementation_artifacts
+    report = root / "report.bin"
+    report.write_bytes(b"inside")
+    outside = paths.project.parent / "outside-artifacts"
+    outside.mkdir()
+    (outside / report.name).write_bytes(b"outside secrets")
+    opener = publication.open_dir_confined
+    swapped = []
+
+    def swap_then_open(walk_root, target, **kwargs):
+        if not swapped:
+            _swap_publication_root(root, outside)
+            swapped.append(True)
+        return opener(walk_root, target, **kwargs)
+
+    monkeypatch.setattr(publication, "open_dir_confined", swap_then_open)
+    with pytest.raises(publication.PublicationError):
+        publication._contents(root, report)
+    assert swapped
+
+
+@pytest.mark.skipif(not publication.DIR_FD_ANCHORED_WRITES, reason="POSIX descriptor reads")
+def test_root_swapped_between_confined_and_open_is_not_measured(publication_case, monkeypatch):
+    """DW-338, `_file_size`: a root replaced by a link after `_confined` accepted
+    it is refused rather than measured.
+
+    Ablation: stop passing `root_identity=` in `_file_size` and this fails
+    `DID NOT RAISE` — it returns the outside file's size."""
+    _task, paths, _source = publication_case
+    root = paths.implementation_artifacts
+    report = root / "report.bin"
+    report.write_bytes(b"inside")
+    outside = paths.project.parent / "outside-artifacts"
+    outside.mkdir()
+    (outside / report.name).write_bytes(b"outside secrets")
+    opener = publication.open_dir_confined
+    swapped = []
+
+    def swap_then_open(walk_root, target, **kwargs):
+        if not swapped:
+            _swap_publication_root(root, outside)
+            swapped.append(True)
+        return opener(walk_root, target, **kwargs)
+
+    monkeypatch.setattr(publication, "open_dir_confined", swap_then_open)
+    with pytest.raises(publication.PublicationError):
+        publication._file_size(root, report)
+    assert swapped
+
+
+@pytest.mark.skipif(not publication.DIR_FD_ANCHORED_WRITES, reason="POSIX descriptor inventory")
+def test_capture_refuses_a_root_swapped_between_confined_and_open(publication_case, monkeypatch):
+    """DW-338, `capture`: `implementation_artifacts` replaced by a link to an
+    empty outside directory between `walk`'s `_confined` and its root open is
+    refused, and no baseline is recorded.
+
+    Ablation: stop passing `root_identity=` in `walk` and this fails
+    `DID NOT RAISE` — the outside directory is inventoried as an empty baseline."""
+    task, paths, _source = publication_case
+    root = paths.implementation_artifacts
+    outside = paths.project.parent / "outside-artifacts"
+    outside.mkdir()
+    task.artifact_baseline = None
+    opener = publication.open_dir_confined
+    swapped = []
+
+    def swap_then_open(walk_root, target, **kwargs):
+        if not swapped:
+            _swap_publication_root(root, outside)
+            swapped.append(True)
+        return opener(walk_root, target, **kwargs)
+
+    monkeypatch.setattr(publication, "open_dir_confined", swap_then_open)
+    with pytest.raises(publication.PublicationError):
+        publication.capture(task, paths)
+    assert swapped
+    assert task.artifact_baseline is None
+
+
+@pytest.mark.skipif(not publication.DIR_FD_ANCHORED_WRITES, reason="POSIX descriptor writes")
+def test_root_swapped_before_the_publication_write_lands_nothing_outside(
+    publication_case, monkeypatch
+):
+    """DW-338, write side: the root is replaced by a link after `publish`'s last
+    `_confined` predicate, inside the confined writer's own root open. The writer
+    is pinned to the identity that predicate accepted, so it refuses before
+    staging anything — not a byte is ever created outside the repository.
+
+    `publish`'s `_before_replace` validation would ALSO refuse this swap (it
+    re-runs `_confined`), but only after a temp was staged in the outside tree;
+    so the assertion that pins the fix is that nothing was staged at all.
+
+    Ablation: drop `root_identity=` from `publish`'s `atomic_write_bytes_confined`
+    call and this fails — a staging temp is created inside `outside`."""
+    task, paths, source = publication_case
+    bind_and_prepare(task, paths, source)
+    root = paths.implementation_artifacts
+    outside = paths.project.parent / "outside-artifacts"
+    outside.mkdir()
+    writer_open = platform_util.open_dir_confined
+    stage = platform_util._open_exclusive_at
+    swapped = []
+    staged = []
+
+    def swap_then_open(walk_root, target, **kwargs):
+        if not swapped and walk_root == root:
+            _swap_publication_root(root, outside)
+            swapped.append(True)
+        return writer_open(walk_root, target, **kwargs)
+
+    def record_stage(dir_fd, prefix, name):
+        staged.append(os.fstat(dir_fd).st_ino)
+        return stage(dir_fd, prefix, name)
+
+    monkeypatch.setattr(platform_util, "open_dir_confined", swap_then_open)
+    monkeypatch.setattr(platform_util, "_open_exclusive_at", record_stage)
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        publication.publish(task, paths)
+    assert swapped
+    assert staged == []
+    assert list(outside.iterdir()) == []
+    assert not task.artifact_publication_complete
+
+
+@pytest.mark.skipif(not publication.DIR_FD_ANCHORED_WRITES, reason="POSIX descriptor reads")
+def test_root_swapped_before_the_destination_relookup_is_refused(publication_case, monkeypatch):
+    """DW-338, `_destination_path_identity`: the fresh leaf re-lookup behind
+    `_destination_still_names` is pinned too, so a root replaced by a link after
+    its `_confined` never reports an outside leaf's identity.
+
+    Ablation: drop `root_identity=` from `_destination_path_identity`'s
+    `open_dir_confined` call and this fails — the outside file's identity is
+    returned instead of None."""
+    _task, paths, _source = publication_case
+    root = paths.implementation_artifacts
+    report = root / "report.bin"
+    report.write_bytes(b"inside")
+    outside = paths.project.parent / "outside-artifacts"
+    outside.mkdir()
+    (outside / report.name).write_bytes(b"outside secrets")
+    opener = publication.open_dir_confined
+    swapped = []
+
+    def swap_then_open(walk_root, target, **kwargs):
+        if not swapped:
+            _swap_publication_root(root, outside)
+            swapped.append(True)
+        return opener(walk_root, target, **kwargs)
+
+    monkeypatch.setattr(publication, "open_dir_confined", swap_then_open)
+    assert publication._destination_path_identity(root, report) is None
+    assert swapped
+
+
+def test_publish_refuses_when_the_root_identity_cannot_be_retaken(publication_case, monkeypatch):
+    """DW-338: `publish` re-takes the root identity after its mkdir; a root gone
+    by then has no identity, and a pinned caller refuses rather than handing the
+    writer `root_identity=None` (an unpinned write).
+
+    Ablation: delete the `if root_identity is None: raise` guard in `publish`
+    and this fails `DID NOT RAISE` — the payload is written unpinned."""
+    task, paths, source = publication_case
+    bind_and_prepare(task, paths, source)
+    confined = publication._confined
+    calls_from_publish = []
+
+    def lose_root_after_mkdir(root, path):
+        if sys._getframe(1).f_code.co_name == "publish":
+            calls_from_publish.append(path)
+            if len(calls_from_publish) == 2:  # the re-take after the mkdir
+                return None
+        return confined(root, path)
+
+    monkeypatch.setattr(publication, "_confined", lose_root_after_mkdir)
+    with pytest.raises(publication.PublicationError, match="artifact directory is missing"):
+        publication.publish(task, paths)
+    assert len(calls_from_publish) == 2
+    assert not (paths.implementation_artifacts / "report.bin").exists()
+    assert not task.artifact_publication_complete
 
 
 @pytest.mark.skipif(not publication.DIR_FD_ANCHORED_WRITES, reason="POSIX descriptor inventory")

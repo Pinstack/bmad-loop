@@ -29,7 +29,7 @@ from typing import Any, Literal, assert_never, overload
 
 import yaml
 
-from . import deferredwork
+from . import deferredwork, platform_util
 from .bmadconfig import ProjectPaths
 from .frontmatter import FileIdentity  # noqa: F401 — re-export
 from .frontmatter import FrontmatterTargetChangedError  # noqa: F401 — re-export
@@ -57,6 +57,7 @@ from .platform_util import (
     names_win32_alias,
     open_dir_confined,
     path_is_confined,
+    pinned_root_identity,
 )
 from .policy import POLICY_FILE, Policy
 from .sprintstatus import STATUS_ORDER, story_status
@@ -690,6 +691,16 @@ def _stream_snapshot(
 ) -> tuple[int, str]:
     """Publish one file sidecar atomically while keeping memory usage bounded."""
     if not DIR_FD_ANCHORED_WRITES:
+        # Check-then-write pin of the orchestrator-minted snapshot dir (DW-338).
+        # Narrower than `_snapshot_bytes`'s fallback, whose confined writer is
+        # handle-anchored wherever HANDLE_ANCHORED_WRITES holds: this arm is
+        # path-based, so a link planted between this check and `mkstemp` still
+        # redirects the staging file. (A swap after `mkstemp` makes the
+        # path-based `os.replace` miss its source and fail.)
+        if pinned_root_identity(destination.parent) is None:
+            raise IntegrationEvidenceError(
+                "target integration snapshot directory is missing or redirected"
+            )
         fd, temporary = tempfile.mkstemp(prefix=".capture-", dir=destination.parent)
         digest = hashlib.sha256()
         size = 0
@@ -795,7 +806,16 @@ def _stream_snapshot(
 
 def _snapshot_bytes(data: bytes, destination: Path) -> tuple[int, str]:
     if not DIR_FD_ANCHORED_WRITES:
-        atomic_write_bytes_confined(destination, data, confine_root=destination.parent)
+        # Pinned like the POSIX arm's O_NOFOLLOW root open below: the snapshot
+        # directory is orchestrator-minted, so a linked one is refused (DW-338).
+        root_identity = pinned_root_identity(destination.parent)
+        if root_identity is None:
+            raise IntegrationEvidenceError(
+                "target integration snapshot directory is missing or redirected"
+            )
+        atomic_write_bytes_confined(
+            destination, data, confine_root=destination.parent, root_identity=root_identity
+        )
         return len(data), hashlib.sha256(data).hexdigest()
     root_fd = os.open(
         destination.parent,
@@ -10873,7 +10893,9 @@ def _publish_bound_candidate(
         raise GitError("captured branch changed during exact-path publication") from exc
 
 
-def _make_candidate_parents(root: Path, parent: Path) -> None:
+def _make_candidate_parents(
+    root: Path, parent: Path, *, root_identity: os.stat_result | None = None
+) -> None:
     """Create the missing directories from `root` down to `parent`, confined.
 
     `parent.mkdir(parents=True)` follows a redirected ancestor and would create
@@ -10884,8 +10906,15 @@ def _make_candidate_parents(root: Path, parent: Path) -> None:
     each component's ancestry with `path_is_confined` before creating it, which
     keeps a check-then-act residual: a link planted between check and create
     still redirects it. That is narrower than the confined writer, which is
-    handle-anchored there too wherever `HANDLE_ANCHORED_WRITES` holds. `root`
-    itself may be reached through a link, as `open_dir_confined` allows.
+    handle-anchored there too wherever `HANDLE_ANCHORED_WRITES` holds.
+
+    `root_identity` pins `root` itself (DW-338): the candidate worktree is
+    orchestrator-minted, so the caller takes `pinned_root_identity` once after
+    `worktree add` and a root replaced by a link afterwards is refused — by the
+    `fstat` compare in `open_dir_confined` on the anchored arm, by an `lstat`
+    compare (check-then-act, the arm's existing residual) on the path arm. With
+    no identity, `root` may be reached through a link, as `open_dir_confined`
+    allows.
 
     Raises `OSError` on failure. A refused redirect surfaces as the kernel's
     `OSError` (ELOOP/ENOTDIR from the `O_NOFOLLOW` open) on the anchored arm and
@@ -10896,6 +10925,9 @@ def _make_candidate_parents(root: Path, parent: Path) -> None:
     except ValueError as exc:
         raise UnconfinedWriteError(f"{parent} is not under {root}") from exc
     if not DIR_FD_ANCHORED_WRITES:
+        if root_identity is not None:
+            if not platform_util._root_still_pinned(root, root_identity):
+                raise UnconfinedWriteError(f"candidate root {root} was replaced")
         current = root
         for part in relative.parts:
             current = current / part
@@ -10903,7 +10935,7 @@ def _make_candidate_parents(root: Path, parent: Path) -> None:
                 raise UnconfinedWriteError(f"{current.parent} is redirected below {root}")
             current.mkdir(exist_ok=True)
         return
-    fd = open_dir_confined(root, root)
+    fd = open_dir_confined(root, root, root_identity=root_identity)
     if fd is None:
         raise OSError(f"candidate root {root} could not be opened")
     try:
@@ -11139,12 +11171,21 @@ def commit_path_bound(
                         return
                     os.fchmod(fd, (os.fstat(fd).st_mode & 0o777) | 0o100)
 
+                # Pin the engine-minted candidate root once, right after the
+                # add: a root replaced by a link afterwards is refused by both
+                # the parent creation and the write (DW-338).
+                candidate_identity = pinned_root_identity(candidate_root)
+                if candidate_identity is None:
+                    raise GitError("detached candidate checkout root is missing or redirected")
                 try:
-                    _make_candidate_parents(candidate_root, candidate_path.parent)
+                    _make_candidate_parents(
+                        candidate_root, candidate_path.parent, root_identity=candidate_identity
+                    )
                     atomic_write_bytes_confined(
                         candidate_path,
                         accepted_bytes,
                         confine_root=candidate_root,
+                        root_identity=candidate_identity,
                         _after_replace=_pin_exec_bit,
                     )
                 except (OSError, RuntimeError, ValueError) as exc:

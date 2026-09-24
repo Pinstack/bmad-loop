@@ -10290,6 +10290,125 @@ def test_commit_path_bound_recreates_a_missing_candidate_parent(project, monkeyp
     assert git(repo, "show", f"{published}:ledger-dir/ledger.md") == accepted.rstrip("\n")
 
 
+def _swap_candidate_root(candidate_root, outside):
+    """Replace the candidate worktree root with a link to ``outside`` (DW-338)."""
+    candidate_root.rename(candidate_root.with_name("candidate-aside"))
+    candidate_root.symlink_to(outside, target_is_directory=True)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("swap_point", ["before-pin", "after-pin", "before-write"])
+@pytest.mark.parametrize("arm", ["anchored", "fallback"])
+def test_commit_path_bound_refuses_a_candidate_root_swapped_for_a_link(
+    project, tmp_path_factory, monkeypatch, arm, swap_point
+):
+    """DW-338: the engine-minted candidate root is pinned once after `worktree
+    add`. A root that is already a link at the pin is refused (`before-pin`); one
+    swapped after the pin is refused by the parent creation (`after-pin`) or by
+    the confined writer (`before-write`, the outside tree carrying the same
+    subpath so only the root pin can refuse). Nothing lands outside, HEAD stays.
+
+    Ablations, each failing its rows: drop the `candidate_identity is None`
+    refusal (`before-pin` — parents are created in `outside`); drop
+    `root_identity=` to `_make_candidate_parents` or its path-arm
+    `_root_still_pinned` check (`after-pin`); drop `root_identity=` to
+    `atomic_write_bytes_confined` (`before-write` — `ledger.md` lands outside)."""
+    repo, path, baseline, accepted, original = _nested_bound_publish_inputs(
+        project, "outer/inner/ledger.md"
+    )
+    outside = tmp_path_factory.mktemp("outside-root")
+    _select_candidate_parent_arm(monkeypatch, arm)
+    swapped = []
+
+    def swap(candidate_root):
+        _swap_candidate_root(candidate_root, outside)
+        swapped.append(True)
+
+    if swap_point == "before-pin":
+        _intercept_candidate_checkout(monkeypatch, swap)
+    elif swap_point == "after-pin":
+        real_pin = verify.pinned_root_identity
+
+        def pin_then_swap(root):
+            identity = real_pin(root)
+            swap(root)
+            return identity
+
+        monkeypatch.setattr(verify, "pinned_root_identity", pin_then_swap)
+    else:
+        (outside / "outer" / "inner").mkdir(parents=True)
+        real_parents = verify._make_candidate_parents
+
+        def parents_then_swap(root, parent, **kwargs):
+            real_parents(root, parent, **kwargs)
+            swap(root)
+
+        monkeypatch.setattr(verify, "_make_candidate_parents", parents_then_swap)
+
+    with pytest.raises(verify.GitError):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+            baseline_commit=original,
+        )
+
+    assert swapped
+    written = sorted(p.relative_to(outside).as_posix() for p in outside.rglob("*"))
+    expected = ["outer", "outer/inner"] if swap_point == "before-write" else []
+    assert written == expected
+    assert verify.rev_parse_head(repo) == original
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_snapshot_bytes_fallback_refuses_a_linked_snapshot_directory(tmp_path, monkeypatch):
+    """DW-338: without descriptor anchoring `_snapshot_bytes` pins its
+    orchestrator-minted snapshot directory, so a linked one is refused rather than
+    written through. Ablation: drop the `pinned_root_identity` refusal and this
+    fails `DID NOT RAISE`, the sidecar landing in `outside`."""
+    monkeypatch.setattr(verify, "DIR_FD_ANCHORED_WRITES", False)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    snapshots = tmp_path / "snapshots"
+    snapshots.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(verify.IntegrationEvidenceError, match="missing or redirected"):
+        verify._snapshot_bytes(b"target bytes", snapshots / "sidecar")
+
+    assert list(outside.iterdir()) == []
+    # Positive control: the same arm writes into a real snapshot directory.
+    real = tmp_path / "real-snapshots"
+    real.mkdir()
+    verify._snapshot_bytes(b"target bytes", real / "sidecar")
+    assert (real / "sidecar").read_bytes() == b"target bytes"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_stream_snapshot_fallback_refuses_a_linked_snapshot_directory(tmp_path, monkeypatch):
+    """DW-338: `_stream_snapshot`'s no-dir-fd arm stages with `mkstemp` into
+    `destination.parent`, so it pre-checks the pin like `_snapshot_bytes`.
+    Ablation: drop the pre-check and this fails `DID NOT RAISE`, the sidecar
+    landing in `outside`."""
+    monkeypatch.setattr(verify, "DIR_FD_ANCHORED_WRITES", False)
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"target bytes")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    snapshots = tmp_path / "snapshots"
+    snapshots.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(verify.IntegrationEvidenceError, match="missing or redirected"):
+        verify._stream_snapshot(source, snapshots / "sidecar")
+
+    assert list(outside.iterdir()) == []
+    real = tmp_path / "real-snapshots"
+    real.mkdir()
+    verify._stream_snapshot(source, real / "sidecar")
+    assert (real / "sidecar").read_bytes() == b"target bytes"
+
+
 def test_prepared_ref_timeout_before_commit_is_not_indeterminate(project):
     repo = project.project
     oid = verify.rev_parse_head(repo)

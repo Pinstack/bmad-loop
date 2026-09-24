@@ -20,6 +20,7 @@ from .platform_util import (
     file_lock,
     is_link_like,
     open_dir_confined,
+    pinned_root_identity,
 )
 
 STATE_FILE = "state.json"
@@ -301,15 +302,30 @@ class Journal:
         as this writer and the names here are engine-minted, so the exposure is a
         redirected diagnostic rather than a foothold.
 
+        The run dir itself is PINNED on the anchored arm (DW-338): it is
+        engine-minted, so a linked run dir is refused by contract, and the walk
+        refuses unless the root it opens is the directory
+        :func:`pinned_root_identity` accepted just before — a run dir replaced by a
+        link in between is not written through. A run dir that is already a link
+        (or missing) has no identity to pin and refuses outright. The win32 arm
+        extends its check-then-write refusal to a linked run dir the same way.
+
         Raises ``OSError`` — including when confinement cannot be established, so
         an unconfined ``verify/`` REFUSES rather than writing through the link.
         The caller degrades (this is observation), it does not swallow it here:
         the record still lands, with a null pointer and ``capture_error``.
         """
         verify_dir = self.run_dir / VERIFY_DIR
-        verify_dir.mkdir(parents=True, exist_ok=True)
+        # Pin (or refuse) the run dir BEFORE the mkdir: a linked run dir must not
+        # get a `verify/` created in its target ahead of the refusal.
         if DIR_FD_ANCHORED_WRITES:
-            dir_fd = open_dir_confined(self.run_dir, verify_dir)
+            root_identity = pinned_root_identity(self.run_dir)
+            if root_identity is None:
+                raise OSError(
+                    f"refusing to write into an unconfined verify directory: {verify_dir}"
+                )
+            verify_dir.mkdir(parents=True, exist_ok=True)
+            dir_fd = open_dir_confined(self.run_dir, verify_dir, root_identity=root_identity)
             if dir_fd is None:
                 raise OSError(
                     f"refusing to write into an unconfined verify directory: {verify_dir}"
@@ -319,7 +335,10 @@ class Journal:
             finally:
                 os.close(dir_fd)
         else:
-            if is_link_like(verify_dir):
+            if is_link_like(self.run_dir):
+                raise OSError(f"refusing to write into a redirected verify directory: {verify_dir}")
+            verify_dir.mkdir(parents=True, exist_ok=True)
+            if is_link_like(self.run_dir) or is_link_like(verify_dir):
                 raise OSError(f"refusing to write into a redirected verify directory: {verify_dir}")
             atomic_write_text(verify_dir / name, content, follow_symlinks=False)
         return (verify_dir / name).relative_to(self.run_dir).as_posix()

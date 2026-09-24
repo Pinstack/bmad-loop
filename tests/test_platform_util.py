@@ -1930,6 +1930,279 @@ def test_open_dir_confined_accepts_a_root_behind_a_link(tmp_path):
         os.close(fd)
 
 
+# ------------------------------------------- open_dir_confined root pin (DW-338)
+#
+# `root_identity=` pins a root the orchestrator minted or validated inside the
+# checkout to the `lstat` identity the caller accepted. The threat: a writer that
+# can reach the checkout replaces such a root (`implementation_artifacts`, a run
+# dir) with a link between the caller's predicate and the root open, and every
+# later confined read or write follows it out of the repository.
+
+
+def _swap_root_for_link(root: Path, outside: Path, sub: str) -> None:
+    """Rename ``root`` aside and plant a link at its name to an outside tree
+    carrying the same subpath, so the walk below the root still succeeds."""
+    (outside / sub).mkdir(parents=True, exist_ok=True)
+    root.rename(root.with_name(root.name + "-aside"))
+    root.symlink_to(outside, target_is_directory=True)
+
+
+@DIR_FD
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_open_dir_confined_pinned_root_refuses_a_root_swapped_for_a_link(tmp_path):
+    """The DW-338 swap: identity taken by `lstat`, root then replaced by a link to
+    an outside tree with the same subpath — the pinned walk refuses.
+
+    Ablation: remove the identity compare in `open_dir_confined` and this fails —
+    the pinned call returns a descriptor into `outside` exactly as the unpinned
+    control below does."""
+    root = tmp_path / "project" / "artifacts"
+    (root / "specs").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    identity = os.lstat(root)
+
+    _swap_root_for_link(root, outside, "specs")
+
+    assert platform_util.open_dir_confined(root, root / "specs", root_identity=identity) is None
+    # Control: the swap really redirects an unpinned walk into `outside`.
+    fd = platform_util.open_dir_confined(root, root / "specs")
+    assert fd is not None
+    try:
+        assert os.fstat(fd).st_ino == (outside / "specs").stat().st_ino
+    finally:
+        os.close(fd)
+
+
+@DIR_FD
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_open_dir_confined_pinned_root_refuses_an_ancestor_swapped_for_a_link(tmp_path):
+    """The compare also catches an ANCESTOR of the root swapped between the
+    caller's predicate and the open: root's parent replaced by a link to an
+    outside tree holding the same subpath reaches a different directory, which
+    `O_NOFOLLOW` on the root alone would never notice.
+
+    Ablation: remove the identity compare in `open_dir_confined` and this fails —
+    the walk returns a descriptor into `outside/artifacts/specs`."""
+    project = tmp_path / "project"
+    root = project / "artifacts"
+    (root / "specs").mkdir(parents=True)
+    identity = os.lstat(root)
+    outside = tmp_path / "outside"
+    (outside / "artifacts" / "specs").mkdir(parents=True)
+
+    project.rename(tmp_path / "project-aside")
+    project.symlink_to(outside, target_is_directory=True)
+
+    assert platform_util.open_dir_confined(root, root / "specs", root_identity=identity) is None
+
+
+@ANCHORED
+def test_open_dir_confined_pin_refuses_a_non_directory_identity(tmp_path):
+    """An identity carrying the root's real `(st_dev, st_ino)` but a regular-file
+    mode is refused: only a DIRECTORY identity can pin a directory root.
+
+    Ablation: drop the `S_ISDIR` half of `_same_dir_identity` and this fails —
+    the matching device and inode alone would admit the walk."""
+    root = tmp_path / "artifacts"
+    (root / "specs").mkdir(parents=True)
+    fields = list(os.lstat(root)[:10])
+    fields[0] = stat.S_IFREG | 0o644  # st_mode
+    not_a_dir = os.stat_result(fields)
+
+    assert platform_util.open_dir_confined(root, root / "specs", root_identity=not_a_dir) is None
+
+
+@ANCHORED
+def test_open_dir_confined_pinned_root_unchanged_returns_the_descriptor(tmp_path):
+    """Positive control for the pin: an untouched root whose identity was taken by
+    `lstat` (or `pinned_root_identity`) walks exactly as an unpinned one does."""
+    root = tmp_path / "project" / "artifacts"
+    nested = root / "specs"
+    nested.mkdir(parents=True)
+
+    for identity in (os.lstat(root), platform_util.pinned_root_identity(root)):
+        assert identity is not None
+        fd = platform_util.open_dir_confined(root, nested, root_identity=identity)
+        assert fd is not None
+        try:
+            assert os.fstat(fd).st_ino == nested.stat().st_ino
+        finally:
+            os.close(fd)
+
+
+@DIR_FD
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_open_dir_confined_pin_refuses_a_link_lstat_identity(tmp_path):
+    """An identity that is a link's own `lstat` never matches the directory the
+    open reaches through it: the pin refuses rather than degrading to "unpinned".
+
+    Ablation: drop the `S_ISDIR` requirement from `_same_dir_identity` and compare
+    only `(st_dev, st_ino)` — still refused (a link's inode is its own); drop the
+    compare altogether and this fails."""
+    real = tmp_path / "real"
+    (real / "specs").mkdir(parents=True)
+    root = tmp_path / "artifacts"
+    root.symlink_to(real, target_is_directory=True)
+
+    assert (
+        platform_util.open_dir_confined(root, root / "specs", root_identity=os.lstat(root)) is None
+    )
+
+
+@ANCHORED
+def test_open_dir_confined_pin_refuses_a_zero_inode_identity(tmp_path):
+    """A synthetic identity with `st_ino == 0` carries no identity at all; even
+    with a matching `st_dev` and mode it refuses. And the same root with its real
+    inode walks, so the refusal is the zero, not the synthetic stat itself.
+
+    Ablation: drop the nonzero-inode requirement from `_same_dir_identity` and the
+    `_same_dir_identity(zero, zero)` assert fails — two identity-less stats would
+    otherwise "match" each other. (The seam assert alone would still pass on the
+    inode mismatch, which is why the helper is asserted directly.)"""
+    root = tmp_path / "artifacts"
+    (root / "specs").mkdir(parents=True)
+    real = os.lstat(root)
+    fields = list(real[:10])
+    fields[1] = 0  # st_ino
+    zero = os.stat_result(fields)
+
+    assert platform_util.open_dir_confined(root, root / "specs", root_identity=zero) is None
+    assert not platform_util._same_dir_identity(zero, zero)
+    assert platform_util._same_dir_identity(real, real)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("writer", ["text", "bytes", "exclusive"])
+def test_confined_writer_fallback_refuses_a_swapped_pinned_root(tmp_path, monkeypatch, writer):
+    """No-handle fallback (`HANDLE_ANCHORED_WRITES` False): `path_is_confined`
+    checks only components BELOW the root, so a root swapped for a link to a tree
+    with the same subpath passes it — the pin's `lstat` compare is what refuses.
+    Check-then-write; the residual (DW-295) is unchanged otherwise.
+
+    Ablation: delete the `_root_still_pinned` check in `_atomic_write_confined` /
+    `create_exclusive_confined` and this fails `DID NOT RAISE`, with the file
+    landing in `outside/specs/`."""
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+    root = tmp_path / "project" / "artifacts"
+    (root / "specs").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    identity = platform_util.pinned_root_identity(root)
+    assert identity is not None
+    target = root / "specs" / "record.md"
+
+    def write() -> None:
+        if writer == "text":
+            platform_util.atomic_write_text_confined(
+                target, "x\n", confine_root=root, root_identity=identity
+            )
+        elif writer == "bytes":
+            platform_util.atomic_write_bytes_confined(
+                target, b"x\n", confine_root=root, root_identity=identity
+            )
+        else:
+            os.close(
+                platform_util.create_exclusive_confined(
+                    target, confine_root=root, root_identity=identity
+                )
+            )
+
+    _swap_root_for_link(root, outside, "specs")
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        write()
+    assert list((outside / "specs").iterdir()) == []
+
+    # Positive control: the same fallback writes through the unswapped root.
+    root.unlink()
+    root.with_name(root.name + "-aside").rename(root)
+    write()
+    assert target.exists()
+
+
+@DIR_FD
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("writer", ["text", "bytes", "exclusive"])
+def test_confined_writer_anchored_refuses_a_swapped_pinned_root(tmp_path, writer):
+    """The anchored arm forwards `root_identity` to `open_dir_confined`, so a root
+    swapped for a link after the caller accepted it raises and nothing lands
+    outside.
+
+    Ablation: stop forwarding `root_identity` from the writer (or remove the
+    compare in `open_dir_confined`) and this fails `DID NOT RAISE`."""
+    root = tmp_path / "project" / "artifacts"
+    (root / "specs").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    identity = platform_util.pinned_root_identity(root)
+    assert identity is not None
+    target = root / "specs" / "record.md"
+
+    _swap_root_for_link(root, outside, "specs")
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        if writer == "text":
+            platform_util.atomic_write_text_confined(
+                target, "x\n", confine_root=root, root_identity=identity
+            )
+        elif writer == "bytes":
+            platform_util.atomic_write_bytes_confined(
+                target, b"x\n", confine_root=root, root_identity=identity
+            )
+        else:
+            platform_util.create_exclusive_confined(
+                target, confine_root=root, root_identity=identity
+            )
+    assert list((outside / "specs").iterdir()) == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_pinned_root_identity_refuses_links_files_and_missing_roots(tmp_path):
+    """A pinned caller treats None as a refusal, so every root it cannot vouch for
+    must answer None: a symlinked root, a file, a missing path. A real directory
+    answers its own `lstat`."""
+    real = tmp_path / "real"
+    real.mkdir()
+    linked = tmp_path / "linked"
+    linked.symlink_to(real, target_is_directory=True)
+    a_file = tmp_path / "file"
+    a_file.write_text("x", encoding="utf-8")
+
+    assert platform_util.pinned_root_identity(linked) is None
+    assert platform_util.pinned_root_identity(a_file) is None
+    assert platform_util.pinned_root_identity(tmp_path / "absent") is None
+    identity = platform_util.pinned_root_identity(real)
+    assert identity is not None
+    assert identity.st_ino == os.lstat(real).st_ino
+
+
+def test_pinned_root_identity_refuses_a_reparse_tagged_dir(tmp_path, monkeypatch):
+    """A win32 junction `lstat`s as a DIRECTORY with a nonzero inode, so only the
+    reparse-tag check stands between it and a pinned identity; drive that
+    Windows-only branch here (the tuple is substituted, as the neighbours do).
+
+    Ablation: delete the `st_reparse_tag` check in `pinned_root_identity` and
+    this fails — the junction's own directory stat is returned as the pin."""
+
+    class _IdentifiedReparseStat(_ReparseStat):
+        st_dev = 1
+        st_ino = 4242
+
+    junction = tmp_path / "junction"
+    junction.mkdir()
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    monkeypatch.setattr(platform_util, "_LINK_REPARSE_TAGS", (_ReparseStat.st_reparse_tag,))
+    real_lstat = os.lstat
+    monkeypatch.setattr(
+        platform_util.os,
+        "lstat",
+        lambda p, *a, **k: _IdentifiedReparseStat() if str(p) == str(junction) else real_lstat(p),
+    )
+
+    assert platform_util.pinned_root_identity(junction) is None
+    identity = platform_util.pinned_root_identity(plain)
+    assert identity is not None
+    assert identity.st_ino == real_lstat(plain).st_ino
+
+
 @DIR_FD
 def test_open_dir_confined_readable_default_supports_scandir(tmp_path):
     root = tmp_path / "project"
@@ -2740,8 +3013,8 @@ def test_atomic_write_confined_is_anchored_against_an_ancestor_swap(tmp_path, mo
     outside.mkdir()
     real_open = platform_util.open_dir_confined
 
-    def swap_after_the_walk(confine_root: Path, target: Path):
-        fd = real_open(confine_root, target)
+    def swap_after_the_walk(confine_root: Path, target: Path, **kwargs):
+        fd = real_open(confine_root, target, **kwargs)
         # attacker wins: the name now points outside, the fd still points home
         target.rename(tmp_path / "moved-aside")
         target.symlink_to(outside, target_is_directory=True)

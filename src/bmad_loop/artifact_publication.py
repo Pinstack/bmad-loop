@@ -101,21 +101,33 @@ def _relative(value: object) -> str:
     return value
 
 
-def _confined(root: Path, path: Path) -> None:
-    """Reject links at every component, including the configured root."""
+def _confined(root: Path, path: Path) -> os.stat_result | None:
+    """Reject links at every component, including the configured root, and
+    return the ``lstat`` this took for ``root`` (None when ``root`` is missing).
+
+    That result is the identity the caller accepted: every descriptor-relative
+    open below passes it as ``open_dir_confined``'s ``root_identity``, so a root
+    replaced by a link between this predicate and the open is refused rather than
+    walked (DW-338). A None identity is itself a refusal for an opening caller —
+    there is no accepted root to pin to."""
     if has_parent_ref(path):
         raise PublicationError(f"artifact path contains parent traversal: {path}")
     if not path.is_relative_to(root):
         raise PublicationError(f"artifact is outside {root}: {path}")
+    root_identity: os.stat_result | None = None
     for part in (path, *path.parents):
         try:
-            mode = part.lstat().st_mode
+            metadata = part.lstat()
         except FileNotFoundError:
             continue
+        mode = metadata.st_mode
         if stat.S_ISLNK(mode):
             raise PublicationError(f"artifact path is a symlink: {part}")
         if part != path and not stat.S_ISDIR(mode):
             raise PublicationError(f"artifact parent is not a directory: {part}")
+        if part == root:
+            root_identity = metadata
+    return root_identity
 
 
 def _read_bytes(stream: BinaryIO, max_bytes: int | None) -> bytes:
@@ -136,7 +148,7 @@ def _read_bytes(stream: BinaryIO, max_bytes: int | None) -> bytes:
 @contextmanager
 def _open_regular(root: Path, path: Path) -> Iterator[BinaryIO | None]:
     """Open one confined regular file without following its leaf on POSIX."""
-    _confined(root, path)
+    root_identity = _confined(root, path)
     try:
         mode = path.lstat().st_mode
     except FileNotFoundError:
@@ -149,7 +161,11 @@ def _open_regular(root: Path, path: Path) -> Iterator[BinaryIO | None]:
         with path.open("rb") as stream:
             yield stream
         return
-    parent_fd = open_dir_confined(root, path.parent)
+    parent_fd = (
+        None
+        if root_identity is None
+        else open_dir_confined(root, path.parent, root_identity=root_identity)
+    )
     if parent_fd is None:
         raise PublicationError(f"artifact parent was redirected: {path}")
     try:
@@ -236,7 +252,13 @@ def _destination_path_identity(root: Path, path: Path) -> _FileIdentity | None:
             return None
         return _file_identity(metadata)
 
-    parent_fd = open_dir_confined(root, path.parent)
+    try:
+        root_identity = _confined(root, path)
+    except PublicationError:
+        return None
+    if root_identity is None:
+        return None
+    parent_fd = open_dir_confined(root, path.parent, root_identity=root_identity)
     if parent_fd is None:
         return None
     try:
@@ -328,7 +350,7 @@ def _destination_equals(root: Path, path: Path, expected: bytes) -> bool:
 
 def _file_size(root: Path, path: Path) -> int | None:
     """Measure a confined regular file without following a replaced leaf."""
-    _confined(root, path)
+    root_identity = _confined(root, path)
     try:
         metadata = path.lstat()
     except FileNotFoundError:
@@ -337,7 +359,11 @@ def _file_size(root: Path, path: Path) -> int | None:
         raise PublicationError(f"artifact is not a regular file: {path}")
     if not DIR_FD_ANCHORED_WRITES:
         return metadata.st_size  # checked fallback; no descriptor-relative API
-    parent_fd = open_dir_confined(root, path.parent)
+    parent_fd = (
+        None
+        if root_identity is None
+        else open_dir_confined(root, path.parent, root_identity=root_identity)
+    )
     if parent_fd is None:
         raise PublicationError(f"artifact parent was redirected: {path}")
     try:
@@ -372,8 +398,12 @@ def capture(task: StoryTask, paths: ProjectPaths) -> None:
     inventory: dict[str, str] = {}
 
     def walk(directory: Path) -> None:
-        _confined(root, directory)
-        directory_fd = open_dir_confined(root, directory) if DIR_FD_ANCHORED_WRITES else None
+        root_identity = _confined(root, directory)
+        directory_fd = (
+            open_dir_confined(root, directory, root_identity=root_identity)
+            if DIR_FD_ANCHORED_WRITES and root_identity is not None
+            else None
+        )
         if DIR_FD_ANCHORED_WRITES and directory_fd is None:
             raise PublicationError(f"artifact inventory directory was redirected: {directory}")
         try:
@@ -921,6 +951,11 @@ def publish(task: StoryTask, paths: ProjectPaths) -> None:
             raise PublicationError(f"artifact destination is no longer ignored: {path}")
         _confined(root, path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        # Re-take the root identity after the mkdir: the writer below pins the
+        # root it walks to the one this predicate accepted (DW-338).
+        root_identity = _confined(root, path)
+        if root_identity is None:
+            raise PublicationError(f"artifact directory is missing: {root}")
         if _destination_observation(root, path) != current:
             raise PublicationError(f"artifact destination changed during publication: {path}")
 
@@ -929,7 +964,11 @@ def publish(task: StoryTask, paths: ProjectPaths) -> None:
                 raise PublicationError(f"artifact destination changed during publication: {path}")
 
         atomic_write_bytes_confined(
-            path, intended, confine_root=root, _before_replace=validate_destination
+            path,
+            intended,
+            confine_root=root,
+            root_identity=root_identity,
+            _before_replace=validate_destination,
         )
         if not _destination_equals(root, path, intended):
             raise PublicationError(f"published artifact is not visible at destination: {path}")

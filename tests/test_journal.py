@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import sys
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -302,6 +303,54 @@ def test_write_verify_stream_refuses_a_symlinked_verify_directory(tmp_path):
 
 
 @pytest.mark.skipif(not journal_mod.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only")
+def test_write_verify_stream_refuses_a_run_dir_swapped_after_the_pin(tmp_path, monkeypatch):
+    """DW-338: the run dir itself is engine-minted, so the anchored write pins it.
+    A run dir replaced by a link (to a tree that also carries `verify/`) after
+    `pinned_root_identity` accepted it, but before the root open, is refused —
+    the confinement walk below the run dir alone would pass that swap.
+
+    Ablation: drop `root_identity=` from the `open_dir_confined` call in
+    `write_verify_stream` and this fails `DID NOT RAISE`, with `v.stdout.log`
+    written into `elsewhere/verify/`."""
+    run_dir, elsewhere = tmp_path / "run", tmp_path / "elsewhere"
+    (run_dir / "verify").mkdir(parents=True)
+    (elsewhere / "verify").mkdir(parents=True)
+    journal = Journal(run_dir)
+    opener = journal_mod.open_dir_confined
+
+    def swap_then_open(root, target, **kwargs):
+        run_dir.rename(tmp_path / "run-aside")
+        run_dir.symlink_to(elsewhere, target_is_directory=True)
+        return opener(root, target, **kwargs)
+
+    monkeypatch.setattr(journal_mod, "open_dir_confined", swap_then_open)
+    with pytest.raises(OSError, match=r"unconfined verify directory"):
+        journal.write_verify_stream("v.stdout.log", "verifier output")
+
+    assert list((elsewhere / "verify").iterdir()) == []
+    assert list((tmp_path / "run-aside" / "verify").iterdir()) == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.skipif(not journal_mod.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only")
+def test_write_verify_stream_refuses_a_linked_run_dir(tmp_path):
+    """A run dir that is already a link has no identity to pin: the engine mints
+    run dirs, so a linked one is refused by contract rather than walked.
+
+    Ablation: fall back to an unpinned open when `pinned_root_identity` answers
+    None and this fails `DID NOT RAISE`, the stream landing in `real/verify/`."""
+    real = tmp_path / "real"
+    real.mkdir()
+    run_dir = tmp_path / "run"
+    run_dir.symlink_to(real, target_is_directory=True)
+
+    with pytest.raises(OSError, match=r"unconfined verify directory"):
+        Journal(run_dir).write_verify_stream("v.stdout.log", "verifier output")
+
+    assert not (real / "verify").exists()  # not even the directory
+
+
+@pytest.mark.skipif(not journal_mod.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only")
 def test_write_verify_stream_refuses_a_symlinked_verify_directory_on_the_win32_path(
     tmp_path, monkeypatch
 ):
@@ -319,6 +368,24 @@ def test_write_verify_stream_refuses_a_symlinked_verify_directory_on_the_win32_p
         journal.write_verify_stream("v.stdout.log", "verifier output")
 
     assert list(elsewhere.iterdir()) == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_write_verify_stream_refuses_a_linked_run_dir_on_the_win32_path(tmp_path, monkeypatch):
+    """DW-338 on the check-then-write arm: a linked run dir is refused there too.
+
+    Ablation: drop the `is_link_like(self.run_dir)` check and this fails
+    `DID NOT RAISE`, the stream landing in `real/verify/`."""
+    monkeypatch.setattr(journal_mod, "DIR_FD_ANCHORED_WRITES", False)
+    real = tmp_path / "real"
+    real.mkdir()
+    run_dir = tmp_path / "run"
+    run_dir.symlink_to(real, target_is_directory=True)
+
+    with pytest.raises(OSError, match=r"redirected verify directory"):
+        Journal(run_dir).write_verify_stream("v.stdout.log", "verifier output")
+
+    assert not (real / "verify").exists()  # not even the directory
 
 
 def test_write_verify_stream_writes_an_ordinary_verify_directory(tmp_path):
