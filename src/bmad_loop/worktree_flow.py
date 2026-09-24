@@ -23,13 +23,14 @@ from __future__ import annotations
 import copy
 import json
 import secrets
+from collections import Counter
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, NoReturn
 
-from . import artifact_publication, gates, verify
+from . import artifact_publication, deferredwork, gates, verify
 from .adapters.profile import ProfileError
 from .install import (
     _REVIEW_LAYER_SKILLS,
@@ -99,6 +100,118 @@ def _crlf_normalized(data: bytes) -> bytes:
     """``data`` with every CRLF read as LF — the one translation a git checkout
     under ``core.autocrlf`` applies on its own (see `_warn_accepted_spec_superseded`)."""
     return data.replace(b"\r\n", b"\n")
+
+
+def _artifact_seed(artifact: Path, repo: Path, worktree: Path) -> tuple[str, ...]:
+    """The seed rel for one orchestrator-owned artifact (ledger or board), or ``()``.
+
+    The shared body of ``WorktreeFlow._ledger_seed`` and ``_board_seed``. The rel
+    is the CONFIGURED path — the parent resolved, the leaf NOT — because that is
+    the path ``ProjectPaths.rebased`` hands every worktree reader. Resolving the
+    leaf too followed a symlinked artifact to its target's rel, so the copy landed
+    where no reader looks (DW-377, was #462).
+
+    The fully resolved target rel has two uses. First, it keeps the out-of-repo
+    exclusion: the seed loop refuses such a source whatever rel it is handed, so
+    an untracked leaf link to an outside target leaves the worktree's configured
+    path absent (the worktree reads an outside target in place only when the
+    checkout carries the link, or when the artifacts DIR itself is out of tree).
+    Second, it is the seed rel when the checkout carries the link as a tracked
+    DANGLING entry: the seed loop will not copy through a link, so the target is
+    the only path it will write, and the link then reads that copy.
+
+    ``()`` on any resolve/relative fault; for an artifact absent from the main
+    checkout (dropped silently by the seed loop, so naming it would be invisible
+    rather than inert); for one the checkout already delivers; and behind a
+    worktree link whose target is already in the worktree. Every probe is total.
+    """
+    try:
+        repo_resolved = repo.resolve()
+        rel = (artifact.parent.resolve() / artifact.name).relative_to(repo_resolved).as_posix()
+        target_rel = artifact.resolve().relative_to(repo_resolved).as_posix()
+    except (OSError, RuntimeError, ValueError):
+        return ()
+    if not _is_file(artifact) or _is_file(worktree / rel):
+        return ()
+    try:
+        linked = (worktree / rel).is_symlink()
+    except (OSError, ValueError):
+        # An entry that cannot be inspected is not safe to write through either.
+        return ()
+    if linked:
+        return () if _occupied(worktree / target_rel) else (target_rel,)
+    return (rel,)
+
+
+def _normalized_ledger_lines(text: str) -> list[str]:
+    """Rstripped non-blank lines, engine ``seen-again:`` stamps dropped."""
+    return [
+        line
+        for line in (raw.rstrip() for raw in text.splitlines())
+        if line and not line.startswith("seen-again:")
+    ]
+
+
+def _uncarried_ledger_changes(
+    seed: str,
+    current: str,
+    *,
+    harvested: Collection[tuple[str, str]],
+    closed: Collection[str],
+) -> tuple[list[str], int]:
+    """What differs between a seeded ledger and its worktree copy beyond engine writes.
+
+    Pure (DW-375). ``harvested`` is the task's recorded ``(origin, source_spec)``
+    pairs and ``closed`` its intended story/bundle close ids — the writes the
+    post-merge carry re-applies. Explained ids are the closed ids plus every id
+    NEW in ``current`` that carries a harvested pair (harvest ids minted in the
+    worktree are not recorded, so the pair is the key, as it is the carry's).
+    Entries compare by id over a normalized body (rstripped non-blank lines,
+    ``seen-again:`` dropped). Returns the unexplained ids — seed order, then
+    current order — and ``count``, the symmetric multiset difference of
+    normalized non-blank lines outside every canonical span (flat blocks and
+    other non-entry text).
+    """
+    seed_entries = deferredwork.parse_ledger(seed)
+    current_entries = deferredwork.parse_ledger(current)
+
+    def bodies(entries: list[deferredwork.DWEntry]) -> dict[str, list[list[str]]]:
+        by_id: dict[str, list[list[str]]] = {}
+        for entry in entries:
+            by_id.setdefault(entry.id, []).append(_normalized_ledger_lines(entry.body))
+        return by_id
+
+    seed_bodies = bodies(seed_entries)
+    current_bodies = bodies(current_entries)
+    explained = set(closed)
+    for entry in current_entries:
+        if entry.id not in seed_bodies and any(
+            deferredwork.field_line_present(entry, "origin", origin)
+            and deferredwork.field_line_present(entry, "source_spec", source_spec)
+            for origin, source_spec in harvested
+        ):
+            explained.add(entry.id)
+    unexplained: list[str] = []
+    for entry in (*seed_entries, *current_entries):
+        dw_id = entry.id
+        if dw_id in explained or dw_id in unexplained:
+            continue
+        if seed_bodies.get(dw_id) != current_bodies.get(dw_id):
+            unexplained.append(dw_id)
+
+    def outside(text: str, entries: list[deferredwork.DWEntry]) -> Counter[str]:
+        kept: list[str] = []
+        cursor = 0
+        for start, end in sorted(entry.span for entry in entries):
+            kept.append(text[cursor:start])
+            cursor = max(cursor, end)
+        kept.append(text[cursor:])
+        return Counter(line for chunk in kept for line in _normalized_ledger_lines(chunk))
+
+    before = outside(seed, seed_entries)
+    after = outside(current, current_entries)
+    count = sum(((before - after) + (after - before)).values())
+    return unexplained, count
 
 
 def _worktree_skill_copy_candidates(repo_root: Path, tree: str) -> tuple[str, ...]:
@@ -1446,27 +1559,21 @@ class WorktreeFlow:
         seed loop itself decides on, and unlike ``verify.path_tracked`` it costs no
         subprocess and cannot raise.
 
-        A ledger that is itself a symlink keeps the dir in-tree, so ``rebased``
-        moves it and the worktree path does not exist: the exclusion is still right
-        for an out-of-repo target (``provision_worktree`` refuses that source
-        whatever rel it is handed), but an in-repo target is seeded to the WRONG
-        path and still hits #426 (#462). Resolving also names the target of a
-        TRACKED ledger symlink whose target is untracked — the only path the seed
-        loop will write, since it refuses to copy through a link. ``relative_to``
-        decides PLACEMENT; containment is re-checked against both roots at the copy
-        site.
+        A ledger that is itself a symlink is seeded at its CONFIGURED path — the
+        one ``ProjectPaths.rebased`` hands the worktree's readers — and never at
+        the link's target rel, which is where resolving the leaf used to put it,
+        so the gate read an absent file and the unit still hit #426 (DW-377, was
+        #462). The target is seeded only when the checkout already carries the
+        link as a tracked, dangling entry: the seed loop refuses to copy through
+        a link, so the target is the one path it will write, and the checked-out
+        link then reads the copy. An out-of-repo target stays excluded
+        (``provision_worktree`` refuses that source whatever rel it is handed).
+        See :func:`_artifact_seed`; containment is re-checked against both roots
+        at the copy site.
 
         Deduped against ``scm.worktree_seed`` by the caller.
         """
-        ledger = self.paths.deferred_work
-        repo = self.paths.repo_root
-        try:
-            rel = ledger.resolve().relative_to(repo.resolve()).as_posix()
-        except (OSError, RuntimeError, ValueError):
-            return ()
-        if not _is_file(ledger) or _is_file(worktree / rel):
-            return ()
-        return (rel,)
+        return _artifact_seed(self.paths.deferred_work, self.paths.repo_root, worktree)
 
     def _board_seed(self, worktree: Path) -> tuple[str, ...]:
         """The sprint board, when a worktree checkout cannot deliver it (#350).
@@ -1507,8 +1614,10 @@ class WorktreeFlow:
         WORKTREE, not of git, for the ledger's reason: it is the predicate the seed
         loop itself decides on, it costs no subprocess and it cannot raise.
 
-        A board that is itself a symlink inherits ``_ledger_seed``'s caveat verbatim
-        (#462); it is derived there and not repeated here.
+        A board that is itself a symlink is placed exactly as ``_ledger_seed``
+        places a symlinked ledger — at the configured path, or at the target only
+        behind a tracked dangling link (DW-377, was #462); both delegate to
+        :func:`_artifact_seed`.
 
         INHERITED LIMITATION — parity, not a regression, and NOT fixed here: a
         non-fixable rollback does not restore a seeded board. Rollback resets
@@ -1524,15 +1633,7 @@ class WorktreeFlow:
 
         Deduped against ``scm.worktree_seed`` by the caller.
         """
-        board = self.paths.sprint_status
-        repo = self.paths.repo_root
-        try:
-            rel = board.resolve().relative_to(repo.resolve()).as_posix()
-        except (OSError, RuntimeError, ValueError):
-            return ()
-        if not _is_file(board) or _is_file(worktree / rel):
-            return ()
-        return (rel,)
+        return _artifact_seed(self.paths.sprint_status, self.paths.repo_root, worktree)
 
     def _accepted_spec_seed(
         self,
@@ -1966,7 +2067,8 @@ class WorktreeFlow:
         seeds.extend(scm.worktree_seed)
         # the two orchestrator-owned artifacts a tracked-only checkout can leave
         # behind — each decides its own exclusions; see the methods.
-        seeds.extend(self._ledger_seed(unit.path))
+        ledger_seed = self._ledger_seed(unit.path)
+        seeds.extend(ledger_seed)
         seeds.extend(self._board_seed(unit.path))
         seeds.extend(
             self._accepted_spec_seed(
@@ -1998,6 +2100,16 @@ class WorktreeFlow:
             # "why" to the inner message rather than asserting one of the three.
             reason = f"cannot safely provision the worktree for {task.story_key}: {e}"
             self.escalate_unit(task, reason)  # always raises RunPaused
+        # The seeded ledger's text as it landed, for the success-path teardown
+        # check (DW-375): the carry brings back only the writes the engine
+        # recorded, so anything else a session appends to this copy vanishes with
+        # the worktree. A fresh open, so always overwritten — None when no ledger
+        # was nominated, the seed was undelivered, or the read degraded.
+        task.ledger_seed_text = (
+            deferredwork.observe_ledger(unit.workspace.paths.deferred_work)[0]
+            if ledger_seed
+            else None
+        )
         if skipped_seeds:
             # A seed entry whose destination already exists is a no-op. Harmless for
             # a file the checkout legitimately carries, but a directory entry is
@@ -2250,6 +2362,11 @@ class WorktreeFlow:
                 kept=scm.keep_failed,
                 patch=str(patch) if patch else None,
             )
+            # The unit's work is discarded by design, so no uncarried-write check
+            # runs here (DW-375); drop the seed snapshot rather than keep it.
+            if task.ledger_seed_text is not None:
+                task.ledger_seed_text = None
+                self._save()
 
     def _carried_artifact_rels(self, repo: Path, task: StoryTask) -> tuple[str, ...]:
         """The repo-relative posix paths the RUN commits for itself after the merge —
@@ -4031,7 +4148,17 @@ class WorktreeFlow:
                     cause=exc,
                 )
         if unit is None:
-            return  # journal-proven merge can publish from durable bytes alone
+            # journal-proven merge can publish from durable bytes alone. With the
+            # mount gone there is nothing left to check, so drop the snapshot rather
+            # than keep it in state.json; a still-mounted worktree gets a follow-up
+            # call with its reopened unit, whose check needs the snapshot.
+            if task.ledger_seed_text is not None and not (
+                task.worktree_path and Path(task.worktree_path).is_dir()
+            ):
+                task.ledger_seed_text = None
+                self._save()
+            return
+        self._warn_isolated_ledger_uncarried(task, unit)
         scm = self.policy.scm
         close_unit_workspace(
             unit,
@@ -4044,6 +4171,69 @@ class WorktreeFlow:
                 "worktree-teardown-degraded", story_key=task.story_key, error=msg
             ),
         )
+
+    def _warn_isolated_ledger_uncarried(self, task: StoryTask, unit: UnitWorkspace) -> None:
+        """Journal the seeded-ledger writes the post-merge carry will not bring back.
+
+        Under worktree isolation a gitignored ledger reaches the unit only as the
+        seeded copy, the unit commit is shielded from it, and
+        ``_carry_isolated_ledger_writes`` re-applies only what the engine recorded
+        on the task — harvested deferrals and story/bundle closes. Anything else
+        the session wrote to that copy (a canonical entry of its own, an edit to a
+        seeded entry, a flat block) is lost when teardown removes the worktree
+        (DW-375). The decision is warn-only: nothing is carried back.
+
+        Runs here, before ``close_unit_workspace``, because ``merge_local`` has
+        already consumed the merge but the worktree is still mounted; the carry
+        runs later, against the main ledger. OBSERVATION: never raises, never
+        pauses, never writes a ledger — a read fault is journaled under the same
+        kind with an ``error`` field. The snapshot is cleared and SAVED right after
+        the record, so a replay after that save cannot record the same loss twice;
+        a crash in the narrow window between the journal append and the save can
+        still replay it once more. Engine
+        ``seen-again:`` stamps are excused (their loss is accepted); a
+        review-timeout salvage refile is not, since it is never carried.
+        """
+        seed = task.ledger_seed_text
+        if seed is None:
+            return
+        try:
+            mounted = unit.path.is_dir()
+        except OSError:
+            mounted = False
+        if not mounted:
+            # replay after the worktree was already removed
+            task.ledger_seed_text = None
+            self._save()
+            return
+        current, fault = deferredwork.observe_ledger(unit.workspace.paths.deferred_work)
+        ledger = str(self.paths.deferred_work)
+        if fault is not None:
+            self.journal.append(
+                "isolated-ledger-writes-uncarried",
+                story_key=task.story_key,
+                ledger=ledger,
+                error=fault,
+            )
+        else:
+            harvested = [
+                (str(item.get("origin", "")), str(item.get("source_spec", "")))
+                for item in task.harvested_deferrals
+            ]
+            closed = [*task.story_closes_intended, *task.bundle_closes_intended]
+            dw_ids, count = _uncarried_ledger_changes(
+                seed, current or "", harvested=harvested, closed=closed
+            )
+            if dw_ids or count:
+                self.journal.append(
+                    "isolated-ledger-writes-uncarried",
+                    story_key=task.story_key,
+                    ledger=ledger,
+                    dw_ids=dw_ids,
+                    count=count,
+                )
+        task.ledger_seed_text = None
+        self._save()
 
     def keep_branch_and_escalate(self, task: StoryTask, unit: UnitWorkspace, reason: str) -> None:
         """Preserve a DONE unit's branch (no delete, kept for manual merge) and

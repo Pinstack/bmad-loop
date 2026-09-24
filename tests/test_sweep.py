@@ -3399,6 +3399,8 @@ def test_isolated_bundle_carries_its_gitignored_ledger_close_to_the_main_checkou
         e for e in engine.journal.entries() if e["kind"] == "sweep-bundle-close-carry-uncommitted"
     ]
     assert len(uncommitted) == 1 and uncommitted[0]["dw_ids"] == ["DW-1"]
+    # the bundle close is an engine-recorded write, excused by the DW-375 check
+    assert "isolated-ledger-writes-uncarried" not in journal_kinds(engine)
     assert [p.resolve() for p in verify.worktree_list(project.project)] == [
         project.project.resolve()
     ]

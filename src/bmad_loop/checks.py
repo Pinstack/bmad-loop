@@ -108,6 +108,7 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "deferred.hard-gate-unstructured",
         "deferred.ledger-unreadable",
         "deferred.ledger-untracked",
+        "deferred.ledger-ignored-isolated",
     }
 )
 

@@ -599,6 +599,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
     # git-backed check placed there would re-pay a hung git's full deadline.
     if git_answers and paths is not None:
         _validate_deferred_ledger_tracking(paths, report)
+        _validate_isolated_ledger_ignored(paths, pol, report)
 
     report.extend(_platform_preflight(project))
 
@@ -1932,6 +1933,53 @@ def _validate_deferred_ledger_tracking(
         "belongs in git — left that way, bmad-loop's own commits decide (the first isolated "
         "merge that carries a ledger write, or a non-isolated story commit's `git add -A`, "
         "takes it in); commit it or add it to .gitignore to decide on purpose",
+        {"ledger": str(ledger), "path": rel},
+    )
+
+
+def _validate_isolated_ledger_ignored(
+    paths: bmadconfig.ProjectPaths, pol: policy_mod.Policy | None, report: ValidationReport
+) -> None:
+    """WARN when worktree isolation meets a gitignored ledger (DW-375).
+
+    Under ``scm.isolation = "worktree"`` a gitignored ledger reaches each unit only
+    as a seeded copy, shielded from the unit commit, and the post-merge carry brings
+    back only the writes the engine recorded (harvested deferrals, story and bundle
+    closes). Anything a session appends to that copy itself is lost at teardown;
+    the run journals ``isolated-ledger-writes-uncarried`` when it happens, and this
+    says so before the first run.
+
+    The ledger need not exist yet: the hazard applies to the file the first harvest
+    creates. A warning, never a problem. Silent under ``isolation = "none"``, on a
+    ledger outside ``paths.repo_root`` (the worktree then shares the main file), on a
+    path that exists but is not a regular file, and on a git fault (``git.probe``
+    owns that report).
+    """
+    if pol is None or pol.scm.isolation != "worktree":
+        return
+    ledger = paths.deferred_work
+    repo = paths.repo_root
+    try:
+        try:
+            st = ledger.stat()
+        except (FileNotFoundError, NotADirectoryError):
+            st = None
+        if st is not None and not S_ISREG(st.st_mode):
+            return
+        rel = (ledger.parent.resolve() / ledger.name).relative_to(repo.resolve()).as_posix()
+    except (OSError, RuntimeError, ValueError):
+        return
+    try:
+        if verify.path_tracked(repo, rel) or not verify.path_ignored(repo, ledger):
+            return
+    except verify.GitError:
+        return
+    report.warn(
+        "deferred.ledger-ignored-isolated",
+        f'{ledger} is gitignored and scm.isolation is "worktree", so each unit works on a '
+        "seeded copy and only the engine's own recorded ledger writes are carried back — "
+        "entries a session writes to that copy itself are lost at teardown (journaled as "
+        "isolated-ledger-writes-uncarried); track the ledger in git to keep them",
         {"ledger": str(ledger), "path": rel},
     )
 

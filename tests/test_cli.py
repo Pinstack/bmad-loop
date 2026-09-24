@@ -48,7 +48,9 @@ from conftest import (
     write_sprint,
 )
 
-from bmad_loop import bmadconfig, cli, deferredwork, envvars, platform_util
+from bmad_loop import bmadconfig
+from bmad_loop import checks as checks_mod
+from bmad_loop import cli, deferredwork, envvars, platform_util
 from bmad_loop import policy as policy_mod
 from bmad_loop import probe as probe_mod
 from bmad_loop import runs, runsetup, verify
@@ -13773,6 +13775,125 @@ def test_validate_ledger_tracking_probe_skips_a_hung_git(project, monkeypatch, c
     findings = _validate_findings(project, capsys, rc=1)
     assert probes == []
     assert "deferred.ledger-untracked" not in findings
+
+
+def _ignore_ledger(project) -> str:
+    """Commit a `.gitignore` rule for the ledger so the tree stays clean."""
+    rel = project.deferred_work.relative_to(project.repo_root).as_posix()
+    gitignore = project.repo_root / ".gitignore"
+    gitignore.write_text(gitignore.read_text(encoding="utf-8") + f"/{rel}\n", encoding="utf-8")
+    git(project.project, "add", ".gitignore")
+    git(project.project, "commit", "-q", "-m", "ignore the ledger")
+    return rel
+
+
+def test_validate_warns_on_a_gitignored_ledger_under_worktree_isolation(
+    project, monkeypatch, capsys
+):
+    """DW-375: under worktree isolation a gitignored ledger reaches each unit only
+    as a seeded copy, and entries a session writes there are lost at teardown.
+    Exactly one warning, never `deferred.ledger-untracked`, and rc 0 — the finding
+    never moves the exit code.
+
+    Ablation: drop the `_validate_isolated_ledger_ignored` call from `cmd_validate`
+    and this fails on the id lookup."""
+    _make_validate_pass(project, monkeypatch, capsys, policy=ISOLATION_WORKTREE_POLICY)
+    rel = _ignore_ledger(project)
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=0)
+    hits = [f for f in doc["findings"] if f["check"] == "deferred.ledger-ignored-isolated"]
+    assert len(hits) == 1
+    assert hits[0]["severity"] == "warning"
+    assert hits[0]["detail"] == {"ledger": str(project.deferred_work), "path": rel}
+    assert not any(f["check"] == "deferred.ledger-untracked" for f in doc["findings"])
+
+
+def test_validate_warns_on_a_gitignored_ledger_not_yet_created(project, monkeypatch, capsys):
+    """The hazard applies to the file the first harvest creates, so an absent
+    ledger under an ignore rule still warns."""
+    _make_validate_pass(project, monkeypatch, capsys, policy=ISOLATION_WORKTREE_POLICY)
+    _ignore_ledger(project)
+
+    assert not project.deferred_work.exists()
+    findings = _validate_findings(project, capsys)
+    assert findings["deferred.ledger-ignored-isolated"]["severity"] == "warning"
+
+
+def test_validate_is_silent_on_a_non_file_at_an_ignored_ledger_path(project, monkeypatch, capsys):
+    """A directory squatting the ignored ledger path is not a ledger the first
+    harvest will create, so the isolated-ledger advisory stays silent. Asserts only
+    on this id; the other findings are not this row's concern.
+
+    Ablation: drop the `S_ISREG` return in `_validate_isolated_ledger_ignored` and
+    this reports the warning."""
+    _make_validate_pass(project, monkeypatch, capsys, policy=ISOLATION_WORKTREE_POLICY)
+    _ignore_ledger(project)
+    project.deferred_work.mkdir(parents=True)
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    assert not any(f["check"] == "deferred.ledger-ignored-isolated" for f in doc["findings"])
+
+
+def test_validate_is_silent_on_a_gitignored_ledger_without_isolation(project, monkeypatch, capsys):
+    """Clearing leg: in place, the orchestrator writes the main ledger directly."""
+    _make_validate_pass(project, monkeypatch, capsys, policy=NO_ISOLATION_POLICY)
+    _ignore_ledger(project)
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+
+    findings = _validate_findings(project, capsys)
+    assert "deferred.ledger-ignored-isolated" not in findings
+
+
+def test_validate_is_silent_on_a_tracked_ledger_under_worktree_isolation(
+    project, monkeypatch, capsys
+):
+    """Clearing leg: a tracked ledger rides the unit merge, session writes too."""
+    _make_validate_pass(project, monkeypatch, capsys, policy=ISOLATION_WORKTREE_POLICY)
+    write_ledger(project, {"DW-1": "open"})
+
+    findings = _validate_findings(project, capsys)
+    assert "deferred.ledger-ignored-isolated" not in findings
+
+
+def _isolated_ledger_probe(tmp_path, ledger: Path) -> checks_mod.ValidationReport:
+    report = checks_mod.ValidationReport()
+    paths = types.SimpleNamespace(repo_root=tmp_path / "repo", deferred_work=ledger)
+    pol = types.SimpleNamespace(scm=types.SimpleNamespace(isolation="worktree"))
+    cli._validate_isolated_ledger_ignored(paths, pol, report)  # type: ignore[arg-type]
+    return report
+
+
+def test_isolated_ledger_advisory_is_silent_on_a_git_fault(tmp_path, monkeypatch):
+    """`git.probe` owns a git failure, so this advisory stays silent rather than
+    crash validate. The positive control proves the fault is what silenced it.
+    Ablation: delete the `except verify.GitError: return` and this raises."""
+    (tmp_path / "repo").mkdir()
+    ledger = tmp_path / "repo" / "impl" / "deferred-work.md"
+    monkeypatch.setattr(cli.verify, "path_tracked", lambda _repo, _rel: False)
+    monkeypatch.setattr(cli.verify, "path_ignored", lambda _repo, _path: True)
+    assert [f.check for f in _isolated_ledger_probe(tmp_path, ledger).findings] == [
+        "deferred.ledger-ignored-isolated"
+    ]
+
+    def _fault(_repo, _path):
+        raise verify.GitError("git check-ignore failed")
+
+    monkeypatch.setattr(cli.verify, "path_ignored", _fault)
+    assert _isolated_ledger_probe(tmp_path, ledger).findings == []
+
+
+def test_isolated_ledger_advisory_is_silent_on_an_out_of_repo_ledger(tmp_path, monkeypatch):
+    """A ledger outside the repo is shared by the worktree, not seeded, so there is
+    nothing to warn about and git is never asked. Ablation: drop `ValueError` from
+    the rel `except` and this raises."""
+    (tmp_path / "repo").mkdir()
+    probes: list[str] = []
+    monkeypatch.setattr(cli.verify, "path_tracked", lambda _repo, rel: probes.append(rel))
+    ledger = tmp_path / "outside" / "deferred-work.md"
+
+    assert _isolated_ledger_probe(tmp_path, ledger).findings == []
+    assert probes == []
 
 
 def test_validate_warns_on_a_stale_index_entry(project, capsys):

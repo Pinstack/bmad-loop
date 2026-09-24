@@ -29,6 +29,10 @@ breaking changes may land in a minor release.
 - Warn in `validate` (`deferred.ledger-untracked`) when the deferred-work ledger exists but
   is neither committed nor gitignored, since bmad-loop's own commits would otherwise take it
   in at the first isolated merge or story commit (DW-361).
+- Warn in `validate` (`deferred.ledger-ignored-isolated`) when the ledger is gitignored under
+  `isolation = "worktree"`, and journal `isolated-ledger-writes-uncarried` at success-path
+  teardown when a session's own writes to the seeded ledger copy would be lost — warn-only,
+  nothing is carried back (DW-375).
 - Show auto-sweep outcomes in the TUI run header: a refused sweep gets a warning line
   with its trigger and reason (`auto-sweep not run: run-end (dirty)`), a delivered one a
   dim `auto-sweep ran:` line, both read from state.json like `status` (DW-366).
@@ -48,6 +52,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Seed a leaf-symlinked ledger or board at its configured path instead of the link target's,
+  so an isolated unit's gates read the seeded copy and no longer hit the #426 defer loop;
+  the target is seeded only behind a tracked dangling link (DW-377, was #462).
 - Retry a sweep migration ESCALATED from `committing` on cycle-one resume: intact
   baseline/manifest/rewrite/result records and a live ledger equal to the accepted rewrite
   re-enter the idempotent commit tail (DONE, one `sweep-migrated` row, `post_migrate`);

@@ -352,6 +352,13 @@ class StoryTask:
     # the commit boundary. Same ledger, same isolation problem: a gitignored path
     # never merges out of the unit worktree, so the flip has to be re-applied.
     story_closes_intended: list[str] = field(default_factory=list)
+    # The seeded deferred-work ledger's text as provisioning laid it into this
+    # unit's worktree (DW-375), or None when no ledger seed was nominated (a
+    # tracked or out-of-tree ledger, or one the main checkout does not carry).
+    # Success-path teardown diffs the worktree ledger against it and journals
+    # whatever the engine-recorded writes above do not explain; persisted, like
+    # `pre_harvest_ledger`, so a resume replaying the merge still has it.
+    ledger_seed_text: str | None = None
     # The sprint-status stage `_post_dev_state_sync` REQUESTED for this story, or
     # None when it never ran (sweep bundles, stories mode, the legacy path). Same
     # isolation problem as the ledger payloads above, one file over: under
@@ -589,6 +596,7 @@ class StoryTask:
             "harvested_deferrals": self.harvested_deferrals,
             "bundle_closes_intended": self.bundle_closes_intended,
             "story_closes_intended": self.story_closes_intended,
+            "ledger_seed_text": self.ledger_seed_text,
             "board_advance_intended": self.board_advance_intended,
             "accepted_dev_session_index": self.accepted_dev_session_index,
             "harvest_carry_commit_pending": self.harvest_carry_commit_pending,
@@ -837,6 +845,9 @@ class StoryTask:
             harvested_deferrals=[deepcopy(dict(item)) for item in d.get("harvested_deferrals", [])],
             bundle_closes_intended=[str(i) for i in d.get("bundle_closes_intended", [])],
             story_closes_intended=[str(i) for i in d.get("story_closes_intended", [])],
+            ledger_seed_text=(
+                str(d.get("ledger_seed_text")) if d.get("ledger_seed_text") is not None else None
+            ),
             board_advance_intended=(
                 str(d["board_advance_intended"])
                 if d.get("board_advance_intended") is not None

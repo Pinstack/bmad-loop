@@ -795,11 +795,12 @@ _DEFERRED_STATE_KEYS = (
     "accepted_dev_session_index",
     "harvest_carry_commit_pending",
     "isolated_ledger_carried",
+    "ledger_seed_text",
 )
 
 
 def test_deferred_work_state_fields_round_trip_through_json():
-    """All eleven fields are hand-enumerated in both serializers. Non-default
+    """All twelve fields are hand-enumerated in both serializers. Non-default
     values make a missing line on either side observable, while the JSON leg pins
     the on-disk container shape rather than only an in-memory dataclass copy."""
     task = StoryTask(
@@ -816,6 +817,7 @@ def test_deferred_work_state_fields_round_trip_through_json():
         accepted_dev_session_index=3,
         harvest_carry_commit_pending=True,
         isolated_ledger_carried=True,
+        ledger_seed_text="# Deferred Work\n",
     )
     restored = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
 
@@ -831,10 +833,11 @@ def test_deferred_work_state_fields_round_trip_through_json():
     assert restored.accepted_dev_session_index == 3
     assert restored.harvest_carry_commit_pending is True
     assert restored.isolated_ledger_carried is True
+    assert restored.ledger_seed_text == "# Deferred Work\n"
 
 
 def test_deferred_work_state_fields_default_for_one_old_state_dict():
-    """A state.json written before this package has none of the eleven keys.
+    """A state.json written before this package has none of the twelve keys.
     Every load must use ``d.get`` so resume reaches the old behavior instead of
     raising KeyError; one shared old document prevents testing only a subset."""
     doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
@@ -853,6 +856,7 @@ def test_deferred_work_state_fields_default_for_one_old_state_dict():
     assert restored.accepted_dev_session_index is None
     assert restored.harvest_carry_commit_pending is False
     assert restored.isolated_ledger_carried is False
+    assert restored.ledger_seed_text is None
 
 
 def test_pre_harvest_ledger_preserves_absent_empty_and_text_states():

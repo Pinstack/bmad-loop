@@ -1672,6 +1672,7 @@ JOURNAL_KINDS = frozenset(
         # worktree_flow.py
         "accepted-spec-delivery-unreachable",
         "accepted-spec-write-unreachable",
+        "isolated-ledger-writes-uncarried",
         "isolation-flip-orphan-preserved",
         "merge-preflight-refused",
         "merge-target-cleaned",

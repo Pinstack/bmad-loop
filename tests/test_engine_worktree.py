@@ -7846,6 +7846,146 @@ def test_gitignored_declared_closure_reaches_the_main_ledger(project):
     assert "resolution: resolved by story 1-1-a" in entry.body
 
 
+def test_leaf_symlinked_gitignored_ledger_is_seeded_at_the_configured_path(project):
+    """DW-377 (was #462): a gitignored ledger that is itself a symlink to an
+    in-repo gitignored target used to be seeded at the TARGET's rel, so the
+    worktree's configured ledger path stayed absent, the declared close read an
+    empty ledger and journaled `deferred-close-unmatched` — the #426 loop with a
+    different spelling. Seeded at the configured path, the gate reads the copy.
+
+    Ablation: restore `artifact.resolve().relative_to(...)` in `_artifact_seed` and
+    `deferred-close-unmatched` comes back."""
+    target_rel = "_bmad-output/ledger-store/ledger.md"
+    ignore_before_commit(project, "deferred-work.md", "/_bmad-output/ledger-store/")
+    target = project.project / target_rel
+    target.parent.mkdir(parents=True)
+    target.write_text("", encoding="utf-8")
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.symlink_to(target)
+    write_ledger(project, {"DW-1": "open"})
+    rel = project.deferred_work.relative_to(project.project).as_posix()
+    assert git(project.project, "check-ignore", rel).strip() == rel
+    assert not verify.path_tracked(project.project, rel)
+    assert not verify.path_tracked(project.project, target_rel)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+
+    seen: list[bool] = []
+    inner = wt_dev_effect(project, "1-1-a", followup_review=False, closes_deferred=["DW-1"])
+
+    def effect(spec):
+        seen.append(project.rebased(spec.cwd).deferred_work.is_file())
+        return inner(spec)
+
+    engine, _ = make_engine(project, [effect])
+    summary = engine.run()
+
+    assert seen == [True]
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    assert "deferred-close-unmatched" not in journal_kinds(engine)
+    closed = [e for e in engine.journal.entries() if e["kind"] == "story-deferred-closed"]
+    assert [e["dw_ids"] for e in closed] == [["DW-1"]]
+    # the existing carry delivers the close to the main ledger, through the link
+    entry = _ledger_entry(project, "DW-1")
+    assert entry.status.startswith("done") and not entry.open
+    assert "resolution: resolved by story 1-1-a" in entry.body
+    assert "isolated-ledger-writes-uncarried" not in journal_kinds(engine)
+
+
+@pytest.mark.parametrize("session_appends", [True, False], ids=["session-append", "engine-only"])
+def test_session_write_to_a_seeded_ledger_is_journaled_at_teardown(project, session_appends):
+    """DW-375: a gitignored ledger reaches the unit only as the seeded copy, and the
+    carry brings back only the writes the engine recorded. A session's own append
+    is lost at teardown — warn-only, so it is journaled, not carried. The
+    engine-only leg (a declared close, carried) journals nothing.
+
+    Ablation: drop the `_warn_isolated_ledger_uncarried` call from
+    `finish_publication` and the session-append leg fails."""
+    ignore_before_commit(project, "deferred-work.md")
+    write_ledger(project, {"DW-1": "open"})
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    inner = wt_dev_effect(project, "1-1-a", followup_review=False, closes_deferred=["DW-1"])
+
+    def effect(spec):
+        if session_appends:
+            ledger = project.rebased(spec.cwd).deferred_work
+            with ledger.open("a", encoding="utf-8") as fh:
+                fh.write("\n- source_spec: spec-session.md\n  note: written by the session\n")
+        return inner(spec)
+
+    engine, _ = make_engine(project, [effect])
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    rows = [e for e in engine.journal.entries() if e["kind"] == "isolated-ledger-writes-uncarried"]
+    if session_appends:
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["story_key"] == "1-1-a"
+        assert row["ledger"] == str(project.deferred_work)
+        assert row["dw_ids"] == []
+        assert row["count"] > 0
+        # warn-only: the session's block never reaches the main ledger
+        assert "spec-session.md" not in project.deferred_work.read_text(encoding="utf-8")
+    else:
+        assert rows == []
+    assert engine.state.tasks["1-1-a"].ledger_seed_text is None
+
+
+def test_real_harvest_into_a_seeded_ledger_is_not_reported_uncarried(project):
+    """DW-375's harvest excuse at engine level: a pre-existing gitignored ledger is
+    seeded, the dev and review sessions each file a real harvest into the seeded
+    copy, and the carry re-files both into the main ledger — engine-recorded
+    writes, so teardown journals no uncarried row.
+
+    Ablation: drop the harvested-pair arm of `_uncarried_ledger_changes` and the
+    harvested ids are reported."""
+    ignore_before_commit(project, "deferred-work.md")
+    write_ledger(project, {"DW-1": "open"})
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            wt_dev_effect(project, "1-1-a", deferred=[_HARVEST_CARRY]),
+            wt_review_effect(project, "1-1-a", clean=True, deferred=[_HARVEST_CARRY_LATER]),
+        ],
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed and not summary.paused
+    titles = [entry.title for entry in _main_harvest_entries(project)]
+    assert _HARVEST_CARRY["summary"] in titles and _HARVEST_CARRY_LATER["summary"] in titles
+    assert _harvest_carry_events(engine)
+    assert "isolated-ledger-writes-uncarried" not in journal_kinds(engine)
+
+
+def test_session_write_to_a_tracked_ledger_rides_the_merge_unreported(project):
+    """A TRACKED ledger is delivered by the checkout, so it is never seeded, the
+    snapshot stays None and the teardown check never runs — correctly, since the
+    session's append rides the unit commit into the merge.
+
+    Ablation: snapshot unconditionally at provisioning (drop `if ledger_seed`) and
+    the append is reported as lost although the merge delivered it."""
+    write_ledger(project, {"DW-1": "open"})
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    rel = project.deferred_work.relative_to(project.project).as_posix()
+    assert verify.path_tracked(project.project, rel)
+    inner = wt_dev_effect(project, "1-1-a", followup_review=False)
+
+    def effect(spec):
+        ledger = project.rebased(spec.cwd).deferred_work
+        with ledger.open("a", encoding="utf-8") as fh:
+            fh.write("\n- source_spec: spec-session.md\n  note: written by the session\n")
+        return inner(spec)
+
+    engine, _ = make_engine(project, [effect])
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    assert "isolated-ledger-writes-uncarried" not in journal_kinds(engine)
+    assert "spec-session.md" in project.deferred_work.read_text(encoding="utf-8")
+
+
 # ------------------------------------------------------- gitignored sprint board
 
 

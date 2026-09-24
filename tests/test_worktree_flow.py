@@ -26,7 +26,12 @@ from bmad_loop.workspace import (
     open_unit_workspace,
     unit_worktrees_dir,
 )
-from bmad_loop.worktree_flow import WorktreeFlow, _setup_mcp_agent_id, provision_worktree
+from bmad_loop.worktree_flow import (
+    WorktreeFlow,
+    _setup_mcp_agent_id,
+    _uncarried_ledger_changes,
+    provision_worktree,
+)
 
 QUIET = NotifyPolicy(desktop=False, file=True)
 
@@ -384,6 +389,282 @@ def test_board_seed_skips_a_board_outside_the_project_tree(tmp_path):
 
     assert flow.paths.rebased(worktree).sprint_status == flow.paths.sprint_status
     assert flow._board_seed(worktree) == ()
+
+
+# ------------------------------------------------------- symlinked artifact seeds
+#
+# DW-377 (was #462): a leaf-symlinked ledger or board was relativized through its
+# TARGET, so the copy landed where no worktree reader looks. Both seeds share
+# `_artifact_seed`, so every row runs for both artifacts.
+
+_SEED_ARTIFACTS = [
+    pytest.param("_ledger_seed", "deferred_work", id="ledger"),
+    pytest.param("_board_seed", "sprint_status", id="board"),
+]
+
+
+@pytest.mark.parametrize(("method", "attr"), _SEED_ARTIFACTS)
+def test_artifact_seed_names_the_configured_path_of_a_leaf_symlink(tmp_path, method, attr):
+    """The worktree reads the CONFIGURED path (`ProjectPaths.rebased`), so that is
+    where the copy must land — not at the link target's rel. Ablation: restore
+    `artifact.resolve().relative_to(...)` and this answers `other/target.md`."""
+    flow = _artifact_flow(tmp_path)
+    repo = flow.paths.repo_root
+    configured: Path = getattr(flow.paths, attr)
+    target = repo / "other" / "target.md"
+    target.parent.mkdir()
+    target.write_text("# Deferred Work\n", encoding="utf-8")
+    configured.symlink_to(target)
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    rel = configured.relative_to(repo).as_posix()
+    assert getattr(flow, method)(worktree) == (rel,)
+    assert getattr(flow.paths.rebased(worktree), attr) == worktree / rel
+
+
+@pytest.mark.parametrize(("method", "attr"), _SEED_ARTIFACTS)
+def test_artifact_seed_names_the_target_behind_a_tracked_dangling_link(tmp_path, method, attr):
+    """A checkout carrying the link itself leaves it dangling when the target is
+    untracked; the seed loop refuses to copy through a link, so the target is the
+    one path it will write — and the checked-out link then reads that copy."""
+    flow = _artifact_flow(tmp_path)
+    repo = flow.paths.repo_root
+    configured: Path = getattr(flow.paths, attr)
+    target = repo / "other" / "target.md"
+    target.parent.mkdir()
+    target.write_text("# Deferred Work\n", encoding="utf-8")
+    configured.symlink_to(Path("..") / ".." / "other" / "target.md")
+    worktree = tmp_path / "wt"
+    rel = configured.relative_to(repo)
+    (worktree / rel).parent.mkdir(parents=True)
+    (worktree / rel).symlink_to(Path("..") / ".." / "other" / "target.md")
+
+    assert getattr(flow, method)(worktree) == ("other/target.md",)
+
+    # ...and once the target is in the worktree the link delivers it: nothing to seed.
+    (worktree / "other").mkdir()
+    (worktree / "other" / "target.md").write_text("# Deferred Work\n", encoding="utf-8")
+    assert getattr(flow, method)(worktree) == ()
+
+
+@pytest.mark.parametrize(("method", "attr"), _SEED_ARTIFACTS)
+def test_artifact_seed_skips_a_leaf_symlink_escaping_the_repo(tmp_path, method, attr):
+    """The out-of-repo exclusion survives the fix: the seed loop refuses such a
+    source whatever rel it is handed."""
+    flow = _artifact_flow(tmp_path)
+    configured: Path = getattr(flow.paths, attr)
+    outside = tmp_path / "outside.md"
+    outside.write_text("# Deferred Work\n", encoding="utf-8")
+    configured.symlink_to(outside)
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    assert getattr(flow, method)(worktree) == ()
+
+
+# ------------------------------------------------------ uncarried ledger changes
+#
+# `_uncarried_ledger_changes` (DW-375) diffs a seeded ledger against its worktree
+# copy and excuses exactly the writes the post-merge carry re-applies.
+
+_SEED_LEDGER = """# Deferred Work
+
+### DW-1: seeded open entry
+origin: review of 1-1
+location: n/a
+source_spec: `spec-a.md`
+reason: something
+status: open
+
+### DW-2: seeded entry to close
+origin: review of 1-2
+location: n/a
+source_spec: `spec-b.md`
+reason: other
+status: open
+"""
+
+_HARVEST_ENTRY = """
+### DW-3: engine harvest
+origin: harvest of 1-3
+location: n/a
+source_spec: `spec-c.md`
+reason: harvested
+status: open
+"""
+
+
+def _engine_only_ledger() -> str:
+    text = _SEED_LEDGER.replace(
+        "reason: something\nstatus: open\n",
+        "reason: something\nstatus: open\nseen-again: 2026-09-24 (review of 1-9)\n",
+    )
+    text = text.replace(
+        "reason: other\nstatus: open\n", "reason: other\nstatus: done 2026-09-24 (closed)\n"
+    )
+    return text + _HARVEST_ENTRY
+
+
+def test_uncarried_ledger_changes_excuses_engine_only_writes():
+    changes = _uncarried_ledger_changes(
+        _SEED_LEDGER,
+        _engine_only_ledger(),
+        harvested=[("harvest of 1-3", "spec-c.md")],
+        closed=["DW-2"],
+    )
+    assert changes == ([], 0)
+
+
+def test_uncarried_ledger_changes_counts_a_flat_block():
+    current = _engine_only_ledger() + "\n- source_spec: spec-z.md\n  note: session wrote this\n"
+    ids, count = _uncarried_ledger_changes(
+        _SEED_LEDGER, current, harvested=[("harvest of 1-3", "spec-c.md")], closed=["DW-2"]
+    )
+    assert ids == []
+    assert count > 0
+
+
+def test_uncarried_ledger_changes_names_a_session_canonical_entry():
+    current = _engine_only_ledger() + _HARVEST_ENTRY.replace("DW-3", "DW-4").replace(
+        "harvest of 1-3", "session of 1-3"
+    )
+    assert _uncarried_ledger_changes(
+        _SEED_LEDGER, current, harvested=[("harvest of 1-3", "spec-c.md")], closed=["DW-2"]
+    ) == (["DW-4"], 0)
+
+
+def test_uncarried_ledger_changes_names_an_edited_seed_entry():
+    current = _engine_only_ledger().replace("reason: something", "reason: edited by session")
+    assert _uncarried_ledger_changes(
+        _SEED_LEDGER, current, harvested=[("harvest of 1-3", "spec-c.md")], closed=["DW-2"]
+    ) == (["DW-1"], 0)
+
+
+def test_uncarried_ledger_changes_names_a_removed_seed_entry():
+    current = _SEED_LEDGER.split("### DW-2:")[0]
+    assert _uncarried_ledger_changes(_SEED_LEDGER, current, harvested=[], closed=[]) == (
+        ["DW-2"],
+        0,
+    )
+
+
+def _teardown_unit(tmp_path: Path, flow: WorktreeFlow) -> UnitWorkspace:
+    wt = tmp_path / "wt"
+    return UnitWorkspace(
+        workspace=Workspace(root=wt, paths=flow.paths.rebased(wt)),
+        repo_root=flow.paths.repo_root,
+        branch="bmad-loop/run-1/1-1",
+        path=wt,
+        baseline="abc123",
+    )
+
+
+def test_uncarried_warning_is_skipped_for_an_unseeded_ledger(tmp_path):
+    """A tracked ledger is never seeded, so the snapshot is None and the check never
+    reads the worktree — even a divergent copy (it rides the unit merge) is silent.
+    Ablation: replace the read with `seed = task.ledger_seed_text or ""` and this
+    journals the session block (a literal deletion of the `seed is None` return
+    raises inside `parse_ledger(None)` first)."""
+    flow = _artifact_flow(tmp_path)
+    unit = _teardown_unit(tmp_path, flow)
+    ledger = unit.workspace.paths.deferred_work
+    ledger.parent.mkdir(parents=True)
+    ledger.write_text(_SEED_LEDGER + "\n- source_spec: spec-z.md\n", encoding="utf-8")
+    task = StoryTask(story_key="1-1", epic=1)
+
+    flow._warn_isolated_ledger_uncarried(task, unit)
+
+    assert flow.journal.entries == []
+
+
+def test_uncarried_warning_records_an_unreadable_worktree_ledger(tmp_path, monkeypatch):
+    """Observation degrades to a record: a read fault journals the same kind with its
+    `error` and no ids, and never raises."""
+    import bmad_loop.worktree_flow as worktree_flow
+
+    flow = _artifact_flow(tmp_path)
+    unit = _teardown_unit(tmp_path, flow)
+    unit.path.mkdir()
+    task = StoryTask(story_key="1-1", epic=1, ledger_seed_text=_SEED_LEDGER)
+    monkeypatch.setattr(
+        worktree_flow.deferredwork,
+        "observe_ledger",
+        lambda _path: (None, "PermissionError: [Errno 13] denied"),
+    )
+
+    flow._warn_isolated_ledger_uncarried(task, unit)
+
+    assert flow.journal.entries == [
+        (
+            "isolated-ledger-writes-uncarried",
+            {
+                "story_key": "1-1",
+                "ledger": str(flow.paths.deferred_work),
+                "error": "PermissionError: [Errno 13] denied",
+            },
+        )
+    ]
+    assert task.ledger_seed_text is None
+
+
+def test_uncarried_warning_is_silent_once_the_worktree_is_gone(tmp_path):
+    """A replayed teardown after the worktree was removed must not read the absent
+    copy as "every seeded entry removed". Ablation: drop the `is_dir` guard and this
+    journals DW-1 and DW-2."""
+    flow = _artifact_flow(tmp_path)
+    unit = _teardown_unit(tmp_path, flow)
+    task = StoryTask(story_key="1-1", epic=1, ledger_seed_text=_SEED_LEDGER)
+
+    assert not unit.path.exists()
+    flow._warn_isolated_ledger_uncarried(task, unit)
+
+    assert flow.journal.entries == []
+    assert task.ledger_seed_text is None
+
+
+def test_payload_replay_keeps_the_snapshot_for_a_still_mounted_worktree(tmp_path):
+    """The resume replay publishes from the saved payload (`unit=None`) and then,
+    while the worktree is still mounted, repeats with the reopened unit — whose
+    check needs the snapshot. The record is saved-cleared once, so a second replay
+    on the same mount journals nothing new.
+
+    Ablation: clear the snapshot unconditionally in the `unit is None` arm and no
+    row is journaled; drop the post-record `_save()` and `saves` stays 0."""
+    flow = _artifact_flow(tmp_path)
+    unit = _teardown_unit(tmp_path, flow)
+    ledger = unit.workspace.paths.deferred_work
+    ledger.parent.mkdir(parents=True)
+    ledger.write_text(_SEED_LEDGER + "\n- source_spec: spec-z.md\n", encoding="utf-8")
+    task = StoryTask(story_key="1-1", epic=1, ledger_seed_text=_SEED_LEDGER)
+    task.worktree_path = str(unit.path)
+
+    flow.finish_publication(task, None)
+    assert task.ledger_seed_text == _SEED_LEDGER
+    assert flow.calls.saves == 0
+
+    flow._warn_isolated_ledger_uncarried(task, unit)
+    assert [kind for kind, _ in flow.journal.entries] == ["isolated-ledger-writes-uncarried"]
+    assert task.ledger_seed_text is None
+    assert flow.calls.saves == 1
+
+    flow._warn_isolated_ledger_uncarried(task, unit)
+    assert len(flow.journal.entries) == 1
+
+
+def test_payload_replay_drops_the_snapshot_once_the_worktree_is_gone(tmp_path):
+    """With no mount left, the payload replay is the last teardown call, so it
+    drops the snapshot from state.json itself. Ablation: delete that clear and the
+    snapshot survives."""
+    flow = _artifact_flow(tmp_path)
+    task = StoryTask(story_key="1-1", epic=1, ledger_seed_text=_SEED_LEDGER)
+    task.worktree_path = str(tmp_path / "wt")
+
+    flow.finish_publication(task, None)
+
+    assert task.ledger_seed_text is None
+    assert flow.calls.saves == 1
+    assert flow.journal.entries == []
 
 
 # --------------------------------------------------------------- profiles / agents
