@@ -387,6 +387,19 @@ def test_migration_commit_escalated_defaults_false_for_pre_upgrade_state():
     assert StoryTask.from_dict(doc).migration_commit_escalated is False
 
 
+def test_migration_ledger_rival_round_trips():
+    """DW-429: the refused-a-rival latch survives state.json."""
+    task = StoryTask(story_key="sweep-migrate", epic=0, migration_ledger_rival=True)
+    back = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+    assert back.migration_ledger_rival is True
+
+
+def test_migration_ledger_rival_defaults_false_for_pre_upgrade_state():
+    doc = StoryTask(story_key="sweep-migrate", epic=0, migration_ledger_rival=True).to_dict()
+    del doc["migration_ledger_rival"]
+    assert StoryTask.from_dict(doc).migration_ledger_rival is False
+
+
 def test_legacy_park_eligible_state_loads_but_is_not_persisted():
     """Retired authorization state is tolerated but cannot influence new runs."""
     doc = StoryTask(story_key="1-1-a", epic=1).to_dict()

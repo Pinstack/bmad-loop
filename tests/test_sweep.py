@@ -22684,6 +22684,8 @@ def test_migration_restore_escalates_when_a_rival_writes_inside_the_reset_window
     assert engine.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
     assert "changed underneath the failed migration attempt" in engine.state.paused_reason
     assert "sweep-migration-restore-diverged" in journal_kinds(engine)
+    # DW-429: a readable mismatch latches the rival for the next restart
+    assert load_state(engine.run_dir).tasks["sweep-migrate"].migration_ledger_rival is True
     # the rival's line stands, and the refusal did not paper the rewrite over
     text = project.deferred_work.read_text(encoding="utf-8")
     assert "Filed by another process" in text and text != LEGACY_LEDGER
@@ -22754,6 +22756,8 @@ def test_migration_restore_escalates_when_the_baseline_probe_fails(project, monk
     kinds = journal_kinds(engine)
     assert "ledger-baseline-probe-failed" in kinds
     assert "sweep-migration-restore-diverged" in kinds
+    # DW-429: an anchor-less probe proves no rival, so nothing is latched
+    assert load_state(engine.run_dir).tasks["sweep-migrate"].migration_ledger_rival is False
     # escalated on the FIRST failed attempt: an unprovable restore does not get
     # to spend the retry budget over a ledger nobody has graded
     assert len(adapter.sessions) == 1
@@ -33960,6 +33964,492 @@ def test_marked_triage_running_refuses_a_rival_after_the_observation(project, mo
     assert project.deferred_work.read_text(encoding="utf-8") == rival
 
 
+_RIVAL_LEGACY_LEDGER = LEGACY_LEDGER + "- **Rival legacy thing** — landed after the observation\n"
+
+
+def _escalate_on_a_tracked_rival(project, monkeypatch):
+    """DW-429 setup: the marked TRIAGE_RUNNING restore refuses a tracked legacy
+    rival that landed inside its reset window, and escalates with it on disk."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine = _crash_in_triage_running(project)
+    resumed, adapter = resume_sweep(project, engine, [])
+    real_reset = resumed._safe_reset
+
+    def reset_then_rival(task, **kwargs):
+        real_reset(task, **kwargs)
+        project.deferred_work.write_text(_RIVAL_LEGACY_LEDGER, encoding="utf-8")
+
+    monkeypatch.setattr(resumed, "_safe_reset", reset_then_rival)
+    summary = resumed.run()
+    assert summary.paused and adapter.sessions == []
+    task = load_state(resumed.run_dir).tasks["sweep-migrate"]
+    assert task.phase == Phase.ESCALATED
+    assert project.deferred_work.read_text(encoding="utf-8") == _RIVAL_LEGACY_LEDGER
+    return resumed
+
+
+@needs_dir_fd_recovery
+def test_escalated_restart_keeps_a_refused_rival_as_the_migration_input(project, monkeypatch):
+    """DW-429: a refused readable rival latches `migration_ledger_rival`, and the
+    next resume's generic ESCALATED restart puts the rival back after its reset
+    instead of hard-resetting it away. The replacement session grades the rival
+    text (on disk before dispatch, and pinned as the attempt's baseline record),
+    the validation-retry restore republishes it for the second attempt, and
+    leaving ESCALATED consumes the latch — the cap escalation that follows is not
+    a rival refusal and stamps it False.
+
+    The sessions reject rather than convert: a dirty tracked ledger's accepted
+    migration is refused by the publisher's committed-blob binding
+    (`commit_path_bound`), which is outside this fix.
+
+    Ablation, performed: force `keep_ledger = False` in the generic restart and
+    this reddens — the reset republishes the committed legacy ledger and the
+    session observes that instead of the rival. Delete the restart's
+    `task.migration_ledger_rival = False` consumption and the dispatch-time
+    `latches` row reddens."""
+    escalated = _escalate_on_a_tracked_rival(project, monkeypatch)
+    assert load_state(escalated.run_dir).tasks["sweep-migrate"].migration_ledger_rival is True
+    observed: list[str] = []
+    baselines: list[str] = []
+    latches: list[bool] = []
+    reject = migrate_effect(project, _RIVAL_LEGACY_LEDGER, [])  # converts nothing
+
+    def reject_after_observing(spec):
+        observed.append(project.deferred_work.read_text(encoding="utf-8"))
+        # persisted at dispatch, BEFORE the cap escalation re-stamps it
+        latches.append(load_state(escalated.run_dir).tasks["sweep-migrate"].migration_ledger_rival)
+        baselines.append((escalated.run_dir / "migrate-baseline.md").read_text(encoding="utf-8"))
+        return reject(spec)
+
+    resumed, adapter = resume_sweep(
+        project, escalated, [reject_after_observing, reject_after_observing]
+    )
+
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed and len(adapter.sessions) == 2
+    assert observed == [_RIVAL_LEGACY_LEDGER, _RIVAL_LEGACY_LEDGER]
+    assert baselines == [_RIVAL_LEGACY_LEDGER, _RIVAL_LEGACY_LEDGER]
+    assert latches == [False, False]  # leaving ESCALATED consumed the latch
+    task = load_state(resumed.run_dir).tasks["sweep-migrate"]
+    assert task.phase == Phase.ESCALATED and task.migration_ledger_rival is False
+    assert "failed deterministic validation" in resumed.state.paused_reason
+    assert project.deferred_work.read_text(encoding="utf-8") == _RIVAL_LEGACY_LEDGER
+
+
+@needs_dir_fd_recovery
+def test_escalated_restart_keeps_an_untracked_rival_the_reset_leaves_in_place(project, monkeypatch):
+    """DW-429, the other compare-and-set arm: a baseline-untracked ledger keeps
+    the tree dirty, so the latched restart still parks and resets, but the reset
+    never touches that ledger. The kept rival is then still live (`current ==
+    observed`), accepted as-is rather than diverged: no new
+    `sweep-migration-restore-diverged` row, the replacement session grades the
+    rival text, and the latch is consumed at dispatch.
+
+    Ablation, performed: replace `elif current == observed:` in
+    `_migration_reset` with `elif False:` and this reddens — the restart
+    journals a second divergence and re-pauses ESCALATED on every resume,
+    dispatching nothing."""
+    write_legacy_ledger(project, LEGACY_LEDGER, commit=False)
+    assert git(project.project, "ls-files", "--", ledger_rel(project)) == ""
+    engine = _crash_in_triage_running(project)
+    first, adapter = resume_sweep(project, engine, [])
+    real_reset = first._safe_reset
+
+    def reset_then_rival(task, **kwargs):
+        real_reset(task, **kwargs)
+        project.deferred_work.write_text(_RIVAL_LEGACY_LEDGER, encoding="utf-8")
+
+    monkeypatch.setattr(first, "_safe_reset", reset_then_rival)
+    assert first.run().paused and adapter.sessions == []
+    escalated = load_state(first.run_dir).tasks["sweep-migrate"]
+    assert escalated.phase == Phase.ESCALATED and escalated.migration_ledger_rival is True
+    assert len(_records(first, "sweep-migration-restore-diverged")) == 1
+    observed: list[str] = []
+    latches: list[bool] = []
+    reject = migrate_effect(project, _RIVAL_LEGACY_LEDGER, [])  # converts nothing
+
+    def reject_after_observing(spec):
+        observed.append(project.deferred_work.read_text(encoding="utf-8"))
+        latches.append(load_state(first.run_dir).tasks["sweep-migrate"].migration_ledger_rival)
+        return reject(spec)
+
+    resumed, adapter = resume_sweep(
+        project, first, [reject_after_observing, reject_after_observing]
+    )
+
+    summary = resumed.run()
+
+    assert not summary.crashed and len(adapter.sessions) == 2
+    assert observed == [_RIVAL_LEGACY_LEDGER, _RIVAL_LEGACY_LEDGER]
+    assert latches == [False, False]
+    assert len(_records(resumed, "sweep-migration-restore-diverged")) == 1
+    assert "failed deterministic validation" in resumed.state.paused_reason
+
+
+@needs_dir_fd_recovery
+def test_escalated_restart_refuses_a_third_writer_over_the_kept_rival(project, monkeypatch):
+    """DW-429 race: with the latch set, a third writer that lands between the
+    restart's reset and its compare-and-set is never overwritten. The restart
+    journals `sweep-migration-restore-diverged`, re-pauses still ESCALATED with
+    the latch kept, dispatches nothing, and the rival's bytes stay recoverable
+    from the recovery ref parked before the reset.
+
+    Ablation: accept any live value in `_migration_reset`'s compare-and-set and
+    this reddens: the third writer is clobbered by the rival and a session is
+    dispatched."""
+    escalated = _escalate_on_a_tracked_rival(project, monkeypatch)
+    third = LEGACY_LEDGER + "- **Third writer** — landed inside the restart window\n"
+    resumed, adapter = resume_sweep(project, escalated, [])
+    real_reset = resumed._safe_reset
+
+    def reset_then_third(task, **kwargs):
+        real_reset(task, **kwargs)
+        project.deferred_work.write_text(third, encoding="utf-8")
+
+    monkeypatch.setattr(resumed, "_safe_reset", reset_then_third)
+
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed and adapter.sessions == []
+    persisted = load_state(resumed.run_dir)
+    assert persisted.paused_stage == PAUSE_ESCALATION
+    task = persisted.tasks["sweep-migrate"]
+    assert task.phase == Phase.ESCALATED and task.migration_ledger_rival is True
+    assert len(_records(resumed, "sweep-migration-restore-diverged")) == 2
+    assert project.deferred_work.read_text(encoding="utf-8") == third
+    ref = _records(resumed, "attempt-worktree-preserved")[-1]["ref"]
+    assert ref.startswith("refs/attempt-preserve-dirty/")
+    parked = git(project.project, "show", f"{ref}:{ledger_rel(project)}")
+    assert parked == _RIVAL_LEGACY_LEDGER.rstrip("\n")
+
+
+@needs_dir_fd_recovery
+def test_escalated_restart_refuses_an_unreadable_kept_rival(project, monkeypatch):
+    """DW-429: when the keep-ledger read before the restart's reset faults, there
+    is no rival text to put back, so the restart re-pauses ESCALATED with the
+    tree untouched, dispatches nothing and keeps the latch.
+
+    The fault is scoped to `_migration_reset`'s own read: a truly unreadable file
+    would stop at the cycle reader first.
+
+    Ablation, performed: replace the `if observed is None:` guard with
+    `if False:` and this reddens — the reset runs and the restore crashes on the
+    missing observation."""
+    escalated = _escalate_on_a_tracked_rival(project, monkeypatch)
+    head = git(project.project, "rev-parse", "HEAD")
+    preserved_before = len(_records(escalated, "attempt-worktree-preserved"))
+    real_read = deferredwork.read_for_write
+
+    def fault_the_keep_read(path, *args, **kwargs):
+        if sys._getframe(1).f_code.co_name == "_migration_reset":
+            raise deferredwork.LedgerReadError("injected keep-ledger read fault")
+        return real_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(deferredwork, "read_for_write", fault_the_keep_read)
+    resumed, adapter = resume_sweep(project, escalated, [])
+
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed and adapter.sessions == []
+    persisted = load_state(resumed.run_dir)
+    assert persisted.paused_stage == PAUSE_ESCALATION
+    task = persisted.tasks["sweep-migrate"]
+    assert task.phase == Phase.ESCALATED and task.migration_ledger_rival is True
+    assert "rival ledger" in persisted.paused_reason
+    assert project.deferred_work.read_text(encoding="utf-8") == _RIVAL_LEGACY_LEDGER
+    assert git(project.project, "rev-parse", "HEAD") == head
+    assert len(_records(resumed, "attempt-worktree-preserved")) == preserved_before
+
+
+@needs_dir_fd_recovery
+def test_escalated_restart_parks_operator_work_made_during_the_pause(project):
+    """DW-313, the realistic surface: resume has no clean-tree gate, so work an
+    operator makes while a migration sits ESCALATED meets the restart's
+    whole-checkout reset. A commit above the migration baseline is parked on a
+    journaled `attempt-preserve/*` branch, and an unrelated tracked edit plus a
+    new untracked file are parked on the journaled `refs/attempt-preserve-dirty/*`
+    snapshot, before the reset runs.
+
+    Ablation, performed: drop `_preserve_attempt_commits` from `_migration_reset`
+    and the commits row reddens; drop `_preserve_attempt_worktree` and the
+    snapshot rows redden."""
+    (project.project / "notes.txt").write_text("committed\n", encoding="utf-8")
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    partial = LEGACY_LEDGER + "\n### DW-1: Old fixed thing\n\norigin: migr"
+
+    def partial_then_env_fault(spec):
+        project.deferred_work.write_text(partial, encoding="utf-8")
+        return SessionResult(status="timeout", env_fault=True, env_fault_evidence="ECONNRESET")
+
+    engine, _ = make_sweep(project, [partial_then_env_fault])
+    assert engine.run().paused
+    assert load_state(engine.run_dir).tasks["sweep-migrate"].phase == Phase.ESCALATED
+    # the operator works in the paused checkout
+    (project.project / "operator.txt").write_text("operator commit\n", encoding="utf-8")
+    git(project.project, "add", "--", "operator.txt")
+    git(project.project, "commit", "-q", "-m", "operator work during the pause")
+    operator_commit = git(project.project, "rev-parse", "HEAD")
+    (project.project / "notes.txt").write_text("operator edit\n", encoding="utf-8")
+    (project.project / "scratch.txt").write_text("operator scratch\n", encoding="utf-8")
+    mapping = _valid_migration_mapping()
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    resumed, _ = resume_sweep(
+        project, engine, [migrate_effect(project, migrated_ledger(), mapping), triage_effect(plan)]
+    )
+
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    commits = _records(resumed, "attempt-commits-preserved")
+    assert len(commits) == 1 and commits[0]["story_key"] == MIGRATE_KEY
+    branch = commits[0]["ref"]
+    assert git(project.project, "rev-parse", branch) == operator_commit
+    ref = _records(resumed, "attempt-worktree-preserved")[0]["ref"]
+    assert ref.startswith("refs/attempt-preserve-dirty/")
+    assert git(project.project, "show", f"{ref}:notes.txt") == "operator edit"
+    assert git(project.project, "show", f"{ref}:scratch.txt") == "operator scratch"
+    assert git(project.project, "show", f"{ref}:operator.txt") == "operator commit"
+    # the reset still ran
+    assert (project.project / "notes.txt").read_text(encoding="utf-8") == "committed\n"
+    assert not (project.project / "scratch.txt").exists()
+
+
+def _crash_after_accepted_rewrite(project, monkeypatch):
+    """A marked migration whose rewrite was accepted but whose result record
+    never published: resume takes `_restore_accepted_migration`."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, _ = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
+    real_write = sweep_mod.atomic_write_text_confined
+
+    def fail_result(path, text, **kwargs):
+        if path.name == "migrate-result.json":
+            raise OSError("result publication fault")
+        return real_write(path, text, **kwargs)
+
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", fail_result)
+    assert engine.run().crashed
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", real_write)
+    assert load_state(engine.run_dir).tasks["sweep-migrate"].phase == Phase.TRIAGE_VERIFY
+    return engine
+
+
+@needs_dir_fd_recovery
+@pytest.mark.parametrize("case", ["pre-reset-rival", "post-reset-rival", "in-lock-read-fault"])
+def test_accepted_rewrite_restore_latches_only_a_readable_rival(project, monkeypatch, case):
+    """DW-429 at `_restore_accepted_migration`: a readable rival — found before
+    the reset or landing inside its window — escalates with the latch set; an
+    in-lock read fault escalates with it clear. No session is dispatched.
+
+    Ablation, performed: pass `ledger_rival=False` at either rival refusal and
+    its row reddens; pass `ledger_rival=True` for the post-reset divergence
+    regardless of the read fault and the fault row reddens."""
+    engine = _crash_after_accepted_rewrite(project, monkeypatch)
+    rival = LEGACY_LEDGER + "- **Rival legacy thing** — landed during recovery\n"
+    if case == "pre-reset-rival":
+        project.deferred_work.write_text(rival, encoding="utf-8")
+    resumed, adapter = resume_sweep(project, engine, [])
+    if case == "post-reset-rival":
+        real_reset = resumed._safe_reset
+
+        def reset_then_rival(task, **kwargs):
+            real_reset(task, **kwargs)
+            project.deferred_work.write_text(rival, encoding="utf-8")
+
+        monkeypatch.setattr(resumed, "_safe_reset", reset_then_rival)
+    elif case == "in-lock-read-fault":
+        ledger = project.deferred_work
+        real_lock = deferredwork.ledger_lock
+        real_read = deferredwork.read_for_write
+        inside: list[bool] = []
+
+        @contextlib.contextmanager
+        def tracking_lock(path, *args, **kwargs):
+            with real_lock(path, *args, **kwargs):
+                inside.append(True)
+                try:
+                    yield
+                finally:
+                    inside.pop()
+
+        def faulting_read(path, *args, **kwargs):
+            if inside and Path(path) == ledger:
+                raise OSError(5, "Input/output error")
+            return real_read(path, *args, **kwargs)
+
+        monkeypatch.setattr(deferredwork, "ledger_lock", tracking_lock)
+        monkeypatch.setattr(deferredwork, "read_for_write", faulting_read)
+
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed and adapter.sessions == []
+    task = load_state(resumed.run_dir).tasks["sweep-migrate"]
+    assert task.phase == Phase.ESCALATED
+    assert task.migration_ledger_rival is (case != "in-lock-read-fault")
+    if case != "pre-reset-rival":
+        assert len(_records(resumed, "sweep-migration-restore-diverged")) == 1
+
+
+@needs_dir_fd_recovery
+def test_accepted_rewrite_restore_parks_unrelated_dirt(project, monkeypatch):
+    """DW-313 at `_restore_accepted_migration`: an unrelated tracked edit made
+    while the run was down is parked on the journaled
+    `refs/attempt-preserve-dirty/*` snapshot before the restore's reset.
+
+    Ablation, performed: revert that site to `self._safe_reset(task)` and this
+    reddens — no snapshot is journaled and the edit is gone."""
+    (project.project / "notes.txt").write_text("committed\n", encoding="utf-8")
+    engine = _crash_after_accepted_rewrite(project, monkeypatch)
+    (project.project / "notes.txt").write_text("operator edit\n", encoding="utf-8")
+    mapping = _valid_migration_mapping()
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    resumed, _ = resume_sweep(
+        project, engine, [migrate_effect(project, migrated_ledger(), mapping), triage_effect(plan)]
+    )
+
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    ref = _records(resumed, "attempt-worktree-preserved")[0]["ref"]
+    assert ref.startswith("refs/attempt-preserve-dirty/")
+    assert git(project.project, "show", f"{ref}:notes.txt") == "operator edit"
+    assert (project.project / "notes.txt").read_text(encoding="utf-8") == "committed\n"
+
+
+@needs_dir_fd_recovery
+def test_marked_triage_running_restore_parks_unrelated_dirt(project):
+    """DW-313 at `_restore_running_migration_baseline`: an unrelated tracked edit
+    beside the dead session's residue is parked on the journaled
+    `refs/attempt-preserve-dirty/*` snapshot before the restore's reset.
+
+    Ablation, performed: revert that site to `self._safe_reset(task)` and this
+    reddens — no snapshot is journaled and the edit is gone."""
+    (project.project / "notes.txt").write_text("committed\n", encoding="utf-8")
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine = _crash_in_triage_running(project)
+    (project.project / "notes.txt").write_text("operator edit\n", encoding="utf-8")
+    mapping = _valid_migration_mapping()
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    resumed, _ = resume_sweep(
+        project, engine, [migrate_effect(project, migrated_ledger(), mapping), triage_effect(plan)]
+    )
+
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    ref = _records(resumed, "attempt-worktree-preserved")[0]["ref"]
+    assert ref.startswith("refs/attempt-preserve-dirty/")
+    assert git(project.project, "show", f"{ref}:notes.txt") == "operator edit"
+    assert (project.project / "notes.txt").read_text(encoding="utf-8") == "committed\n"
+
+
+@needs_dir_fd_recovery
+def test_escalated_restart_without_the_latch_still_resets_a_partial_ledger(project):
+    """DW-429 negative control: an escalation that refused no rival (here an
+    env-fault pause over the session's partial rewrite) leaves the latch False,
+    so the ESCALATED restart keeps today's behavior — the partial rewrite is
+    parked, the reset restores the committed legacy ledger, and that is what the
+    replacement session grades.
+
+    Ablation: make the restart keep the ledger unconditionally and this reddens:
+    the session observes the partial rewrite."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+
+    # still legacy, so the resume routes back into the migration restart
+    partial = LEGACY_LEDGER + "\n### DW-1: Old fixed thing\n\norigin: migr"
+
+    def partial_then_env_fault(spec):
+        project.deferred_work.write_text(partial, encoding="utf-8")
+        return SessionResult(status="timeout", env_fault=True, env_fault_evidence="ECONNRESET")
+
+    engine, _ = make_sweep(project, [partial_then_env_fault])
+    assert engine.run().paused
+    task = load_state(engine.run_dir).tasks["sweep-migrate"]
+    assert task.phase == Phase.ESCALATED and task.migration_ledger_rival is False
+    assert project.deferred_work.read_text(encoding="utf-8") == partial
+    observed: list[str] = []
+    mapping = _valid_migration_mapping()
+
+    def migrate_after_observing(spec):
+        observed.append(project.deferred_work.read_text(encoding="utf-8"))
+        return migrate_effect(project, migrated_ledger(), mapping)(spec)
+
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    resumed, _ = resume_sweep(project, engine, [migrate_after_observing, triage_effect(plan)])
+
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert observed == [LEGACY_LEDGER]
+    ref = _records(resumed, "attempt-worktree-preserved")[0]["ref"]
+    parked = git(project.project, "show", f"{ref}:{ledger_rel(project)}")
+    assert parked == partial.rstrip("\n")
+
+
+def test_migration_reset_parks_unrelated_dirt_in_a_recovery_ref(project):
+    """DW-313: the migration validation-retry reset is whole-checkout, so it
+    hard-resets an unrelated tracked edit and deletes an unrelated run-created
+    untracked file. Both are parked under a named `refs/attempt-preserve-dirty/*`
+    ref (journaled `attempt-worktree-preserved`) before the reset runs, and the
+    reset itself still proceeds as before.
+
+    Ablation, performed: drop the `_preserve_attempt_worktree` call from
+    `_migration_reset` and this reddens — no ref is journaled and the edit is
+    gone for good."""
+    (project.project / "notes.txt").write_text("committed\n", encoding="utf-8")
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    bad = migrate_effect(project, LEGACY_LEDGER, [])  # converts nothing: rejected
+
+    def bad_beside_unrelated_work(spec):
+        (project.project / "notes.txt").write_text("operator edit\n", encoding="utf-8")
+        (project.project / "scratch.txt").write_text("operator scratch\n", encoding="utf-8")
+        return bad(spec)
+
+    engine, adapter = make_sweep(project, [bad_beside_unrelated_work, bad])
+
+    summary = engine.run()
+
+    assert summary.paused and len(adapter.sessions) == 2
+    preserved = _records(engine, "attempt-worktree-preserved")
+    assert preserved and preserved[0]["story_key"] == MIGRATE_KEY
+    ref = preserved[0]["ref"]
+    assert ref.startswith("refs/attempt-preserve-dirty/")
+    assert git(project.project, "show", f"{ref}:notes.txt") == "operator edit"
+    assert git(project.project, "show", f"{ref}:scratch.txt") == "operator scratch"
+    # the reset still ran: the checkout is back at the baseline
+    assert (project.project / "notes.txt").read_text(encoding="utf-8") == "committed\n"
+    assert not (project.project / "scratch.txt").exists()
+    assert project.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
+
+
+def test_migration_reset_refuses_when_unrelated_dirt_cannot_be_parked(project, monkeypatch):
+    """DW-313, the #340 gate: a snapshot that fails over work at risk pauses for
+    manual recovery with the tree untouched instead of resetting past it.
+
+    Ablation: pass `allow_pause=False` to `_preserve_attempt_worktree` in
+    `_migration_reset` and this reddens: the reset runs and the edit is lost."""
+    (project.project / "notes.txt").write_text("committed\n", encoding="utf-8")
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    bad = migrate_effect(project, LEGACY_LEDGER, [])
+
+    def bad_beside_unrelated_work(spec):
+        (project.project / "notes.txt").write_text("operator edit\n", encoding="utf-8")
+        return bad(spec)
+
+    def fail_snapshot(*args, **kwargs):
+        raise verify.GitError("injected snapshot failure")
+
+    monkeypatch.setattr(verify, "snapshot_worktree", fail_snapshot)
+    engine, adapter = make_sweep(project, [bad_beside_unrelated_work, bad])
+
+    summary = engine.run()
+
+    assert summary.paused and len(adapter.sessions) == 1
+    assert "attempt-worktree-preserve-failed" in journal_kinds(engine)
+    assert (project.project / "notes.txt").read_text(encoding="utf-8") == "operator edit\n"
+
+
 @needs_dir_fd_recovery
 @pytest.mark.parametrize("fault", ["undecodable", "os-fault"])
 def test_marked_triage_running_escalates_an_unreadable_ledger(project, monkeypatch, fault):
@@ -34167,6 +34657,8 @@ def test_marked_triage_running_escalates_an_in_lock_read_fault(project, monkeypa
     persisted = load_state(resumed.run_dir)
     assert persisted.paused_stage == PAUSE_ESCALATION
     assert persisted.tasks["sweep-migrate"].phase == Phase.ESCALATED
+    # DW-429: a read fault is no readable rival; the latch stays off
+    assert persisted.tasks["sweep-migrate"].migration_ledger_rival is False
     assert len(_records(resumed, "sweep-migration-restore-diverged")) == 1
     assert project.deferred_work.read_bytes() == live
 

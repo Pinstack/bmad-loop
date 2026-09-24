@@ -69,6 +69,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Park unrelated uncommitted work under a `refs/attempt-preserve-dirty/*` recovery ref before
+  every sweep-migration recovery reset, pausing for manual recovery when it cannot be parked
+  (DW-313); keep a readable rival ledger a migration escalation refused, so the next resume
+  grades it as the migration input instead of hard-resetting it away (DW-429).
 - Stop the stall wake nudge from answering a parked CLI's prompt (#727): at stall-grace
   expiry, a latched parked hook signal or a `parked_prompt_patterns` pane match withholds
   the nudge and ends the session `stalled` + `parked`, which every dev, review, fix,

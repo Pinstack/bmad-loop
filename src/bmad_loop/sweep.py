@@ -3309,17 +3309,25 @@ class SweepEngine(Engine):
             for entry in deferredwork.parse_legacy(text)
         ]
 
-    def _migration_evidence_failure(self, task: StoryTask, detail: str) -> NoReturn:
-        """Refuse current-format recovery evidence without mutating the ledger."""
+    def _migration_evidence_failure(
+        self, task: StoryTask, detail: str, *, ledger_rival: bool = False
+    ) -> NoReturn:
+        """Refuse current-format recovery evidence without mutating the ledger.
+
+        ``ledger_rival`` passes through to :meth:`_escalate`: True only when the
+        refusal is a READABLE live ledger the restore would have overwritten
+        (DW-429)."""
         self.journal.append(
             "sweep-migration-recovery-invalid",
             story_key=MIGRATE_KEY,
             detail=detail,
         )
-        self._escalate(task, f"migration recovery evidence is invalid: {detail}")
+        self._escalate(
+            task, f"migration recovery evidence is invalid: {detail}", ledger_rival=ledger_rival
+        )
         raise AssertionError("migration escalation returned")
 
-    def _escalate(self, task: StoryTask, reason: str) -> None:
+    def _escalate(self, task: StoryTask, reason: str, *, ledger_rival: bool = False) -> None:
         """Escalate the migrate task along legal edges only (DW-405/407/314).
 
         Every other task takes ``Engine._escalate`` unchanged. The migrate task
@@ -3328,7 +3336,10 @@ class SweepEngine(Engine):
         first, and a refusal while already ESCALATED (the escalated commit-tail
         arm) re-pauses without any transition. ``migration_commit_escalated`` is
         re-stamped on every real escalation, so a stale value can never grant a
-        commit-tail retry.
+        commit-tail retry. ``migration_ledger_rival`` (DW-429) is re-stamped
+        beside it from ``ledger_rival``: True only when this escalation refused a
+        readable rival ledger, which the generic ESCALATED restart then keeps.
+        The already-ESCALATED re-pause arm leaves both untouched.
         """
         if task.story_key != MIGRATE_KEY:
             super()._escalate(task, reason)
@@ -3351,6 +3362,7 @@ class SweepEngine(Engine):
         if task.phase == Phase.TRIAGE_RUNNING:
             advance(task, Phase.TRIAGE_VERIFY)
         task.migration_commit_escalated = task.phase == Phase.COMMITTING
+        task.migration_ledger_rival = ledger_rival
         super()._escalate(task, reason)
 
     def _resume_escalated_migration_commit(self, task: StoryTask) -> None:
@@ -3519,6 +3531,78 @@ class SweepEngine(Engine):
             )
         return result
 
+    def _migration_reset(self, task: StoryTask, *, keep_ledger: bool = False) -> None:
+        """Whole-checkout migration reset that parks the dirty tree first (DW-313/429).
+
+        Every migration recovery site resets the checkout to the task baseline,
+        which hard-resets tracked edits and deletes run-created untracked files
+        — including unrelated operator work sharing the checkout. Park both
+        halves under the attempt rollback's recovery refs before the reset
+        (``refs/attempt-preserve-dirty/*`` for the tree, ``attempt-preserve/*``
+        for commits above baseline), with the #340 gate: a capture that fails
+        over work at risk pauses for manual recovery with the tree untouched.
+        ``RecoveryFlow.safe_reset`` itself stays shared and unchanged; this is
+        the sweep-side wrapper, and it still routes through ``self._safe_reset``.
+
+        ``keep_ledger`` (DW-429, the ESCALATED restart when
+        ``migration_ledger_rival`` is latched): the latest escalation refused a
+        readable rival ledger, so observe it before the reset and put it back
+        afterward by compare-and-set against the text the reset republished. An
+        unreadable or absent rival re-pauses with the tree untouched; a third
+        writer inside the reset window is never overwritten — it journals
+        ``sweep-migration-restore-diverged`` and re-pauses (the task is still
+        ESCALATED), keeping the latch, and the rival stays in the recovery ref.
+        """
+        ledger = self.workspace.paths.deferred_work
+        observed: str | None = None
+        if keep_ledger:
+            try:
+                observed = deferredwork.read_for_write(ledger)
+            except (deferredwork.LedgerReadError, OSError):
+                observed = None
+            if observed is None:
+                self._escalate(
+                    task,
+                    "the rival ledger the migration escalation kept cannot be read — "
+                    "re-run the sweep",
+                )
+        self._preserve_attempt_commits(task, allow_pause=True)
+        self._preserve_attempt_worktree(task, allow_pause=True)
+        self._safe_reset(task)
+        if not keep_ledger:
+            return
+        # Probed BEFORE the lock: it spawns git (#286, #735).
+        anchor, committed = self._ledger_baseline_text(task)
+        diverged = False
+        with deferredwork.ledger_lock(ledger):
+            # PURE TEXT ONLY under the hold.
+            try:
+                current = deferredwork.read_for_write(ledger)
+            except (deferredwork.LedgerReadError, OSError):
+                current = None
+                diverged = True
+            if diverged:
+                pass
+            elif current == observed:
+                pass
+            elif anchor is _LedgerAnchor.BASELINE and current == committed:
+                assert observed is not None
+                ledger.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write_text(ledger, observed)
+            else:
+                diverged = True
+        if diverged:
+            self.journal.append(
+                "sweep-migration-restore-diverged",
+                story_key=MIGRATE_KEY,
+                ledger=str(ledger),
+            )
+            self._escalate(
+                task,
+                "the ledger changed underneath the kept rival migration input — "
+                "re-run the sweep",
+            )
+
     def _restore_accepted_migration(self, task: StoryTask, baseline: str, rewrite: str) -> None:
         """Restore a validated rewrite by compare-and-set, never over a rival."""
         try:
@@ -3535,10 +3619,13 @@ class SweepEngine(Engine):
             )
         if current not in (baseline, rewrite):
             self._migration_evidence_failure(
-                task, "live ledger diverged from migration recovery records"
+                task,
+                "live ledger diverged from migration recovery records",
+                ledger_rival=True,
             )
-        self._safe_reset(task)
+        self._migration_reset(task)
         diverged = False
+        read_fault = False
         ledger = self.workspace.paths.deferred_work
         with deferredwork.ledger_lock(ledger):
             try:
@@ -3546,6 +3633,7 @@ class SweepEngine(Engine):
             except (deferredwork.LedgerReadError, OSError):
                 current = None
                 diverged = True
+                read_fault = True
             if not diverged and current == rewrite:
                 ledger.parent.mkdir(parents=True, exist_ok=True)
                 atomic_write_text(ledger, baseline)
@@ -3562,6 +3650,7 @@ class SweepEngine(Engine):
             self._escalate(
                 task,
                 "the ledger changed underneath the failed migration attempt — re-run the sweep",
+                ledger_rival=not read_fault,
             )
 
     def _restore_running_migration_baseline(self, task: StoryTask) -> str:
@@ -3593,10 +3682,11 @@ class SweepEngine(Engine):
         if task.baseline_commit and not verify.worktree_clean(self.workspace.root):
             # Non-ledger residue of the dead session; the ledger itself is
             # decided below against the snapshot, never re-baselined.
-            self._safe_reset(task)
+            self._migration_reset(task)
             # Probed BEFORE the lock: it spawns git (#286, #735).
             anchor, committed = self._ledger_baseline_text(task)
         diverged = False
+        read_fault = False
         with deferredwork.ledger_lock(ledger):
             # PURE TEXT ONLY under the hold.
             try:
@@ -3604,6 +3694,7 @@ class SweepEngine(Engine):
             except (deferredwork.LedgerReadError, OSError):
                 current = None
                 diverged = True
+                read_fault = True
             if diverged:
                 pass
             elif current == baseline:
@@ -3623,6 +3714,7 @@ class SweepEngine(Engine):
                 task,
                 "the ledger changed underneath the interrupted migration session — "
                 "re-run the sweep",
+                ledger_rival=not read_fault,
             )
         return baseline
 
@@ -3863,14 +3955,20 @@ class SweepEngine(Engine):
         elif task.phase != Phase.PENDING:
             # resumed mid-migration or retrying after an escalation: restart
             self.journal.append("resume-restart", story_key=MIGRATE_KEY, phase=str(task.phase))
+            # DW-429: read before ESCALATED clears below. The latest escalation
+            # refused a readable rival ledger, so the reset must put that rival
+            # back and let it become the migration input, not erase it.
+            keep_ledger = task.phase == Phase.ESCALATED and task.migration_ledger_rival
             if task.phase == Phase.ESCALATED:
                 task.attempt = 0  # the human resumed deliberately; fresh budget
                 _rearm_generation(task)  # ...and into a fresh session-id namespace
                 task.migration_commit_escalated = False
             if task.baseline_commit and not verify.worktree_clean(self.workspace.root):
-                self._safe_reset(task)  # a session died mid-rewrite; restore our ledger
+                # a session died mid-rewrite; restore our ledger (or keep the rival)
+                self._migration_reset(task, keep_ledger=keep_ledger)
                 # REPAIR/WRITE (DW-146): the restored text this migration grades.
                 text = deferredwork.read_for_write(ledger) or ""
+            task.migration_ledger_rival = False  # leaving ESCALATED consumes the latch
             task.phase = Phase.PENDING  # deliberate reset, not a normal transition
         # **The invariant: a refusal that dispatches nothing leaves this task
         # owning NO baseline.** It takes both halves below. Sitting above the
@@ -4112,7 +4210,7 @@ class SweepEngine(Engine):
             # never re-prompt over a half-broken rewrite; the baseline reset
             # covers tracked files, the explicit write covers an untracked
             # ledger that `git reset` cannot restore
-            self._safe_reset(task)
+            self._migration_reset(task)
             # The WRITE anchor derives from the committed blob, never from an
             # observation of the tree taken after the very reset it would attest
             # to: a rival writing a tracked ledger inside that window would BE
@@ -4183,6 +4281,9 @@ class SweepEngine(Engine):
                     task,
                     "the ledger changed underneath the failed migration attempt — "
                     "re-run the sweep",
+                    # DW-429: only a readable mismatch is a rival worth keeping;
+                    # an anchor-less probe keeps today's reset-on-restart.
+                    ledger_rival=anchor is not _LedgerAnchor.NONE,
                 )
             if task.attempt >= self.policy.sweep.max_migration_attempts:
                 self._escalate(
