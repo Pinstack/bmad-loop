@@ -1901,15 +1901,16 @@ async def test_tall_terminal_dialog_height_unchanged(project):
 # ellipsis (BaseDialog `.title`; the SpecReviewModal and PauseReasonModal
 # subtitles; `_TailPath`), so a docked block costs its LINE count in rows, never
 # its length (DW-358). Docked warnings and hints are module text and are NOT so
-# held. The spec viewer's action row wraps into a two-column grid below 80
-# columns instead of clipping its right-most buttons (DW-359). The rows below
-# pin each face:
+# held: they are sized to fit instead — every EscalationModal hint arm stays
+# within 3 rows at 35 columns, and ConfirmResumeModal's `-short` body yields
+# its rows to the warning (DW-414, DW-415). The spec viewer's action row wraps
+# into a two-column grid below 80 columns instead of clipping its right-most
+# buttons (DW-359). The rows below pin each face:
 #
 # - every covered dialog at 39x9, including the spec viewer (long subtitle and
-#   path), the pause-reason viewer (long subtitle) and the validate viewer:
-#   title, one body row and every docked control visible — two recorded
-#   exceptions, EscalationModal and ConfirmResumeModal's real warning, each a
-#   strict xfail below;
+#   path), the pause-reason viewer (long subtitle), the validate viewer, every
+#   escalation hint arm and the resume confirmation's double-drive warning over
+#   a long pause reason: title, one body row and every docked control visible;
 # - a 300- and 2000-character ledger heading at 39x9: a one-row `.title`, and
 #   the done/legacy markers on lines of their own;
 # - a 63- and 300-character validate spec folder at 39x9: a three-row header
@@ -1948,45 +1949,21 @@ assert len(_LONG_SUBTITLE) > 290
 _MIN_SIZE_CASES = (
     "confirm",
     "confirm-warning",
-    # The second known defect: `confirm-warning` passes a one-character warning,
-    # so it cannot see that ConfirmResumeModal's real double-drive warning —
-    # module text, not held to one row — wraps to three rows at 39 columns and
-    # clips `#ok`, `#cancel` and `#warning` itself. Out of scope for DW-358/359
-    # (another modal's layout); strict, so the fix has to remove this mark.
-    pytest.param(
-        "confirm-resume-warning",
-        marks=pytest.mark.xfail(
-            strict=True,
-            raises=AssertionError,
-            reason="ConfirmResumeModal's double-drive warning wraps past a 39x9 dialog",
-        ),
-    ),
+    # `confirm-warning` passes a one-character warning; this is the real
+    # double-drive warning, which wraps to three rows at 39 columns (DW-415)
+    "confirm-resume-warning",
     "start-run",
     "start-sweep",
     "decision",
     "deferred-entry",
     "story-checkpoint",
-    # A known defect, pinned rather than hidden: EscalationModal does not fit the
-    # pair, twice over. At 39 columns its three-button row (9 + 17 + 7 plus three
-    # 1-column margins = 36) is one column wider than the dialog's 35-column
-    # content region, so `close` loses its right edge at ANY height. And the
-    # restore-patch hint — module-owned safety text docked above the buttons —
-    # wraps to five rows: 2 border + title + 1 body row + 5 hint + 1 button = 10
-    # rows against a 90%-of-9 = 8-row dialog, so `#dialog` clips the whole button
-    # row; it needs a larger terminal. The screen-containment check this test
-    # used before could see neither clip, which is how 39x9 came to be recorded
-    # as this dialog's size. Out of scope
-    # for DW-358/359 (not caller text; another modal's layout); strict, so the
-    # fix has to remove this mark.
-    pytest.param(
-        "escalation",
-        marks=pytest.mark.xfail(
-            strict=True,
-            raises=AssertionError,
-            reason="EscalationModal clips at 39x9: button row 1 column too wide, "
-            "restore hint wraps past the dialog",
-        ),
-    ),
+    # One row per `#hint` arm (DW-414): at 39 columns the three-button row must
+    # fit 35 content columns, and 2 border + title + 1 body row + hint + 1 button
+    # must fit the 8-row (90%-of-9) dialog, so no arm may pass 3 rows.
+    "escalation",
+    "escalation-unreadable",
+    "escalation-ready",
+    "escalation-plain",
     "pause-reason",
     "text-output",
     "spec-review",
@@ -2013,8 +1990,16 @@ def _minimum_size_case(name: str, project):
             "#body",
         )
     if name == "confirm-resume-warning":
-        # the real modal, so a fix that rewords its warning lifts the xfail
-        state = RunState(run_id="r1", project=str(project.project), started_at="now")
+        # the real modal and its real warning, over a pause reason far longer
+        # than the body's rows, so the body has to scroll rather than push the
+        # warning and buttons out of the dialog
+        state = RunState(
+            run_id="r1",
+            project=str(project.project),
+            started_at="now",
+            paused_stage="dev",
+            paused_reason="a long pause reason " * 20,
+        )
         return (
             ConfirmResumeModal("r1", state, engine_alive=True),
             ("#ok", "#cancel", "#warning"),
@@ -2044,7 +2029,15 @@ def _minimum_size_case(name: str, project):
             ("#act-continue", "#act-stop", "#cancel"),
             "#body",
         )
-    if name == "escalation":
+    if name.startswith("escalation"):
+        # `escalation` is the restore-patch arm, the one that gates an enabled
+        # Re-arm; the suffixed rows are the other three arms of the same hint
+        arm = {
+            "escalation": {"resolution_ready": True, "restore_recorded": True},
+            "escalation-unreadable": {"resolution_ready": False, "unreadable": True},
+            "escalation-ready": {"resolution_ready": True},
+            "escalation-plain": {"resolution_ready": False},
+        }[name]
         return (
             EscalationModal(
                 story_key="e-1-s",
@@ -2052,9 +2045,8 @@ def _minimum_size_case(name: str, project):
                 description="d",
                 blocking="b",
                 sentinel_kind="",
-                resolution_ready=True,
                 engine_live=False,
-                restore_recorded=True,
+                **arm,
             ),
             ("#act-resolve", "#act-rearm", "#cancel", "#hint"),
             "#body",
@@ -2090,6 +2082,24 @@ def _minimum_size_case(name: str, project):
         )
     assert name == "text-output", name
     return TextOutputModal("validate", 0, "out\n" * 40), ("#ok",), "#output"
+
+
+async def test_resume_confirm_without_warning_stays_compact_on_a_short_terminal(project):
+    """DW-415's `-short` fix gives the WARNED resume confirm a `1fr` body, which
+    grows the auto dialog to the full screen. Without the warning it is a
+    bounded-tier confirm that already fits, so it must keep its content height
+    rather than balloon to the 15 rows available here."""
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(64, 15)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        state = RunState(run_id="r1", project=str(project.project), started_at="now")
+        modal = ConfirmResumeModal("r1", state, engine_alive=False)
+        app.push_screen(modal)
+        await until(pilot, lambda: app.screen is modal)
+        await ready(pilot, "#body")
+        assert "-short" in app.screen.classes
+        # 2 border + title + 2 body rows + 1-row button row
+        assert app.screen.query_one("#dialog").region.height == 6
 
 
 @pytest.mark.parametrize("case", _MIN_SIZE_CASES)

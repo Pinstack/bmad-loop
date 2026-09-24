@@ -27,13 +27,9 @@ start/sweep option forms, the escalation, checkpoint, spec and validate viewers
 — are the tightest thing the TUI draws. The figures below describe those
 **dialogs**, not the dashboard behind them, which simply shows fewer rows as the
 window shrinks. **39 columns × 9 rows** is the size at which a dialog shows its
-title, a row of body and all of its docked buttons, fully visible — the spec
-viewer and the validate viewer included. Two dialogs are recorded exceptions
-and need a larger terminal: the **escalation viewer**, whose button row is one
-column wider than a 39-column dialog and whose hints (a restore-patch warning,
-an unreadable-spec notice) wrap above the buttons, and the **resume
-confirmation** when it shows its double-drive warning, which wraps above the
-buttons too.
+title, a row of body and all of its docked buttons, fully visible — every
+dialog included: the spec and validate viewers, the escalation viewer with any
+of its hints, and the resume confirmation with its double-drive warning.
 
 Caller-supplied text cannot move that size. Titles, headers, subtitles and file
 paths are docked _outside_ the scrolling body, and their length comes from the
@@ -41,7 +37,9 @@ caller — a deferred-work ledger heading, a story title, a `spec:` folder, a
 spec path. Each of their lines is held to **one row**, ending in `…` when it is
 too long, so a dialog's height depends on how many lines it docks, never on how
 long they are. Docked warnings and hints are the TUI's own text and are not
-held this way — that is what the two exceptions above run into.
+held this way; they are written short enough to fit that size whole. On a
+short terminal the resume confirmation's body scrolls rather than push its
+warning out.
 
 What the `…` cuts is not always shown anywhere else. Some of it is: the spec
 path is cut from the front so it keeps its file name, and `copy path` copies the
@@ -425,7 +423,7 @@ whose state is unreadable. The confirmation modal shows what you are resuming:
 
 - paused runs: `paused at <stage> — <reason>` in yellow;
 - non-paused runs: `run is not paused — it looks interrupted` (dim);
-- and, in bold red, `engine.pid is still alive — resuming would double-drive
+- and, in bold red, `engine.pid may still be live — resuming could double-drive
 this run` when the original engine still appears to be running. Heed this
   one: two engines driving one run dir corrupt each other's state. It can also
   mean the pid was recycled by another process — verify before resuming.
@@ -758,7 +756,7 @@ if the operator has marked `policy.toml` read-only (#593, #597).
 | `run <id> already finished`                                                         | finished runs can't be resumed                                                                                                       |
 | `nothing to attach: no live agent session … runs started outside the TUI have none` | between sessions there is no agent window, and shell-started runs have no ctl window; wait for the next session or attach manually   |
 | `cannot suspend here — run manually: tmux attach …`                                 | the terminal can't suspend the TUI; run the printed command in another terminal                                                      |
-| `engine.pid is still alive — resuming would double-drive this run`                  | the original engine still runs (or its pid was recycled); attach and check before resuming                                           |
+| `engine.pid may still be live — resuming could double-drive this run`               | the original engine still runs (or its pid was recycled); attach and check before resuming                                           |
 | `policy.toml is not valid TOML: …`                                                  | hand-edited file is syntactically broken; fix it in an editor — the settings screen needs a parseable document to start from         |
 | sprint tree shows `sprint status unavailable`                                       | missing/invalid `_bmad/bmm/config.yaml` or sprint-status.yaml; run `bmad-loop init` / `bmad-sprint-planning`                         |
 | deferred pane shows `deferred ledger unavailable`                                   | missing/unreadable `deferred-work.md`; normal until the first session defers something                                               |

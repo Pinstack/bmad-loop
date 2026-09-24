@@ -146,11 +146,11 @@ class BaseDialog(ModalScreen):
     # its path). Such a block's height is therefore its LINE count, never its
     # length, and caller text cannot move a dialog's floor off the 39x9 pair
     # tests/test_tui_app.py pins and docs/tui-guide.md quotes (DW-358). Docked
-    # warnings and hints are module text and are NOT held to one row: two of
-    # them wrap past that pair — EscalationModal's restore hint (plus a button
-    # row one column too wide at 39) and ConfirmResumeModal's double-drive
-    # warning — each pinned there as a strict xfail. The full caller text stays
-    # in the widget — the ellipsis is render-only.
+    # warnings and hints are module text and are NOT held to one row; each is
+    # sized to fit that pair instead — EscalationModal keeps every #hint arm
+    # within 3 rows at 39 columns (DW-414), and ConfirmResumeModal's `-short`
+    # body yields its rows to the double-drive warning (DW-415). The full caller
+    # text stays in the widget — the ellipsis is render-only.
     VERTICAL_BREAKPOINTS = [(0, "-short"), (20, "-tall")]
 
     BINDINGS = [Binding("escape", "cancel", "cancel")]
@@ -388,6 +388,21 @@ class ConfirmResumeModal(ConfirmModal):
     """Resume confirmation with pause details and a double-drive warning when
     the recorded engine pid may still be live."""
 
+    # The warning wraps to three rows at 39 columns, and ConfirmModal's auto
+    # #body keeps its own rows (up to its 60% cap), so on a short terminal the
+    # docked warning and buttons were clipped by #dialog (DW-415). Under
+    # `-short` #body takes only the rows left over, so the auto dialog grows to
+    # BaseDialog's `-short` max-height (the full screen) and a long pause reason
+    # scrolls instead of pushing the warning out. Scoped to `-warned` on
+    # purpose: without the warning this is a bounded-tier confirm that already
+    # fits, and the `1fr` body would balloon it (see BaseDialog's #dialog note).
+    DEFAULT_CSS = """
+    ConfirmResumeModal.-short.-warned #body {
+        height: 1fr;
+        max-height: 100%;
+    }
+    """
+
     def __init__(self, run_id: str, state: RunState, engine_alive: bool):
         body = Text()
         body.append("resume run ")
@@ -405,6 +420,8 @@ class ConfirmResumeModal(ConfirmModal):
             else None
         )
         super().__init__("resume run", body, confirm_label="resume", warning=warning)
+        if warning:
+            self.add_class("-warned")
 
 
 class DeferredEntryModal(BaseDialog):
@@ -800,6 +817,13 @@ class EscalationModal(BaseDialog):
         border: solid $primary-darken-2;
         padding: 0 1;
     }
+    /* At 39 columns the row is 9 + 17 + 7 plus three 1-column `-narrow`
+       margins = 36 against 35 content columns, so `close` lost its right edge
+       (DW-414). The row is right-aligned, so the first button's margin is dead
+       space: dropping it makes the row exactly 35. */
+    EscalationModal.-narrow #act-resolve {
+        margin-left: 0;
+    }
     """
 
     def __init__(
@@ -877,16 +901,23 @@ class EscalationModal(BaseDialog):
                     )
             # The restore-discard branch below gates an enabled Re-arm, so the hint
             # is docked outside #body (never scrolled off) — directly above the buttons.
+            #
+            # Every arm stays within 3 rows at 35 columns, the content width of a
+            # 39-column dialog: 2 border + title + 1 body row + hint + 1-row button
+            # row must fit the 8-row (90%-of-9) dialog at the 39x9 pair (DW-414).
+            # The reasons behind each arm live in the comments and in
+            # docs/tui-guide.md, not in the hint.
             hint = Text()
             if self._unreadable:
                 # Precedence over both branches below: they explain when Re-arm
                 # unlocks, and neither is true while the evidence cannot be read.
+                # Re-arm would flip the frontmatter, strip the result and re-stamp
+                # the baseline on evidence nobody could read. Resolve stays OPEN: it
+                # is the non-destructive remedy, and a bad anchor is exactly what it
+                # repairs.
                 hint.append(
-                    "re-arm is refused while the spec is unreadable — it flips the "
-                    "frontmatter, strips the result and re-stamps the baseline on "
-                    "evidence nobody could read. Resolve stays OPEN: it is the "
-                    "non-destructive remedy, and a bad anchor is exactly what it "
-                    "repairs — `bmad-loop resolve` does the same from the CLI",
+                    "⚠ spec unreadable — Re-arm is refused; Resolve (or "
+                    "`bmad-loop resolve`) repairs it",
                     style="red",
                 )
             elif self._restore_recorded:
@@ -894,17 +925,16 @@ class EscalationModal(BaseDialog):
                 # indistinguishable from a fresh one), so Re-arm stays a plain
                 # from-scratch re-drive — but never a silent drop of the decision.
                 hint.append(
-                    "⚠ the resolution records a restore patch — Re-arm here re-drives "
-                    "from scratch and drops it; run `bmad-loop resolve` to honor the "
-                    "restore",
+                    "⚠ restore patch recorded — Re-arm re-drives from scratch and "
+                    "drops it; `bmad-loop resolve` honors it",
                     style="yellow",
                 )
             elif self._resolution_ready:
                 hint.append("resolution recorded — re-arm & resume when ready", style="green")
             else:
                 hint.append(
-                    "resolve opens an interactive agent to fix the frozen spec; "
-                    "re-arm unlocks once it records a resolution",
+                    "Resolve opens an agent to fix the frozen spec; Re-arm unlocks "
+                    "once it records a resolution",
                     style="dim",
                 )
             yield Static(hint, id="hint")

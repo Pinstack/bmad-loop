@@ -74,8 +74,11 @@ breaking changes may land in a minor release.
   keeps its file name; the deferred-work viewer's done/legacy markers move to lines of
   their own), so long caller text no longer pushes the buttons off-screen; on terminals
   narrower than 80 columns, wrap the spec viewer's action row into a grid two buttons
-  wide at full terminal height. Every dialog fits 39×9 except the escalation viewer and the resume
-  confirmation's double-drive warning, pinned as known defects (DW-358, DW-359).
+  wide at full terminal height (DW-358, DW-359).
+- Fit the escalation viewer and the resume confirmation's double-drive warning to 39×9, so
+  every dialog now does: the escalation button row drops its dead leading margin, every
+  escalation hint fits in three rows at that width, and on short terminals the warned resume
+  confirmation's body scrolls instead of pushing the warning and buttons out (DW-414, DW-415).
 - Prove a latch-only retry of the harvested-deferral carry commit (nothing newly appended)
   holds only HEAD plus the task's rows in the tracked ledger's working tree and index, else
   pause (`harvest-carry-foreign-dirt`) with nothing committed and the latch kept (DW-355).
