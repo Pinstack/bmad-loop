@@ -658,6 +658,78 @@ def missing_stories_support(project: Path, trees: Sequence[str]) -> list[Finding
     return problems
 
 
+# The one bundled skill a triage session dispatches (`/bmad-loop-sweep`). Named
+# here so the triage-tree preflight (:func:`missing_sweep_skill`) and its callers
+# spell it once; it is also a MODULE_SKILLS member, which is how `init` lays it down.
+SWEEP_SKILL = "bmad-loop-sweep"
+# `init --force-skills` rmtree's and re-copies every MODULE_SKILLS dir (`_copy_skills`),
+# so the remediation says so rather than silently costing the operator local edits.
+_SWEEP_REMEDIATION = (
+    "run `bmad-loop init --force-skills` (it re-copies every bmad-loop-* skill in the "
+    "tree, overwriting local edits)"
+)
+
+
+def bundled_skill_files(skill: str) -> tuple[str, ...]:
+    """The POSIX rels of every file the wheel bundles under ``skills/<skill>/``.
+
+    Read from the installed package rather than restated as a literal, so a mode
+    file added to the bundled skill is required by the preflight the moment it
+    ships — a hand-kept list would silently stop checking it. Sorted and
+    deterministic (the walk itself sorts)."""
+    root = resources.files("bmad_loop.data").joinpath("skills").joinpath(skill)
+    return tuple(rel for rel, entry in _walk_traversable_files(root) if rel and _is_file(entry))
+
+
+def missing_sweep_skill(project: Path, trees: Sequence[str]) -> list[Finding]:
+    """Problems for the triage skill tree(s) a sweep dispatches ``/bmad-loop-sweep`` into.
+
+    Triage is deliberately outside :data:`DEV_PRIMITIVE_ROLES` (see that comment):
+    its whole prompt surface is :data:`SWEEP_SKILL`, which `bmad-loop init` lays
+    down. That exclusion left the skill itself unchecked, so a deleted or partial
+    copy stalled every triage session at ``Unknown command`` until timeout. For
+    every distinct ``trees`` entry — callers pass the triage profile's tree only —
+    confirm each file the wheel bundles for the skill (:func:`bundled_skill_files`)
+    exists, via the fault-total :func:`_is_file`. Existence only: content is the
+    operator's (a local edit to a mode file is theirs to make).
+
+    Two check ids, one per condition: ``skills.sweep-missing`` (no skill directory
+    at all) and ``skills.sweep-incomplete`` (present, but some bundled file absent —
+    ``missing_files`` carries exactly the absent rels, as a list). Both share the
+    single remediation, ``bmad-loop init --force-skills``. Empty list means OK."""
+    required = bundled_skill_files(SWEEP_SKILL)
+    problems: list[Finding] = []
+    for tree in dict.fromkeys(trees):
+        skill_dir = project / tree / SWEEP_SKILL
+        missing = [rel for rel in required if not _is_file(skill_dir.joinpath(*rel.split("/")))]
+        if not missing:
+            continue
+        detail: dict[str, object] = {"tree": tree, "skill": SWEEP_SKILL}
+        if not _is_dir(skill_dir):
+            problems.append(
+                Finding(
+                    "skills.sweep-missing",
+                    "problem",
+                    f"{tree}/{SWEEP_SKILL} not found — triage sessions would stall at an "
+                    f"unknown /{SWEEP_SKILL}; {_SWEEP_REMEDIATION}",
+                    detail,
+                )
+            )
+            continue
+        problems.append(
+            Finding(
+                "skills.sweep-incomplete",
+                "problem",
+                f"{tree}/{SWEEP_SKILL} is incomplete (missing {', '.join(missing)}: "
+                f"deleted or partial, or laid down by an older bmad-loop release) — "
+                f"triage sessions would stall at an unknown or broken /{SWEEP_SKILL}; "
+                f"{_SWEEP_REMEDIATION}",
+                {**detail, "missing_files": missing},
+            )
+        )
+    return problems
+
+
 def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
     """Problems for the upstream skills the orchestrator drives but doesn't bundle.
 

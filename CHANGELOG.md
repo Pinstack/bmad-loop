@@ -46,6 +46,12 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Preflight the triage tree for the complete bundled `bmad-loop-sweep` skill (every file the
+  wheel bundles for it): `sweep`, a sweep-run `resume` and an auto-sweep child
+  refuse a deleted or partial copy before any side effect, naming the tree and
+  `bmad-loop init --force-skills`; `validate` reports `skills.sweep` /
+  `skills.sweep-missing` / `skills.sweep-incomplete`, and the `sweep --dry-run` banner lists
+  it, instead of every triage session stalling at `Unknown command` (DW-367).
 - Decode the unity plugin scripts' child output as UTF-8 with `errors="replace"` (and pin
   the helper scripts' stdio to UTF-8), so non-UTF-8 output on a legacy Windows codepage
   such as cp932 no longer raises `UnicodeDecodeError`; an unlaunchable CLI now fails

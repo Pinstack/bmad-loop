@@ -2456,6 +2456,85 @@ def test_missing_base_skills_reports_absent_and_incomplete(tmp_path):
     assert missing_base_skills(tmp_path, [claude.skill_tree]) == []
 
 
+def test_bundled_sweep_file_set_is_read_from_the_wheel():
+    """The required set is the bundle itself, never a restated literal: every file
+    under the package's `data/skills/bmad-loop-sweep/` is required, so a mode file
+    added there is checked the moment it ships."""
+    from importlib import resources
+
+    from bmad_loop.install import SWEEP_SKILL, bundled_skill_files
+
+    assert SWEEP_SKILL in MODULE_SKILLS
+    bundle = resources.files("bmad_loop.data").joinpath("skills").joinpath(SWEEP_SKILL)
+    on_disk = sorted(entry.name for entry in bundle.iterdir() if entry.is_file())
+    assert list(bundled_skill_files(SWEEP_SKILL)) == on_disk
+    assert {"SKILL.md", "automation-mode.md", "migration-mode.md"} <= set(on_disk)
+
+
+def test_missing_sweep_skill_complete_deleted_and_partial(tmp_path):
+    """DW-367: the triage tree's `/bmad-loop-sweep` target is probed for the whole
+    bundled file set. Absent dir and partial copy are separate ids; the partial one
+    names exactly the absent rels as a list; both remediate with `init --force-skills`."""
+    from bmad_loop.checks import VALIDATE_CHECKS
+    from bmad_loop.install import SWEEP_SKILL, _copy_skills, missing_sweep_skill
+
+    tree = get_profile("gemini").skill_tree
+
+    # deleted → one skills.sweep-missing problem
+    problems = missing_sweep_skill(tmp_path, [tree])
+    assert [(p.check, p.severity) for p in problems] == [("skills.sweep-missing", "problem")]
+    assert problems[0].detail == {"tree": tree, "skill": SWEEP_SKILL}
+    assert "bmad-loop init --force-skills" in problems[0].message
+    assert f"{tree}/{SWEEP_SKILL}" in problems[0].message
+
+    # what `bmad-loop init` lays down satisfies the probe (fixture parity with init)
+    _copy_skills(tmp_path, [tree], force=False)
+    assert missing_sweep_skill(tmp_path, [tree]) == []
+
+    # partial → one skills.sweep-incomplete problem naming exactly the absent rels
+    skill_dir = tmp_path / tree / SWEEP_SKILL
+    (skill_dir / "automation-mode.md").unlink()
+    (skill_dir / "migration-mode.md").unlink()
+    problems = missing_sweep_skill(tmp_path, [tree])
+    assert [p.check for p in problems] == ["skills.sweep-incomplete"]
+    assert problems[0].severity == "problem"
+    assert problems[0].detail == {
+        "tree": tree,
+        "skill": SWEEP_SKILL,
+        "missing_files": ["automation-mode.md", "migration-mode.md"],
+    }
+    assert "missing automation-mode.md, migration-mode.md" in problems[0].message
+    assert "bmad-loop init --force-skills" in problems[0].message
+
+    # a lone SKILL.md is not a sweep skill either: the mode files are what it reads
+    for extra in skill_dir.iterdir():
+        if extra.name != "SKILL.md":
+            extra.unlink()
+    (only,) = missing_sweep_skill(tmp_path, [tree])
+    assert only.check == "skills.sweep-incomplete"
+    assert "SKILL.md" not in only.detail["missing_files"]
+
+    # a directory where SKILL.md should be is not a usable file
+    (skill_dir / "SKILL.md").unlink()
+    (skill_dir / "SKILL.md").mkdir()
+    (only,) = missing_sweep_skill(tmp_path, [tree])
+    assert "SKILL.md" in only.detail["missing_files"]
+    assert {"skills.sweep", "skills.sweep-missing", "skills.sweep-incomplete"} <= VALIDATE_CHECKS
+
+
+def test_missing_sweep_skill_probes_each_distinct_tree_once(tmp_path):
+    """Duplicate trees collapse (one finding per tree), and distinct trees are
+    answered independently — a complete `.claude` copy never covers a bare `.agents`."""
+    from bmad_loop.install import _copy_skills, missing_sweep_skill
+
+    claude, agents = get_profile("claude").skill_tree, get_profile("gemini").skill_tree
+    assert claude != agents
+    assert len(missing_sweep_skill(tmp_path, [agents, agents])) == 1
+    _copy_skills(tmp_path, [claude], force=False)
+    problems = missing_sweep_skill(tmp_path, [claude, agents])
+    assert [p.detail["tree"] for p in problems] == [agents]
+
+
 def test_missing_stories_support_probes_step01_content(tmp_path):
     from bmad_loop.install import (
         STORIES_PROBE_FILE,

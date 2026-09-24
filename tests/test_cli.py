@@ -34,6 +34,7 @@ from conftest import (
     install_build_auto_skill,
     install_dev_base_skills,
     install_dev_shim,
+    install_sweep_skill,
     machine_json,
     mark_ledger_done,
     plant_root_markers,
@@ -204,6 +205,55 @@ def test_sweep_dry_run_warns_when_preflight_would_abort(project, capsys):
     assert not project.deferred_work.is_file()  # the early-return leg
     assert cli._sweep_dry_run(project, pol) == 0
     assert "NOT runnable" in capsys.readouterr().err
+
+
+def _break_sweep_skill(root: Path, tree: str, how: str) -> None:
+    """Leave ``root/tree``'s `bmad-loop-sweep` deleted outright or partial (its
+    automation mode file gone) — the two DW-367 damage shapes."""
+    import shutil
+
+    skill = root / tree / "bmad-loop-sweep"
+    if how == "deleted":
+        shutil.rmtree(skill)
+    else:
+        (skill / "automation-mode.md").unlink()
+
+
+def test_sweep_dry_run_banner_names_a_broken_sweep_skill(project, capsys):
+    """DW-367: `sweep --dry-run` returns before `_require_sweep_skill`, so the banner
+    mirrors it. rc stays 0 (the preview is still rendered) and the FAIL line goes to
+    stderr. Ablation: drop `require_sweep=True` from `_sweep_dry_run` and this reddens."""
+    from conftest import install_base_skills
+
+    install_base_skills(project)
+    _write_policy(project.project, CLAUDE_ONLY_POLICY)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    assert cli._sweep_dry_run(project, pol) == 0
+    assert "NOT runnable" not in capsys.readouterr().err  # complete → no banner
+
+    _break_sweep_skill(project.project, ".claude/skills", "deleted")
+    assert cli._sweep_dry_run(project, pol) == 0
+    err = capsys.readouterr().err
+    assert "NOT runnable" in err
+    assert "FAIL: .claude/skills/bmad-loop-sweep not found" in err
+    assert "bmad-loop init --force-skills" in err
+
+
+def test_run_dry_run_banner_ignores_the_sweep_skill(project, capsys):
+    """The sweep skill is a sweep-only gate: a story-run preview must not promise an
+    abort `run` never makes. Ablation: default `require_sweep` to True and this reddens."""
+    from conftest import install_base_skills
+
+    install_base_skills(project)
+    _break_sweep_skill(project.project, ".claude/skills", "deleted")
+    _break_sweep_skill(project.project, ".agents/skills", "deleted")
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    _write_policy(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(project, pol, args) == 0
+    assert "NOT runnable" not in capsys.readouterr().err
 
 
 def test_sweep_dry_run_refuses_an_undecodable_ledger(project, capsys):
@@ -3132,6 +3182,7 @@ def test_cmd_sweep_forwards_selector_to_start_sweep(
     monkeypatch.setattr(cli, "_reject_isolation_conflict", lambda _paths, _pol: None)
     monkeypatch.setattr(cli.verify, "worktree_clean", lambda _root: True)
     monkeypatch.setattr(cli, "_require_base_skills", lambda _project, _pol: True)
+    monkeypatch.setattr(cli, "_require_sweep_skill", lambda _project, _pol: True)
     monkeypatch.setattr(cli, "_reconcile_stale", lambda *_args: None)
     monkeypatch.setattr(
         cli,
@@ -7199,6 +7250,45 @@ def test_resume_restamps_policy_snapshot_for_sweep_runs(project, monkeypatch):
     assert load_state(run_dir).cache_read_weight() == 0.5
 
 
+@pytest.mark.parametrize("how", ["deleted", "partial"])
+def test_sweep_resume_refuses_a_broken_sweep_skill_before_any_write(
+    project, monkeypatch, capsys, how
+):
+    """DW-367: a resumed sweep re-dispatches `/bmad-loop-sweep`, so resume refuses a
+    deleted or partial skill — and before the journal row, the pin re-stamp and the
+    engine arm, exactly like the base-skills gate it sits beside.
+    Ablation: delete the `state.run_type == "sweep"` gate in `_prepare_resume_locked`
+    and this reddens on the rc (the stub engine runs)."""
+    from bmad_loop import runs
+
+    run_dir = _paused_run_for_resume(project, monkeypatch, run_type="sweep")
+    runs.write_trusted_config_digest(project.project, run_dir.name, "OLDPIN")
+    _break_sweep_skill(project.project, ".claude/skills", how)
+    armed: list[str] = []
+    monkeypatch.setattr(runs, "write_pid", lambda _d: armed.append("armed"))
+    monkeypatch.setattr(cli, "SweepEngine", _StubEngine)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    err = capsys.readouterr().err
+    assert "FAIL: .claude/skills/bmad-loop-sweep" in err
+    assert "bmad-loop init --force-skills" in err
+    assert "run `bmad-loop validate` for details" in err
+    assert armed == []
+    assert _resume_entries(run_dir) == []
+    assert runs.read_trusted_config_digest(project.project, run_dir.name) == "OLDPIN"
+
+
+def test_story_resume_is_not_gated_on_the_sweep_skill(project, monkeypatch):
+    """A story run never dispatches `/bmad-loop-sweep`, so its resume ignores the
+    skill. Ablation: drop the `run_type` guard on the resume gate and this reddens."""
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    _break_sweep_skill(project.project, ".claude/skills", "deleted")
+    _break_sweep_skill(project.project, ".agents/skills", "deleted")
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+
 # ------------------------------------------- resume re-stamps the code root
 
 # `repo_root:` is the one ProjectPaths member that decides which git TREE the run
@@ -10807,6 +10897,9 @@ def test_validate_reports_an_undecodable_profile_overlay_instead_of_crashing(pro
     assert finding["severity"] == "problem"
     assert "not valid UTF-8" in finding["message"]
     assert str(overlay) in finding["message"]  # the finding names the file at fault
+    # DW-367: no triage tree resolved, so no sweep-skill verdict at all — never a
+    # green `skills.sweep` assembled from an empty probe
+    assert not [f for f in doc["findings"] if f["check"].startswith("skills.sweep")]
 
 
 def test_validate_json_counts_and_ok_agree_with_findings(project, capsys):
@@ -14505,10 +14598,13 @@ def _pinned_sweep_factory(project, monkeypatch, *, policy_text=PIN_POLICY):
     `compose_sweep` is driven by
     `test_auto_sweep_launches_the_profile_bytes_the_gate_validated`."""
     from bmad_loop import bmadconfig
+    from bmad_loop.adapters.profile import get_profile
 
     install_bmad_config(project)
     _write_policy(project.project, policy_text)
     _pin_profile(project)
+    # the triage tree the child sweep dispatches `/bmad-loop-sweep` into
+    install_sweep_skill(project.project, get_profile("mycli", project.project).skill_tree)
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     launched = []
     monkeypatch.setattr(cli, "_start_sweep", _stub_start_sweep(launched))
@@ -14617,6 +14713,9 @@ def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monke
     install_bmad_config(project)
     _write_policy(project.project, PIN_POLICY)
     _pin_profile(project)
+    install_sweep_skill(
+        project.project, profile_mod.get_profile("mycli", project.project).skill_tree
+    )
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     pin = _config_pin(project)
 
@@ -14661,6 +14760,99 @@ def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monke
     # what survives a project rename (the state root is keyed by resolved path), so
     # a launch that stamped only out of tree loses the pin on the first move.
     assert captured["state"].trusted_config_digest == pin
+
+
+@pytest.mark.parametrize("how", ["deleted", "partial"])
+def test_auto_sweep_refuses_a_broken_sweep_skill_before_started(project, monkeypatch, how):
+    """DW-367: the auto-sweep child dispatches `/bmad-loop-sweep` from the triage
+    tree, so a deleted or partial skill raises before `started` can fire — the parent
+    journals `sweep-auto-not-started` and keeps its trigger. Ablation: delete the
+    `missing_sweep_skill` raise in `_sweep_factory` and this reddens (the child launches)."""
+    from bmad_loop.adapters.profile import get_profile
+
+    factory, launched = _pinned_sweep_factory(project, monkeypatch)
+    tree = get_profile("mycli", project.project).skill_tree
+    _break_sweep_skill(project.project, tree, how)
+
+    with pytest.raises(RuntimeError, match=r"bmad-loop init --force-skills"):
+        factory("epic-boundary", started=_never_started)
+    assert launched == []
+
+
+def _commit_all(project, message: str) -> None:
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "--allow-empty", "-m", message)
+
+
+@pytest.mark.parametrize("how", ["deleted", "partial"])
+def test_sweep_refuses_a_broken_sweep_skill_before_any_run_dir(project, monkeypatch, capsys, how):
+    """DW-367 acceptance: a triage tree lacking a complete `bmad-loop-sweep` makes
+    `bmad-loop sweep` exit 1 naming the tree and `init --force-skills`, with no engine
+    started and no run directory created. Every other preflight passes (the fixture is
+    `validate`-clean) so the refusal is this gate's and no one else's.
+    Ablation: delete the `_require_sweep_skill` call in `cmd_sweep` and this reddens."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    _break_sweep_skill(project.project, ".claude/skills", how)
+    _commit_all(project, "break the sweep skill")
+    started: list = []
+    monkeypatch.setattr(cli, "_start_sweep", lambda *a, **kw: started.append(kw) or 0)
+
+    assert cli.main(["sweep", "--no-prompt", "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert "FAIL: .claude/skills/bmad-loop-sweep" in err
+    assert "bmad-loop init --force-skills" in err
+    assert "run `bmad-loop validate` for details" in err
+    assert started == []
+    runs_root = project.project / runs.RUNS_DIR
+    assert not runs_root.exists() or list(runs_root.iterdir()) == []
+
+
+def test_sweep_passes_the_gate_on_a_complete_sweep_skill(project, monkeypatch, capsys):
+    """The positive leg of the row above, so its refusal is not green for a reason
+    unrelated to the skill."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    started: list = []
+    monkeypatch.setattr(cli, "_start_sweep", lambda *a, **kw: started.append(kw) or 0)
+
+    assert cli.main(["sweep", "--no-prompt", "--project", str(project.project)]) == 0
+    assert len(started) == 1
+
+
+def test_validate_reports_the_sweep_skill_ok_then_incomplete(project, monkeypatch, capsys):
+    """DW-367 acceptance: `validate --json` reports ok `skills.sweep` on an init'd
+    project, and a failed `skills.sweep-incomplete` naming the missing file with rc 1
+    once a mode file is gone."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    ok = _validate_findings(project, capsys)["skills.sweep"]
+    assert ok["severity"] == "ok"
+    assert ok["detail"]["trees"] == [".claude/skills"]
+
+    _break_sweep_skill(project.project, ".claude/skills", "partial")
+    _commit_all(project, "break the sweep skill")
+    findings = _validate_findings(project, capsys, rc=1)
+    assert "skills.sweep" not in findings
+    bad = findings["skills.sweep-incomplete"]
+    assert bad["severity"] == "problem"
+    assert bad["detail"]["missing_files"] == ["automation-mode.md"]
+    assert bad["detail"]["tree"] == ".claude/skills"
+
+
+def test_validate_probes_only_the_triage_tree_for_the_sweep_skill(project, monkeypatch, capsys):
+    """Distinct trees: dev on claude, triage on gemini. Only the triage profile's
+    tree is asked about `bmad-loop-sweep` — the dev tree losing it changes nothing,
+    the triage tree losing it fails naming that tree."""
+    policy = CLAUDE_ONLY_POLICY + '[adapter.triage]\nname = "gemini"\n'
+    _make_validate_pass(project, monkeypatch, capsys, policy=policy)
+    _break_sweep_skill(project.project, ".claude/skills", "deleted")
+    _commit_all(project, "drop the dev tree's sweep skill")
+    assert _validate_findings(project, capsys)["skills.sweep"]["detail"]["trees"] == [
+        ".agents/skills"
+    ]
+
+    _break_sweep_skill(project.project, ".agents/skills", "deleted")
+    _commit_all(project, "drop the triage tree's sweep skill")
+    bad = _validate_findings(project, capsys, rc=1)["skills.sweep-missing"]
+    assert bad["detail"] == {"tree": ".agents/skills", "skill": "bmad-loop-sweep"}
 
 
 def test_run_pins_the_profile_bytes_it_launches(project, monkeypatch):

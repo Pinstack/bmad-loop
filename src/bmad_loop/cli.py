@@ -1005,6 +1005,21 @@ def cmd_validate(args: argparse.Namespace) -> int:
     report.extend(base_findings)
     report.extend(install.dev_primitive_warnings(project, dev_trees))
 
+    # The triage tree's `bmad-loop-sweep`, probed exactly as `_require_sweep_skill`
+    # probes it so validate and the sweep refusal agree. Only when a triage tree
+    # resolved: an unloadable triage profile is already reported above, and an ok
+    # line over an empty probe would be a green sentence about nothing.
+    triage_trees = _triage_trees(project, pol) if pol is not None else []
+    if triage_trees:
+        sweep_findings = install.missing_sweep_skill(project, triage_trees)
+        if not sweep_findings:
+            report.ok(
+                "skills.sweep",
+                f"{install.SWEEP_SKILL} present ({', '.join(triage_trees)})",
+                {"trees": triage_trees, "skill": install.SWEEP_SKILL},
+            )
+        report.extend(sweep_findings)
+
     if getattr(args, "json", False):
         # getattr, not args.json: cmd_validate is called directly by tests (and by
         # anything holding a hand-built Namespace) that predate the flag.
@@ -1347,7 +1362,11 @@ def _warn_bypass_dropped(pol, project: Path, roles: tuple[str, ...]) -> None:
 
 
 def _warn_preflight_would_abort(
-    paths: bmadconfig.ProjectPaths, pol, *, require_stories: bool = False
+    paths: bmadconfig.ProjectPaths,
+    pol,
+    *,
+    require_stories: bool = False,
+    require_sweep: bool = False,
 ) -> None:
     """Dry-run honesty banner: say so when the real command would refuse to run.
 
@@ -1385,12 +1404,21 @@ def _warn_preflight_would_abort(
     The exit code deliberately stays 0. A dry-run is a diagnostic — refusing to
     print the schedule would withhold the very thing the operator asked for, and
     every existing caller reads rc 0 as "the preview rendered", not as "the
-    project is ready". The banner goes to stderr so stdout stays the preview."""
+    project is ready". The banner goes to stderr so stdout stays the preview.
+
+    ``require_sweep`` (the sweep dry-run) also mirrors `_require_sweep_skill`:
+    the triage tree's ``bmad-loop-sweep`` is a sweep-only gate, so a story-run
+    preview must not promise an abort over it."""
     trees = _skill_trees(paths.project, pol)
     problems = [
         p.message
         for p in install.missing_base_skills(paths.project, trees)
         + (install.missing_stories_support(paths.project, trees) if require_stories else [])
+        + (
+            install.missing_sweep_skill(paths.project, _triage_trees(paths.project, pol))
+            if require_sweep
+            else []
+        )
         if p.severity == "problem"
     ]
     conflict = bmadconfig.worktree_isolation_conflict(paths, pol.scm.isolation)
@@ -1504,6 +1532,40 @@ def _require_base_skills(project: Path, pol, *, require_stories: bool = False) -
         print("run `bmad-loop validate` for details", file=sys.stderr)
         return False
     return True
+
+
+def _triage_trees(project: Path, pol) -> list[str]:
+    """The skill tree the triage adapter reads — where a sweep dispatches
+    ``/bmad-loop-sweep``. A list (empty or one entry) so it composes with the
+    ``Sequence[str]`` probes; an unloadable profile is skipped exactly as
+    :func:`_skill_trees` skips one, since an unknown adapter name is the policy
+    loader's problem, not the skill probe's.
+
+    Separate from :func:`_skill_trees` on purpose, not a widening of it: that
+    helper's role set is the one `WorktreeFlow.worktree_profiles` provisions and
+    every question it answers is a dev-primitive one (see its docstring)."""
+    from .adapters.profile import ProfileError, get_profile
+
+    try:
+        return [get_profile(pol.adapter.resolved("triage").name, project).skill_tree]
+    except ProfileError:
+        return []
+
+
+def _require_sweep_skill(project: Path, pol) -> bool:
+    """Preflight the triage tree for the complete bundled ``bmad-loop-sweep`` skill.
+
+    Returns True when it is in place; otherwise prints each problem as a ``FAIL:``
+    line plus the validate hint to stderr and returns False, so every entrypoint
+    that is about to dispatch ``/bmad-loop-sweep`` can refuse before any side
+    effect instead of stalling each triage session at ``Unknown command``."""
+    problems = install.missing_sweep_skill(project, _triage_trees(project, pol))
+    if not problems:
+        return True
+    for problem in problems:
+        print(f"FAIL: {problem.message}", file=sys.stderr)
+    print("run `bmad-loop validate` for details", file=sys.stderr)
+    return False
 
 
 def _stories_mode(args: argparse.Namespace, pol) -> tuple[bool, str]:
@@ -2631,6 +2693,14 @@ def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths, trusted_digest
         # `started` leaves the parent's trigger unspent.
         if (found := verify.git_below_floor(paths.project)) is not None:
             raise RuntimeError(verify.under_floor_git_message(found))
+        # The child's triage sessions dispatch `/bmad-loop-sweep` from this `pol`'s
+        # triage tree; a deleted or partial skill would stall each one at `Unknown
+        # command`. Raise, not return, for the reason above. The tree comes off the
+        # frozen `profiles` read, not `_triage_trees`' fresh one, so the probe asks
+        # about the exact tree the child is about to launch into.
+        triage_tree = profiles["triage"].skill_tree
+        if sweep_problems := install.missing_sweep_skill(project, [triage_tree]):
+            raise RuntimeError("; ".join(p.message for p in sweep_problems))
         _start_sweep(
             project,
             paths,
@@ -2706,6 +2776,9 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         return 1
 
     if not _require_base_skills(project, pol):
+        return 1
+
+    if not _require_sweep_skill(project, pol):
         return 1
 
     _reconcile_stale(project, paths, pol)
@@ -2855,7 +2928,7 @@ def _sweep_dry_run(
 ) -> int:
     # Before the no-ledger early return below: a broken install is worth saying so
     # about whether or not there is anything to sweep.
-    _warn_preflight_would_abort(paths, pol)
+    _warn_preflight_would_abort(paths, pol, require_sweep=True)
     ledger = paths.deferred_work
     # OBSERVATION arm of the ledger-read contract (DW-146): this listing writes
     # nothing, but it is an OPERATOR SURFACE, so degrading to an empty document
@@ -3057,6 +3130,11 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
     if (rc := _reject_isolation_conflict(paths, pol)) is not None:
         return rc
     if not _require_base_skills(project, pol, require_stories=state.source == "stories"):
+        return 1
+    # A resumed sweep re-dispatches `/bmad-loop-sweep`; a story run never does, so
+    # only the sweep arm is gated. Same placement constraint as the gate above:
+    # ahead of every journal/pin/stop-request side effect below.
+    if state.run_type == "sweep" and not _require_sweep_skill(project, pol):
         return 1
     journal = Journal(run_dir)
     # Read the outgoing weight BEFORE the re-stamp below replaces it: the

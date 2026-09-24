@@ -78,6 +78,7 @@ from conftest import (
     bind_recorded_child,
     install_build_auto_skill,
     install_dev_base_skills,
+    install_sweep_skill,
     kill_recorded_child,
     preflight_pidfd_support,
     proc_starttime,
@@ -616,6 +617,8 @@ def _scaffold_sweep(root: Path) -> None:
 
     # the SAME folder+id-capable skill stubs the other scaffolds install
     install_dev_base_skills(root, folder_id=True)  # tree matches PROFILE_TOML's skill_tree
+    # the triage session dispatches `/bmad-loop-sweep`, as `bmad-loop init` lays it down
+    install_sweep_skill(root)
 
     # canonical DW-format ledger (no legacy content → migration is skipped)
     (impl / "deferred-work.md").write_text(

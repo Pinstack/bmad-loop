@@ -1415,11 +1415,33 @@ def install_base_skills(paths: ProjectPaths, trees=(".claude/skills", ".agents/s
 
     BASE_SKILLS names BOTH primitive eras, so this lays down both and the tree
     resolves to `bmad-build-auto`. For a single-era scaffold use
-    :func:`install_dev_base_skills` (legacy) or :func:`install_build_auto_skill`."""
+    :func:`install_dev_base_skills` (legacy) or :func:`install_build_auto_skill`.
+    Each tree also gets a real copy of the bundled `bmad-loop-sweep`
+    (:func:`install_sweep_skill`), as `bmad-loop init` would lay it down."""
     from bmad_loop.install import BASE_SKILLS
 
     for tree in trees:
         _write_skill_stubs(paths.project / tree, BASE_SKILLS)
+        install_sweep_skill(paths.project, tree)
+
+
+def install_sweep_skill(root: Path, tree: str = ".claude/skills") -> Path:
+    """Copy the wheel's bundled `bmad-loop-sweep` into ``root/tree``, the way
+    `bmad-loop init` lays it down, so the triage-tree preflight
+    (`install.missing_sweep_skill`) passes for the right reason: the file set it
+    requires is read from the same bundle, so a stub list here would drift the
+    moment a mode file is added. Idempotent. Returns the skill directory."""
+    from importlib import resources
+
+    from bmad_loop.install import SWEEP_SKILL, bundled_skill_files
+
+    src = resources.files("bmad_loop.data").joinpath("skills").joinpath(SWEEP_SKILL)
+    dst = Path(root) / tree / SWEEP_SKILL
+    for rel in bundled_skill_files(SWEEP_SKILL):
+        target = dst.joinpath(*rel.split("/"))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(src.joinpath(*rel.split("/")).read_bytes())
+    return dst
 
 
 def attach_profile(adapter, name: str = "claude", project: Path | None = None):
