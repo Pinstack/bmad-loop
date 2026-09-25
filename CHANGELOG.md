@@ -330,6 +330,13 @@ breaking changes may land in a minor release.
   pinned root before every later git call on it and skip `worktree remove` on a replaced
   root, pruning instead (DW-425); create missing candidate parents on Windows through
   handle-relative opens that refuse a junction (DW-420).
+- Create missing artifact destination parents, and a missing artifacts directory, through
+  anchored no-follow opens pinned to the accepted root instead of `mkdir(parents=True)`, so
+  a root swapped for a link gets nothing created outside the repository (DW-421). On
+  Windows and no-dir-fd hosts, refuse a directory junction at or below the artifacts
+  directory (capture records it `nonregular`) and pin the path-based fallback reads to the
+  accepted root; junctions above it still work, except that creating a MISSING artifacts
+  directory refuses a junctioned ancestor on Windows — pre-create it (DW-422).
 
 ## [0.12.0] — 2026-09-20
 

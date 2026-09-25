@@ -1,9 +1,11 @@
 """Publication authority and byte preservation without involving receipt proof."""
 
 import base64
+import errno
 import hashlib
 import json
 import os
+import shutil
 import stat
 import sys
 import time
@@ -1912,6 +1914,7 @@ def test_destination_edit_during_fsync_refuses_replace(publication_case, monkeyp
         monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
         monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
         monkeypatch.setattr(publication, "DIR_FD_ANCHORED_WRITES", False)
+        monkeypatch.setattr(publication, "HANDLE_ANCHORED_WRITES", False)
     monkeypatch.setattr(os, "fsync", edit_during_fsync)
     with pytest.raises(publication.PublicationError, match="changed during publication"):
         publication.publish(task, paths)
@@ -1968,10 +1971,21 @@ def test_source_swap_between_check_and_read_is_refused(publication_case, monkeyp
     assert (outside / report.name).read_bytes() == b"outside secrets"
 
 
+def _plant_directory_redirect(link, target):
+    """A directory redirect at ``link``: a symlink on POSIX; on win32 a JUNCTION,
+    the redirect an unprivileged session can plant (see test_recovery_flow)."""
+    if sys.platform == "win32":
+        import _winapi  # Windows-only stdlib module
+
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
 def _swap_publication_root(root, outside):
-    """Replace the in-checkout artifact root with a link to ``outside`` (DW-338)."""
+    """Replace the in-checkout artifact root with a redirect to ``outside`` (DW-338)."""
     root.rename(root.with_name(root.name + "-aside"))
-    root.symlink_to(outside, target_is_directory=True)
+    _plant_directory_redirect(root, outside)
 
 
 @pytest.mark.skipif(not publication.DIR_FD_ANCHORED_WRITES, reason="POSIX descriptor reads")
@@ -2139,28 +2153,29 @@ def test_root_swapped_before_the_destination_relookup_is_refused(publication_cas
 
 
 def test_publish_refuses_when_the_root_identity_cannot_be_retaken(publication_case, monkeypatch):
-    """DW-338: `publish` re-takes the root identity after its mkdir; a root gone
-    by then has no identity, and a pinned caller refuses rather than handing the
-    writer `root_identity=None` (an unpinned write).
+    """DW-338/DW-421: `_make_parents` creates a root it found missing and then
+    re-takes the root identity; a root that still has none by then is refused
+    rather than handing the parent creation and the writer `root_identity=None`
+    (an unpinned walk and write).
 
-    Ablation: delete the `if root_identity is None: raise` guard in `publish`
-    and this fails `DID NOT RAISE` — the payload is written unpinned."""
+    Ablation: delete the `if root_identity is None: raise` guard in
+    `_make_parents` and this fails `DID NOT RAISE` — the payload is written
+    unpinned."""
     task, paths, source = publication_case
     bind_and_prepare(task, paths, source)
     confined = publication._confined
-    calls_from_publish = []
+    calls_from_make_parents = []
 
-    def lose_root_after_mkdir(root, path):
-        if sys._getframe(1).f_code.co_name == "publish":
-            calls_from_publish.append(path)
-            if len(calls_from_publish) == 2:  # the re-take after the mkdir
-                return None
+    def lose_root_identity(root, path):
+        if sys._getframe(1).f_code.co_name == "_make_parents":
+            calls_from_make_parents.append(path)
+            return None  # the first look and the re-take after creation
         return confined(root, path)
 
-    monkeypatch.setattr(publication, "_confined", lose_root_after_mkdir)
+    monkeypatch.setattr(publication, "_confined", lose_root_identity)
     with pytest.raises(publication.PublicationError, match="artifact directory is missing"):
         publication.publish(task, paths)
-    assert len(calls_from_publish) == 2
+    assert len(calls_from_make_parents) == 2
     assert not (paths.implementation_artifacts / "report.bin").exists()
     assert not task.artifact_publication_complete
 
@@ -2195,3 +2210,392 @@ def test_undecodable_accepted_spec_refuses_intent(publication_case):
     with pytest.raises(UnicodeDecodeError):
         bind_and_prepare(task, paths, source)
     assert task.artifact_payload is None
+
+
+_JUNCTION_TAG = 0xA0000003  # IO_REPARSE_TAG_MOUNT_POINT
+
+
+class _JunctionStat:
+    """`os.lstat` stand-in for a win32 directory junction: a DIRECTORY mode (so
+    `S_ISLNK` misses it) carrying a reparse tag, with the real directory's
+    identity so an accepted root identity still pins (see test_platform_util's
+    `_ReparseStat`)."""
+
+    st_reparse_tag = _JUNCTION_TAG
+
+    def __init__(self, real):
+        self.st_mode = stat.S_IFDIR | 0o755
+        self.st_dev = real.st_dev
+        self.st_ino = real.st_ino
+        self.st_size = real.st_size
+
+
+def _simulate_junctions(monkeypatch, *junctions):
+    """Make `os.lstat` report each of ``junctions`` as a win32 junction."""
+    wanted = {str(path) for path in junctions}
+    real_lstat = os.lstat
+
+    def lstat(path, *args, **kwargs):
+        real = real_lstat(path, *args, **kwargs)
+        return _JunctionStat(real) if str(path) in wanted else real
+
+    monkeypatch.setattr(platform_util, "_LINK_REPARSE_TAGS", (_JUNCTION_TAG,))
+    monkeypatch.setattr(os, "lstat", lstat)
+
+
+def _force_path_fallback(monkeypatch):
+    """Neither handle arm: path-based reads, parent creation and writes."""
+    monkeypatch.setattr(publication, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(publication, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
+
+
+def _declare_nested_deliverable(task, paths, source, relative):
+    output = source.implementation_artifacts / relative
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(b"nested correction")
+    (source.implementation_artifacts / "spec.md").write_text(
+        f"---\nstatus: done\nartifact_deliverables: [{relative}]\n---\n"
+    )
+    publication.capture(task, paths)
+    bind_and_prepare(task, paths, source)
+
+
+@pytest.mark.parametrize("where", ["root", "below"])
+def test_confined_refuses_a_junction_at_or_below_the_artifacts_root(
+    publication_case, monkeypatch, where
+):
+    """DW-422: a win32 junction's `lstat` is `S_IFDIR`, so the `S_ISLNK` refusal
+    alone accepted it and the path-based fallback reads followed it. `_confined`
+    refuses a link-like reparse point at the artifacts root and below it.
+
+    Ablation: delete the `link_like_stat` refusal in `_confined` and this fails
+    `DID NOT RAISE`."""
+    _task, paths, _source = publication_case
+    root = paths.implementation_artifacts
+    nested = root / "nested"
+    nested.mkdir()
+    report = nested / "report.bin"
+    report.write_bytes(b"inside")
+    assert publication._confined(root, report) is not None  # positive control
+    _simulate_junctions(monkeypatch, root if where == "root" else nested)
+    with pytest.raises(publication.PublicationError, match="reparse point"):
+        publication._confined(root, report)
+
+
+@pytest.mark.parametrize("where", ["repo_root", "intermediate"])
+def test_a_junction_above_the_artifacts_root_is_accepted(publication_case, monkeypatch, where):
+    """DW-422, recorded decision "refuse below root only": the repository root
+    and the directories between it and the artifacts root are the operator's
+    layout, so a junction there keeps working — `_confined`, `_root`, capture
+    and publish all accept it.
+
+    Ablation: drop the `part.is_relative_to(root)` scope of the reparse refusal
+    in `_confined`, or revert `_root` to `_confined(paths.repo_root, root)`, and
+    this fails with `link-like reparse point`."""
+    task, paths, source = publication_case
+    root = paths.implementation_artifacts
+    junction = paths.repo_root if where == "repo_root" else root.parent
+    assert root.parent != paths.repo_root  # the layout has an intermediate
+    _simulate_junctions(monkeypatch, junction)
+    assert platform_util.link_like_stat(os.lstat(junction))  # the simulation is live
+    assert publication._confined(root, root / "report.bin") is not None
+    assert publication._root(paths) == root
+    publication.capture(task, paths)
+    bind_and_prepare(task, paths, source)
+    publication.publish(task, paths)
+    assert (root / "report.bin").read_bytes() == b"\xff\x00\r\nreport"
+    assert task.artifact_publication_complete
+
+
+def _swap_root_after_confined(monkeypatch, root, outside, *, caller=None, nested_only=False):
+    """Swap ``root`` for a link to ``outside`` right after one `_confined` call
+    (optionally only one made from ``caller``) accepted it."""
+    confined = publication._confined
+    swapped = []
+
+    def confined_then_swap(walk_root, path):
+        identity = confined(walk_root, path)
+        if (
+            not swapped
+            and (caller is None or sys._getframe(1).f_code.co_name == caller)
+            and (not nested_only or path.parent != walk_root)
+        ):
+            _swap_publication_root(root, outside)
+            swapped.append(True)
+        return identity
+
+    monkeypatch.setattr(publication, "_confined", confined_then_swap)
+    return swapped
+
+
+@pytest.mark.parametrize("reader", ["contents", "size", "identity"])
+def test_fallback_reads_refuse_a_root_swapped_after_confined(publication_case, monkeypatch, reader):
+    """DW-422: without descriptor-relative reads, `_open_regular`, `_file_size`
+    and `_destination_path_identity` read by path; a root replaced by a link
+    after `_confined` accepted it is caught by the `_still_pinned` lstat compare,
+    so the outside file is never read, measured or identified.
+
+    Ablation: delete the `_still_pinned` check in the matching fallback arm and
+    this fails — `outside secrets`, its size, or its identity comes back. The
+    swap is a symlink on POSIX and a junction on win32, this fallback's host."""
+    _task, paths, _source = publication_case
+    monkeypatch.setattr(publication, "DIR_FD_ANCHORED_WRITES", False)
+    root = paths.implementation_artifacts
+    report = root / "report.bin"
+    report.write_bytes(b"inside")
+    outside = paths.project.parent / "outside-artifacts"
+    outside.mkdir()
+    (outside / report.name).write_bytes(b"outside secrets")
+    swapped = _swap_root_after_confined(monkeypatch, root, outside)
+    if reader == "identity":
+        assert publication._destination_path_identity(root, report) is None
+    else:
+        read = publication._contents if reader == "contents" else publication._file_size
+        with pytest.raises(publication.PublicationError, match="replaced"):
+            read(root, report)
+    assert swapped
+
+
+def test_fallback_capture_refuses_a_root_swapped_after_confined(publication_case, monkeypatch):
+    """DW-422, `capture` without descriptor-relative inventory: a root replaced
+    by a link to an empty outside directory after `walk`'s `_confined` is
+    refused, and no baseline is recorded.
+
+    Ablation: delete the `_still_pinned` check in `walk`'s fallback and this
+    fails `DID NOT RAISE` — the outside directory becomes an empty baseline."""
+    task, paths, _source = publication_case
+    monkeypatch.setattr(publication, "DIR_FD_ANCHORED_WRITES", False)
+    root = paths.implementation_artifacts
+    outside = paths.project.parent / "outside-artifacts"
+    outside.mkdir()
+    task.artifact_baseline = None
+    swapped = _swap_root_after_confined(monkeypatch, root, outside, caller="walk")
+    with pytest.raises(publication.PublicationError, match="replaced"):
+        publication.capture(task, paths)
+    assert swapped
+    assert task.artifact_baseline is None
+
+
+@pytest.mark.parametrize("fallback", [False, True], ids=["descriptor", "fallback"])
+def test_capture_inventories_a_link_like_directory_as_nonregular(
+    publication_case, monkeypatch, fallback
+):
+    """DW-422: a junction entry under the artifacts root reports `S_IFDIR`, so
+    `walk` recursed into it. It is inventoried `"nonregular"`, as a POSIX
+    symlink entry is, and never walked.
+
+    Ablation: drop the `link_like_stat` arm in `walk` and this fails — the entry
+    is a `"directory"` and `linked/secret.md` is inventoried."""
+    task, paths, _source = publication_case
+    root = paths.implementation_artifacts
+    linked = root / "linked"
+    linked.mkdir()
+    (linked / "secret.md").write_text("behind the junction")
+    (root / "plain.md").write_text("inventoried")
+    if fallback:
+        monkeypatch.setattr(publication, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "_LINK_REPARSE_TAGS", (_JUNCTION_TAG,))
+    real_scandir = os.scandir
+
+    class _Entry:
+        def __init__(self, entry):
+            self._entry = entry
+            self.name = entry.name
+
+        def stat(self, *, follow_symlinks=True):
+            real = self._entry.stat(follow_symlinks=follow_symlinks)
+            return _JunctionStat(real) if self.name == linked.name else real
+
+    @contextmanager
+    def scandir(target):
+        with real_scandir(target) as entries:
+            yield [_Entry(entry) for entry in entries]
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    publication.capture(task, paths)
+    assert task.artifact_baseline["linked"] == "nonregular"
+    assert "linked/secret.md" not in task.artifact_baseline
+    assert "plain.md" in task.artifact_baseline  # the walk itself still ran
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink swap")
+@pytest.mark.parametrize("fallback", [False, True], ids=["descriptor", "fallback"])
+def test_root_swapped_before_parent_creation_creates_nothing_outside(
+    publication_case, monkeypatch, fallback
+):
+    """DW-421: `publish` created missing parents with `mkdir(parents=True)`,
+    which follows a root swapped for a link after `_confined`, so empty
+    directories landed outside the repository before the pinned writer refused.
+    `_make_parents` creates them anchored below the root pinned to the accepted
+    identity, so the swap is refused and nothing is created outside.
+
+    Ablation: drop `root_identity=` from `_create_directories`'
+    `open_dir_confined` call (descriptor), or its `_root_still_pinned` check
+    (fallback), and this fails — `errata/` is created inside `outside`."""
+    task, paths, source = publication_case
+    if not fallback and not publication.DIR_FD_ANCHORED_WRITES:
+        pytest.skip("descriptor-relative writes are unavailable")
+    _declare_nested_deliverable(task, paths, source, "errata/nested/correction.md")
+    root = paths.implementation_artifacts
+    outside = paths.project.parent / "outside-artifacts"
+    outside.mkdir()
+    if fallback:
+        _force_path_fallback(monkeypatch)
+    swapped = _swap_root_after_confined(
+        monkeypatch, root, outside, caller="_make_parents", nested_only=True
+    )
+    refusal = "was replaced" if fallback else "could not be opened"
+    with pytest.raises(publication.PublicationError, match=refusal):
+        publication.publish(task, paths)
+    assert swapped
+    assert list(outside.iterdir()) == []
+    assert not task.artifact_publication_complete
+
+
+@pytest.mark.parametrize("fallback", [False, True], ids=["descriptor", "fallback"])
+def test_publish_creates_a_missing_artifacts_root(publication_case, monkeypatch, fallback):
+    """DW-421: with `implementation_artifacts` absent and an empty baseline,
+    `_make_parents` creates the root by an anchored walk from the repository
+    root, re-takes its identity, and creates the nested parents pinned to it.
+    The handle variant runs the POSIX `dir_fd` arm, and on win32 the
+    `open_at(O_CREAT | AT_DIRECTORY | AT_NOFOLLOW)` arm.
+
+    Ablation: delete the `_create_directories(repo_root, root, ...)` call in
+    `_make_parents` and this fails with `artifact directory is missing`."""
+    task, paths, source = publication_case
+    if not fallback and not publication.HANDLE_ANCHORED_WRITES:
+        pytest.skip("handle-anchored writes are unavailable")
+    root = paths.implementation_artifacts
+    shutil.rmtree(root)
+    _declare_nested_deliverable(task, paths, source, "errata/correction.md")
+    assert task.artifact_baseline == {}
+    if fallback:
+        _force_path_fallback(monkeypatch)
+    publication.publish(task, paths)
+    assert (root / "errata" / "correction.md").read_bytes() == b"nested correction"
+    assert task.artifact_publication_complete
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink swap")
+@pytest.mark.parametrize("fallback", [False, True], ids=["descriptor", "fallback"])
+def test_missing_root_with_a_swapped_ancestor_creates_nothing_outside(
+    publication_case, monkeypatch, fallback
+):
+    """DW-421: creating a missing root walks from the repository root without
+    following a link, so an intermediate directory swapped for a link after
+    `_make_parents` found the root missing gets nothing created through it.
+
+    Ablation: replace the `_create_directories(repo_root, root, ...)` call with
+    `root.mkdir(parents=True, exist_ok=True)` and this fails —
+    `implementation-artifacts/` is created inside `outside`."""
+    task, paths, source = publication_case
+    if not fallback and not publication.DIR_FD_ANCHORED_WRITES:
+        pytest.skip("descriptor-relative writes are unavailable")
+    root = paths.implementation_artifacts
+    intermediate = root.parent
+    assert intermediate != paths.repo_root
+    shutil.rmtree(root)
+    _declare_nested_deliverable(task, paths, source, "errata/correction.md")
+    outside = paths.project.parent / "outside-output"
+    outside.mkdir()
+    if fallback:
+        _force_path_fallback(monkeypatch)
+    swapped = _swap_root_after_confined(monkeypatch, intermediate, outside, caller="_make_parents")
+    if fallback:
+        with pytest.raises(publication.PublicationError, match="is redirected"):
+            publication.publish(task, paths)
+    else:
+        with pytest.raises(OSError) as refused:
+            publication.publish(task, paths)
+        assert refused.value.errno in (errno.ELOOP, errno.ENOTDIR)  # the no-follow open
+    assert swapped
+    assert list(outside.iterdir()) == []
+    assert not task.artifact_publication_complete
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="real win32 directory junction")
+def test_a_real_junction_below_the_artifacts_root_is_refused(publication_case, tmp_path):
+    """DW-422 on a real win32 junction under the artifacts root: `_confined`
+    refuses it, capture inventories it `"nonregular"` without walking it, and a
+    deliverable declared beneath it is refused with nothing written into the
+    junction's target.
+
+    Ablation: delete the `link_like_stat` refusal in `_confined` (and its arm in
+    `walk`) and this fails — the junction is walked and published through."""
+    import _winapi  # Windows-only stdlib module, as test_win32_at uses it
+
+    task, paths, source = publication_case
+    root = paths.implementation_artifacts
+    target = tmp_path / "junction-target"
+    target.mkdir()
+    (target / "secret.md").write_text("behind the junction")
+    junction = root / "linked"
+    _winapi.CreateJunction(str(target), str(junction))
+    with pytest.raises(publication.PublicationError, match="reparse point"):
+        publication._confined(root, junction / "secret.md")
+    publication.capture(task, paths)
+    assert task.artifact_baseline["linked"] == "nonregular"
+    assert "linked/secret.md" not in task.artifact_baseline
+    output = source.implementation_artifacts / "linked" / "report.md"
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b"report")
+    (source.implementation_artifacts / "spec.md").write_text(
+        "---\nstatus: done\nartifact_deliverables: [linked/report.md]\n---\n"
+    )
+    bind_and_prepare(task, paths, source)
+    with pytest.raises(publication.PublicationError, match="reparse point"):
+        publication.publish(task, paths)
+    assert sorted(entry.name for entry in target.iterdir()) == ["secret.md"]
+    assert not task.artifact_publication_complete
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="real win32 directory junction")
+def test_a_real_junction_above_the_artifacts_root_is_accepted(publication_case, tmp_path):
+    """DW-422 decision "refuse below root only" on a real win32 junction: the
+    directory between the repository root and the artifacts root is moved out
+    and junctioned back, and `_confined`, `_root` and publish still accept it.
+
+    Ablation: drop the `part.is_relative_to(root)` scope of the reparse refusal
+    in `_confined` and this fails with `link-like reparse point`."""
+    import _winapi  # Windows-only stdlib module, as test_win32_at uses it
+
+    task, paths, source = publication_case
+    root = paths.implementation_artifacts
+    intermediate = root.parent
+    assert intermediate != paths.repo_root
+    relocated = tmp_path / "relocated-output"
+    intermediate.rename(relocated)
+    _winapi.CreateJunction(str(relocated), str(intermediate))
+    assert publication._confined(root, root / "report.bin") is not None
+    assert publication._root(paths) == root
+    bind_and_prepare(task, paths, source)
+    publication.publish(task, paths)
+    assert (relocated / root.name / "report.bin").read_bytes() == b"\xff\x00\r\nreport"
+    assert task.artifact_publication_complete
+
+
+@pytest.mark.skipif(not platform_util.HANDLE_ANCHORED_WRITES, reason="handle-anchored creation")
+def test_create_directories_refuses_a_redirected_component(publication_case, tmp_path):
+    """DW-421: `_create_directories` opens every component no-follow relative to
+    the one above — `O_NOFOLLOW` on POSIX, `open_at(O_CREAT | AT_DIRECTORY |
+    AT_NOFOLLOW)` on win32 — so a component planted as a redirect (a symlink, or
+    a junction on win32) is refused and nothing is created through it.
+
+    Ablation: drop `O_NOFOLLOW` (POSIX arm) or `AT_NOFOLLOW` (win32 arm) from
+    `_create_directories` and this fails `DID NOT RAISE` — `inner` is created
+    inside `outside`."""
+    _task, paths, _source = publication_case
+    root = paths.implementation_artifacts
+    identity = platform_util.pinned_root_identity(root)
+    assert identity is not None
+    publication._create_directories(root, root / "plain" / "inner", root_identity=identity)
+    assert (root / "plain" / "inner").is_dir()  # positive control
+    outside = tmp_path / "outside-dir"
+    outside.mkdir()
+    _plant_directory_redirect(root / "outer", outside)
+    with pytest.raises(OSError) as refused:
+        publication._create_directories(root, root / "outer" / "inner", root_identity=identity)
+    assert refused.value.errno in (errno.ELOOP, errno.ENOTDIR)
+    assert list(outside.iterdir()) == []

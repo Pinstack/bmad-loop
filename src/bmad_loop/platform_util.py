@@ -953,6 +953,20 @@ def is_link_like(path: Path) -> bool:
         return False
 
 
+def link_like_stat(info: os.stat_result) -> bool:
+    """:func:`is_link_like` over a stat the caller already took with
+    ``follow_symlinks=False`` (an ``os.lstat`` or a ``DirEntry.stat``): True for
+    ``S_IFLNK``, and on win32 for a symlink or DIRECTORY JUNCTION reparse tag
+    (:data:`_LINK_REPARSE_TAGS`), whose mode is ``S_IFDIR``.
+
+    One predicate over one observation, so a caller that also reads the mode or
+    the identity from that stat never answers the link question about a second,
+    later ``lstat`` of the same name."""
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    return getattr(info, "st_reparse_tag", 0) in _LINK_REPARSE_TAGS  # win32-only field
+
+
 class UnconfinedWriteError(OSError):
     """A confined write refused: the path is not under its root, or a component
     below that root is a link, is missing, or cannot be probed.
