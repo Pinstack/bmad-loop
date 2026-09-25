@@ -79,6 +79,11 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Stop charging an attempt for a session of any role that times out having consumed zero tokens (a
+  provider quota stall): a `timeout` with tracked zero usage is now an environment fault, so the
+  run pauses and re-arm restores the attempt. `claude-jsonl` and `opencode-http` usage with no
+  usage signal now reads as untracked — `session-end` journals `tokens`/`tokens_weighted` as null,
+  not 0 — and untracked timeouts retry as before (DW-364).
 - Honor a hard `bmad-loop stop` inside verify commands and declarative plugin hooks: the command's
   process tree is killed and the run records `stopped` (`run-stop via=stop-request`) instead of
   being force-killed on native Windows. Timeouts kill the whole tree, not just the shell. Journals

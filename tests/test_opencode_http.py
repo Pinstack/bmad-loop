@@ -38,6 +38,7 @@ from bmad_loop import runs
 from bmad_loop.adapters import base as adapter_base
 from bmad_loop.adapters import generic, opencode_http
 from bmad_loop.adapters.base import (
+    ZERO_TOKEN_TIMEOUT_EVIDENCE,
     AdapterTaskDirectoryError,
     SessionHandle,
     SessionResult,
@@ -199,7 +200,7 @@ def run_turn():
         finish_turn(); push(idle_event())
     elif SCENARIO == "stall":
         finish_turn(); push(idle_event())
-    elif SCENARIO in ("busy-forever", "busy-big-usage"):
+    elif SCENARIO in ("busy-forever", "busy-big-usage", "busy-zero-errored", "busy-zero-aborted"):
         write_spec()  # visible only post-kill: the turn never ends or idles
     elif SCENARIO == "big-usage-then-complete":
         time.sleep(0.35)  # stay busy through several fast heartbeat samples
@@ -243,6 +244,21 @@ class Handler(BaseHTTPRequestHandler):
                         "tokens": {"input": 4000000, "output": 1000000, "reasoning": 0,
                                    "cache": {"read": 0, "write": 0}},
                         "cost": 1.0,
+                    },
+                    "parts": [],
+                }]
+            elif SCENARIO in ("busy-zero-errored", "busy-zero-aborted"):
+                # A finished zero-token step: a provider refusal (APIError) or
+                # the step the timeout's abort cancelled (MessageAbortedError).
+                name = "APIError" if SCENARIO == "busy-zero-errored" else "MessageAbortedError"
+                msgs = [{
+                    "info": {
+                        "id": "msg_zero1", "role": "assistant",
+                        "time": {"created": now_ms() - 10, "completed": now_ms()},
+                        "tokens": {"input": 0, "output": 0, "reasoning": 0,
+                                   "cache": {"read": 0, "write": 0}},
+                        "error": {"name": name, "data": {"message": "fake"}},
+                        "cost": 0,
                     },
                     "parts": [],
                 }]
@@ -1307,7 +1323,38 @@ def test_sum_usage_maps_opencode_tokens():
     assert usage == TokenUsage(
         input_tokens=110, output_tokens=75, cache_read_tokens=8, cache_creation_tokens=5
     )
-    assert _sum_usage("garbage") == TokenUsage()
+    # Untracked is None, never a zero (DW-364): a zero reads as a measured
+    # no-spend session, which the base adapter classifies as an env fault.
+    assert _sum_usage("garbage") is None
+    assert _sum_usage([]) is None
+    assert _sum_usage([{"info": {"role": "user", "tokens": {"input": 9}}}]) is None
+    assert _sum_usage([{"info": {"role": "assistant"}}]) is None
+    assert _sum_usage([{"info": {"role": "assistant", "tokens": {}}}]) is None
+    zero = {"input": 0, "output": 0}
+    # All-zero tokens on a still-in-flight first step: no usage signal yet.
+    assert _sum_usage([{"info": {"role": "assistant", "tokens": zero}}]) is None
+    # A completed assistant message makes the zero a measured one.
+    assert (
+        _sum_usage([{"info": {"role": "assistant", "tokens": zero, "time": {"completed": 1}}}])
+        == TokenUsage()
+    )
+    # An aborted step is stamped completed by opencode's cleanup; still in flight.
+    aborted = {"name": "MessageAbortedError", "data": {"message": "Aborted"}}
+    assert (
+        _sum_usage(
+            [
+                {
+                    "info": {
+                        "role": "assistant",
+                        "tokens": zero,
+                        "time": {"completed": 1},
+                        "error": aborted,
+                    }
+                }
+            ]
+        )
+        is None
+    )
 
 
 def test_missing_httpx_names_the_extra(tmp_path, monkeypatch):
@@ -2251,6 +2298,35 @@ def test_e2e_timeout_aborts(tmp_path, fake_opencode):
     aborts = read_jsonl(rec / "aborts.jsonl")
     assert aborts and "/abort" in aborts[0]["path"]
     assert_server_gone(rec)
+
+
+def test_e2e_timeout_with_tracked_zero_usage_is_env_fault(tmp_path, fake_opencode):
+    """DW-364 through the real adapter: the timeout exit captures a finished
+    zero-token step, stashes it by session id, and the base post-mortem reads
+    it back as a tracked zero."""
+    launcher, rec = fake_opencode
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    spec = make_spec(tmp_path, rec, "busy-zero-errored", timeout_s=1.5)
+
+    result = adapter.run(spec)
+
+    assert result.status == "timeout"
+    assert adapter.read_usage(result) == TokenUsage()
+    assert result.env_fault is True
+    assert result.env_fault_evidence == ZERO_TOKEN_TIMEOUT_EVIDENCE
+
+
+def test_e2e_timeout_on_aborted_zero_step_is_not_env_fault(tmp_path, fake_opencode):
+    """The step the timeout's own abort cancelled is not a measured zero."""
+    launcher, rec = fake_opencode
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    spec = make_spec(tmp_path, rec, "busy-zero-aborted", timeout_s=1.5)
+
+    result = adapter.run(spec)
+
+    assert result.status == "timeout"
+    assert adapter.read_usage(result) is None
+    assert result.env_fault is False
 
 
 # ------------------------------ mid-session token-budget guard (#158)
@@ -3682,4 +3758,6 @@ def test_env_fault_log_is_dropped_at_session_start(tmp_path, fake_opencode):
 
     assert result.status == "timeout"
     assert result.env_fault is False, f"classified off a stale log: {result.env_fault_evidence}"
+    # No token-bearing assistant message: untracked, never stashed as a zero (DW-364).
+    assert adapter.read_usage(result) is None
     assert "Usage limit reached" not in stale.read_text(encoding="utf-8", errors="replace")

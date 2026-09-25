@@ -28,6 +28,7 @@ from bmad_loop import devcontract, runs
 from bmad_loop.adapters import base as adapter_base
 from bmad_loop.adapters import env_fault, generic, tmux_base
 from bmad_loop.adapters.base import (
+    ZERO_TOKEN_TIMEOUT_EVIDENCE,
     AdapterTaskDirectoryError,
     SessionHandle,
     SessionResult,
@@ -3221,6 +3222,56 @@ def test_run_classifies_env_fault_after_reconcile(tmp_path):
     assert result.status == "timeout"
     assert result.env_fault is True
     assert "ECONNREFUSED" in result.env_fault_evidence
+
+
+def _run_timeout_over_transcript(tmp_path, entries) -> SessionResult:
+    """Drive the production dev adapter's run() to a non-rescued timeout whose
+    transcript is a real claude-jsonl file holding `entries` (no task log, so
+    the EnvFaultMixin pattern hook finds nothing)."""
+    adapter, _impl = make_dev_adapter(tmp_path)
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text("".join(json.dumps(e) + "\n" for e in entries), encoding="utf-8")
+    adapter.start_session = lambda spec: _dev_handle()
+    adapter.wait_for_completion = lambda handle, spec: SessionResult(
+        status="timeout", session_id="sess", transcript_path=str(transcript)
+    )
+    adapter.kill = lambda handle: None
+    adapter._window_alive = lambda handle: True  # alive → reconcile keeps the timeout
+    return adapter.run(_dev_spec(tmp_path))
+
+
+def test_run_classifies_zero_token_timeout_on_production_adapter(tmp_path):
+    """DW-364 through the real adapter's run(), whose `_classify_env_fault` is
+    EnvFaultMixin's (no super): a timeout whose transcript holds only Claude
+    Code's synthetic API-error entry (tracked, all-zero usage) is an env fault.
+    ABLATION: moving the zero-token step into the base `_classify_env_fault`
+    hook leaves this False."""
+    synthetic_error = {
+        "type": "assistant",
+        "isApiErrorMessage": True,
+        "message": {
+            "model": "<synthetic>",
+            "role": "assistant",
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+            },
+        },
+    }
+    result = _run_timeout_over_transcript(tmp_path, [synthetic_error])
+    assert result.status == "timeout"
+    assert result.env_fault is True
+    assert result.env_fault_evidence == ZERO_TOKEN_TIMEOUT_EVIDENCE
+
+
+def test_run_does_not_classify_untracked_timeout_on_production_adapter(tmp_path):
+    """DW-364 guard pin: a transcript with no usage block is untracked, not free."""
+    user_line = {"type": "user", "message": {"role": "user", "content": "go"}}
+    result = _run_timeout_over_transcript(tmp_path, [user_line])
+    assert result.status == "timeout"
+    assert result.env_fault is False
 
 
 def test_run_reconcile_upgrade_is_not_reclassified(tmp_path):

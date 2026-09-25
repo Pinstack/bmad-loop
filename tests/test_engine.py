@@ -50,7 +50,7 @@ from conftest import (
 )
 
 from bmad_loop import deferredwork, devcontract, gates, platform_util, runs, verify
-from bmad_loop.adapters.base import SessionResult
+from bmad_loop.adapters.base import ZERO_TOKEN_TIMEOUT_EVIDENCE, SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import (
     _UNREADABLE_LEDGER_DIGEST,
@@ -12630,6 +12630,63 @@ def test_session_env_fault_pauses_dev_without_burning_budget(project):
     # the resolve workflow's re-arm step restores the attempt budget
     rearm_escalation(engine.run_dir, isolated_redrive=False, resolution_recorded=True)
     assert load_state(engine.run_dir).tasks["1-1-a"].attempt == 0
+
+
+def test_zero_token_timeout_pauses_dev_without_burning_budget(project):
+    """DW-364: a dev session that times out with TRACKED zero usage (a provider
+    quota stall — the CLI never got a usable response) is classified an environment
+    fault by the base adapter's post-mortem, so the run pauses at the first story
+    with the zero-token evidence instead of charging the attempt; the session-end
+    journal carries `env_fault: true` and re-arm restores the budget.
+
+    ABLATION: drop the `_classify_zero_token_timeout` call from
+    `CodingCLIAdapter.run()` and this RETRYs — a second dev session is launched."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [SessionResult(status="timeout"), SessionResult(status="timeout")],
+    )
+    adapter.usage_per_session = TokenUsage()  # tracked, and zero
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev"]  # no retry session burned
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED
+    assert task.attempt == 1
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    assert "environment fault: dev session timeout" in engine.state.paused_reason
+    assert ZERO_TOKEN_TIMEOUT_EVIDENCE in engine.state.paused_reason
+
+    dec = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"][-1]
+    assert dec["action"] == "pause"
+    assert dec["env_fault"] is True
+    end = [e for e in engine.journal.entries() if e["kind"] == "session-end"][-1]
+    assert end["env_fault"] is True
+    assert end["env_fault_evidence"] == ZERO_TOKEN_TIMEOUT_EVIDENCE
+    assert end["tokens"] == 0  # tracked zero, journaled as 0 (not None)
+
+    rearm_escalation(engine.run_dir, isolated_redrive=False, resolution_recorded=True)
+    assert load_state(engine.run_dir).tasks["1-1-a"].attempt == 0
+
+
+def test_untracked_usage_timeout_is_charged_and_retried(project):
+    """DW-364 guard pin: untracked usage (`read_usage` -> None) never reads as
+    free, so a timeout is charged and retried exactly as before."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [SessionResult(status="timeout"), SessionResult(status="timeout")],
+    )
+    adapter.usage_per_session = None  # untracked
+    engine.run()
+
+    assert [s.role for s in adapter.sessions] == ["dev", "dev"]  # the retry ran
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert decisions[0]["action"] == "retry"
+    assert all(d["env_fault"] is False for d in decisions)
+    ends = [e for e in engine.journal.entries() if e["kind"] == "session-end"]
+    assert all(e["tokens"] is None and "env_fault" not in e for e in ends)
 
 
 def test_session_with_no_work_pauses_dev_without_burning_budget(project):

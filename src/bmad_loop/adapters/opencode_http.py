@@ -1523,6 +1523,8 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             usage = _sum_usage(resp.json())
         except Exception:  # sampling is advisory
             return None
+        if usage is None:
+            return None
         return usage.weighted_total(spec.cache_read_weight)
 
     def _capture_usage(self, handle: SessionHandle, sess: _ServerSession) -> str | None:
@@ -1539,7 +1541,9 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             messages = resp.json()
             path = self.tasks_dir / handle.task_id / "messages.json"
             path.write_text(json.dumps(messages, ensure_ascii=False, indent=2), encoding="utf-8")
-            self._stash_usage(sess.session_id, _sum_usage(messages))
+            usage = _sum_usage(messages)
+            if usage is not None:
+                self._stash_usage(sess.session_id, usage)
             return str(path)
         except Exception:  # usage is metadata, never a gate
             return None
@@ -1750,19 +1754,43 @@ class OpencodeDevAdapter(_DevSynthesisMixin, OpencodeHttpAdapter):
         return proc.poll() is None
 
 
-def _sum_usage(messages: Any) -> TokenUsage:
+def _sum_usage(messages: Any) -> TokenUsage | None:
     """Sum assistant-message token counts. Reasoning tokens are
     billed as output; OpenCode's cache read/write map onto the claude-style
     cache_read/cache_creation fields. Child-session (subagent) tokens are not
-    visible here — the messages endpoint is scoped per session."""
-    usage = TokenUsage()
+    visible here — the messages endpoint is scoped per session.
+
+    None (untracked) when the payload is not a message list or no assistant
+    message carries a non-empty ``tokens`` block — the same untracked-is-not-zero
+    rule as ``tokens.tally`` (DW-364), which skips an empty block too. Also None
+    when the sum is zero and no assistant message has a truthy
+    ``info.time.completed``: opencode creates the assistant message with an
+    all-zero ``tokens`` block before its first step finishes, so a timeout
+    during an in-flight FIRST step (slow stream, hung first tool call) has no
+    usage signal yet. An aborted message does not count as completed: the
+    timeout path aborts before it captures, and opencode's cleanup stamps
+    ``time.completed`` on the step it cancelled, flagged by a
+    ``MessageAbortedError`` ``info.error``. A nonzero sum keeps every message's
+    tokens, completed or not. A zero here is load-bearing: the base adapter classifies a timeout
+    with a TRACKED zero tally as an environment fault, so a malformed, empty or
+    still-in-flight response must not read as a measured zero."""
     if not isinstance(messages, list):
-        return usage
+        return None
+    usage: TokenUsage | None = None
+    any_completed = False
     for msg in messages:
         info = (msg or {}).get("info") or {}
         if info.get("role") != "assistant":
             continue
-        tokens = info.get("tokens") or {}
+        error = info.get("error")
+        aborted = isinstance(error, dict) and error.get("name") == "MessageAbortedError"
+        if (info.get("time") or {}).get("completed") and not aborted:
+            any_completed = True
+        tokens = info.get("tokens")
+        if not isinstance(tokens, dict) or not tokens:
+            continue
+        if usage is None:
+            usage = TokenUsage()
         cache = tokens.get("cache") or {}
         usage.add(
             TokenUsage(
@@ -1772,4 +1800,6 @@ def _sum_usage(messages: Any) -> TokenUsage:
                 cache_creation_tokens=int(cache.get("write") or 0),
             )
         )
+    if usage is not None and usage.total == 0 and not any_completed:
+        return None
     return usage

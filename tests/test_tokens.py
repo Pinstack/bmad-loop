@@ -55,6 +55,7 @@ def test_tally_mixed_shapes(tmp_path):
         f.write("\n")
 
     usage = tally(path)
+    assert usage is not None
     assert usage.input_tokens == 111
     assert usage.output_tokens == 56
     assert usage.cache_read_tokens == 2000
@@ -63,7 +64,43 @@ def test_tally_mixed_shapes(tmp_path):
 
 
 def test_tally_missing_file(tmp_path):
-    assert tally(tmp_path / "nope.jsonl").total == 0
+    # Untracked, not free (DW-364): no transcript is no usage signal.
+    assert tally(tmp_path / "nope.jsonl") is None
+
+
+def test_tally_no_usage_lines_is_untracked(tmp_path):
+    path = tmp_path / "t.jsonl"
+    lines = [
+        {"type": "user", "message": {"content": "hi"}},
+        {"type": "summary"},
+        {"type": "assistant", "message": {"usage": {}}},  # empty block: no signal
+        # non-empty block with no recognized token key: no signal either
+        {"type": "assistant", "message": {"usage": {"service_tier": None}}},
+    ]
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines) + "garbage\n")
+    assert tally(path) is None
+    assert read_usage("claude-jsonl", path) is None
+
+
+def test_tally_block_without_token_keys_is_untracked(tmp_path):
+    path = tmp_path / "t.jsonl"
+    entry = {"type": "assistant", "message": {"usage": {"service_tier": None}}}
+    path.write_text(json.dumps(entry) + "\n")
+    assert tally(path) is None
+
+
+def test_tally_all_zero_usage_is_tracked_zero(tmp_path):
+    # An all-zero usage block still counts as seen: tracked zero spend (DW-364).
+    path = tmp_path / "t.jsonl"
+    lines = [
+        {"type": "assistant", "message": {"usage": {"input_tokens": 0, "output_tokens": 0}}},
+        {"type": "message", "usage": {"input_tokens": 0}},
+    ]
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines))
+    usage = tally(path)
+    assert usage is not None
+    assert usage == TokenUsage()
+    assert usage.total == 0
 
 
 def test_codex_rollout_last_cumulative_wins(tmp_path):
