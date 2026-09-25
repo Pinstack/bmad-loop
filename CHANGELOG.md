@@ -69,6 +69,12 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Refuse every sweep-migration recovery or retry reset over a HEAD that moved past the task
+  baseline, pausing at `escalation` (`story-gate` for a `done` migration) with a converging
+  remedy (keep HEAD, make the tree clean, resume) instead of rewinding a landed migration
+  commit or operator commits (DW-427, DW-428); re-stamp the baseline at the current HEAD when a marked `triage-running` restore
+  or a clean-tree restart resumes, so a later failed attempt cannot rewind to a stale one
+  (DW-430).
 - Park unrelated uncommitted work under a `refs/attempt-preserve-dirty/*` recovery ref before
   every sweep-migration recovery reset, pausing for manual recovery when it cannot be parked
   (DW-313); keep a readable rival ledger a migration escalation refused, so the next resume

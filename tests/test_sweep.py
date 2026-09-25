@@ -34166,14 +34166,13 @@ def test_escalated_restart_refuses_an_unreadable_kept_rival(project, monkeypatch
 def test_escalated_restart_parks_operator_work_made_during_the_pause(project):
     """DW-313, the realistic surface: resume has no clean-tree gate, so work an
     operator makes while a migration sits ESCALATED meets the restart's
-    whole-checkout reset. A commit above the migration baseline is parked on a
-    journaled `attempt-preserve/*` branch, and an unrelated tracked edit plus a
-    new untracked file are parked on the journaled `refs/attempt-preserve-dirty/*`
-    snapshot, before the reset runs.
+    whole-checkout reset. An unrelated tracked edit plus a new untracked file are
+    parked on the journaled `refs/attempt-preserve-dirty/*` snapshot before the
+    reset runs. (An operator COMMIT during the pause is refused before any reset
+    instead: `test_escalated_restart_refuses_an_operator_commit_over_dirt`.)
 
-    Ablation, performed: drop `_preserve_attempt_commits` from `_migration_reset`
-    and the commits row reddens; drop `_preserve_attempt_worktree` and the
-    snapshot rows redden."""
+    Ablation, performed: drop `_preserve_attempt_worktree` from
+    `_migration_reset` and the snapshot rows redden."""
     (project.project / "notes.txt").write_text("committed\n", encoding="utf-8")
     write_legacy_ledger(project, LEGACY_LEDGER)
     partial = LEGACY_LEDGER + "\n### DW-1: Old fixed thing\n\norigin: migr"
@@ -34186,10 +34185,6 @@ def test_escalated_restart_parks_operator_work_made_during_the_pause(project):
     assert engine.run().paused
     assert load_state(engine.run_dir).tasks["sweep-migrate"].phase == Phase.ESCALATED
     # the operator works in the paused checkout
-    (project.project / "operator.txt").write_text("operator commit\n", encoding="utf-8")
-    git(project.project, "add", "--", "operator.txt")
-    git(project.project, "commit", "-q", "-m", "operator work during the pause")
-    operator_commit = git(project.project, "rev-parse", "HEAD")
     (project.project / "notes.txt").write_text("operator edit\n", encoding="utf-8")
     (project.project / "scratch.txt").write_text("operator scratch\n", encoding="utf-8")
     mapping = _valid_migration_mapping()
@@ -34201,18 +34196,361 @@ def test_escalated_restart_parks_operator_work_made_during_the_pause(project):
     summary = resumed.run()
 
     assert not summary.crashed and not summary.paused
-    commits = _records(resumed, "attempt-commits-preserved")
-    assert len(commits) == 1 and commits[0]["story_key"] == MIGRATE_KEY
-    branch = commits[0]["ref"]
-    assert git(project.project, "rev-parse", branch) == operator_commit
     ref = _records(resumed, "attempt-worktree-preserved")[0]["ref"]
     assert ref.startswith("refs/attempt-preserve-dirty/")
     assert git(project.project, "show", f"{ref}:notes.txt") == "operator edit"
     assert git(project.project, "show", f"{ref}:scratch.txt") == "operator scratch"
-    assert git(project.project, "show", f"{ref}:operator.txt") == "operator commit"
     # the reset still ran
     assert (project.project / "notes.txt").read_text(encoding="utf-8") == "committed\n"
     assert not (project.project / "scratch.txt").exists()
+
+
+_ADVANCED_HEAD = "repository advanced beyond migration baseline"
+
+
+def _assert_advanced_head_refusal(resumed, baseline: str, head: str) -> None:
+    """The DW-427/428 refusal: paused at escalation with its own remedy, never
+    the restore-the-ledger one that recreates the refused dirty tree."""
+    persisted = load_state(resumed.run_dir)
+    assert persisted.paused_stage == PAUSE_ESCALATION
+    assert persisted.paused_story_key == MIGRATE_KEY
+    reason = persisted.paused_reason or ""
+    assert f"{_ADVANCED_HEAD} {baseline} (HEAD {head})" in reason
+    assert "make the working tree clean" in reason
+    assert "delete the migrate-*" not in reason
+    assert "restore the pre-migration ledger" not in reason
+    detail = _records(resumed, "sweep-migration-recovery-invalid")[-1]["detail"]
+    assert detail.startswith(f"{_ADVANCED_HEAD} {baseline} (HEAD {head})")
+    assert persisted.tasks[MIGRATE_KEY].phase == Phase.ESCALATED
+
+
+def _operator_commit(project, name: str = "operator.txt") -> str:
+    (project.project / name).write_text("operator commit\n", encoding="utf-8")
+    git(project.project, "add", "--", name)
+    git(project.project, "commit", "-q", "-m", f"operator commit {name}")
+    return git(project.project, "rev-parse", "HEAD")
+
+
+def _is_ancestor(project, commit: str) -> bool:
+    return git(project.project, "merge-base", commit, "HEAD") == commit
+
+
+def test_restore_delete_resume_over_a_landed_migration_commit_refuses_then_converges(
+    project, monkeypatch
+):
+    """DW-427: the migration commit landed and the task escalated from
+    COMMITTING. The old remedy (restore the legacy ledger, delete the migrate-*
+    records, resume) leaves a dirty tree over a HEAD above the baseline, and the
+    generic restart's reset would rewind the migration's own commit. It refuses
+    instead: HEAD and the restored ledger are untouched, nothing is dispatched,
+    and the reason carries the new remedy. Committing the legacy ledger (clean
+    tree, HEAD kept) and resuming re-stamps the baseline and runs to DONE on top
+    of that commit.
+
+    Ablation, performed: drop the refusal call at the generic restart and this
+    reddens — the reset rewinds the migration commit and the run proceeds."""
+    engine = _escalate_commit_tail_under_fallback(project, monkeypatch, landed=True)
+    baseline = load_state(engine.run_dir).tasks[MIGRATE_KEY].baseline_commit
+    migration_head = git(project.project, "rev-parse", "HEAD")
+    assert baseline and baseline != migration_head
+    # the operator follows the ESCALATED remedy: restore, delete, resume
+    write_legacy_ledger(project, LEGACY_LEDGER, commit=False)
+    for record in engine.run_dir.glob("migrate-*"):
+        record.unlink()
+    before = load_state(engine.run_dir).tasks[MIGRATE_KEY]
+    resumed, adapter = resume_sweep(project, engine, [])
+
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed and adapter.sessions == []
+    _assert_advanced_head_refusal(resumed, baseline, migration_head)
+    task = load_state(resumed.run_dir).tasks[MIGRATE_KEY]
+    assert (task.attempt, task.generation) == (before.attempt, before.generation)
+    assert task.migration_commit_escalated is True
+    assert git(project.project, "rev-parse", "HEAD") == migration_head
+    assert project.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
+
+    # the new remedy: keep HEAD, make the tree clean, resume
+    git(project.project, "add", "--", ledger_rel(project))
+    git(project.project, "commit", "-q", "-m", "operator restores the legacy ledger")
+    restore_commit = git(project.project, "rev-parse", "HEAD")
+    stamped: list[str | None] = []
+    migrate = migrate_effect(project, migrated_ledger(), _valid_migration_mapping())
+
+    def migrate_observing_baseline(spec):
+        stamped.append(load_state(engine.run_dir).tasks[MIGRATE_KEY].baseline_commit)
+        return migrate(spec)
+
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    converged, adapter = resume_sweep(
+        project, engine, [migrate_observing_baseline, triage_effect(plan)]
+    )
+
+    summary = converged.run()
+
+    assert not summary.crashed and not summary.paused
+    assert stamped == [restore_commit]
+    assert load_state(converged.run_dir).tasks[MIGRATE_KEY].phase == Phase.DONE
+    assert _is_ancestor(project, restore_commit)
+    assert project.deferred_work.read_text(encoding="utf-8") == migrated_ledger()
+
+
+@needs_dir_fd_recovery
+def test_escalated_restart_refuses_an_operator_commit_over_dirt(project):
+    """Site 1 (DW-428 at the generic restart): a migration ESCALATED on an env
+    fault with a dirty partial ledger; the operator commits during the pause.
+    The resume refuses BEFORE the ESCALATED-branch mutations, so `attempt`,
+    `generation` and the latches persist unchanged, and HEAD and the dirt stay.
+    Cleaning the tree (HEAD kept) and resuming re-stamps the baseline at the
+    operator commit and runs to DONE on top of it.
+
+    Ablation, performed: move the refusal below the ESCALATED mutations and the
+    `attempt`/`generation` row reddens; drop it and the reset rewinds the
+    operator commit. Drop the clean-tree baseline clear and the `stamped` row
+    reddens (the stale baseline is kept)."""
+    (project.project / "notes.txt").write_text("committed\n", encoding="utf-8")
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    partial = LEGACY_LEDGER + "\n### DW-1: Old fixed thing\n\norigin: migr"
+
+    def partial_then_env_fault(spec):
+        project.deferred_work.write_text(partial, encoding="utf-8")
+        return SessionResult(status="timeout", env_fault=True, env_fault_evidence="ECONNRESET")
+
+    engine, _ = make_sweep(project, [partial_then_env_fault])
+    assert engine.run().paused
+    before = load_state(engine.run_dir).tasks[MIGRATE_KEY]
+    assert before.phase == Phase.ESCALATED and before.attempt > 0
+    baseline = before.baseline_commit
+    assert baseline
+    operator_commit = _operator_commit(project)
+    (project.project / "notes.txt").write_text("operator edit\n", encoding="utf-8")
+    resumed, adapter = resume_sweep(project, engine, [])
+
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed and adapter.sessions == []
+    _assert_advanced_head_refusal(resumed, baseline, operator_commit)
+    task = load_state(resumed.run_dir).tasks[MIGRATE_KEY]
+    assert (task.attempt, task.generation) == (before.attempt, before.generation)
+    assert task.migration_ledger_rival == before.migration_ledger_rival
+    assert task.migration_commit_escalated == before.migration_commit_escalated
+    assert task.baseline_commit == baseline
+    assert git(project.project, "rev-parse", "HEAD") == operator_commit
+    assert (project.project / "notes.txt").read_text(encoding="utf-8") == "operator edit\n"
+    assert project.deferred_work.read_text(encoding="utf-8") == partial
+    assert _records(resumed, "attempt-worktree-preserved") == []
+
+    # the remedy: keep HEAD, make the tree clean, resume
+    git(project.project, "checkout", "--", ".")
+    stamped: list[str | None] = []
+    migrate = migrate_effect(project, migrated_ledger(), _valid_migration_mapping())
+
+    def migrate_observing_baseline(spec):
+        stamped.append(load_state(engine.run_dir).tasks[MIGRATE_KEY].baseline_commit)
+        return migrate(spec)
+
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    converged, _ = resume_sweep(project, engine, [migrate_observing_baseline, triage_effect(plan)])
+
+    summary = converged.run()
+
+    assert not summary.crashed and not summary.paused
+    assert stamped == [operator_commit]
+    assert load_state(converged.run_dir).tasks[MIGRATE_KEY].phase == Phase.DONE
+    assert _is_ancestor(project, operator_commit)
+
+
+@needs_dir_fd_recovery
+@pytest.mark.parametrize("tree", ["dirty", "clean"])
+def test_escalated_restart_refuses_a_head_probe_fault(project, monkeypatch, tree):
+    """A HEAD probe fault at the generic ESCALATED restart is a refusal, never a
+    reset or a redispatch: over a dirty tree it faults inside the advanced-HEAD
+    guard, over a clean one inside the stale-baseline check. Either way it
+    pauses at `escalation` with its own remedy (never the restore-the-ledger
+    one), dispatches nothing and leaves HEAD, the ledger and the baseline alone.
+
+    Ablation, performed: make `_migration_head`'s fault arm return the baseline
+    and both rows redden — the dirty one resets and dispatches, the clean one
+    dispatches."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    partial = LEGACY_LEDGER + "\n### DW-1: Old fixed thing\n\norigin: migr"
+
+    def partial_then_env_fault(spec):
+        project.deferred_work.write_text(partial, encoding="utf-8")
+        return SessionResult(status="timeout", env_fault=True, env_fault_evidence="ECONNRESET")
+
+    engine, _ = make_sweep(project, [partial_then_env_fault])
+    assert engine.run().paused
+    baseline = load_state(engine.run_dir).tasks[MIGRATE_KEY].baseline_commit
+    assert baseline
+    if tree == "clean":
+        git(project.project, "checkout", "--", ".")
+    live = project.deferred_work.read_bytes()
+    head = git(project.project, "rev-parse", "HEAD")
+    mapping = _valid_migration_mapping()
+    resumed, adapter = resume_sweep(
+        project, engine, [migrate_effect(project, migrated_ledger(), mapping)]
+    )
+
+    def faulting_head(repo):
+        raise verify.GitError("injected HEAD probe fault")
+
+    monkeypatch.setattr(verify, "rev_parse_head", faulting_head)
+
+    summary = resumed.run()
+
+    monkeypatch.undo()
+    assert summary.paused and not summary.crashed and adapter.sessions == []
+    persisted = load_state(resumed.run_dir)
+    assert persisted.paused_stage == PAUSE_ESCALATION
+    assert "delete the migrate-*" not in (persisted.paused_reason or "")
+    detail = _records(resumed, "sweep-migration-recovery-invalid")[-1]["detail"]
+    assert detail.startswith("migration baseline cannot be verified")
+    assert persisted.tasks[MIGRATE_KEY].phase == Phase.ESCALATED
+    assert persisted.tasks[MIGRATE_KEY].baseline_commit == baseline
+    assert git(project.project, "rev-parse", "HEAD") == head
+    assert project.deferred_work.read_bytes() == live
+
+
+def test_legacy_text_over_a_done_migration_pauses_without_a_transition(project):
+    """A DONE migration whose legacy ledger text reappears (uncommitted) on a
+    cycle-1 resume reaches the generic restart, whose advanced-HEAD refusal
+    cannot escalate: DONE has no outgoing edge. It pauses re-askably at
+    `story-gate` instead of crashing on an illegal transition, with the task
+    still DONE, HEAD at the migration commit and the ledger bytes untouched.
+
+    Ablation, performed: drop the DONE arm in `SweepEngine._escalate` and this
+    reddens — the run crashes with an illegal DONE -> ESCALATED transition."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+
+    def triage_crashes(spec):
+        raise OSError("host died in triage")
+
+    engine, _ = make_sweep(
+        project,
+        [migrate_effect(project, migrated_ledger(), _valid_migration_mapping()), triage_crashes],
+    )
+    assert engine.run().crashed
+    assert load_state(engine.run_dir).tasks[MIGRATE_KEY].phase == Phase.DONE
+    head = git(project.project, "rev-parse", "HEAD")
+    write_legacy_ledger(project, LEGACY_LEDGER, commit=False)
+    resumed, adapter = resume_sweep(project, engine, [])
+
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed and adapter.sessions == []
+    persisted = load_state(resumed.run_dir)
+    assert persisted.paused_stage == PAUSE_STORY_GATE
+    assert persisted.paused_story_key == MIGRATE_KEY
+    assert _ADVANCED_HEAD in (persisted.paused_reason or "")
+    assert persisted.tasks[MIGRATE_KEY].phase == Phase.DONE
+    assert git(project.project, "rev-parse", "HEAD") == head
+    assert project.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
+
+
+@needs_dir_fd_recovery
+def test_marked_triage_running_restore_refuses_an_advanced_head_over_dirt(project):
+    """DW-428: a marked TRIAGE_RUNNING crash leaves partial bytes in the tracked
+    ledger; the operator commits an unrelated file before resuming. The restore
+    refuses before its reset (escalating through TRIAGE_VERIFY): HEAD stays at
+    the operator commit, the partial ledger stays in place, nothing dispatches.
+
+    Ablation, performed: drop the refusal call in
+    `_restore_running_migration_baseline` and this reddens — the reset rewinds
+    the operator commit and a replacement session is dispatched."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine = _crash_in_triage_running(project)
+    baseline = load_state(engine.run_dir).tasks[MIGRATE_KEY].baseline_commit
+    assert baseline
+    operator_commit = _operator_commit(project)
+    resumed, adapter = resume_sweep(project, engine, [])
+
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed and adapter.sessions == []
+    _assert_advanced_head_refusal(resumed, baseline, operator_commit)
+    assert git(project.project, "rev-parse", "HEAD") == operator_commit
+    assert project.deferred_work.read_bytes() == _PARTIAL_MIGRATION.encode()
+    assert _records(resumed, "attempt-worktree-preserved") == []
+
+
+@needs_dir_fd_recovery
+def test_marked_triage_running_clean_restore_restamps_the_baseline(project):
+    """DW-430: an ignored ledger leaves the tree clean after a marked
+    TRIAGE_RUNNING crash, so the restore resets nothing; the operator commits
+    before resuming. The restore re-stamps the baseline at the operator HEAD,
+    so the first replacement's failed validation resets to that commit (never
+    rewinding it), the second passes, and the run reaches DONE without a pause.
+
+    Ablation, performed: drop the baseline clear in the marked TRIAGE_RUNNING
+    branch and this reddens — the stale baseline makes the validation-retry
+    site refuse (and, without that guard, rewind the operator commit)."""
+    ignore_before_commit(project, "_bmad-output/")
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine = _crash_in_triage_running(project)
+    assert worktree_clean(project.project)
+    operator_commit = _operator_commit(project)
+    mapping = _valid_migration_mapping()
+    stamped: list[str | None] = []
+
+    def observing(effect):
+        def run(spec):
+            stamped.append(load_state(engine.run_dir).tasks[MIGRATE_KEY].baseline_commit)
+            return effect(spec)
+
+        return run
+
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    resumed, adapter = resume_sweep(
+        project,
+        engine,
+        [
+            observing(migrate_effect(project, _PARTIAL_MIGRATION, mapping)),
+            observing(migrate_effect(project, migrated_ledger(), mapping)),
+            triage_effect(plan),
+        ],
+    )
+    # the crashed session spent attempt 1; leave room for a failed and a passing one
+    resumed.policy = replace(
+        resumed.policy, sweep=replace(resumed.policy.sweep, max_migration_attempts=3)
+    )
+
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert len(adapter.sessions) == 3
+    assert stamped == [operator_commit, operator_commit]
+    assert load_state(resumed.run_dir).tasks[MIGRATE_KEY].phase == Phase.DONE
+    assert _is_ancestor(project, operator_commit)
+    assert (project.project / "operator.txt").is_file()
+    assert _records(resumed, "sweep-migration-recovery-invalid") == []
+
+
+def test_validation_retry_refuses_a_commit_made_during_the_session(project):
+    """Site 3: a migration session commits, then its rewrite fails validation.
+    The validation-retry reset would rewind that commit, so it refuses and
+    escalates instead: HEAD and the rejected rewrite stay, nothing redispatches.
+
+    Ablation, performed: drop the refusal call before the validation-retry
+    `_migration_reset` and this reddens — the reset rewinds the session commit
+    and a second attempt is dispatched."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    baseline = git(project.project, "rev-parse", "HEAD")
+    reject = migrate_effect(project, _PARTIAL_MIGRATION, _valid_migration_mapping())
+    committed: list[str] = []
+
+    def commit_then_reject(spec):
+        committed.append(_operator_commit(project, "session.txt"))
+        return reject(spec)
+
+    engine, adapter = make_sweep(project, [commit_then_reject, commit_then_reject])
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed and len(adapter.sessions) == 1
+    _assert_advanced_head_refusal(engine, baseline, committed[0])
+    assert git(project.project, "rev-parse", "HEAD") == committed[0]
+    assert project.deferred_work.read_text(encoding="utf-8") == _PARTIAL_MIGRATION
 
 
 def _crash_after_accepted_rewrite(project, monkeypatch):

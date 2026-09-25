@@ -3310,24 +3310,41 @@ class SweepEngine(Engine):
         ]
 
     def _migration_evidence_failure(
-        self, task: StoryTask, detail: str, *, ledger_rival: bool = False
+        self,
+        task: StoryTask,
+        detail: str,
+        *,
+        ledger_rival: bool = False,
+        own_remedy: bool = False,
     ) -> NoReturn:
         """Refuse current-format recovery evidence without mutating the ledger.
 
         ``ledger_rival`` passes through to :meth:`_escalate`: True only when the
         refusal is a READABLE live ledger the restore would have overwritten
-        (DW-429)."""
+        (DW-429). ``own_remedy`` passes through too: the detail carries its own
+        remedy, so the already-ESCALATED re-pause must not append the
+        restore-and-delete one (DW-427)."""
         self.journal.append(
             "sweep-migration-recovery-invalid",
             story_key=MIGRATE_KEY,
             detail=detail,
         )
         self._escalate(
-            task, f"migration recovery evidence is invalid: {detail}", ledger_rival=ledger_rival
+            task,
+            f"migration recovery evidence is invalid: {detail}",
+            ledger_rival=ledger_rival,
+            own_remedy=own_remedy,
         )
         raise AssertionError("migration escalation returned")
 
-    def _escalate(self, task: StoryTask, reason: str, *, ledger_rival: bool = False) -> None:
+    def _escalate(
+        self,
+        task: StoryTask,
+        reason: str,
+        *,
+        ledger_rival: bool = False,
+        own_remedy: bool = False,
+    ) -> None:
         """Escalate the migrate task along legal edges only (DW-405/407/314).
 
         Every other task takes ``Engine._escalate`` unchanged. The migrate task
@@ -3339,13 +3356,30 @@ class SweepEngine(Engine):
         commit-tail retry. ``migration_ledger_rival`` (DW-429) is re-stamped
         beside it from ``ledger_rival``: True only when this escalation refused a
         readable rival ledger, which the generic ESCALATED restart then keeps.
-        The already-ESCALATED re-pause arm leaves both untouched.
+        The already-ESCALATED re-pause arm leaves both untouched, and appends
+        the restore-the-ledger remedy unless ``own_remedy`` says the reason
+        already names one (DW-427: that remedy would recreate the dirty tree the
+        advanced-HEAD refusal refused).
         """
         if task.story_key != MIGRATE_KEY:
             super()._escalate(task, reason)
             return
+        if task.phase == Phase.DONE:
+            # Legacy text reappearing over a DONE migration reaches the generic
+            # restart, and its advanced-HEAD refusal lands here. DONE has no
+            # outgoing edge, so pause without a transition — re-askable like the
+            # duplicate-id refusal: every escalation action requires ESCALATED,
+            # so the gate stage (whose action is "resume") is the honest one.
+            gates.notify(
+                self.policy,
+                self.run_dir,
+                f"migration refused: {task.story_key}",
+                f"{reason} — `bmad-loop resume {self.state.run_id}`",
+            )
+            self._save()
+            raise RunPaused(reason, PAUSE_STORY_GATE, MIGRATE_KEY)
         if task.phase == Phase.ESCALATED:
-            if "delete the migrate-*" not in reason:
+            if not own_remedy and "delete the migrate-*" not in reason:
                 reason = (
                     f"{reason}; restore the pre-migration ledger, delete the migrate-* "
                     f"records in {self.run_dir}, then resume"
@@ -3531,6 +3565,52 @@ class SweepEngine(Engine):
             )
         return result
 
+    def _migration_head(self, task: StoryTask) -> str:
+        """HEAD for the advanced-HEAD guards (DW-427/428/430).
+
+        A probe fault is a refusal, never an answer either way, and carries its
+        own remedy: the restore-the-ledger one would recreate the dirty tree."""
+        try:
+            return verify.rev_parse_head(self.workspace.root)
+        except verify.GitError:
+            self._migration_evidence_failure(
+                task,
+                "migration baseline cannot be verified: HEAD cannot be read — "
+                "repair the repository, then resume",
+                own_remedy=True,
+            )
+
+    def _migration_head_advanced(self, task: StoryTask) -> bool:
+        """True when HEAD no longer equals the task baseline (DW-427/428/430)."""
+        assert task.baseline_commit
+        return self._migration_head(task) != task.baseline_commit
+
+    def _refuse_advanced_migration_head(self, task: StoryTask) -> None:
+        """Refuse a whole-checkout migration reset over an advanced HEAD (DW-427/428).
+
+        :meth:`_migration_reset` rewinds to ``task.baseline_commit``, so any
+        commit above it — the migration's own landed commit, or operator work
+        made between a crash and the resume — would be rewound. Every reset
+        site calls this first; it returns only when HEAD still equals the
+        baseline. The refusal runs no reset, moves nothing and rewrites no
+        ledger, and its remedy converges: with HEAD kept and the tree clean,
+        the next resume re-stamps the baseline at the current HEAD instead of
+        reaching a reset at all.
+        """
+        baseline = task.baseline_commit
+        assert baseline
+        head = self._migration_head(task)
+        if head == baseline:
+            return
+        self._migration_evidence_failure(
+            task,
+            f"repository advanced beyond migration baseline {baseline} (HEAD {head}) — "
+            "a reset would rewind the commits above it, so none ran; leave HEAD where "
+            "it is, make the working tree clean (commit what to keep, discard the "
+            "rest), then resume",
+            own_remedy=True,
+        )
+
     def _migration_reset(self, task: StoryTask, *, keep_ledger: bool = False) -> None:
         """Whole-checkout migration reset that parks the dirty tree first (DW-313/429).
 
@@ -3543,6 +3623,9 @@ class SweepEngine(Engine):
         over work at risk pauses for manual recovery with the tree untouched.
         ``RecoveryFlow.safe_reset`` itself stays shared and unchanged; this is
         the sweep-side wrapper, and it still routes through ``self._safe_reset``.
+        Every caller refuses an advanced HEAD first (DW-427/428), so
+        ``_preserve_attempt_commits`` is only a backstop for a HEAD that moves
+        between that guard and this reset.
 
         ``keep_ledger`` (DW-429, the ESCALATED restart when
         ``migration_ledger_rival`` is latched): the latest escalation refused a
@@ -3662,9 +3745,12 @@ class SweepEngine(Engine):
         cleanliness decides nothing here: an ignored or baseline-untracked
         ledger holding the session's partial bytes leaves the tree clean. Only a
         value that changed after the observation is a rival, which escalates
-        rather than being overwritten. Idempotent across a crash before the
-        caller's ``PENDING`` save: the next pass finds live == baseline and
-        writes nothing. Returns the baseline text the replacement session grades.
+        rather than being overwritten. A dirty tree over a HEAD that moved past
+        the baseline refuses before any reset (DW-428). Idempotent across a
+        crash before the caller's ``PENDING`` save (which also clears the
+        baseline so the redispatch re-stamps the current HEAD, DW-430): the next
+        pass finds live == baseline and writes nothing. Returns the baseline
+        text the replacement session grades.
         """
         if task.migration_recovery_format != _MIGRATION_RECOVERY_FORMAT:
             self._migration_evidence_failure(task, "unknown migration recovery marker")
@@ -3682,6 +3768,7 @@ class SweepEngine(Engine):
         if task.baseline_commit and not verify.worktree_clean(self.workspace.root):
             # Non-ledger residue of the dead session; the ledger itself is
             # decided below against the snapshot, never re-baselined.
+            self._refuse_advanced_migration_head(task)
             self._migration_reset(task)
             # Probed BEFORE the lock: it spawns git (#286, #735).
             anchor, committed = self._ledger_baseline_text(task)
@@ -3952,6 +4039,13 @@ class SweepEngine(Engine):
         elif task.phase == Phase.TRIAGE_RUNNING and task.migration_recovery_format != 0:
             text = self._restore_running_migration_baseline(task)
             task.phase = Phase.PENDING  # deliberate reset, not a normal transition
+            # DW-430: the redispatch re-stamps the current HEAD, as the
+            # TRIAGE_VERIFY restore above does. Keeping the pre-crash baseline
+            # would let a later failed attempt's reset rewind commits made
+            # between the crash and this resume.
+            task.baseline_commit = None
+            task.baseline_untracked = None
+            self._save()
         elif task.phase != Phase.PENDING:
             # resumed mid-migration or retrying after an escalation: restart
             self.journal.append("resume-restart", story_key=MIGRATE_KEY, phase=str(task.phase))
@@ -3959,15 +4053,28 @@ class SweepEngine(Engine):
             # refused a readable rival ledger, so the reset must put that rival
             # back and let it become the migration input, not erase it.
             keep_ledger = task.phase == Phase.ESCALATED and task.migration_ledger_rival
+            dirty = bool(task.baseline_commit) and not verify.worktree_clean(self.workspace.root)
+            if dirty:
+                # DW-427/428: refused BEFORE the ESCALATED mutations below, so
+                # a re-pause persists none of them.
+                self._refuse_advanced_migration_head(task)
+            # A clean tree over a moved HEAD is the refusal's remedy applied:
+            # re-stamp the baseline there, never keep the stale one (DW-430).
+            stale_baseline = (
+                bool(task.baseline_commit) and not dirty and self._migration_head_advanced(task)
+            )
             if task.phase == Phase.ESCALATED:
                 task.attempt = 0  # the human resumed deliberately; fresh budget
                 _rearm_generation(task)  # ...and into a fresh session-id namespace
                 task.migration_commit_escalated = False
-            if task.baseline_commit and not verify.worktree_clean(self.workspace.root):
+            if dirty:
                 # a session died mid-rewrite; restore our ledger (or keep the rival)
                 self._migration_reset(task, keep_ledger=keep_ledger)
                 # REPAIR/WRITE (DW-146): the restored text this migration grades.
                 text = deferredwork.read_for_write(ledger) or ""
+            elif stale_baseline:
+                task.baseline_commit = None
+                task.baseline_untracked = None
             task.migration_ledger_rival = False  # leaving ESCALATED consumes the latch
             task.phase = Phase.PENDING  # deliberate reset, not a normal transition
         # **The invariant: a refusal that dispatches nothing leaves this task
@@ -4209,7 +4316,9 @@ class SweepEngine(Engine):
                 return
             # never re-prompt over a half-broken rewrite; the baseline reset
             # covers tracked files, the explicit write covers an untracked
-            # ledger that `git reset` cannot restore
+            # ledger that `git reset` cannot restore. Never over a HEAD that
+            # moved past the baseline: the reset would rewind it (DW-427/428).
+            self._refuse_advanced_migration_head(task)
             self._migration_reset(task)
             # The WRITE anchor derives from the committed blob, never from an
             # observation of the tree taken after the very reset it would attest
