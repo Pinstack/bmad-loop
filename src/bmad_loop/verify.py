@@ -47,7 +47,10 @@ from .frontmatter import (
 )
 from .model import StoryTask, VerifyOutcome, result_mapping
 from .platform_util import (
+    AT_DIRECTORY,
+    AT_NOFOLLOW,
     DIR_FD_ANCHORED_WRITES,
+    HANDLE_ANCHORED_WRITES,
     UnconfinedWriteError,
     atomic_replace,
     atomic_write_bytes,
@@ -569,6 +572,11 @@ def _validated_index_state(value: object) -> dict[str, object]:
 # Whether receipt paths are held to Win32 name rules: the host's own, like
 # `DIR_FD_ANCHORED_WRITES`, and monkeypatched by tests to read the other arm.
 WIN32_PATH_NAMES = sys.platform == "win32"
+
+# Whether `_make_candidate_parents` walks through `win32_at`'s handle-relative
+# create-or-open (DW-420): handle-anchored without the POSIX `dir_fd` family.
+# The host's own, like `WIN32_PATH_NAMES`, and monkeypatched by tests.
+WIN32_HANDLE_PARENTS = HANDLE_ANCHORED_WRITES and not DIR_FD_ANCHORED_WRITES
 
 
 def _portable_integration_path(value: object) -> str:
@@ -10902,28 +10910,46 @@ def _make_candidate_parents(
     empty directories outside `root` before the confined write refuses (DW-404).
     With descriptor-anchored writes each component is created and then opened
     `O_NOFOLLOW` relative to the one above it, so a link below `root` refuses
-    before anything is created through it. Hosts without `dir_fd` (win32) check
-    each component's ancestry with `path_is_confined` before creating it, which
-    keeps a check-then-act residual: a link planted between check and create
-    still redirects it. That is narrower than the confined writer, which is
-    handle-anchored there too wherever `HANDLE_ANCHORED_WRITES` holds.
+    before anything is created through it. On win32 with `win32_at`
+    (`WIN32_HANDLE_PARENTS`) each component is created-or-opened in ONE
+    handle-relative call (`O_CREAT` without `O_EXCL`, `AT_DIRECTORY`,
+    `AT_NOFOLLOW`), so a junction or symlink at a component is opened as the
+    reparse point itself and refused, never traversed (DW-420). Only hosts with
+    neither handle arm keep the path walk: each component's ancestry is checked
+    with `path_is_confined` before it is created, a check-then-act residual — a
+    link planted between check and create still redirects it.
 
     `root_identity` pins `root` itself (DW-338): the candidate worktree is
     orchestrator-minted, so the caller takes `pinned_root_identity` once after
     `worktree add` and a root replaced by a link afterwards is refused — by the
-    `fstat` compare in `open_dir_confined` on the anchored arm, by an `lstat`
+    `fstat` compare in `open_dir_confined` on both handle arms, by an `lstat`
     compare (check-then-act, the arm's existing residual) on the path arm. With
     no identity, `root` may be reached through a link, as `open_dir_confined`
     allows.
 
     Raises `OSError` on failure. A refused redirect surfaces as the kernel's
-    `OSError` (ELOOP/ENOTDIR from the `O_NOFOLLOW` open) on the anchored arm and
-    as `UnconfinedWriteError` on the path-based arm.
+    `OSError` (ELOOP/ENOTDIR from the `O_NOFOLLOW` open) on the POSIX arm, as
+    `win32_at`'s ELOOP `OSError` on the win32 handle arm, and as
+    `UnconfinedWriteError` on the path-based arm.
     """
     try:
         relative = parent.relative_to(root)
     except ValueError as exc:
         raise UnconfinedWriteError(f"{parent} is not under {root}") from exc
+    if WIN32_HANDLE_PARENTS:
+        fd = open_dir_confined(root, root, root_identity=root_identity)
+        if fd is None:
+            raise OSError(f"candidate root {root} could not be opened")
+        try:
+            for part in relative.parts:
+                nested = platform_util.open_at(
+                    fd, part, os.O_RDONLY | os.O_CREAT | AT_DIRECTORY | AT_NOFOLLOW
+                )
+                fd, previous = nested, fd
+                os.close(previous)
+        finally:
+            os.close(fd)
+        return
     if not DIR_FD_ANCHORED_WRITES:
         if root_identity is not None:
             if not platform_util._root_still_pinned(root, root_identity):
@@ -10949,6 +10975,17 @@ def _make_candidate_parents(
             os.close(previous)
     finally:
         os.close(fd)
+
+
+def _require_pinned_candidate(root: Path, identity: os.stat_result) -> None:
+    """Refuse a git call on the candidate worktree unless `root` is still the
+    directory pinned right after `worktree add` (DW-425). Git takes the root by
+    path, so a root swapped for a link would steer the call into whatever the
+    link names. An `lstat` compare — check-then-act, the residual
+    `_root_still_pinned` documents: a swap landing between this check and git's
+    own open of the path still wins."""
+    if not platform_util._root_still_pinned(root, identity):
+        raise GitError("detached candidate checkout root was replaced")
 
 
 def commit_path_bound(
@@ -10984,17 +11021,43 @@ def commit_path_bound(
     refuses rather than re-adding it. Without it an absent target has no
     authority and is refused the same way.
 
-    The candidate checkout runs with repository hooks disabled (`-c
-    core.hooksPath=<empty dir>`, command-line config outranking any
-    repo-configured path): a post-checkout hook would otherwise run before the
-    accepted bytes land and could leave any pathname behind (DW-326). Only that
-    checkout is hook-free — the candidate `git commit` still runs the repo's
-    pre-commit and commit-msg hooks, and validation catches what they change.
+    The candidate checkout — the `worktree add` and the index population —
+    runs with repository hooks disabled (`-c core.hooksPath=<empty dir>`,
+    command-line config outranking any repo-configured path): the index write
+    would otherwise fire a `post-index-change` hook (and a full checkout a
+    `post-checkout` one) before the accepted bytes land, which could leave any
+    pathname behind (DW-326). It is
+    also filter-free and fsmonitor-free (DW-401): `worktree add --no-checkout`
+    under `-c core.fsmonitor=` (empty: off on every supported git — before 2.36
+    the key is a hook path, so `false` would name a command) writes nothing but
+    `.git`, and the
+    candidate index is filled from the captured commit by `read-tree` without
+    `-u`, so no repo-configured smudge/process filter or fsmonitor command runs
+    before the accepted bytes land. The orchestrator writes only the target
+    path (and its missing parents) into the candidate worktree. Only that checkout is
+    hook-, filter- and fsmonitor-free — the candidate `git add` still applies
+    the clean filter (checkin attributes fall back to the index when a
+    directory's `.gitattributes` is absent from the worktree), and the
+    candidate `git commit` still runs the repo's pre-commit and commit-msg
+    hooks, and validation catches what they change. Those hooks now see a
+    worktree holding only the target, so the rest of the tree reads as
+    unstaged deletions; a hook that stages them (`git add -A`) is refused by
+    the one-path scope validation before anything publishes.
     The accepted bytes are written through the descriptor-anchored confined
     writer, so on POSIX a symlink or FIFO at the leaf is replaced rather than
     written through and a redirected ancestor refuses the write (win32 gets the
     confined writer's documented check-then-write degrade); the staged mode is
     pinned to the captured target's with `git add --chmod`.
+
+    The candidate root is pinned once, right after `worktree add` (DW-338),
+    and re-checked against that pin before every later git call on it — the
+    index population, `git add`, the staged-entry read, `git commit` and the
+    candidate `rev-parse` — and before the cleanup `worktree remove` (DW-425):
+    git takes the root by path, so a root swapped for a link would steer those
+    calls elsewhere. A replaced root refuses with a typed `GitError`, and
+    cleanup skips the remove and leaves the registration to the prune below.
+    Each re-check is an `lstat` compare, check-then-act: a swap landing between
+    the check and git's own open of the path is the accepted residual.
 
     The object-content reads run under `GIT_NO_REPLACE_OBJECTS=1`
     (`_bound_git_env`), so those decisions are made on the raw objects the
@@ -11016,10 +11079,12 @@ def commit_path_bound(
     may already have registered one (DW-402). The temporary directory's own
     removal never replaces the propagating error: a directory that survives it
     is named in a note on that error, and tolerated silently on success because
-    the published commit is truthful (DW-403). Missing candidate parents are
-    created component by component beneath the candidate root without following
-    a redirected ancestor, so a swapped-in link refuses before any directory is
-    created outside it (DW-404).
+    the published commit is truthful (DW-403). A root that was never pinned or
+    has been replaced skips `worktree remove` and counts as such a cleanup
+    fault (DW-425). Missing candidate parents are created component by
+    component beneath the candidate root without following a redirected
+    ancestor, so a swapped-in link refuses before any directory is created
+    outside it (DW-404) — handle-anchored on POSIX and on win32 (DW-420).
 
     Every success return is closed by a final observation. Where Git honours
     `core.fileMode` the live exec bit must match the committed mode, refused
@@ -11141,13 +11206,19 @@ def commit_path_bound(
                 raise GitError("detached candidate hook isolation could not be prepared") from exc
             # An add can register `.git/worktrees/<name>` and still fail or time
             # out, so any failure marks the fault the outer prune clears (DW-402).
+            # `--no-checkout` with fsmonitor off: the add writes nothing but
+            # `.git`, so no repo-configured smudge/process filter or fsmonitor
+            # command runs before the accepted bytes land (DW-401).
             try:
                 rc, _out = _git_env(
                     repo_root,
                     "-c",
                     f"core.hooksPath={hooks_dir}",
+                    "-c",
+                    "core.fsmonitor=",
                     "worktree",
                     "add",
+                    "--no-checkout",
                     "--detach",
                     str(candidate_root),
                     captured.oid,
@@ -11159,6 +11230,7 @@ def commit_path_bound(
             if rc != 0:
                 cleanup_fault = True
                 raise GitError(f"git detached candidate checkout failed in {repo_root}")
+            candidate_identity: os.stat_result | None = None
             try:
                 candidate_path = candidate_root / rel
                 executable = expected_mode == "100755"
@@ -11177,6 +11249,27 @@ def commit_path_bound(
                 candidate_identity = pinned_root_identity(candidate_root)
                 if candidate_identity is None:
                     raise GitError("detached candidate checkout root is missing or redirected")
+                # `--no-checkout` leaves the candidate index empty; fill it from
+                # the captured commit without `-u`, so the worktree stays
+                # untouched and no smudge runs (DW-401). It stands in for the
+                # checkout's index half, so it reads raw objects (DW-331), and
+                # runs hook-free like the add: its index write would otherwise
+                # fire `post-index-change` before the accepted bytes land (DW-326).
+                _require_pinned_candidate(candidate_root, candidate_identity)
+                rc, _out = _git_env(
+                    candidate_root,
+                    "-c",
+                    f"core.hooksPath={hooks_dir}",
+                    "-c",
+                    "core.fsmonitor=",
+                    "read-tree",
+                    captured.oid,
+                    env=_bound_git_env(),
+                )
+                if rc != 0:
+                    raise GitError(
+                        f"detached candidate index could not be populated in {repo_root}"
+                    )
                 try:
                     _make_candidate_parents(
                         candidate_root, candidate_path.parent, root_identity=candidate_identity
@@ -11190,6 +11283,7 @@ def commit_path_bound(
                     )
                 except (OSError, RuntimeError, ValueError) as exc:
                     raise GitError("exact-path candidate content could not be written") from exc
+                _require_pinned_candidate(candidate_root, candidate_identity)
                 rc, _out = _git(
                     candidate_root,
                     "add",
@@ -11199,15 +11293,18 @@ def commit_path_bound(
                 )
                 if rc != 0:
                     raise GitError(f"git exact-path candidate staging failed in {repo_root}")
+                _require_pinned_candidate(candidate_root, candidate_identity)
                 staged_entry = _bound_index_entry(candidate_root, rel)
                 if staged_entry != _BoundGitEntry(expected_mode, "blob", accepted_oid):
                     raise GitError("exact-path candidate staging changed accepted content")
                 _bound_live_ledger_identity(lexical, target, accepted_text, observed=observed)
                 if _bound_checkout_identity(repo_root) != captured:
                     raise GitError("checkout changed before exact-path candidate hooks")
+                _require_pinned_candidate(candidate_root, candidate_identity)
                 rc, _out = _git_env(candidate_root, "commit", "-m", message, env=_bound_git_env())
                 if rc != 0:
                     raise GitError(f"git exact-path candidate commit failed in {repo_root}")
+                _require_pinned_candidate(candidate_root, candidate_identity)
                 try:
                     candidate = rev_parse_head(candidate_root)
                 except GitError as exc:
@@ -11235,19 +11332,28 @@ def commit_path_bound(
             finally:
                 cleanup_detail: str | None = None
                 cleanup_exc: GitError | None = None
-                try:
-                    rc, out = _git(
-                        repo_root,
-                        "worktree",
-                        "remove",
-                        "--force",
-                        str(candidate_root),
-                    )
-                    if rc != 0:
-                        cleanup_detail = out
-                except GitError as exc:
-                    cleanup_exc = exc
-                    cleanup_detail = str(exc)
+                # `worktree remove --force` takes the root by path too: a root
+                # never pinned, or replaced since, would have git delete
+                # whatever it now names (DW-425). Skip it and leave the entry
+                # to the prune below, once the temporary directory is gone.
+                if candidate_identity is None:
+                    cleanup_detail = "candidate root was never pinned; worktree remove skipped"
+                elif not platform_util._root_still_pinned(candidate_root, candidate_identity):
+                    cleanup_detail = "candidate root was replaced; worktree remove skipped"
+                else:
+                    try:
+                        rc, out = _git(
+                            repo_root,
+                            "worktree",
+                            "remove",
+                            "--force",
+                            str(candidate_root),
+                        )
+                        if rc != 0:
+                            cleanup_detail = out
+                    except GitError as exc:
+                        cleanup_exc = exc
+                        cleanup_detail = str(exc)
                 if cleanup_detail is not None:
                     cleanup_fault = True
                     if active_error is None:

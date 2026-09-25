@@ -52,6 +52,10 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- Commit hooks in the exact-path candidate worktree now see a worktree holding only the
+  target: a hook that reads other tracked files (whole-tree lint or tests) sees them missing
+  and may fail the publication, and one that stages the rest of the tree is refused by scope
+  validation (DW-401).
 - For the claude profile, a dev, review or workflow session that ends a turn without a result and
   then sits idle now pauses as parked at stall-grace expiry instead of receiving the
   stall wake nudge (claude's `idle_prompt` is mapped to `IdlePrompt`); opt out with a
@@ -320,6 +324,12 @@ breaking changes may land in a minor release.
   of followed outside the repository. A run dir that is already a link now fails
   verify-stream writes (the journal records `capture_error`). Operator-chosen roots may
   still be links; worktree-mount spec-writer roots are not yet pinned (DW-338).
+- Harden the exact-path candidate worktree: check it out `--no-checkout` with
+  fsmonitor off and fill its index by `read-tree`, so no repo-configured smudge/process
+  filter or fsmonitor command runs before the accepted bytes land (DW-401); re-check the
+  pinned root before every later git call on it and skip `worktree remove` on a replaced
+  root, pruning instead (DW-425); create missing candidate parents on Windows through
+  handle-relative opens that refuse a junction (DW-420).
 
 ## [0.12.0] — 2026-09-20
 

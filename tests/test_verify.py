@@ -9603,8 +9603,15 @@ def _intercept_candidate_checkout(monkeypatch, after_add):
 def test_commit_path_bound_candidate_checkout_runs_no_post_checkout_hook(
     project, tmp_path, hooks_location
 ):
+    """DW-326/401: the candidate `worktree add` and its `read-tree` index
+    population run hook-free, so neither `post-checkout` nor the
+    `post-index-change` the index write fires runs in the candidate, while the
+    candidate commit is still gated by pre-commit. Ablation: drop `-c
+    core.hooksPath` from the candidate `read-tree` and `post-index-change` runs.
+    (`--no-checkout` alone already keeps `post-checkout` from firing.)"""
     repo, path, baseline, accepted = _bound_publish_inputs(project)
     post_checkout = tmp_path / "post-checkout-ran"
+    post_index_change = tmp_path / "post-index-change-candidate"
     pre_commit = tmp_path / "pre-commit-ran"
     if hooks_location == "git-dir":
         hooks = repo / ".git" / "hooks"
@@ -9617,6 +9624,16 @@ def test_commit_path_bound_candidate_checkout_runs_no_post_checkout_hook(
     hook = hooks / "post-checkout"
     hook.write_text(f"#!/bin/sh\n: > '{post_checkout.as_posix()}'\n")
     hook.chmod(0o755)
+    # `post-index-change` also fires for the live checkout's index sync and for
+    # the (deliberately hooked) candidate `git add`/`commit`, so it records only
+    # a run inside the candidate BEFORE the accepted bytes land there.
+    index_hook = hooks / "post-index-change"
+    index_hook.write_text(
+        "#!/bin/sh\n"
+        'case "$(pwd)" in */candidate) '
+        f"[ -e src.txt ] || : > '{post_index_change.as_posix()}' ;; esac\n"
+    )
+    index_hook.chmod(0o755)
     gate = hooks / "pre-commit"
     gate.write_text(f"#!/bin/sh\n: > '{pre_commit.as_posix()}'\n")
     gate.chmod(0o755)
@@ -9632,6 +9649,7 @@ def test_commit_path_bound_candidate_checkout_runs_no_post_checkout_hook(
     assert published == verify.rev_parse_head(repo)
     assert git(repo, "show", f"{published}:src.txt") == accepted.rstrip("\n")
     assert not post_checkout.exists()
+    assert not post_index_change.exists()
     # Only the checkout is hook-free: the candidate commit is still gated.
     assert pre_commit.exists()
 
@@ -9646,7 +9664,9 @@ def test_commit_path_bound_replaces_a_leaf_symlink_left_after_checkout(
 
     def swap_leaf(candidate_root):
         leaf = candidate_root / "src.txt"
-        leaf.unlink()
+        # The checkout is `--no-checkout` (DW-401), so the leaf is normally
+        # absent; a planted link is what the confined writer must replace.
+        leaf.unlink(missing_ok=True)
         leaf.symlink_to(outside)
 
     _intercept_candidate_checkout(monkeypatch, swap_leaf)
@@ -9683,8 +9703,9 @@ def test_commit_path_bound_refuses_an_ancestor_symlink_left_after_checkout(
 
     def swap_ancestor(candidate_root):
         nested = candidate_root / "ledger-dir"
-        (nested / "ledger.md").unlink()
-        nested.rmdir()
+        # Absent after the `--no-checkout` add (DW-401); cleared if present.
+        if nested.is_dir():
+            shutil.rmtree(nested)
         nested.symlink_to(outside, target_is_directory=True)
 
     _intercept_candidate_checkout(monkeypatch, swap_ancestor)
@@ -10225,8 +10246,9 @@ def _nested_bound_publish_inputs(project, rel):
 def _select_candidate_parent_arm(monkeypatch, arm):
     if arm == "fallback":
         monkeypatch.setattr(verify, "DIR_FD_ANCHORED_WRITES", False)
-    elif not verify.DIR_FD_ANCHORED_WRITES:
-        pytest.skip("host has no descriptor-anchored writes")
+        monkeypatch.setattr(verify, "WIN32_HANDLE_PARENTS", False)
+    elif not (verify.DIR_FD_ANCHORED_WRITES or verify.WIN32_HANDLE_PARENTS):
+        pytest.skip("host has no handle-anchored parent creation")
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
@@ -10246,7 +10268,9 @@ def test_commit_path_bound_creates_no_parent_through_a_redirected_ancestor(
 
     def swap_ancestor(candidate_root):
         outer = candidate_root / "outer"
-        shutil.rmtree(outer)
+        # Absent after the `--no-checkout` add (DW-401); cleared if present.
+        if outer.is_dir():
+            shutil.rmtree(outer)
         outer.symlink_to(outside, target_is_directory=True)
 
     _intercept_candidate_checkout(monkeypatch, swap_ancestor)
@@ -10267,14 +10291,18 @@ def test_commit_path_bound_creates_no_parent_through_a_redirected_ancestor(
 @pytest.mark.parametrize("arm", ["anchored", "fallback"])
 def test_commit_path_bound_recreates_a_missing_candidate_parent(project, monkeypatch, arm):
     """DW-404: the confined parent creation still recreates a plain missing
-    candidate parent, so publication succeeds."""
+    candidate parent, so publication succeeds. Since DW-401 the `--no-checkout`
+    add leaves every parent missing, so this is the ordinary publication path."""
     repo, path, baseline, accepted, original = _nested_bound_publish_inputs(
         project, "ledger-dir/ledger.md"
     )
     _select_candidate_parent_arm(monkeypatch, arm)
-    _intercept_candidate_checkout(
-        monkeypatch, lambda candidate_root: shutil.rmtree(candidate_root / "ledger-dir")
-    )
+    missing = []
+
+    def observe_parent(candidate_root):
+        missing.append(not os.path.lexists(candidate_root / "ledger-dir"))
+
+    _intercept_candidate_checkout(monkeypatch, observe_parent)
 
     published = verify.commit_path_bound(
         repo,
@@ -10285,6 +10313,7 @@ def test_commit_path_bound_recreates_a_missing_candidate_parent(project, monkeyp
         baseline_commit=original,
     )
 
+    assert missing == [True]
     assert published == verify.rev_parse_head(repo)
     assert git(repo, "show", "--format=", "--name-only", published) == "ledger-dir/ledger.md"
     assert git(repo, "show", f"{published}:ledger-dir/ledger.md") == accepted.rstrip("\n")
@@ -10297,22 +10326,29 @@ def _swap_candidate_root(candidate_root, outside):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
-@pytest.mark.parametrize("swap_point", ["before-pin", "after-pin", "before-write"])
+@pytest.mark.parametrize(
+    "swap_point", ["before-pin", "after-pin", "before-parents", "before-write"]
+)
 @pytest.mark.parametrize("arm", ["anchored", "fallback"])
 def test_commit_path_bound_refuses_a_candidate_root_swapped_for_a_link(
     project, tmp_path_factory, monkeypatch, arm, swap_point
 ):
     """DW-338: the engine-minted candidate root is pinned once after `worktree
     add`. A root that is already a link at the pin is refused (`before-pin`); one
-    swapped after the pin is refused by the parent creation (`after-pin`) or by
-    the confined writer (`before-write`, the outside tree carrying the same
-    subpath so only the root pin can refuse). Nothing lands outside, HEAD stays.
+    swapped right after the pin is refused by the re-check before the index
+    population (`after-pin`, DW-425); one swapped after the index population is
+    refused by the parent creation (`before-parents`) or by the confined writer
+    (`before-write`, the outside tree carrying the same subpath so only the
+    root pin can refuse). Nothing lands outside, HEAD stays.
 
     Ablations, each failing its rows: drop the `candidate_identity is None`
     refusal (`before-pin` — parents are created in `outside`); drop
     `root_identity=` to `_make_candidate_parents` or its path-arm
-    `_root_still_pinned` check (`after-pin`); drop `root_identity=` to
-    `atomic_write_bytes_confined` (`before-write` — `ledger.md` lands outside)."""
+    `_root_still_pinned` check (`before-parents`); drop `root_identity=` to
+    `atomic_write_bytes_confined` (`before-write` — `ledger.md` lands outside);
+    drop the cleanup's `candidate_identity is None` skip (`before-pin` — the
+    remove runs on the linked root). `after-pin` is pinned by message in the
+    DW-425 test below."""
     repo, path, baseline, accepted, original = _nested_bound_publish_inputs(
         project, "outer/inner/ledger.md"
     )
@@ -10324,7 +10360,9 @@ def test_commit_path_bound_refuses_a_candidate_root_swapped_for_a_link(
         _swap_candidate_root(candidate_root, outside)
         swapped.append(True)
 
+    removes = None
     if swap_point == "before-pin":
+        removes = _record_worktree_removes(monkeypatch)
         _intercept_candidate_checkout(monkeypatch, swap)
     elif swap_point == "after-pin":
         real_pin = verify.pinned_root_identity
@@ -10335,6 +10373,16 @@ def test_commit_path_bound_refuses_a_candidate_root_swapped_for_a_link(
             return identity
 
         monkeypatch.setattr(verify, "pinned_root_identity", pin_then_swap)
+    elif swap_point == "before-parents":
+        real_git_env = verify._git_env
+
+        def read_tree_then_swap(git_repo, *args, **kwargs):
+            result = real_git_env(git_repo, *args, **kwargs)
+            if "read-tree" in args:
+                swap(Path(git_repo))
+            return result
+
+        monkeypatch.setattr(verify, "_git_env", read_tree_then_swap)
     else:
         (outside / "outer" / "inner").mkdir(parents=True)
         real_parents = verify._make_candidate_parents
@@ -10345,7 +10393,7 @@ def test_commit_path_bound_refuses_a_candidate_root_swapped_for_a_link(
 
         monkeypatch.setattr(verify, "_make_candidate_parents", parents_then_swap)
 
-    with pytest.raises(verify.GitError):
+    with pytest.raises(verify.GitError) as raised:
         verify.commit_path_bound(
             repo,
             "chore: bound ledger",
@@ -10360,6 +10408,388 @@ def test_commit_path_bound_refuses_a_candidate_root_swapped_for_a_link(
     expected = ["outer", "outer/inner"] if swap_point == "before-write" else []
     assert written == expected
     assert verify.rev_parse_head(repo) == original
+    if swap_point == "before-pin":
+        # A root never pinned is never handed to `worktree remove` (DW-425).
+        notes = getattr(raised.value, "__notes__", [])
+        assert any("never pinned; worktree remove skipped" in note for note in notes)
+        assert removes == []
+        assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+# DW-401/420/425: filter-free candidate checkout, root re-checks, handle-anchored
+# win32 parent creation.
+
+
+def test_commit_path_bound_candidate_checkout_runs_no_smudge_filter(project, tmp_path, monkeypatch):
+    """DW-401: the candidate `worktree add` is `--no-checkout` and its index is
+    filled by `read-tree` without `-u`, so a repo-configured smudge driver never
+    runs, while the published blob and the rest of the tree are exactly right,
+    and the candidate `git add` still applies the clean driver. Ablation: drop
+    `--no-checkout` and the smudge marker is written; a candidate `git add`
+    that stopped cleaning appends no `candidate` line to the clean record."""
+    repo = project.project
+    marker = tmp_path / "smudge-ran"
+    cleaned_in = tmp_path / "clean-ran-in"
+    git(repo, "config", "filter.recorder.smudge", f": > '{marker.as_posix()}'; cat")
+    git(repo, "config", "filter.recorder.clean", f"pwd >> '{cleaned_in.as_posix()}'; cat")
+    (repo / ".gitattributes").write_text("* filter=recorder\n", encoding="utf-8")
+    git(repo, "add", "--", ".gitattributes")
+    git(repo, "commit", "-q", "-m", "route tracked files through a smudge recorder")
+    marker.unlink(missing_ok=True)
+    cleaned_in.unlink(missing_ok=True)
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    # Only the lines the candidate `git add` itself appends: a later candidate
+    # `git commit` may re-clean a racily-clean target and would mask a lost filter.
+    cleaned_by_add = []
+    real_git = verify._git
+
+    def observe_add(git_repo, *args, **kwargs):
+        if args[:1] != ("add",):
+            return real_git(git_repo, *args, **kwargs)
+        before = cleaned_in.read_text(encoding="utf-8") if cleaned_in.exists() else ""
+        result = real_git(git_repo, *args, **kwargs)
+        after = cleaned_in.read_text(encoding="utf-8") if cleaned_in.exists() else ""
+        cleaned_by_add.extend(after[len(before) :].splitlines())
+        return result
+
+    monkeypatch.setattr(verify, "_git", observe_add)
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert published == verify.rev_parse_head(repo)
+    assert not marker.exists()
+    # The candidate `git add` still cleans: with no `.gitattributes` on disk the
+    # checkin attributes fall back to the index.
+    assert any(line.rstrip("/").endswith("candidate") for line in cleaned_by_add)
+    accepted_oid = git(repo, "hash-object", "--", "src.txt")
+    assert git(repo, "rev-parse", f"{published}:src.txt") == accepted_oid
+    assert git(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", original, published) == (
+        "src.txt"
+    )
+
+
+def _candidate_tree(candidate_root):
+    """Every entry under the candidate root, relative and sorted. A linked
+    worktree's `.git` is a gitdir FILE, so it is listed like any other file."""
+    found = []
+    for dirpath, dirs, files in os.walk(candidate_root):
+        base = Path(dirpath).relative_to(candidate_root)
+        found.extend((base / name).as_posix() for name in [*dirs, *files])
+    return sorted(found)
+
+
+def test_commit_path_bound_candidate_holds_only_the_target(project, monkeypatch):
+    """DW-401: the candidate worktree holds only `.git` after the add, and only
+    the target path (with its parents) once the confined write lands. Ablation:
+    drop `--no-checkout` and every tracked file is listed after the add."""
+    repo, path, baseline, accepted, original = _nested_bound_publish_inputs(
+        project, "outer/inner/ledger.md"
+    )
+    seen = {}
+    _intercept_candidate_checkout(
+        monkeypatch, lambda root: seen.setdefault("after-add", _candidate_tree(root))
+    )
+    real_git = verify._git
+
+    def observe_add(git_repo, *args, **kwargs):
+        if args[:1] == ("add",):
+            seen["before-stage"] = _candidate_tree(Path(git_repo))
+        return real_git(git_repo, *args, **kwargs)
+
+    monkeypatch.setattr(verify, "_git", observe_add)
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+        baseline_commit=original,
+    )
+
+    assert published == verify.rev_parse_head(repo)
+    assert seen["after-add"] == [".git"]
+    assert seen["before-stage"] == [
+        ".git",
+        "outer",
+        "outer/inner",
+        "outer/inner/ledger.md",
+    ]
+    assert git(repo, "show", "--format=", "--name-only", published) == "outer/inner/ledger.md"
+
+
+def _outside_repo(tmp_path_factory):
+    """A separate repository the swapped candidate root points at: a git call
+    that follows the link would stage or commit here."""
+    outside = tmp_path_factory.mktemp("outside-repo")
+    git(outside, "init", "-q")
+    (outside / "keep.txt").write_text("outside\n", encoding="utf-8")
+    git(outside, "add", "--", "keep.txt")
+    git(outside, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "outside")
+    return outside
+
+
+def _record_worktree_removes(monkeypatch):
+    removes = []
+    real_git = verify._git
+
+    def recording(git_repo, *args, **kwargs):
+        if args[:2] == ("worktree", "remove"):
+            removes.append(args)
+        return real_git(git_repo, *args, **kwargs)
+
+    monkeypatch.setattr(verify, "_git", recording)
+    return removes
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize(
+    "swap_point",
+    ["before-read-tree", "before-add", "before-index-read", "before-commit", "before-rev-parse"],
+)
+def test_commit_path_bound_rechecks_the_candidate_root_before_each_git_call(
+    project, tmp_path_factory, monkeypatch, swap_point
+):
+    """DW-425: the pinned candidate root is re-checked before every later git
+    call on it. A root swapped for a link to another repository right before
+    the index population, `git add`, the staged-entry read, `git commit` or the
+    candidate `rev-parse` refuses with a typed `GitError`; nothing runs in the
+    other repository, HEAD stays, cleanup skips `worktree remove` and the
+    registration is pruned.
+
+    Ablation: drop the matching `_require_pinned_candidate` call and its row
+    fails — the refusal message changes (the git call runs in `outside`, e.g.
+    `before-commit` finds nothing staged there and fails as "candidate commit
+    failed"). Drop the cleanup pin
+    check and `worktree remove` runs on the swapped path."""
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    outside = _outside_repo(tmp_path_factory)
+    outside_head = verify.rev_parse_head(outside)
+    swapped = []
+
+    def swap(candidate_root):
+        _swap_candidate_root(candidate_root, outside)
+        swapped.append(True)
+
+    removes = _record_worktree_removes(monkeypatch)
+    if swap_point == "before-read-tree":
+        real_pin = verify.pinned_root_identity
+
+        def pin_then_swap(root):
+            identity = real_pin(root)
+            swap(root)
+            return identity
+
+        monkeypatch.setattr(verify, "pinned_root_identity", pin_then_swap)
+    elif swap_point == "before-add":
+        real_write = verify.atomic_write_bytes_confined
+
+        def write_then_swap(target, data, **kwargs):
+            real_write(target, data, **kwargs)
+            swap(kwargs["confine_root"])
+
+        monkeypatch.setattr(verify, "atomic_write_bytes_confined", write_then_swap)
+    elif swap_point == "before-index-read":
+        recording_git = verify._git
+
+        def add_then_swap(git_repo, *args, **kwargs):
+            result = recording_git(git_repo, *args, **kwargs)
+            if args[:1] == ("add",):
+                swap(Path(git_repo))
+            return result
+
+        monkeypatch.setattr(verify, "_git", add_then_swap)
+    elif swap_point == "before-commit":
+        real_entry = verify._bound_index_entry
+
+        def entry_then_swap(git_repo, rel):
+            result = real_entry(git_repo, rel)
+            if Path(git_repo).name == "candidate":
+                swap(Path(git_repo))
+            return result
+
+        monkeypatch.setattr(verify, "_bound_index_entry", entry_then_swap)
+    else:
+        real_git_env = verify._git_env
+
+        def commit_then_swap(git_repo, *args, **kwargs):
+            result = real_git_env(git_repo, *args, **kwargs)
+            if args[:1] == ("commit",):
+                swap(Path(git_repo))
+            return result
+
+        monkeypatch.setattr(verify, "_git_env", commit_then_swap)
+
+    with pytest.raises(verify.GitError, match="candidate checkout root was replaced") as raised:
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert swapped
+    notes = getattr(raised.value, "__notes__", [])
+    assert any("worktree remove skipped" in note for note in notes)
+    assert removes == []
+    assert verify.rev_parse_head(repo) == original
+    assert verify.rev_parse_head(outside) == outside_head
+    assert git(outside, "status", "--porcelain") == ""
+    assert sorted(p.name for p in outside.iterdir()) == [".git", "keep.txt"]
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+@pytest.mark.parametrize("fault", ["swapped", "unpinned"])
+def test_commit_path_bound_skips_worktree_remove_on_a_replaced_candidate_root(
+    project, tmp_path_factory, monkeypatch, fault
+):
+    """DW-425: a candidate root replaced after the last git call on it (here,
+    after publication) is never handed to `worktree remove --force`. The
+    successful publication raises the typed cleanup `GitError`, and the
+    registration is pruned once the temporary directory is gone. `unpinned`
+    stands in for the swap by failing the pin check at cleanup, so the row runs
+    on every host. Ablation: drop the cleanup pin check and `removes` records
+    the remove (on `swapped`, git deletes through the link)."""
+    if fault == "swapped" and sys.platform == "win32":
+        pytest.skip("POSIX symlinks")
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    outside = _outside_repo(tmp_path_factory)
+    removes = _record_worktree_removes(monkeypatch)
+    real_publish = verify._publish_bound_candidate
+    roots = []
+    _intercept_candidate_checkout(monkeypatch, roots.append)
+
+    def publish_then_replace(*args, **kwargs):
+        real_publish(*args, **kwargs)
+        if fault == "swapped":
+            _swap_candidate_root(roots[0], outside)
+        else:
+            monkeypatch.setattr(platform_util, "_root_still_pinned", lambda *_a: False)
+
+    monkeypatch.setattr(verify, "_publish_bound_candidate", publish_then_replace)
+
+    with pytest.raises(verify.GitError, match="cleanup failed.*worktree remove skipped"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    published = verify.rev_parse_head(repo)
+    assert published != original
+    assert git(repo, "show", f"{published}:src.txt") == accepted.rstrip("\n")
+    assert removes == []
+    assert sorted(p.name for p in outside.iterdir()) == [".git", "keep.txt"]
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+def test_commit_path_bound_refuses_a_hook_staging_the_missing_tree(project):
+    """DW-401: the candidate worktree holds only the target, so a pre-commit
+    hook running `git add -A` stages every other tracked path as deleted; the
+    one-path scope validation refuses that candidate before anything publishes.
+    Ablation: drop the scope check in `_validate_bound_candidate` and the
+    deletions publish."""
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    others = [rel for rel in git(repo, "ls-files").splitlines() if rel != "src.txt"]
+    assert others
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\ngit add -A\n")
+    hook.chmod(0o755)
+
+    with pytest.raises(verify.GitError, match="outside its declared scope"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original
+    assert all((repo / rel).exists() for rel in others)
+
+
+def _plant_directory_link(link, target):
+    """A junction on win32 (the unprivileged redirect), a symlink elsewhere."""
+    if sys.platform == "win32":
+        import _winapi  # Windows-only stdlib module, as test_win32_at uses it
+
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+@pytest.mark.skipif(not platform_util.HANDLE_ANCHORED_WRITES, reason="no handle-anchored arm")
+def test_make_candidate_parents_refuses_a_linked_component_without_the_path_check(
+    tmp_path, monkeypatch
+):
+    """DW-420: on every handle-anchored host `_make_candidate_parents` refuses a
+    link at a missing-parent component by handle, not by the path check — on
+    win32 through `win32_at`'s create-or-open with `AT_NOFOLLOW`, on POSIX
+    through the `dir_fd` walk. `path_is_confined` is forced True to stand in for
+    the check-then-act race the path arm loses. Ablation (win32): drop the
+    `WIN32_HANDLE_PARENTS` arm and the path arm creates `inner` through the
+    junction, inside `outside`."""
+    monkeypatch.setattr(verify, "path_is_confined", lambda *_a: True)
+    root = tmp_path / "candidate"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _plant_directory_link(root / "outer", outside)
+
+    with pytest.raises(OSError) as raised:
+        verify._make_candidate_parents(
+            root,
+            root / "outer" / "inner",
+            root_identity=platform_util.pinned_root_identity(root),
+        )
+
+    assert raised.value.errno in (errno.ELOOP, errno.ENOTDIR)
+    assert platform_util.is_link_like(root / "outer")
+    assert list(outside.iterdir()) == []
+    # Positive control: plain missing parents are created, and existing ones reused.
+    clean = tmp_path / "clean"
+    clean.mkdir()
+    (clean / "a").mkdir()
+    verify._make_candidate_parents(
+        clean,
+        clean / "a" / "b" / "c",
+        root_identity=platform_util.pinned_root_identity(clean),
+    )
+    assert (clean / "a" / "b" / "c").is_dir()
+
+
+@pytest.mark.skipif(not platform_util.HANDLE_ANCHORED_WRITES, reason="no handle-anchored arm")
+def test_make_candidate_parents_refuses_a_root_replaced_by_a_link(tmp_path):
+    """DW-338/420: the handle arms open `root` through `open_dir_confined` with
+    the pin, so a root renamed aside and replaced by a directory link (a
+    junction on win32) is refused before any parent is created through it.
+    Ablation: drop `root_identity=` from the arm's `open_dir_confined` and
+    `outer/inner` is created inside `outside`."""
+    root = tmp_path / "candidate"
+    root.mkdir()
+    identity = platform_util.pinned_root_identity(root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    root.rename(tmp_path / "candidate-aside")
+    _plant_directory_link(root, outside)
+
+    with pytest.raises(OSError):
+        verify._make_candidate_parents(root, root / "outer" / "inner", root_identity=identity)
+
+    assert list(outside.iterdir()) == []
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
