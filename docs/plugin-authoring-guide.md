@@ -203,6 +203,20 @@ clean non-zero exit vetoes); set `fail_closed = true` to make any failure defer
 the unit. An in-process handler can opt into the same by setting `fail_closed =
 True` on its class.
 
+**Hard stops.** Declarative hooks (and the verify commands) run through a
+stop-aware runner. A hard `bmad-loop stop` that lands while a hook is running
+kills the hook's process tree, and the run stops: the bus journals
+`plugin-hook-interrupted` (`plugin`, `stage`) instead of `plugin-hook-error`, and
+`fail_closed` never turns that into a veto, because an interrupted hook has not
+failed. If the interrupted hook is on `post_run`, the run still finishes. A hook
+timeout kills the tree the same way. The kill reaches the processes the hook's
+root still has when the stop lands. A process that has already been reparented
+away from it cannot be reached, such as a background job whose parent shell
+exited, or a process started after the kill began. On macOS without `psutil`,
+only the root is killed. Hooks that run as part of the stop's own unwind —
+`pre_worktree_teardown`/`post_worktree_teardown`, `pre_rollback`/`post_rollback` —
+are not interrupted and still run to completion.
+
 **Versioning.** Every manifest declares `api_version`. The framework supports a
 set of versions (`SUPPORTED_API`). A **builtin** with an unsupported version is a
 hard error (a packaging bug we shipped); a **third-party** one is **skipped with a
@@ -452,7 +466,13 @@ passes apart — `output_tail`, `spawn_error`, byte counts, and run-relative `st
 `stderr_path` pointers under the run's `verify/` directory; full streams are not
 embedded in the journal. `spawn_error` rides the record because the record's
 readers are out-of-process and `returncode` alone cannot separate a child that
-never started from one that ran. That store is deliberately separate from `logs/`, which
+never started from one that ran. A pass cut short by a hard `bmad-loop stop` (DW-353)
+records `interrupted: true` with `returncode` −1001 (`INTERRUPTED_RC`): the command
+the stop killed has `output_tail` `interrupted by a hard stop request`, and every later
+command, which was never started, still gets a record, with `output_tail`
+`not started: an earlier command was interrupted by a hard stop request`. The run
+stops right after journalling that pass, so no hook observes it and no decision is
+taken on it. The field is absent from every pass that ran through. That store is deliberately separate from `logs/`, which
 holds coding-CLI pane captures named after session task ids and is read as such
 by the TUI.
 
@@ -525,7 +545,10 @@ Two consequences a handler has to be written for:
 
 - **`verify-command-result` entries are a complete census of a RUN's verifier
   command invocations, but not of every gate visit or of a project's.** Every
-  command executed by an in-run dev, fix or review pass lands a record. A pass
+  command an in-run dev, fix or review pass executed lands a record. A pass cut
+  short by a hard stop also records each command it never started, marked
+  `interrupted: true` with a `not started:` `output_tail`, so the record count of
+  such a pass is its configured command count, not what actually ran. A pass
   with no `[verify] commands` configured executes nothing and therefore records
   nothing; `bmad-loop confirm --reverify` stays outside because it runs after the
   run that parked the story is over. Count distinct `verification_sequence`

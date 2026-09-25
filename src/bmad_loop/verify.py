@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import io
-import locale
 import os
 import queue
 import re
@@ -29,7 +28,7 @@ from typing import Any, Literal, assert_never, overload
 
 import yaml
 
-from . import deferredwork, platform_util
+from . import childrun, deferredwork, platform_util
 from .bmadconfig import ProjectPaths
 from .frontmatter import FileIdentity  # noqa: F401 — re-export
 from .frontmatter import FrontmatterTargetChangedError  # noqa: F401 — re-export
@@ -9036,6 +9035,12 @@ class CommandResult:
     LAST and defaulted because the construction sites pass three to seven
     POSITIONAL arguments; a field inserted anywhere else would silently re-bind
     them.
+
+    ``interrupted`` marks a result a HARD stop request cut short (DW-353): the
+    command was killed mid-run, or never spawned because an earlier command was
+    already interrupted. It is not a verdict on the command — never a failure,
+    an env fault or a retry — and it now sits after ``spawn_error`` for the same
+    positional reason. Its rc is :data:`INTERRUPTED_RC`.
     """
 
     command: str
@@ -9046,6 +9051,17 @@ class CommandResult:
     stdout_full_bytes: int | None = None
     stderr_full_bytes: int | None = None
     spawn_error: str | None = None
+    interrupted: bool = False
+
+
+class VerifyInterrupted(Exception):
+    """An interrupted :class:`CommandResult` reached the classifier.
+
+    The engine turns an interrupted verify pass into ``RunStopped`` right after
+    journaling it, before any decision is taken, so reaching
+    :func:`verify_command_results_outcome` with one is a missed boundary. This
+    is the fail-loud backstop: an interrupted pass classified as a failure would
+    dispatch a repair, and as a pass would commit unverified work."""
 
 
 # The synthetic return code on a result whose child never started.
@@ -9069,6 +9085,15 @@ class CommandResult:
 # exists so the journal record and the plugin payload carry an rc that no real
 # child could have produced.
 SPAWN_FAULT_RC = -1000
+
+# The synthetic return code on a result a hard stop request cut short (DW-353):
+# its child was killed by the stop, or never spawned because an earlier command
+# already was. Same magnitude argument as ``SPAWN_FAULT_RC`` — outside every
+# signal death — and distinct from both it (``-1000``) and the timeout leg's
+# ``-1``, so no reader keying on the rc can read an interrupted command as one
+# that never started or one that hung. ``interrupted`` is the discriminator the
+# engine keys on; this code is what the journal record carries beside it.
+INTERRUPTED_RC = -1001
 
 # The sink a caller hands :func:`verify_commands_outcome` to observe the results
 # it is about to classify — the engine journals review-gate results through it.
@@ -9229,39 +9254,16 @@ def env_fault_reason(result: CommandResult, cwd: Path) -> str | None:
 
 
 def _timeout_stream(value: str | bytes | None) -> str:
-    """Normalize optional timeout output into what the completed path would give.
+    """Normalize optional timeout output — see :func:`childrun.timeout_stream`,
+    where the normalisation moved with the runner (DW-353).
 
-    ``subprocess.run``'s timeout leg is not uniform, so three shapes arrive:
-
-    * ``bytes`` — POSIX. ``Popen._communicate`` raises ``TimeoutExpired`` from
-      ``_check_timeout`` with the raw chunks joined, *before* the text-mode
-      decode that ends the loop, so ``text=True`` never touched them.
-    * ``str`` — Windows, where ``run`` calls ``communicate()`` after ``kill()``
-      and the text wrapper has already decoded. Load-bearing: on that platform
-      this branch is the only way the output arrives at all.
-    * ``None`` — POSIX again, when nothing had been buffered on that stream.
-
-    So the bytes branch has to reproduce what text mode would have done to them,
-    which is exactly ``Popen._translate_newlines``: decode, then collapse ``\\r\\n``
-    and lone ``\\r`` to ``\\n``. Doing neither made the same bytes read back
-    differently depending on which path produced them — under an ASCII locale
-    ``b"caf\\xc3\\xa9\\r\\n"`` completed as ``"caf\\ufffd\\ufffd\\n"`` but timed out
-    as ``"café\\r\\n"``. The codec half also contradicted
-    :func:`run_verify_commands`' own rule (#378) that host-tool output stays on
-    the locale codec: ``locale.getpreferredencoding(False)`` is what ``text=True``
-    resolves for an unset ``encoding`` — deliberately not ``locale.getencoding()``,
-    which disagrees with it under UTF-8 mode (PEP 540), a mode the C/POSIX locale
-    enables by itself. ``errors="replace"`` for the reason the completed path uses
-    it: one undecodable byte must not raise and lose every result.
-
-    The str branch is left alone: its newlines were translated by the text
-    wrapper the reader thread read through, so there is nothing left to collapse."""
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        decoded = value.decode(locale.getpreferredencoding(False), errors="replace")
-        return decoded.replace("\r\n", "\n").replace("\r", "\n")
-    return value
+    Only tests reach this name now; no production caller does. A timed-out
+    command's output normally comes from the completed post-kill
+    ``communicate`` inside ``childrun.run_child``, which is already text-mode
+    decoded. ``childrun.timeout_stream`` runs only on that runner's drain-timeout
+    arm — a straggler still holding a pipe past ``childrun.DRAIN_S``. The name is
+    kept so the existing shape tests keep pinning that normalisation."""
+    return childrun.timeout_stream(value)
 
 
 def run_verify_commands(policy: Policy, cwd: Path) -> list[CommandResult]:
@@ -9275,37 +9277,33 @@ def run_verify_commands(policy: Policy, cwd: Path) -> list[CommandResult]:
     precisely because these are host tools — contrast tui/launch.py, which pins
     ``encoding="utf-8"`` because its child is our own UTF-8 CLI.
 
-    "One apiece" holds across all three legs: a completed child, a timeout, and a
-    child that could never be spawned each append exactly one result and the loop
-    goes on to the next command. The three are told apart on the result itself —
-    an rc for the first, ``rc=-1``/``"timed out"`` for the second,
-    ``spawn_error`` plus :data:`SPAWN_FAULT_RC` for the third."""
+    "One apiece" holds across all four legs: a completed child, a timeout, a
+    child that could never be spawned, and a child a hard stop request cut short
+    each append exactly one result and the loop goes on to the next command. The
+    four are told apart on the result itself — an rc for the first,
+    ``rc=-1``/``"timed out"`` for the second, ``spawn_error`` plus
+    :data:`SPAWN_FAULT_RC` for the third, ``interrupted`` plus
+    :data:`INTERRUPTED_RC` for the fourth. Once one command is interrupted every
+    later one yields an interrupted result WITHOUT spawning: the stop is pending,
+    and starting more work under it is exactly what it asked not to happen.
+
+    Every child runs through :func:`childrun.run_child`, which kills the whole
+    process tree on a timeout or a hard stop (DW-353). A hard stop is read off
+    the ambient probe the outermost ``Engine.run()`` installs; outside an engine
+    run (``cli._reverify``) none is installed and no command is ever interrupted."""
     results = []
+    interrupted = False
     for command in policy.verify.commands:
-        try:
-            # Verify commands are operator-authored shell strings from the project's
-            # policy (e.g. "pytest -q && ruff check"); shell=True is intentional here.
-            proc = subprocess.run(  # nosec B602
-                command,
-                shell=True,  # portability: operator-authored verify command — sanctioned shell-out (see plan out-of-scope)
-                cwd=cwd,
-                capture_output=True,
-                text=True,
-                errors="replace",
-                timeout=COMMAND_TIMEOUT_S,
-            )
-        except subprocess.TimeoutExpired as exc:
-            # the timeout leg is bounded too: a command killed at COMMAND_TIMEOUT_S
-            # is exactly the one that may have been spewing output when it died.
-            t_out, t_out_full = byte_tail(_timeout_stream(exc.stdout), MAX_STREAM_MEMORY_BYTES)
-            t_err, t_err_full = byte_tail(_timeout_stream(exc.stderr), MAX_STREAM_MEMORY_BYTES)
-            results.append(
-                CommandResult(command, -1, "timed out", t_out, t_err, t_out_full, t_err_full)
-            )
+        if interrupted:
+            results.append(_interrupted_result(command, "", "", tail=_NOT_STARTED_TAIL))
             continue
+        try:
+            # COMMAND_TIMEOUT_S is read here, at call time, so a patched module
+            # value reaches the child.
+            child = childrun.run_child(command, cwd=cwd, timeout=COMMAND_TIMEOUT_S)
         except (OSError, ValueError) as exc:
             # The child was never started, so no exit status exists to classify:
-            # `subprocess.run` raises out of the fork/exec (or CreateProcess)
+            # `Popen` raises out of the fork/exec (or CreateProcess)
             # itself when `cwd` is unusable — FileNotFoundError (missing),
             # NotADirectoryError (a regular file, or a path beneath one),
             # PermissionError (a directory without +x) — or raises ValueError
@@ -9347,18 +9345,60 @@ def run_verify_commands(policy: Policy, cwd: Path) -> list[CommandResult]:
         # here is a programmer defect, not rejected process configuration, and
         # must remain fail-loud rather than being mislabeled as an environment
         # fault.
-        stdout, stdout_full = byte_tail(proc.stdout, MAX_STREAM_MEMORY_BYTES)
-        stderr, stderr_full = byte_tail(proc.stderr, MAX_STREAM_MEMORY_BYTES)
+        if child.interrupted:
+            interrupted = True
+            results.append(_interrupted_result(command, child.stdout, child.stderr))
+            continue
+        stdout, stdout_full = byte_tail(child.stdout, MAX_STREAM_MEMORY_BYTES)
+        stderr, stderr_full = byte_tail(child.stderr, MAX_STREAM_MEMORY_BYTES)
+        if child.timed_out or child.returncode is None:
+            # the timeout leg is bounded too: a command killed at COMMAND_TIMEOUT_S
+            # is exactly the one that may have been spewing output when it died.
+            # (`returncode is None` is also possible without either flag set:
+            # run_child reports None when the killed root could not be reaped, as
+            # well as for an interrupt. It is not an exit status, so it must not
+            # be classified as one.)
+            results.append(
+                CommandResult(command, -1, "timed out", stdout, stderr, stdout_full, stderr_full)
+            )
+            continue
         # merged from the ceilinged streams, not the raw pair: 2000 chars sits
         # far below the ceiling, so the tail is identical while the full
         # concatenation — a transient copy of both whole streams — is not built.
         output = (stdout + stderr)[-2000:]
         results.append(
             CommandResult(
-                command, proc.returncode, output, stdout, stderr, stdout_full, stderr_full
+                command, child.returncode, output, stdout, stderr, stdout_full, stderr_full
             )
         )
     return results
+
+
+# The journalled `output_tail` is what tells a command the hard stop KILLED apart
+# from a later one it kept from ever starting; both carry the same rc and flag.
+_INTERRUPTED_TAIL = "interrupted by a hard stop request"
+_NOT_STARTED_TAIL = "not started: an earlier command was interrupted by a hard stop request"
+
+
+def _interrupted_result(
+    command: str, stdout: str, stderr: str, *, tail: str = _INTERRUPTED_TAIL
+) -> CommandResult:
+    """The one result an interrupted (or, after an interrupt, unspawned) command
+    yields: :data:`INTERRUPTED_RC` with ``interrupted=True`` and whatever the
+    killed tree wrote, bounded like every other leg. ``tail`` says which of the
+    two it was."""
+    out, out_full = byte_tail(stdout, MAX_STREAM_MEMORY_BYTES)
+    err, err_full = byte_tail(stderr, MAX_STREAM_MEMORY_BYTES)
+    return CommandResult(
+        command,
+        INTERRUPTED_RC,
+        tail,
+        out,
+        err,
+        out_full,
+        err_full,
+        interrupted=True,
+    )
 
 
 def verify_command_results_outcome(results: list[CommandResult], cwd: Path) -> VerifyOutcome:
@@ -9372,7 +9412,16 @@ def verify_command_results_outcome(results: list[CommandResult], cwd: Path) -> V
     fault anywhere in the run wins over earlier ordinary failures: a repair
     session dispatched for the ordinary failure would still run in the
     broken environment. Note the first loop inspects rc=0 results too — on
-    Windows an unrunnable command is a silent pass, not a failure (#302)."""
+    Windows an unrunnable command is a silent pass, not a failure (#302).
+
+    An interrupted result (DW-353) is not classifiable at all and raises
+    :class:`VerifyInterrupted` before anything else is read: the engine raises
+    ``RunStopped`` on one before reaching here, so this is a backstop."""
+    interrupted = [result.command for result in results if result.interrupted]
+    if interrupted:
+        raise VerifyInterrupted(
+            f"verify results interrupted by a hard stop request: {', '.join(interrupted)}"
+        )
     for result in results:
         reason = env_fault_reason(result, cwd)
         if reason is not None:

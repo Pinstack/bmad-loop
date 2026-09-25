@@ -27,6 +27,7 @@ from conftest import (
     write_sprint,
 )
 
+from bmad_loop import childrun
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import Engine
 from bmad_loop.escalation import critical_escalations
@@ -442,6 +443,56 @@ def test_real_subprocess_runner_replaces_undecodable_output(tmp_path):
     assert rc == 7  # the hook verdict a strict decode used to lose entirely
     assert "�" in out  # the replacement, not a survivor
     assert "before" in out and "after" in out
+
+
+@pytest.mark.parametrize("fail_closed", [False, True])
+def test_interrupted_declarative_hook_is_neither_error_nor_veto(fail_closed):
+    """A hook whose tree a hard stop killed (DW-353) journals
+    `plugin-hook-interrupted` and re-raises for the engine to stop on — never a
+    `plugin-hook-error`, and never a defer veto, even under `fail_closed`.
+
+    Ablation: drop the `except ChildInterrupted` arm and the ChildInterrupted
+    still propagates but the `plugin-hook-interrupted` record is missing; catch
+    it as `_HookError` instead and the fail_closed row vetoes and does not raise."""
+
+    def interrupted(*_a, **_k):
+        raise childrun.ChildInterrupted("hook interrupted by a hard stop request: X")
+
+    journal = _FakeJournal()
+    c = ctx()
+    bus = HookBus(
+        registry_of(declarative("pre_story", blocking=True, fail_closed=fail_closed)),
+        journal,
+        runner=interrupted,
+    )
+
+    with pytest.raises(childrun.ChildInterrupted):
+        bus.emit("pre_story", c)
+
+    assert journal.entries == [
+        {"kind": "plugin-hook-interrupted", "plugin": "d", "stage": "pre_story"}
+    ]
+    assert not c.vetoed
+
+
+def test_real_subprocess_runner_raises_child_interrupted_on_hard_stop(tmp_path):
+    """Through the real transport: a pending hard stop surfaces as
+    `ChildInterrupted`, not as `_HookError` (which fail_closed would turn into a
+    veto)."""
+    token = childrun.install_stop_probe(lambda: True)
+    try:
+        with pytest.raises(childrun.ChildInterrupted):
+            _run_subprocess("exit 0", cwd=str(tmp_path), env={}, timeout=10)
+    finally:
+        childrun.reset_stop_probe(token)
+
+
+def test_real_subprocess_runner_timeout_is_a_hook_error(tmp_path):
+    """The timeout leg keeps its shape through the new runner."""
+    script = tmp_path / "hang.py"
+    script.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+    with pytest.raises(_HookError, match="timed out after 1s"):
+        _run_subprocess(f'"{sys.executable}" "{script}"', cwd=str(tmp_path), env={}, timeout=1)
 
 
 def test_shared_persists_across_stages():

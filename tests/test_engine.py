@@ -12008,14 +12008,17 @@ def test_unusable_verify_cwd_pauses_the_run_instead_of_crashing_it(project, monk
     with the traceback in `crash.txt`, which is the bug verbatim."""
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     missing = project.project / "no-such-root"
-    real_run = subprocess.run
+    # Refused at `Popen`: verify children spawn through `childrun.run_child`'s
+    # Popen since DW-353. `subprocess.run` also resolves Popen here, but no git
+    # spawn passes `shell`.
+    real_popen = subprocess.Popen
 
-    def refusing_run(*args, **kwargs):
+    def refusing_popen(*args, **kwargs):
         if kwargs.get("shell"):
             raise NotADirectoryError(20, "Not a directory", str(missing))
-        return real_run(*args, **kwargs)
+        return real_popen(*args, **kwargs)
 
-    monkeypatch.setattr(subprocess, "run", refusing_run)
+    monkeypatch.setattr(subprocess, "Popen", refusing_popen)
     policy = Policy(
         gates=GatesPolicy(mode="none"),
         notify=QUIET,
@@ -12075,7 +12078,7 @@ def test_review_spawn_fault_is_journalled_and_pauses_without_a_fix(project, monk
     environment escalation stops the loop; neither repair nor another review is
     spent trying to fix the host."""
     write_sprint(project, {"1-1-a": "ready-for-dev"})
-    real_run = subprocess.run
+    real_popen = subprocess.Popen
     shell_calls = 0
     failed_cwd = project.project / "review-cwd-became-unusable"
 
@@ -12085,9 +12088,10 @@ def test_review_spawn_fault_is_journalled_and_pauses_without_a_fix(project, monk
             shell_calls += 1
             if shell_calls == 2:
                 raise NotADirectoryError(20, "Not a directory", str(failed_cwd))
-        return real_run(*args, **kwargs)
+        return real_popen(*args, **kwargs)
 
-    monkeypatch.setattr(subprocess, "run", refuse_the_review_spawn)
+    # verify children spawn through `childrun.run_child`'s Popen (DW-353)
+    monkeypatch.setattr(subprocess, "Popen", refuse_the_review_spawn)
     policy = Policy(
         gates=GatesPolicy(mode="none"),
         notify=QUIET,
@@ -19985,3 +19989,412 @@ def test_llm_authored_preference_keys_cannot_hijack_journal_reserved_names(proje
     assert "AcmeVault" not in json.dumps(pref), "an LLM-supplied log_pos reached the journal"
     # ...and the declared schema still rode through untouched
     assert pref["type"] == "preference" and pref["detail"] == "prose"
+
+
+# ---- DW-353: a hard stop landing inside a verify command or declarative hook ------
+#
+# Each row's child LODGES the hard request itself and then sleeps, so the request
+# lands while the engine is blocked on that child — the window no poller covered
+# before DW-353 (native Windows never sees SIGTERM; POSIX's SIGTERM killed only the
+# shell). The stop-aware runner must kill the tree and the engine must record a
+# `stopped` run attributed to the control file, with nothing decided on the cut-short
+# result: no commit, no repair, no veto.
+
+
+def _lodge_then_sleep_cmd(tmp: Path, run_dir: Path, *, pass_first: int = 0) -> str:
+    """A shell command whose child passes its first ``pass_first`` invocations and
+    thereafter lodges a HARD stop request for ``run_dir`` and sleeps well past any
+    test budget. Interpreter is ``sys.executable`` (no bare ``python`` under uv);
+    the double quotes are honored by both sh and cmd."""
+    counter = tmp / "lodge-then-sleep.count"
+    script = tmp / "lodge_then_sleep.py"
+    script.write_text(
+        "import json, pathlib, sys, time\n"
+        f"counter = pathlib.Path({str(counter)!r})\n"
+        "n = int(counter.read_text()) + 1 if counter.exists() else 1\n"
+        "counter.write_text(str(n))\n"
+        f"if n <= {pass_first}:\n"
+        "    sys.exit(0)\n"
+        f"run_dir = pathlib.Path({str(run_dir)!r})\n"
+        "run_dir.mkdir(parents=True, exist_ok=True)\n"
+        f"(run_dir / {STOP_REQUEST_FILE!r}).write_text(\n"
+        "    json.dumps({'requested_at': '2026-09-24T00:00:00', 'mode': 'hard'}),\n"
+        "    encoding='utf-8',\n"
+        ")\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    return f'"{sys.executable}" "{script}"'
+
+
+def _assert_stopped_via_stop_request(engine: Engine) -> list[dict]:
+    saved = load_state(engine.run_dir)
+    assert saved.stopped is True and saved.finished is False and saved.crashed is False
+    entries = engine.journal.entries()
+    kinds = [e["kind"] for e in entries]
+    assert "run-complete" not in kinds
+    stops = [e for e in entries if e["kind"] == "run-stop"]
+    assert stops and stops[-1]["via"] == "stop-request"
+    # consumed by the hard arm — not discarded as stale by run()'s finally
+    assert "stop-request-discarded" not in kinds
+    assert not graceful_stop_requested(engine.run_dir)
+    return entries
+
+
+def test_hard_stop_during_dev_verify_stops_without_commit_or_retry(project, monkeypatch, tmp_path):
+    """The dev leg's verify command is cut short by a hard stop: the pass is
+    journalled with `interrupted=True` and the run stops there — no commit on a
+    pass that never finished, and no repair session for a "failure" that is
+    really a stop.
+
+    Ablation: delete `_stop_if_verify_interrupted` in `_verify_commands_with_results`
+    and the backstop `VerifyInterrupted` crashes the run instead (`crashed` True)."""
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        scm=ScmPolicy(rollback_on_failure=True),
+        verify=VerifyPolicy(commands=(_lodge_then_sleep_cmd(tmp_path, run_dir), _OK)),
+    )
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")], policy=policy)
+
+    started = time.monotonic()
+    engine.run()
+    assert time.monotonic() - started < runs._STOP_WAIT_S
+
+    entries = _assert_stopped_via_stop_request(engine)
+    records = [e for e in entries if e["kind"] == "verify-command-result"]
+    assert [r["verification_stage"] for r in records] == ["dev", "dev"]
+    assert all(r["interrupted"] is True for r in records)
+    assert all(r["returncode"] == verify.INTERRUPTED_RC for r in records)
+    assert len(adapter.sessions) == 1  # no repair session
+    task = load_state(engine.run_dir).tasks["1-1-a"]
+    assert not task.commit_sha
+    assert task.phase != Phase.DONE
+
+
+def test_hard_stop_during_review_verify_stops_without_commit(project, monkeypatch, tmp_path):
+    """The review gate's pass is cut short: the review sink journals it with
+    `interrupted=True` and stops the run before the gate classifies it.
+
+    Ablation: delete the sink's `_stop_if_verify_interrupted` and the gate's
+    `VerifyInterrupted` backstop crashes the run instead."""
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        verify=VerifyPolicy(commands=(_lodge_then_sleep_cmd(tmp_path, run_dir, pass_first=1),)),
+    )
+    engine, adapter = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=policy,
+    )
+
+    engine.run()
+
+    entries = _assert_stopped_via_stop_request(engine)
+    records = [e for e in entries if e["kind"] == "verify-command-result"]
+    assert [r["verification_stage"] for r in records] == ["dev", "review"]
+    assert "interrupted" not in records[0]  # a pass that ran through is unchanged
+    assert records[1]["interrupted"] is True
+    assert len(adapter.sessions) == 2  # dev + review; nothing after the stop
+    task = load_state(engine.run_dir).tasks["1-1-a"]
+    assert not task.commit_sha
+    assert task.phase != Phase.DONE
+
+
+def _declarative_registry(stage: str, cmd: str, *, fail_closed: bool = False):
+    from bmad_loop.plugins import PluginManifest, PluginRegistry
+    from bmad_loop.plugins.model import HookSpec, LoadedPlugin
+
+    manifest = PluginManifest(
+        name="stopper",
+        api_version=1,
+        hooks=(HookSpec(stage=stage, cmd=cmd, blocking=True, fail_closed=fail_closed),),
+    )
+    return PluginRegistry([LoadedPlugin(manifest=manifest)])
+
+
+def test_hard_stop_during_post_session_hook_stops_the_run(project, monkeypatch, tmp_path):
+    """A blocking, fail-closed `post_session` hook cut short by a hard stop is
+    neither a hook error nor a veto: `plugin-hook-interrupted` is journalled and
+    the run stops.
+
+    Ablation: drop `_bus_emit`'s `except ChildInterrupted` and the raw
+    ChildInterrupted crashes the run (`crashed` True)."""
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    registry = _declarative_registry(
+        "post_session", _lodge_then_sleep_cmd(tmp_path, run_dir), fail_closed=True
+    )
+    engine, adapter = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        registry=registry,
+    )
+
+    engine.run()
+
+    entries = _assert_stopped_via_stop_request(engine)
+    kinds = [e["kind"] for e in entries]
+    interrupted = [e for e in entries if e["kind"] == "plugin-hook-interrupted"]
+    assert (
+        interrupted == [{**interrupted[0], "plugin": "stopper", "stage": "post_session"}]
+        and len(interrupted) == 1
+    )
+    assert "plugin-hook-error" not in kinds and "plugin-veto" not in kinds
+    assert len(adapter.sessions) == 1  # the review session never launched
+    assert not load_state(engine.run_dir).tasks["1-1-a"].commit_sha
+
+
+def test_hard_stop_during_post_run_hook_still_finishes(project, monkeypatch, tmp_path):
+    """`post_run` fires on the clean-finish path with `finished` already set: an
+    interrupted hook is journalled, and the run still records `run-complete`. The
+    lodged request is left for `run()`'s finally to discard, as it always was.
+
+    Ablation: drop the `post_run` arm in `_bus_emit` and the run records
+    `stopped` instead of `finished`."""
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    registry = _declarative_registry("post_run", _lodge_then_sleep_cmd(tmp_path, run_dir))
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        registry=registry,
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    saved = load_state(engine.run_dir)
+    assert saved.finished is True and saved.stopped is False
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "run-complete" in kinds and "run-stop" not in kinds
+    assert kinds.count("plugin-hook-interrupted") == 1
+    assert kinds.index("plugin-hook-interrupted") < kinds.index("run-complete")
+    assert "stop-request-discarded" in kinds
+    assert not graceful_stop_requested(engine.run_dir)
+
+
+def _declarative_hooks_registry(*hooks):
+    """A one-plugin registry carrying several declarative hooks (one per stage)."""
+    from bmad_loop.plugins import PluginManifest, PluginRegistry
+    from bmad_loop.plugins.model import LoadedPlugin
+
+    manifest = PluginManifest(name="stopper", api_version=1, hooks=tuple(hooks))
+    return PluginRegistry([LoadedPlugin(manifest=manifest)])
+
+
+@pytest.mark.parametrize("stage", ["pre_session", "pre_dev_session"])
+def test_hard_stop_during_a_session_gate_hook_stops_before_the_session(
+    project, monkeypatch, tmp_path, stage
+):
+    """A blocking, fail-closed declarative hook on the session gate — the generic
+    `pre_session` or the role stage `pre_dev_session`, both dispatched through
+    `_emit_session_gate`'s `_bus_emit` — is cut short by a hard stop: the run
+    records `stopped` (not `crashed`), and the session the gate guarded never
+    launches.
+
+    Ablation: route either `_emit_session_gate` dispatch back through
+    `self._bus.emit` and the raw ChildInterrupted crashes the run for that row."""
+    from bmad_loop.plugins.model import HookSpec
+
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    registry = _declarative_hooks_registry(
+        HookSpec(
+            stage=stage,
+            cmd=_lodge_then_sleep_cmd(tmp_path, run_dir),
+            blocking=True,
+            fail_closed=True,
+        )
+    )
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")], registry=registry)
+
+    engine.run()
+
+    entries = _assert_stopped_via_stop_request(engine)
+    kinds = [e["kind"] for e in entries]
+    assert "run-crash" not in kinds
+    interrupted = [e for e in entries if e["kind"] == "plugin-hook-interrupted"]
+    assert [(e["plugin"], e["stage"]) for e in interrupted] == [("stopper", stage)]
+    assert "plugin-hook-error" not in kinds and "plugin-veto" not in kinds
+    assert adapter.sessions == []  # the gated session never launched
+    assert len(adapter.script) == 1
+
+
+def _marker_cmd(tmp: Path, marker: Path) -> str:
+    """A declarative hook command that writes ``marker`` — cmd- and sh-safe."""
+    script = tmp / "write_marker.py"
+    if not script.exists():
+        script.write_text(
+            "import pathlib, sys\npathlib.Path(sys.argv[1]).write_text('ran', encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+    return f'"{sys.executable}" "{script}" "{marker}"'
+
+
+@pytest.mark.parametrize("route", ["session-abort", "verify-lodged"])
+def test_worktree_teardown_hooks_survive_a_hard_stop(project, monkeypatch, tmp_path, route):
+    """A hard stop is honored inside an isolated unit — mid-session (the adapter
+    read the lodged file and aborted) or mid-verify (the verify child lodged it and
+    was killed). Either way the stop's own unwind still runs BOTH declarative
+    teardown hooks and restores the workspace: once the engine constructed the hard
+    `RunStopped`, the request is honored and the child runner's probe is disarmed,
+    so cleanup hooks are not refused before spawn.
+
+    The `verify-lodged` row is the one that bites: raise site A consumes its file
+    before raising, but the verify conversion leaves it for `run()`'s hard arm, so
+    the file is still on disk while worktree_flow's `finally` fires the teardown.
+
+    Ablation: drop the `unwinding` latch in `RunStopped.__init__` and the
+    `verify-lodged` row fails — the still-lodged file refuses
+    `pre_worktree_teardown` before spawn, its interrupt becomes a second
+    `RunStopped` out of the `finally`, and the `post_worktree_teardown` marker is
+    missing with the workspace left unrestored."""
+    from bmad_loop.plugins.model import HookSpec
+
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "sprint")
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    pre_marker = tmp_path / "pre-teardown.marker"
+    post_marker = tmp_path / "post-teardown.marker"
+    registry = _declarative_hooks_registry(
+        HookSpec(stage="pre_worktree_teardown", cmd=_marker_cmd(tmp_path, pre_marker)),
+        HookSpec(stage="post_worktree_teardown", cmd=_marker_cmd(tmp_path, post_marker)),
+    )
+    verify_commands = (
+        (_lodge_then_sleep_cmd(tmp_path, run_dir),) if route == "verify-lodged" else ()
+    )
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        scm=ScmPolicy(isolation="worktree"),
+        verify=VerifyPolicy(commands=verify_commands),
+    )
+
+    def abort_on_hard_stop(spec):
+        # What a real adapter does when its wait loop reads the lodged hard file:
+        # tear the window down and hand back `aborted`.
+        _lodge_hard_stop_request(run_dir)
+        return SessionResult(status="aborted")
+
+    def dev_in_the_unit(spec):
+        # the dev session runs inside the unit worktree (spec.cwd)
+        return dev_effect(project.rebased(spec.cwd), "1-1-a", followup_review=False)(spec)
+
+    effect = abort_on_hard_stop if route == "session-abort" else dev_in_the_unit
+    engine, adapter = make_engine(project, [effect], policy=policy, registry=registry)
+    main_workspace = engine.workspace
+
+    engine.run()
+
+    entries = _assert_stopped_via_stop_request(engine)
+    assert pre_marker.read_text(encoding="utf-8") == "ran"
+    assert post_marker.read_text(encoding="utf-8") == "ran"
+    assert engine.workspace is main_workspace
+    kinds = [e["kind"] for e in entries]
+    assert "plugin-hook-interrupted" not in kinds
+    assert len(adapter.sessions) == 1
+    records = [e for e in entries if e["kind"] == "verify-command-result"]
+    if route == "verify-lodged":
+        assert len(records) == 1 and records[0]["interrupted"] is True
+    else:
+        assert records == []
+
+
+def test_hard_run_stopped_disarms_the_child_probe_and_graceful_does_not(tmp_path):
+    """Constructing a hard `RunStopped` is where a pending request becomes honored:
+    it latches the ambient probe's `unwinding`, after which the probe reads False
+    even with the hard file still lodged. A graceful stop leaves it armed, and with
+    no probe installed construction is a no-op."""
+    from bmad_loop import childrun
+    from bmad_loop.engine import _hard_stop_probe, _HardStopProbe
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _lodge_hard_stop_request(run_dir)
+    RunStopped()  # no probe installed: nothing to disarm, nothing raised
+
+    probe = _HardStopProbe([run_dir])
+    token = _hard_stop_probe.set(probe)
+    runner_token = childrun.install_stop_probe(probe)
+    try:
+        assert childrun.hard_stop_pending() is True
+        RunStopped(graceful=True)
+        assert probe.unwinding is False and childrun.hard_stop_pending() is True
+        RunStopped(via="stop-request")
+        assert probe.unwinding is True and childrun.hard_stop_pending() is False
+    finally:
+        childrun.reset_stop_probe(runner_token)
+        _hard_stop_probe.reset(token)
+
+
+@pytest.mark.parametrize("lodged_in", ["owner", "child"])
+def test_nested_verify_command_is_interrupted_by_owner_or_own_hard_request(
+    project, monkeypatch, tmp_path, lodged_in
+):
+    """A nested auto-sweep's verify command reads BOTH channels, like its
+    adapters: `stop <owner-id>` lodges in the owning run's dir, `stop <child-id>`
+    in the child's own. The nested engine appends its dir to the owner's probe for
+    its lifetime and removes it on the way out; either request interrupts the
+    child's verify pass, which the nested engine hands up as `RunStopped`.
+
+    The owner's `run()` frame is simulated exactly as the #319 nested rows do,
+    plus the probe the outermost `run()` installs.
+
+    Ablation: drop the nested `dirs.append` in `run()` and the `child` row's verify
+    command sleeps out its 60 s and passes (no interrupt, no RunStopped)."""
+    from bmad_loop import childrun
+    from bmad_loop.engine import _hard_stop_probe, _HardStopProbe
+
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    child_run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    owner = project.project / ".bmad-loop" / "runs" / "parent-run"
+    owner.mkdir(parents=True, exist_ok=True)
+    target = owner if lodged_in == "owner" else child_run_dir
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        scm=ScmPolicy(rollback_on_failure=True),
+        verify=VerifyPolicy(commands=(_lodge_then_sleep_cmd(tmp_path, target),)),
+    )
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")], policy=policy)
+
+    probe = _HardStopProbe([owner])
+    depth_token = _run_depth.set(1)  # simulate the parent's run() frame
+    owner_token = set_owner_run_dir(owner)
+    probe_token = _hard_stop_probe.set(probe)
+    runner_token = childrun.install_stop_probe(probe)
+    started = time.monotonic()
+    try:
+        with pytest.raises(RunStopped) as caught:
+            engine.run()
+    finally:
+        childrun.reset_stop_probe(runner_token)
+        _hard_stop_probe.reset(probe_token)
+        reset_owner_run_dir(owner_token)
+        _run_depth.reset(depth_token)
+
+    assert time.monotonic() - started < runs._STOP_WAIT_S
+    assert caught.value.via == "stop-request"
+    assert probe.dirs == [owner]  # the child's own dir was removed on the way out
+    assert probe.unwinding is True  # the stop is honored; the owner now unwinds
+    records = [e for e in engine.journal.entries() if e["kind"] == "verify-command-result"]
+    assert len(records) == 1 and records[0]["interrupted"] is True
+    assert len(adapter.sessions) == 1
+    assert not load_state(engine.run_dir).tasks["1-1-a"].commit_sha

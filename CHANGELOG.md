@@ -75,6 +75,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Honor a hard `bmad-loop stop` inside verify commands and declarative plugin hooks: the command's
+  process tree is killed and the run records `stopped` (`run-stop via=stop-request`) instead of
+  being force-killed on native Windows. Timeouts kill the whole tree, not just the shell. Journals
+  `plugin-hook-interrupted` and `verify-command-result` `interrupted: true` (DW-353).
 - Journal `spec-reconcile-skipped-status` (`story_key`, `spec`, `status`) when terminal-status
   reconcile refuses a frontmatter status outside `RECONCILABLE_FROM` (e.g. `blocked`), and write a
   `session-probe-failed` crumb to `session-lifecycle.jsonl` when the #489 `has_session` probe

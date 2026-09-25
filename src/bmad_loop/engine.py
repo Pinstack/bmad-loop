@@ -36,6 +36,7 @@ from . import (
 )
 from .adapters.base import CodingCLIAdapter, SessionResult, SessionSpec, SpecSnapshot
 from .bmadconfig import ProjectPaths
+from .childrun import ChildInterrupted, install_stop_probe, reset_stop_probe
 from .escalation import (
     REVIEW_TIMEOUT_STATUSES,
     Action,
@@ -294,6 +295,15 @@ class RunStopped(Exception):
         super().__init__("graceful stop" if graceful else "stopped")
         self.graceful = graceful
         self.via = via
+        if not graceful:
+            # Every hard stop is constructed here (the signal handler, the
+            # boundary and in-session sites, the verify/hook conversions), so this
+            # is where the pending request becomes honored: disarm the child
+            # runner's probe so the stop's own unwind — teardown and rollback
+            # hooks — runs to completion instead of being refused (DW-353).
+            probe = _hard_stop_probe.get()
+            if probe is not None:
+                probe.unwinding = True
 
 
 class SweepFactory(Protocol):
@@ -570,6 +580,41 @@ def _story_label_stripped(value: object, story_key: str = "") -> str:
 # the parent's depth into the child. Tracked independently of signal ownership so an
 # off-main-thread top-level run (which cannot own signals) is still seen as depth-0.
 _run_depth: contextvars.ContextVar[int] = contextvars.ContextVar("bmad_loop_run_depth", default=0)
+
+
+class _HardStopProbe:
+    """The stop-aware child runner's ambient hard-stop probe (DW-353).
+
+    Installed by the outermost :meth:`Engine.run` (via
+    :func:`childrun.install_stop_probe`) and read by ``childrun.run_child`` before
+    it spawns a verify command or declarative hook and every poll while one runs.
+    ``dirs`` holds the run dirs whose ``stop-request.json`` is read: the owner's,
+    plus each nested auto-sweep's own while it runs — so ``stop <owner-id>`` and
+    ``stop <child-id>`` both reach a nested sweep's children, mirroring
+    ``adapters/generic.py::_hard_stop_requested``. Read-only by contract; consuming
+    the request stays with ``run()``'s hard arm.
+
+    ``unwinding`` is a one-way latch set by :class:`RunStopped` when a *hard* stop
+    is constructed. From then on the pending request has been honored, and what
+    runs is the stop's own unwind — worktree teardown hooks, rollback hooks — which
+    must run to completion rather than be refused before spawn and turned into a
+    second ``RunStopped`` inside a ``finally``. A latch on the shared object (not a
+    ContextVar reset) survives a nested engine's ``finally``, while its owner is
+    still unwinding. The probe is thrown away with the outermost run."""
+
+    def __init__(self, dirs: list[Path]):
+        self.dirs = dirs
+        self.unwinding = False
+
+    def __call__(self) -> bool:
+        return not self.unwinding and any(read_stop_request_mode(d) == "hard" for d in self.dirs)
+
+
+# The current run's _HardStopProbe, set beside childrun's probe by the outermost
+# run() so a nested engine can append its own dir and RunStopped can disarm it.
+_hard_stop_probe: contextvars.ContextVar[_HardStopProbe | None] = contextvars.ContextVar(
+    "bmad_loop_hard_stop_probe", default=None
+)
 
 
 class _ArmedClose(NamedTuple):
@@ -935,9 +980,32 @@ class Engine:
         # token in the same finally, ahead of the depth, so the nested re-raise arms
         # unwind through both.
         owner_token = None if self._is_nested else set_owner_run_dir(self.run_dir)
+        # The stop-aware child runner's ambient probe (DW-353), claimed on the same
+        # outermost-only rule: verify commands and declarative hooks poll it while
+        # their child runs and kill the tree on a HARD request. A nested auto-sweep
+        # appends its own run dir to the owner's probe for its lifetime, so both
+        # `stop <owner-id>` and `stop <child-id>` reach its children. The runner
+        # only reads; consuming stays with the hard-stop arm below.
+        probe_token = None
+        runner_token = None
+        nested_probe: _HardStopProbe | None = None
+        if self._is_nested:
+            nested_probe = _hard_stop_probe.get()
+            if nested_probe is not None:
+                nested_probe.dirs.append(self.run_dir)
+        else:
+            probe = _HardStopProbe([self.run_dir])
+            probe_token = _hard_stop_probe.set(probe)
+            runner_token = install_stop_probe(probe)
         try:
             return self._run_inner()
         finally:
+            if nested_probe is not None:
+                nested_probe.dirs.remove(self.run_dir)
+            if runner_token is not None:
+                reset_stop_probe(runner_token)
+            if probe_token is not None:
+                _hard_stop_probe.reset(probe_token)
             if owner_token is not None:
                 reset_owner_run_dir(owner_token)
             _run_depth.reset(token)
@@ -2278,8 +2346,28 @@ class Engine:
         if not self._bus.active(stage):
             return None
         ctx = self._make_context(stage, task, **fields)
-        self._bus.emit(stage, ctx)
+        if not self._bus_emit(stage, ctx):
+            return None
         return ctx
+
+    def _bus_emit(self, stage: str, ctx: HookContext) -> bool:
+        """Dispatch ``ctx`` through the bus, turning a hard-stop interrupt into
+        the engine's stop. Returns False only for an interrupted ``post_run``.
+
+        A declarative hook's tree killed by a pending HARD stop request (DW-353)
+        surfaces as ``ChildInterrupted``; the bus already journalled
+        ``plugin-hook-interrupted``. Every stage but ``post_run`` raises
+        ``RunStopped(via="stop-request")`` here, before any caller reads a veto or
+        mutation off a half-run stage. ``post_run`` fires on the clean-finish path
+        with ``finished`` already set, so the run still finishes and the lodged
+        request is left for ``run()``'s finally to discard."""
+        try:
+            self._bus.emit(stage, ctx)
+        except ChildInterrupted:
+            if stage == "post_run":
+                return False
+            raise RunStopped(via="stop-request") from None
+        return True
 
     def _make_context(self, stage: str, task: StoryTask | None, **fields) -> HookContext:
         base: dict = {
@@ -2378,9 +2466,9 @@ class Engine:
         )
         # role-specific stage first (its mutations are visible to pre_session)
         ctx._stage = session_stage
-        self._bus.emit(session_stage, ctx)
+        self._bus_emit(session_stage, ctx)
         ctx._stage = "pre_session"
-        self._bus.emit("pre_session", ctx)
+        self._bus_emit("pre_session", ctx)
         if ctx.proposed_prompt is not None:
             prompt = ctx.proposed_prompt
         if ctx.proposed_env:
@@ -5485,10 +5573,25 @@ class Engine:
         """
         results = tuple(verify.run_verify_commands(self.policy, self.workspace.root))
         sequence = self._journal_verify_command_results(task, verification_stage, results)
+        self._stop_if_verify_interrupted(results)
         outcome = verify.verify_command_results_outcome(list(results), self.workspace.root)
         return outcome, VerifyCommandRecords(
             results=results, stage=verification_stage, sequence=sequence
         )
+
+    @staticmethod
+    def _stop_if_verify_interrupted(results: Sequence[verify.CommandResult]) -> None:
+        """Raise ``RunStopped(via="stop-request")`` when a hard stop request cut
+        this verify pass short (DW-353).
+
+        Called right after the pass is journalled and before anything decides on
+        it: a PROCEED or retry taken on an interrupted pass would commit
+        unverified work or dispatch a repair, so this is the first point the
+        result would otherwise be acted on. Not consumed here — ``run()``'s hard
+        arm consumes the request (and a nested sweep hands the stop up unconsumed,
+        exactly as the in-session raise sites do)."""
+        if any(result.interrupted for result in results):
+            raise RunStopped(via="stop-request")
 
     def _next_verification_sequence(self, story_key: str) -> int:
         """Allocate this story's next ``verify-command-result`` sequence.
@@ -5622,6 +5725,11 @@ class Engine:
                 streams[f"{kind}_bytes"] = full_bytes
                 streams[f"{kind}_captured_bytes"] = captured_bytes
                 streams[f"{kind}_truncated"] = captured_bytes < full_bytes
+            # Present only on a pass a hard stop cut short (DW-353), so every
+            # record from a pass that ran through is byte-identical to before.
+            marks: dict[str, bool] = {}
+            if result.interrupted:
+                marks["interrupted"] = True
             self.journal.append(
                 "verify-command-result",
                 story_key=task.story_key,
@@ -5641,6 +5749,7 @@ class Engine:
                 spawn_error=result.spawn_error,
                 capture_error=capture_error,
                 **streams,
+                **marks,
             )
         return verification_sequence
 
@@ -6334,6 +6443,9 @@ class Engine:
 
         def sink(results: tuple[verify.CommandResult, ...]) -> None:
             self._journal_verify_command_results(task, "review", results)
+            # Same boundary as the dev side: an interrupted review pass stops the
+            # run before the gate classifies it (DW-353).
+            self._stop_if_verify_interrupted(results)
 
         return sink
 

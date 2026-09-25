@@ -578,6 +578,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # `session-idle` / `session-active` (#680): seconds the live transcript has
         # sat still — a float the adapter measured from two stats, no identifier.
         "idle_s",
+        # `verify-command-result` (DW-353): a bare `True`, present only on a pass a
+        # hard stop request cut short. No identifier.
+        "interrupted",
         "items",
         "kept",
         "key",
@@ -1259,6 +1262,9 @@ JOURNAL_KINDS = frozenset(
         # plugins/bus.py
         "plugin-hook",
         "plugin-hook-error",
+        # DW-353: a declarative hook whose tree a hard stop request killed — neither
+        # an error nor a veto; carries only `plugin` and `stage`.
+        "plugin-hook-interrupted",
         # plugins/bus.py + plugins/registry.py
         "plugin-error",
         # plugins/loader.py
@@ -1782,11 +1788,12 @@ OS_KILL_ALLOW = {
     "process_host.py",
 }
 
-# The two sanctioned `shell=True` spots: operator-authored command strings whose
-# cmd/PowerShell port is an explicit out-of-scope follow-up.
+# The one sanctioned `shell=True` spot: the stop-aware child runner (DW-353) that
+# both operator-authored command families — verify commands and declarative plugin
+# hooks — spawn through. Their cmd/PowerShell port is an explicit out-of-scope
+# follow-up. `verify.py` and `plugins/bus.py` no longer spell `shell=True` at all.
 SHELL_ALLOW = {
-    "verify.py",
-    "plugins/bus.py",
+    "childrun.py",
 }
 
 # Bare POSIX paths that must not be hardcoded outside PATH_ALLOW. `os.devnull` is
@@ -5490,15 +5497,15 @@ def test_start_new_session_only_in_detach_helpers():
 
 
 def test_shell_true_only_in_sanctioned_spots():
-    """``shell=True`` only in the two operator-authored-command spots, each line
-    carrying a `# portability:` ack."""
+    """``shell=True`` only in the sanctioned operator-authored-command spot (the
+    stop-aware child runner), each line carrying a `# portability:` ack."""
     bad = []
     for _, rel, ln, txt in _of("shell"):
         if rel not in SHELL_ALLOW:
             bad.append(f"  {rel}:{ln}: {txt.strip()}  (not a sanctioned shell spot)")
         elif ACK not in txt:
             bad.append(f"  {rel}:{ln}: {txt.strip()}  (missing '{ACK}' ack)")
-    assert not bad, "shell=True outside verify.py / plugins/bus.py:\n" + "\n".join(bad)
+    assert not bad, "shell=True outside childrun.py:\n" + "\n".join(bad)
 
 
 # The probe matrix for the seven older tripwires above — tmux, path, sigkill,
@@ -6056,14 +6063,21 @@ GIT_SCOPE_CASES = [
         'proc = _run_git(["git", "fetch"], repo)\n',
         True,
     ),
-    # The string form is refused inside verify.py too — there `shell=True` is
-    # allowlisted (SHELL_ALLOW), so without this the spelling would slip both
-    # tripwires at once; it can never be the chokepoint's feed position, since
-    # `_run_git` takes a sequence.
+    # The string form is refused inside verify.py too; it can never be the
+    # chokepoint's feed position, since `_run_git` takes a sequence.
     (
         "verify-string-shell",
         "verify.py",
         'import subprocess\nsubprocess.run("git status", shell=True)\n',
+        True,
+    ),
+    # …and inside childrun.py, the one file where `shell=True` is allowlisted
+    # (SHELL_ALLOW, DW-353) — without this the spelling would slip both tripwires
+    # at once there.
+    (
+        "childrun-string-shell",
+        "childrun.py",
+        'import subprocess\nsubprocess.Popen("git status", shell=True)\n',
         True,
     ),
 ]

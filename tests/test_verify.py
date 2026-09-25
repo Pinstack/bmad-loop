@@ -38,7 +38,7 @@ from conftest import (
     write_sprint,
 )
 
-from bmad_loop import platform_util, verify
+from bmad_loop import childrun, platform_util, verify
 from bmad_loop.model import StoryTask
 from bmad_loop.policy import Policy, ReviewPolicy, VerifyPolicy
 
@@ -2362,15 +2362,21 @@ def test_a_spawn_fault_unrelated_to_the_cwd_translates_too(tmp_path, monkeypatch
     assertion excludes the whole phrase, not just the `" in"` spelling, because
     the whole phrase is what the production comment promises to omit — it is
     `cli._reverify` that prefixes "could not run", and any reintroduction here
-    stutters it, however the rest of the sentence is worded."""
-    real_run = subprocess.run
+    stutters it, however the rest of the sentence is worded.
+
+    Injected at `subprocess.Popen`, which `childrun.run_child` (the one spawn
+    seam verify commands reach since DW-353) calls. `childrun.subprocess` IS the
+    global `subprocess` module, so the patch is process-wide, not scoped to
+    `childrun`: other spawns pass through only because the fake filters on the
+    `shell` keyword, which only the verify command's spawn passes."""
+    real_popen = subprocess.Popen
 
     def out_of_memory(*args, **kwargs):
         if kwargs.get("shell"):
             raise OSError(12, "Cannot allocate memory")
-        return real_run(*args, **kwargs)
+        return real_popen(*args, **kwargs)
 
-    monkeypatch.setattr(subprocess, "run", out_of_memory)
+    monkeypatch.setattr(childrun.subprocess, "Popen", out_of_memory)
     policy = Policy(verify=VerifyPolicy(commands=(_OK,)))
 
     (result,) = verify.run_verify_commands(policy, tmp_path)
@@ -2560,6 +2566,93 @@ def test_completed_timed_out_and_never_spawned_legs_survive_one_another(tmp_path
     assert after_spawn_fault.returncode == 0 and after_spawn_fault.spawn_error is None
 
 
+# ---- a hard stop request interrupts the pass (DW-353) -----------------------------
+
+
+def test_hard_stop_interrupts_the_pass_one_result_apiece_and_spawns_nothing_after(
+    tmp_path, monkeypatch
+):
+    """A command killed by a hard stop yields an interrupted result, and every
+    later command yields one too WITHOUT spawning — "one CommandResult apiece"
+    survives the fourth leg, and no work starts under a pending stop.
+
+    The probe flips once the second command has started (its marker exists), so
+    the first completed normally and the third must never run.
+
+    Ablation: drop the `if interrupted:` short-circuit in `run_verify_commands`
+    and the third command spawns (the Popen count reads 3)."""
+    marker = tmp_path / "started"
+    script = tmp_path / "hang.py"
+    script.write_text(
+        f"import time\nopen({str(marker)!r}, 'w').close()\ntime.sleep(30)\n", encoding="utf-8"
+    )
+    hangs = f'"{sys.executable}" "{script}"'
+    commands = (_OK, hangs, _OK)
+    spawned: list[str] = []
+    real_popen = subprocess.Popen
+
+    def counting_popen(*args, **kwargs):
+        if kwargs.get("shell"):
+            spawned.append(args[0])
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(childrun.subprocess, "Popen", counting_popen)
+    token = childrun.install_stop_probe(marker.exists)
+    try:
+        results = verify.run_verify_commands(
+            Policy(verify=VerifyPolicy(commands=commands)), tmp_path
+        )
+    finally:
+        childrun.reset_stop_probe(token)
+
+    assert [r.command for r in results] == list(commands)
+    completed, killed, never_spawned = results
+    assert completed.returncode == 0 and not completed.interrupted
+    for result in (killed, never_spawned):
+        assert result.interrupted
+        assert result.returncode == verify.INTERRUPTED_RC
+        assert result.spawn_error is None  # interrupted is not a spawn fault
+    assert spawned == [_OK, hangs]  # the third command never spawned
+    # the journalled tail is what says whether the command ran at all
+    assert killed.output_tail == "interrupted by a hard stop request"
+    assert never_spawned.output_tail.startswith("not started:")
+    assert killed.output_tail != never_spawned.output_tail
+
+
+def test_no_probe_never_interrupts(tmp_path):
+    """Outside an engine run (`cli._reverify`, `bmad-loop confirm`) no probe is
+    installed and the pass is exactly what it was before DW-353."""
+    (result,) = verify.run_verify_commands(Policy(verify=VerifyPolicy(commands=(_OK,))), tmp_path)
+    assert result == verify.CommandResult(_OK, 0, "", "", "", 0, 0)
+
+
+def test_interrupted_rc_collides_with_no_other_sentinel_or_signal():
+    import signal as signal_mod
+
+    assert verify.INTERRUPTED_RC < 0
+    assert verify.INTERRUPTED_RC not in (-1, verify.SPAWN_FAULT_RC)
+    assert not [s for s in signal_mod.Signals if -s.value == verify.INTERRUPTED_RC]
+
+
+@pytest.mark.parametrize("position", [0, 1])
+def test_classifier_refuses_an_interrupted_pass(tmp_path, position):
+    """`VerifyInterrupted` is the fail-loud backstop: an interrupted result must
+    never be read as a pass, a failure or an env fault — the engine raises
+    `RunStopped` before reaching here. Checked ahead of the env-fault loop, so
+    even an earlier env-fault result cannot mask it.
+
+    Ablation: delete the guard and the first row classifies as a retry (rc
+    -1001 != 0), the second as an env fault."""
+    interrupted = verify.CommandResult(
+        "pytest", verify.INTERRUPTED_RC, "interrupted", interrupted=True
+    )
+    other = verify.CommandResult("missing-tool", 127, "sh: missing-tool: not found")
+    results = [interrupted, other] if position == 0 else [other, interrupted]
+
+    with pytest.raises(verify.VerifyInterrupted, match="pytest"):
+        verify.verify_command_results_outcome(results, tmp_path)
+
+
 def test_verify_commands_bound_a_stream_instead_of_holding_it_whole(tmp_path, monkeypatch):
     """A chatty command's stream is cut to `MAX_STREAM_MEMORY_BYTES` as it is
     collected, and what it emitted is recorded rather than lost.
@@ -2622,7 +2715,9 @@ def test_timeout_stream_shapes_that_carry_no_decode(value, expected):
     ``subprocess.run`` re-collects through ``communicate()`` after ``kill()`` and
     the text wrapper has already decoded — dropping it would lose that
     platform's output entirely. The bytes shape, the only one that picks a
-    codec, is covered by the real-child test below."""
+    codec, is covered by `test_drain_timeout_output_goes_through_timeout_stream`
+    in tests/test_childrun.py — since DW-353 the drain-timeout arm there is the
+    only production path into the normalisation."""
     assert verify._timeout_stream(value) == expected
 
 
@@ -2636,8 +2731,8 @@ def test_timeout_stream_shapes_that_carry_no_decode(value, expected):
 # where the guard is wanted, the inverse of what that marker buys its own tests.
 # The work is therefore driven inside a child interpreter pinned to an ASCII
 # locale. Everything below that boundary is genuine: one real grandchild script
-# emits the bytes on both paths, and CPython's own timeout leg is what hands the
-# hung one over. Monkeypatching `subprocess.run` instead would supply str objects
+# emits the bytes on both paths, and the runner's real timeout leg (tree kill,
+# then the post-kill drain) is what hands the hung one over. Monkeypatching `subprocess.run` instead would supply str objects
 # directly and never run the stdlib's decoding at all (see the #378 block below).
 _TIMEOUT_RAW = b"caf\xc3\xa9\r\nsecond\rthird\n"
 """Undecodable as ASCII and carrying both newline forms, so a single payload
@@ -2646,31 +2741,33 @@ exercises the codec choice, the CRLF pair and the lone CR at once."""
 
 @pytest.mark.skipif(
     sys.platform == "win32",
-    reason="the bytes arm is unreachable on Windows (run() re-collects via "
-    "communicate() after kill(), which returns str, already decoded and "
-    "newline-translated), and LC_ALL is not how Windows resolves the codec",
+    reason="LC_ALL is not how Windows resolves the codec, and its text wrapper "
+    "decodes in the reader threads, so there is no raw-bytes arm to diverge",
 )
 def test_verify_commands_timeout_output_matches_the_completed_path(tmp_path):
     """The same bytes must read back the same whether the command finished or
     timed out — the tail a human or a repair session sees cannot depend on that.
 
-    POSIX raises TimeoutExpired from ``_check_timeout`` with the raw chunks
-    joined, *before* the text-mode conversion at the end of ``_communicate``, so
-    the timeout arm has to redo that conversion itself. It did neither half:
-    ``bytes.decode()`` hardcoded UTF-8 against run_verify_commands' own rule
-    (#378) that host-tool output stays on the locale codec, and nothing
-    collapsed the newlines that ``Popen._translate_newlines`` collapses.
+    Before DW-353, POSIX raised TimeoutExpired from ``_check_timeout`` with the
+    raw chunks joined, *before* the text-mode conversion, so the timeout arm had
+    to redo that conversion itself (#378: locale codec, collapsed newlines). Since
+    DW-353 the timeout leg kills the tree and collects through a *completed*
+    post-kill ``communicate``, which runs the stdlib's own text-mode decode; this
+    row now pins that end-to-end equivalence through ``run_verify_commands``
+    under an ASCII locale, and no longer reaches ``timeout_stream`` at all.
 
     The completed result is the reference rather than a literal, so the assertion
     is against what the stdlib actually does, not against this test's idea of it.
 
-    Ablation, two axes, and each reddens a different assertion: drop the
-    ``locale.getpreferredencoding(False)`` argument and the codec half fails;
-    drop the ``replace`` chain and the newline half does. Note that ``LC_ALL=C``
-    alone does NOT redden the codec axis — the C locale auto-enables UTF-8 mode
-    (PEP 540), putting both spellings back on one codec — so ``PYTHONUTF8=0``
-    below is load-bearing, and the anti-vacuity checks fail loudly if it is
-    ever lost rather than letting the test pass empty."""
+    Ablation: this row no longer guards ``childrun.timeout_stream`` — breaking its
+    codec or newline half leaves it green, because the post-kill drain completes.
+    That normalisation is guarded by the drain-timeout row in
+    tests/test_childrun.py, which forces the arm with an unreachable pipe-holder.
+    What reddens here is any change that makes the timeout leg's output diverge
+    from the completed leg's (e.g. decoding the drained output differently from
+    ``text=True``). ``LC_ALL=C`` alone would make the anti-vacuity checks below
+    fail — the C locale auto-enables UTF-8 mode (PEP 540) — so ``PYTHONUTF8=0``
+    is load-bearing."""
     emit = tmp_path / "emit_timeout.py"
     emit.write_text(
         "import sys, time\n"
@@ -2734,7 +2831,7 @@ def test_verify_commands_timeout_output_matches_the_completed_path(tmp_path):
     assert observed["timeout_rc"] == -1
     assert observed["timeout_tail"] == "timed out"
     assert observed["timeout_stdout"] == observed["completed_stdout"]
-    # The child wrote nothing to stderr, so POSIX handed _timeout_stream None.
+    # The child wrote nothing to stderr, so the drained stream is empty.
     assert observed["timeout_stderr"] == ""
 
 
