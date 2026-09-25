@@ -11,6 +11,7 @@ The g binding opens the policy.toml settings editor.
 
 from __future__ import annotations
 
+import os
 import shlex
 import subprocess
 import time
@@ -698,7 +699,12 @@ class BmadLoopApp(App[None]):
                 if spec_path is None:
                     self.notify("no spec file to reset for replan", severity="error")
                     return
-                self._do_replan(run_id, spec_path, self._paused_spec_root(state))
+                self._do_replan(
+                    run_id,
+                    spec_path,
+                    self._paused_spec_root(state),
+                    root_identity=self._paused_spec_root_identity(state),
+                )
 
         self.push_screen(modal, done)
 
@@ -894,7 +900,14 @@ class BmadLoopApp(App[None]):
             f"resume of {run_id} launched (control session {launch.ctl_session(self.project)})"
         )
 
-    def _do_replan(self, run_id: str, spec_path: Path, confine_root: Path) -> None:
+    def _do_replan(
+        self,
+        run_id: str,
+        spec_path: Path,
+        confine_root: Path,
+        *,
+        root_identity: os.stat_result | None = None,
+    ) -> None:
         """Request-replan: reset the planned spec to draft + strip its Auto Run
         Result, then resume — the next dispatch re-enters step-02 planning. Uses
         the same devcontract primitives the engine's repair path uses.
@@ -905,7 +918,12 @@ class BmadLoopApp(App[None]):
         that `_paused_spec` anchored the path on. `runs.task_spec_root`'s docstring
         carries the rationale — a `confine_root` that disagrees with the anchor is not
         REFUSED, it silently drops both writes to the plain no-follow arm and loses the
-        confined arm's O_NOFOLLOW walk (#593) with no signal at all."""
+        confined arm's O_NOFOLLOW walk (#593) with no signal at all.
+
+        `root_identity` pins `confine_root` when it is the run's worktree mount
+        (`_paused_spec_root_identity`, DW-423): a mount swapped for a link refuses the
+        reset with `UnconfinedWriteError` — the error notice below, no resume — rather
+        than landing the replan outside the repository."""
         # Guard a possibly-live engine BEFORE mutating the spec — a draft-reset +
         # strip under a still-running session would race its writes (the rearm path
         # already checks liveness first; match it so replan can't corrupt a live
@@ -927,7 +945,9 @@ class BmadLoopApp(App[None]):
             self.notify(f"replan: no spec at {spec_path} — not resuming", severity="error")
             return
         try:
-            reset = devcontract.reset_spec_for_replan(spec_path, confine_root=confine_root)
+            reset = devcontract.reset_spec_for_replan(
+                spec_path, confine_root=confine_root, root_identity=root_identity
+            )
         except (OSError, UnicodeDecodeError, verify.FrontmatterWriteError) as e:
             # FrontmatterWriteError is not an OSError: a spec whose `status:` is a
             # block scalar or a flow mapping reads fine and fails the WRITE. It
@@ -1327,6 +1347,17 @@ class BmadLoopApp(App[None]):
         if task:
             return runs.live_spec_root(task, state, self.project)
         return runs.rebase_recorded_project_path(Path(state.project), state, self.project)
+
+    def _paused_spec_root_identity(self, state: RunState) -> os.stat_result | None:
+        """The pin for `_paused_spec_root` (DW-423) — kept beside it so the root and its
+        identity stay one claim. `runs.live_spec_root_identity` answers it: the mount's
+        identity when the root is the worktree mount, `None` for the project (and for
+        the no-task arm, which is the project). Taken at the replan gesture, just
+        before the writes it pins."""
+        task = self._paused_task(state)
+        if task:
+            return runs.live_spec_root_identity(task, state, self.project)
+        return None
 
     def _story_subtitle(self, state: RunState) -> Text:
         key = state.paused_story_key or "?"

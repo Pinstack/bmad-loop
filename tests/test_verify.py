@@ -13690,3 +13690,42 @@ def test_unfolded_changes_reads_a_squash_the_target_had_moved_under_three_way(pr
         "blob.bin",
         "shared.txt",
     )
+
+
+# --------------------------------------------- worktree-mount pin (DW-423)
+
+
+@pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES or sys.platform == "win32",
+    reason="dir-fd anchoring and POSIX symlinks",
+)
+def test_set_frontmatter_field_pinned_mount_refuses_a_mount_swapped_for_a_link(tmp_path):
+    """`root_identity=` pins the worktree mount `set_frontmatter_field` confines to:
+    the mount renamed aside and a link planted at its name to an outside tree with
+    the same spec subpath refuses the re-stamp; the outside bytes are unchanged. The
+    unpinned control shows the swap really lands outside.
+
+    Ablation: drop the `root_identity=` forward in `set_frontmatter_field` and the
+    pinned call lands outside instead of raising."""
+    text = "---\nstatus: blocked\nbaseline_revision: old\n---\nbody\n"
+    mount = tmp_path / "project" / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    (mount / "specs").mkdir(parents=True)
+    (mount / "specs" / "6-4.md").write_text(text, encoding="utf-8")
+    identity = os.lstat(mount)
+    outside = tmp_path / "outside"
+    (outside / "specs").mkdir(parents=True)
+    outside_spec = outside / "specs" / "6-4.md"
+    outside_spec.write_text(text, encoding="utf-8")
+    mount.rename(mount.with_name("1-aside"))
+    mount.symlink_to(outside, target_is_directory=True)
+    spec = mount / "specs" / "6-4.md"
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        verify.set_frontmatter_field(
+            spec, "baseline_revision", "new", confine_root=mount, root_identity=identity
+        )
+    assert outside_spec.read_text(encoding="utf-8") == text
+
+    # Control: unpinned, the swap carries the write outside the repository.
+    assert verify.set_frontmatter_field(spec, "baseline_revision", "new", confine_root=mount)
+    assert "baseline_revision: new" in outside_spec.read_text(encoding="utf-8")

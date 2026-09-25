@@ -7948,7 +7948,14 @@ def capture_diff(repo: Path, baseline: str, *, max_file_bytes: int | None = None
     return "".join(parts)
 
 
-def set_frontmatter_field(path: Path, key: str, value: str, *, confine_root: Path) -> bool:
+def set_frontmatter_field(
+    path: Path,
+    key: str,
+    value: str,
+    *,
+    confine_root: Path,
+    root_identity: os.stat_result | None = None,
+) -> bool:
     """Rewrite (or insert) a scalar ``<key>:`` line in a spec's `---`…`---`
     frontmatter block.
 
@@ -7983,7 +7990,8 @@ def set_frontmatter_field(path: Path, key: str, value: str, *, confine_root: Pat
     identically. ``confine_root`` is required for the reason it is required
     there. So is ``require_writable_target=True`` (#597): this rewrites an
     operator-editable spec, and a read-only one is answered rather than routed
-    around by a replace that only needs the directory writable.
+    around by a replace that only needs the directory writable. ``root_identity``
+    pins ``confine_root`` on the confined arm on the terms stated there (DW-423).
 
     Use the BYTES helper and not the text one:
     `atomic_write_text` keeps ``Path.write_text``'s translating newline default,
@@ -8002,7 +8010,11 @@ def set_frontmatter_field(path: Path, key: str, value: str, *, confine_root: Pat
     payload = (before + edited + after).encode("utf-8")
     if path.is_relative_to(confine_root):
         atomic_write_bytes_confined(
-            path, payload, confine_root=confine_root, require_writable_target=True
+            path,
+            payload,
+            confine_root=confine_root,
+            require_writable_target=True,
+            root_identity=root_identity,
         )
     else:
         atomic_write_bytes(path, payload, follow_symlinks=False, require_writable_target=True)

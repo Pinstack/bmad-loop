@@ -33,6 +33,7 @@ verify.py against actual on-disk state.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from collections.abc import Mapping, Sequence, Set
 from dataclasses import dataclass
@@ -674,7 +675,13 @@ def is_frontmatter_candidate(path: Path, *, since_ns: int) -> bool:
     return status_of(fm) in (DONE, BLOCKED, AWAITING_OPERATOR)
 
 
-def _atomic_write_spec(spec_path: Path, text: str, *, confine_root: Path) -> None:
+def _atomic_write_spec(
+    spec_path: Path,
+    text: str,
+    *,
+    confine_root: Path,
+    root_identity: os.stat_result | None = None,
+) -> None:
     """Rewrite ``spec_path`` with ``text`` via a same-directory temp file + atomic
     rename, so an interrupted / short / disk-full write can never truncate the
     canonical spec — a failed repair must lose no work (fault injection on the old
@@ -708,11 +715,23 @@ def _atomic_write_spec(spec_path: Path, text: str, *, confine_root: Path) -> Non
     belongs to is a pyright error rather than an unconfined write. The two
     `frontmatter`-side writers of these same files land on the identical pair of
     calls (#379); this wrapper stays for its callers' ``str``-in signature and
-    this docstring."""
+    this docstring.
+
+    ``root_identity`` pins ``confine_root`` on the confined arm (DW-423), on the
+    terms `frontmatter.set_frontmatter_status` states; ``None`` is the unpinned
+    write. Threaded only through the writers a ``live_spec_root`` caller reaches
+    (`reset_spec_status`, `strip_auto_run_result`, `reset_spec_for_replan`). The
+    engine's calls pass none: they confine to ``workspace.paths.project``, which
+    under worktree isolation IS the mount, so they are still-unpinned mount
+    writers (deferred), not project-rooted ones."""
     payload = text.encode("utf-8")
     if spec_path.is_relative_to(confine_root):
         atomic_write_bytes_confined(
-            spec_path, payload, confine_root=confine_root, require_writable_target=True
+            spec_path,
+            payload,
+            confine_root=confine_root,
+            require_writable_target=True,
+            root_identity=root_identity,
         )
     else:
         atomic_write_bytes(spec_path, payload, follow_symlinks=False, require_writable_target=True)
@@ -742,7 +761,13 @@ def _render_status_line(line: str, m: re.Match[str], value: str) -> str:
     return f"{pre}{q}{value}{q}{rest}" + ("\n" if line.endswith("\n") else "")
 
 
-def reset_spec_status(spec_path: Path, new_status: str, *, confine_root: Path) -> bool:
+def reset_spec_status(
+    spec_path: Path,
+    new_status: str,
+    *,
+    confine_root: Path,
+    root_identity: os.stat_result | None = None,
+) -> bool:
     """Rewrite the frontmatter ``status:`` value of a spec in place.
 
     Used by the generic-skill repair path: bmad-build-auto self-finalizes a spec to
@@ -799,12 +824,17 @@ def reset_spec_status(spec_path: Path, new_status: str, *, confine_root: Path) -
     if new_body is None:
         return False
     _atomic_write_spec(
-        spec_path, head + new_body + tail + text[fm.end() :], confine_root=confine_root
+        spec_path,
+        head + new_body + tail + text[fm.end() :],
+        confine_root=confine_root,
+        root_identity=root_identity,
     )
     return True
 
 
-def strip_auto_run_result(spec_path: Path, *, confine_root: Path) -> bool:
+def strip_auto_run_result(
+    spec_path: Path, *, confine_root: Path, root_identity: os.stat_result | None = None
+) -> bool:
     """Remove every ``## Auto Run Result`` section from a spec, in place.
 
     Companion to `reset_spec_status` on the re-drive path: re-opening a spec by
@@ -843,11 +873,15 @@ def strip_auto_run_result(spec_path: Path, *, confine_root: Path) -> bool:
         kept.append(text[pos : m.start()])
         pos = _next_heading_start(text, m.end())
     kept.append(text[pos:])
-    _atomic_write_spec(spec_path, "".join(kept), confine_root=confine_root)
+    _atomic_write_spec(
+        spec_path, "".join(kept), confine_root=confine_root, root_identity=root_identity
+    )
     return True
 
 
-def reset_spec_for_replan(spec_path: Path, *, confine_root: Path) -> bool:
+def reset_spec_for_replan(
+    spec_path: Path, *, confine_root: Path, root_identity: os.stat_result | None = None
+) -> bool:
     """Reset a spec to ``draft`` and strip its stale result transactionally.
 
     The TUI exposes those two writes as one operator action. Capture the exact
@@ -860,15 +894,23 @@ def reset_spec_for_replan(spec_path: Path, *, confine_root: Path) -> bool:
     two writes cannot leave a partial replan. A fault that leaves the preimage
     untouched does not rewrite it. If the restore itself fails, that failure
     escapes; otherwise the original stage failure is re-raised.
+
+    ``root_identity`` pins ``confine_root`` for all three writes — reset, strip
+    and the restore — so a worktree mount swapped for a link refuses the replan
+    rather than landing it outside the repository (DW-423).
     """
     original = spec_path.read_bytes()
     try:
-        reset = reset_spec_status(spec_path, "draft", confine_root=confine_root)
+        reset = reset_spec_status(
+            spec_path, "draft", confine_root=confine_root, root_identity=root_identity
+        )
         if not reset:
             if not spec_path.is_file():
                 raise FileNotFoundError(f"replan spec vanished during status reset: {spec_path}")
             return False
-        stripped = strip_auto_run_result(spec_path, confine_root=confine_root)
+        stripped = strip_auto_run_result(
+            spec_path, confine_root=confine_root, root_identity=root_identity
+        )
         if not stripped and not spec_path.is_file():
             raise FileNotFoundError(f"replan spec vanished during result strip: {spec_path}")
     except BaseException:
@@ -877,7 +919,12 @@ def reset_spec_for_replan(spec_path: Path, *, confine_root: Path) -> bool:
         except OSError:
             unchanged = False
         if not unchanged:
-            _atomic_write_spec(spec_path, original.decode("utf-8"), confine_root=confine_root)
+            _atomic_write_spec(
+                spec_path,
+                original.decode("utf-8"),
+                confine_root=confine_root,
+                root_identity=root_identity,
+            )
         raise
     return True
 

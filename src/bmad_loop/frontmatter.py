@@ -456,7 +456,13 @@ def _verified(candidate: str, key: str, value: str, rest: dict[str, Any]) -> str
     return candidate
 
 
-def set_frontmatter_status(path: Path, status: str, *, confine_root: Path) -> bool:
+def set_frontmatter_status(
+    path: Path,
+    status: str,
+    *,
+    confine_root: Path,
+    root_identity: os.stat_result | None = None,
+) -> bool:
     """Rewrite the `status:` field in a spec's `---`…`---` frontmatter block.
 
     A minimal in-place line replacement (not a YAML round-trip) so the spec's
@@ -517,6 +523,23 @@ def set_frontmatter_status(path: Path, status: str, *, confine_root: Path) -> bo
     checkout the spec belongs to is a pyright error rather than an unconfined
     write, which is how every call site of this and its two siblings was found.
 
+    ``root_identity`` pins ``confine_root`` on the confined arm (DW-423), forwarded
+    to `platform_util.atomic_write_bytes_confined`; the external arm ignores it and
+    ``None`` (the default) is the unpinned write. The pin rule: a caller pins only
+    an ORCHESTRATOR-MINTED worktree mount (``<project>/.bmad-loop/runs/<id>/
+    worktrees/<unit>``), whose parent is session-writable, so a mount swapped for a
+    link would otherwise carry the write outside the repository; the project root
+    the operator chose stays unpinned. `runs.live_spec_root_identity` answers the
+    identity beside the ``live_spec_root`` it pins. The pin catches the mount
+    ITSELF swapped, not a swapped parent directory (``worktrees/``,
+    ``runs/<id>/``) — the per-write ``lstat`` follows that, the residual every
+    DW-338 pin shares. `verify.set_frontmatter_field` and
+    `devcontract._atomic_write_spec` take the keyword on the same terms;
+    `set_frontmatter_status_anchored` does not, and the engine's and
+    `recovery_flow`'s callers pass none — under isolation their
+    ``workspace.paths.project`` is the mount, so they remain unpinned mount
+    writers.
+
     ``require_writable_target=True`` on both arms (#597): a spec is
     operator-editable, and a temp-and-replace write needs write permission on the
     PARENT DIRECTORY, never on the entry it replaces — so before this a spec an
@@ -553,7 +576,11 @@ def set_frontmatter_status(path: Path, status: str, *, confine_root: Path) -> bo
     payload = (before + edited + after).encode("utf-8")
     if path.is_relative_to(confine_root):
         atomic_write_bytes_confined(
-            path, payload, confine_root=confine_root, require_writable_target=True
+            path,
+            payload,
+            confine_root=confine_root,
+            require_writable_target=True,
+            root_identity=root_identity,
         )
     else:
         atomic_write_bytes(path, payload, follow_symlinks=False, require_writable_target=True)

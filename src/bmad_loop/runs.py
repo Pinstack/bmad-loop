@@ -55,6 +55,7 @@ from .platform_util import (
     is_absolute_path,
     is_link_like,
     names_tree_root,
+    pinned_root_identity,
     retrying_unlink,
     safe_segment,
 )
@@ -3604,6 +3605,45 @@ def live_spec_root(task: StoryTask, state: RunState, project_root: Path) -> Path
     return rebase_recorded_project_path(task_spec_root(task, state), state, project_root)
 
 
+# An identity no directory can match: mode 0 is not S_ISDIR and inode 0 carries no
+# identity, so `platform_util._same_dir_identity` refuses it — the write refuses.
+_UNPINNABLE_MOUNT = os.stat_result((0,) * 10)
+
+
+def live_spec_root_identity(
+    task: StoryTask, state: RunState, project_root: Path
+) -> os.stat_result | None:
+    """The ``root_identity`` a spec writer confined to `live_spec_root` pins it with
+    (DW-423) — take it fresh at each write, beside the ``confine_root`` it pins.
+
+    ``None`` (unpinned) whenever that root is the PROJECT: no mount, or a spec the
+    mount cannot confine (`task_spec_root`'s out-of-mount arm). The operator chose
+    the project checkout and may keep it behind a link — the pin rule in
+    `platform_util.open_dir_confined` leaves it unpinned.
+
+    The mount's identity when the root IS the orchestrator-minted mount
+    (``<project>/.bmad-loop/runs/<id>/worktrees/<unit>``). Its parent is
+    session-writable, so a mount swapped for a link would otherwise carry the flip,
+    strip, re-stamp, undo and the TUI replan outside the repository, since the
+    confined writers open their root following links (DW-338 class).
+
+    A mount that cannot be pinned — a link, a reparse point, not a directory, gone —
+    answers `_UNPINNABLE_MOUNT`, never ``None`` and never a raise. The refusal then
+    happens AT THE WRITE: every re-arm writer answers a missing spec with ``False``
+    before any open, and a gone mount must keep that no-op rather than become an
+    abort here, while a mount that is itself a link cannot be written through.
+
+    The pin covers the mount ITSELF, not its parent directories: a fresh
+    ``os.lstat`` follows a link at ``worktrees/`` or ``runs/<id>/``, so an ancestor
+    swapped for a link to a tree holding a real ``<unit>`` matches the outside
+    directory, and one gesture's writes may land in different directories. That
+    residual is shared by every DW-338 pin and deferred for all of them at once."""
+    if not task.worktree_path or task_spec_root(task, state) != Path(task.worktree_path):
+        return None
+    identity = pinned_root_identity(live_spec_root(task, state, project_root))
+    return _UNPINNABLE_MOUNT if identity is None else identity
+
+
 def live_stories_root(task: StoryTask | None, state: RunState, project_root: Path) -> Path:
     """`task_stories_root` carried onto the tree the caller is acting in — the root
     the stories folder is located from by the READ side of the re-arm gesture.
@@ -4054,6 +4094,9 @@ def _restore_rearmed_spec(
     otherwise identical (right file, right bytes, `rollback="restored"`), which is why
     nothing downstream could catch it and why the parity is asserted at this seam. The
     arm-selection RULE above is unchanged; only the root it compares against is corrected.
+    The confined arm also pins that root with `live_spec_root_identity`, as the three
+    forward writers do (DW-423): a worktree mount swapped for a link raises here, the
+    same refusal the forward writes hit.
 
     Calling the confined helper unconditionally looked stricter and was strictly
     worse — an artifacts folder configured OUTSIDE both the mount and the project is
@@ -4096,7 +4139,11 @@ def _restore_rearmed_spec(
     try:
         if spec_path.is_relative_to(confine_root):
             atomic_write_bytes_confined(
-                spec_path, original, confine_root=confine_root, require_writable_target=True
+                spec_path,
+                original,
+                confine_root=confine_root,
+                require_writable_target=True,
+                root_identity=live_spec_root_identity(task, state, live_project),
             )
         else:
             atomic_write_bytes(
@@ -5009,6 +5056,7 @@ def _rearm_escalation_locked(
                         spec_path,
                         target_status,
                         confine_root=live_spec_root(task, state, live_project),
+                        root_identity=live_spec_root_identity(task, state, live_project),
                     )
                     # `set_frontmatter_status` answers "nothing to change" with `False`
                     # for FOUR causes, not three — its own docstring lists them: no file,
@@ -5139,7 +5187,9 @@ def _rearm_escalation_locked(
                     # as it found it — a stripped result section on a spec the re-arm then
                     # refused would be the one edit nothing else records.
                     devcontract.strip_auto_run_result(
-                        spec_path, confine_root=live_spec_root(task, state, live_project)
+                        spec_path,
+                        confine_root=live_spec_root(task, state, live_project),
+                        root_identity=live_spec_root_identity(task, state, live_project),
                     )
                 except verify.FrontmatterWriteError as e:
                     # The spec reads fine but carries `status:` in a shape no line
@@ -5343,6 +5393,7 @@ def _rearm_escalation_locked(
                         "baseline_revision",
                         task.baseline_commit,
                         confine_root=live_spec_root(task, state, live_project),
+                        root_identity=live_spec_root_identity(task, state, live_project),
                     )
                 except (OSError, UnicodeDecodeError, verify.FrontmatterWriteError) as e:
                     # FrontmatterWriteError joins the tuple rather than getting its own

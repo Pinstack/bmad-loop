@@ -491,7 +491,7 @@ def test_set_frontmatter_status_write_failure_raises_and_keeps_the_spec(tmp_path
     spec = _spec(tmp_path, _PLAIN)
     before = spec.read_bytes()
 
-    def boom(path, data, *, confine_root, require_writable_target=False):
+    def boom(path, data, *, confine_root, require_writable_target=False, root_identity=None):
         raise OSError("no space left on device")
 
     monkeypatch.setattr(frontmatter, "atomic_write_bytes_confined", boom)
@@ -530,7 +530,7 @@ def test_set_frontmatter_status_hands_the_helper_bytes_not_text(tmp_path, monkey
     seen: list[bytes | str] = []
     real = frontmatter.atomic_write_bytes_confined
 
-    def record(path, data, *, confine_root, require_writable_target=False):
+    def record(path, data, *, confine_root, require_writable_target=False, root_identity=None):
         seen.append(data)
         blob = data if isinstance(data, bytes) else data.encode("utf-8")
         real(
@@ -538,6 +538,7 @@ def test_set_frontmatter_status_hands_the_helper_bytes_not_text(tmp_path, monkey
             blob,
             confine_root=confine_root,
             require_writable_target=require_writable_target,
+            root_identity=root_identity,
         )
 
     monkeypatch.setattr(frontmatter, "atomic_write_bytes_confined", record)
@@ -1226,3 +1227,53 @@ def test_anchored_without_handle_anchored_writes_raises_before_reading(tmp_path,
         frontmatter.set_frontmatter_status_anchored(spec, "done", confine_root=root)
 
     assert spec.read_bytes() == _PLAIN.encode("utf-8")
+
+
+# ============================================================ worktree-mount pin (DW-423)
+#
+# `root_identity=` on `set_frontmatter_status`'s confined arm pins an
+# orchestrator-minted worktree mount. The swap: the mount renamed aside and a link
+# planted at its name to an outside tree carrying the same spec subpath.
+
+requires_symlinked_mount_swap = pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES or sys.platform == "win32",
+    reason="dir-fd anchoring and POSIX symlinks",
+)
+
+
+def _mount_swap_pair(tmp_path, text: str) -> tuple[Path, Path, os.stat_result]:
+    """A mount holding ``specs/6-4.md``, its accepted ``lstat`` identity, then the
+    mount swapped for a link to an outside copy. Returns (mount, outside spec,
+    identity)."""
+    mount = tmp_path / "project" / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    (mount / "specs").mkdir(parents=True)
+    (mount / "specs" / "6-4.md").write_text(text, encoding="utf-8")
+    identity = os.lstat(mount)
+    outside = tmp_path / "outside"
+    (outside / "specs").mkdir(parents=True)
+    (outside / "specs" / "6-4.md").write_text(text, encoding="utf-8")
+    mount.rename(mount.with_name("1-aside"))
+    mount.symlink_to(outside, target_is_directory=True)
+    return mount, outside / "specs" / "6-4.md", identity
+
+
+@requires_symlinked_mount_swap
+def test_set_frontmatter_status_pinned_mount_refuses_a_mount_swapped_for_a_link(tmp_path):
+    """The pinned write refuses a swapped mount and leaves the outside bytes alone;
+    the unpinned control shows the same swap really lands outside.
+
+    Ablation: drop the `root_identity=` forward in `set_frontmatter_status` and the
+    pinned call lands outside instead of raising."""
+    text = "---\nstatus: blocked\n---\nbody\n"
+    mount, outside_spec, identity = _mount_swap_pair(tmp_path, text)
+    spec = mount / "specs" / "6-4.md"
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        frontmatter.set_frontmatter_status(
+            spec, "in-progress", confine_root=mount, root_identity=identity
+        )
+    assert outside_spec.read_text(encoding="utf-8") == text
+
+    # Control: unpinned, the swap carries the write outside the repository.
+    assert frontmatter.set_frontmatter_status(spec, "in-progress", confine_root=mount)
+    assert "status: in-progress" in outside_spec.read_text(encoding="utf-8")

@@ -1043,8 +1043,10 @@ def pinned_root_identity(root: Path) -> os.stat_result | None:
 
     For roots the ORCHESTRATOR mints or validates whose callers opt in — today
     the artifact-publication root, the run dir for the verify-stream write, the
-    exact-path candidate worktree and the integration snapshot directory's
-    no-dir-fd arms: their
+    exact-path candidate worktree, the integration snapshot directory's
+    no-dir-fd arms and the ``live_spec_root`` spec writers — re-arm and TUI
+    replan (DW-423, through ``runs.live_spec_root_identity``, which turns this
+    None into a never-matching identity so the refusal lands at the write): their
     contract refuses a linked root, so a root that is a symlink, a win32 link reparse point
     (:data:`_LINK_REPARSE_TAGS`), not a directory, or cannot be probed answers
     None, and a pinned caller treats None as a refusal — never as "open it
@@ -1186,13 +1188,18 @@ def open_dir_confined(
     through a link (``test_open_dir_confined_accepts_a_root_behind_a_link``),
     their parent lies outside the checkout so nothing inside it can replace them,
     and a pin ``stat``-ed at the same instant as the open would bind nothing.
-    Pinned today: artifact publication, the verify-stream write and the
-    exact-path candidate worktree. The integration snapshot directory is held
-    by its own ``O_NOFOLLOW`` root open on the dir-fd arm (a leaf check, not
-    this identity compare) and by :func:`pinned_root_identity` pre-checks on
-    the others. NOT yet pinned: the worktree-mount spec writers
-    (frontmatter/devcontract/runs with ``confine_root=live_spec_root(...)``) —
-    the rule says they should be, but they still follow a linked root.
+    Pinned today: artifact publication, the verify-stream write, the
+    exact-path candidate worktree and the worktree-mount spec writers
+    (frontmatter/devcontract/runs and the TUI replan with
+    ``confine_root=live_spec_root(...)``, pinned by
+    ``runs.live_spec_root_identity`` — DW-423). The integration snapshot
+    directory is held by its own ``O_NOFOLLOW`` root open on the dir-fd arm (a
+    leaf check, not this identity compare) and by :func:`pinned_root_identity`
+    pre-checks on the others. NOT yet pinned: the engine's and ``recovery_flow``'s
+    spec writers, which confine to ``workspace.paths.project`` — under worktree
+    isolation that IS the mount, so they still follow a mount swapped for a link.
+    A pin taken by a fresh ``lstat`` covers the root ITSELF: a link at one of its
+    parent directories is followed, a residual every pin above shares.
     The confined writers' no-handle fallback re-``lstat``s the root instead —
     check-then-write, the residual :func:`path_is_confined` documents (DW-295)."""
     if not HANDLE_ANCHORED_WRITES:

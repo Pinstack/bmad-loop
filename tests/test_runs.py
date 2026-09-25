@@ -7571,3 +7571,230 @@ def test_legacy_leftovers_dry_run_keeps_what_the_legacy_pass_cannot_claim(tmp_pa
     assert legacy.killed == []  # the legacy pass declined it, as it must
     assert preview == runs.legacy_registry_leftovers(tmp_path)
     assert preview == {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-dup"]}
+
+
+# --------------------------------------------- worktree-mount spec-writer pin (DW-423)
+#
+# `live_spec_root_identity` answers the `root_identity` every `live_spec_root` write
+# site passes: None for the project, the mount's `lstat` for an intact mount, and a
+# never-matching identity for a mount that cannot be pinned — so the refusal lands at
+# the write, and a gone mount keeps its no-op.
+
+requires_symlinked_mount_swap = pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES or sys.platform == "win32",
+    reason="dir-fd anchoring and POSIX symlinks",
+)
+
+_PINNED_SPEC = "---\nstatus: blocked\n---\n\nbody\n\n## Auto Run Result\n\nStatus: blocked\n"
+
+
+def _mount(project: Path) -> Path:
+    return project / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+
+
+def _swap_mount_for_link(mount: Path, outside: Path) -> None:
+    """Copy the mount's spec tree to ``outside``, rename the mount aside and plant a
+    link at its name — the walk below the root still finds the same subpath."""
+    import shutil
+
+    shutil.copytree(mount, outside)
+    mount.rename(mount.with_name(mount.name + "-aside"))
+    mount.symlink_to(outside, target_is_directory=True)
+
+
+def _never_matches(identity) -> bool:
+    import stat
+
+    return identity is not None and not stat.S_ISDIR(identity.st_mode) and identity.st_ino == 0
+
+
+def test_live_spec_root_identity_is_none_for_the_project(tmp_path):
+    """No mount, and a spec the mount cannot confine: both roots are the project,
+    which the operator chose and may keep behind a link — unpinned.
+
+    Ablation: answer `pinned_root_identity(live_spec_root(...))` unconditionally and
+    both rows redden with the project's identity."""
+    no_mount = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md")
+    assert runs.live_spec_root_identity(no_mount.task, no_mount.state, tmp_path) is None
+
+    mount = _mount(tmp_path)
+    mount.mkdir(parents=True)
+    outside = escalated_run(
+        tmp_path,
+        "r2",
+        spec_file=str(tmp_path / "_bmad-output" / "specs" / "6-4.md"),
+        worktree_path=str(mount),
+    )
+    assert runs.task_spec_root(outside.task, outside.state) == tmp_path  # the premise
+    assert runs.live_spec_root_identity(outside.task, outside.state, tmp_path) is None
+
+
+def test_live_spec_root_identity_pins_an_intact_mount(tmp_path):
+    """An intact mount answers its own `lstat` identity.
+
+    Ablation: return `None` for the mount case and this reddens."""
+    mount = _mount(tmp_path)
+    mount.mkdir(parents=True)
+    run = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(mount))
+
+    identity = runs.live_spec_root_identity(run.task, run.state, tmp_path)
+
+    assert identity is not None
+    expected = os.lstat(mount)
+    assert (identity.st_dev, identity.st_ino, identity.st_mode) == (
+        expected.st_dev,
+        expected.st_ino,
+        expected.st_mode,
+    )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_live_spec_root_identity_never_matches_a_linked_mount(tmp_path):
+    """A mount that is a link cannot be pinned, and must not degrade to unpinned:
+    the helper answers an identity no directory matches.
+
+    Ablation: return `pinned_root_identity(...)` raw (None for a link) and this
+    reddens — None is the unpinned write."""
+    mount = _mount(tmp_path)
+    mount.mkdir(parents=True)
+    run = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(mount))
+    _swap_mount_for_link(mount, tmp_path / "outside")
+
+    assert _never_matches(runs.live_spec_root_identity(run.task, run.state, tmp_path))
+
+
+def test_live_spec_root_identity_never_matches_a_gone_mount_without_raising(tmp_path):
+    """A gone mount answers the never-matching identity rather than raising, so the
+    writers keep their missing-spec `False` no-op (they return before any open).
+
+    Ablation: raise when `pinned_root_identity` answers None and this reddens."""
+    mount = _mount(tmp_path)  # never created
+    run = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(mount))
+
+    identity = runs.live_spec_root_identity(run.task, run.state, tmp_path)
+
+    assert _never_matches(identity)
+    # and the no-op it protects: a missing spec is still "nothing to change"
+    spec = runs.live_spec_path(run.task, run.state, tmp_path)
+    assert (
+        verify.set_frontmatter_status(
+            spec, "ready-for-dev", confine_root=mount, root_identity=identity
+        )
+        is False
+    )
+
+
+@requires_symlinked_mount_swap
+def test_restore_rearmed_spec_refuses_a_mount_swapped_for_a_link(tmp_path, monkeypatch):
+    """The re-arm's undo is pinned like the three writes it undoes: a mount swapped
+    for a link raises `RearmError` instead of writing the preimage outside. The
+    unpinned control shows the same swap really lands the undo outside.
+
+    Ablation: drop `root_identity=` from `_restore_rearmed_spec`'s confined call and
+    the pinned row writes the preimage into the outside copy."""
+    mount = _mount(tmp_path)
+    (mount / "specs").mkdir(parents=True)
+    (mount / "specs" / "6-4.md").write_text("flipped\n", encoding="utf-8")
+    run = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(mount))
+    spec = runs.live_spec_path(run.task, run.state, tmp_path)
+    outside = tmp_path / "outside"
+    _swap_mount_for_link(mount, outside)
+    outside_spec = outside / "specs" / "6-4.md"
+
+    with pytest.raises(runs.RearmError):
+        runs._restore_rearmed_spec(spec, b"original\n", run.task, run.state, tmp_path)
+    assert outside_spec.read_bytes() == b"flipped\n"
+
+    # Control: unpinned, the undo follows the link out of the repository.
+    monkeypatch.setattr(runs, "live_spec_root_identity", lambda *a: None)
+    assert (
+        runs._restore_rearmed_spec(spec, b"original\n", run.task, run.state, tmp_path) == "restored"
+    )
+    assert outside_spec.read_bytes() == b"original\n"
+
+
+@requires_symlinked_mount_swap
+def test_rearm_escalation_refuses_an_isolated_mount_swapped_for_a_link(tmp_path, monkeypatch):
+    """Acceptance end-to-end: an isolated run whose mount is replaced by a link. The
+    re-arm aborts with `RearmError` and the link target's spec copy is unchanged;
+    the unpinned control shows the flip would otherwise land there.
+
+    Ablation: drop `root_identity=` from the status flip in `rearm_escalation` (or
+    make `live_spec_root_identity` answer None) and the flip lands in the outside
+    copy."""
+    mount = _mount(tmp_path)
+    (mount / "specs").mkdir(parents=True)
+    (mount / "specs" / "6-4.md").write_text(_PINNED_SPEC, encoding="utf-8")
+    run = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(mount))
+    outside = tmp_path / "outside"
+    _swap_mount_for_link(mount, outside)
+    outside_spec = outside / "specs" / "6-4.md"
+
+    with pytest.raises(runs.RearmError):
+        runs.rearm_escalation(run.run_dir, "s1", isolated_redrive=True, resolution_recorded=False)
+    assert outside_spec.read_text(encoding="utf-8") == _PINNED_SPEC
+    assert load_state(run.run_dir).tasks["s1"].phase.value == "escalated"
+
+    # Control: unpinned, the same re-arm writes the spec outside the repository.
+    monkeypatch.setattr(runs, "live_spec_root_identity", lambda *a: None)
+    runs.rearm_escalation(run.run_dir, "s1", isolated_redrive=True, resolution_recorded=False)
+    assert "status: ready-for-dev" in outside_spec.read_text(encoding="utf-8")
+
+
+@requires_symlinked_mount_swap
+@pytest.mark.parametrize(
+    ("after_module", "after_name", "outside_changes"),
+    [
+        # the flip lands in the real mount, then the mount is swapped: the STRIP's pin
+        ("verify", "set_frontmatter_status", lambda text: "## Auto Run Result" not in text),
+        # the flip and the strip land, then the mount is swapped: the RE-STAMP's pin
+        ("devcontract", "strip_auto_run_result", lambda text: "baseline_revision:" in text),
+    ],
+    ids=["strip", "restamp"],
+)
+@pytest.mark.parametrize("pinned", [True, False], ids=["pinned", "unpinned-control"])
+def test_rearm_escalation_pins_every_later_write_to_the_mount(
+    tmp_path, monkeypatch, after_module, after_name, outside_changes, pinned
+):
+    """The mount swapped for a link MID-re-arm, right after the write before the site
+    under test. Pinned, that site refuses (`RearmError`), the undo refuses too, and
+    the outside copy keeps the bytes it was swapped in with; the unpinned control
+    shows the same site otherwise writes outside the repository.
+
+    Ablation: drop `root_identity=` from the runs strip (`strip` row) or baseline
+    re-stamp (`restamp` row) call and its pinned row reddens — the write lands in the
+    outside copy."""
+    import shutil
+
+    from bmad_loop import devcontract
+
+    mount = _mount(tmp_path)
+    (mount / "specs").mkdir(parents=True)
+    (mount / "specs" / "6-4.md").write_text(_PINNED_SPEC, encoding="utf-8")
+    run = escalated_run(
+        tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(mount), git_project=True
+    )
+    outside = tmp_path.parent / (tmp_path.name + "-outside")
+    outside_spec = outside / "specs" / "6-4.md"
+    module = {"verify": verify, "devcontract": devcontract}[after_module]
+    real = getattr(module, after_name)
+
+    def then_swap(*args, **kwargs):
+        result = real(*args, **kwargs)
+        shutil.copytree(mount, outside)
+        mount.rename(mount.with_name(mount.name + "-aside"))
+        mount.symlink_to(outside, target_is_directory=True)
+        return result
+
+    monkeypatch.setattr(module, after_name, then_swap)
+    if not pinned:
+        monkeypatch.setattr(runs, "live_spec_root_identity", lambda *a: None)
+        runs.rearm_escalation(run.run_dir, "s1", isolated_redrive=True, resolution_recorded=False)
+        assert outside_changes(outside_spec.read_text(encoding="utf-8"))
+        return
+
+    with pytest.raises(runs.RearmError):
+        runs.rearm_escalation(run.run_dir, "s1", isolated_redrive=True, resolution_recorded=False)
+    swapped_in = (mount.with_name(mount.name + "-aside") / "specs" / "6-4.md").read_bytes()
+    assert outside_spec.read_bytes() == swapped_in
+    assert not outside_changes(outside_spec.read_text(encoding="utf-8"))

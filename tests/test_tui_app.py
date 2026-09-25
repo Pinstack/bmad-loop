@@ -11,6 +11,7 @@ import dataclasses
 import json
 import os
 import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -43,7 +44,7 @@ from textual.widgets import (
     TabbedContent,
 )
 
-from bmad_loop import bmadconfig, documents
+from bmad_loop import bmadconfig, documents, platform_util
 from bmad_loop import policy as policy_mod
 from bmad_loop import runs as runs_mod
 from bmad_loop import verify
@@ -4079,6 +4080,50 @@ async def test_plan_checkpoint_replan_writes_the_worktree_spec_not_the_main_twin
     assert "## Auto Run Result" not in spec.read_text(encoding="utf-8")
     assert twin.read_bytes() == untouched
     assert roots == [wt, wt]
+
+
+@pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES or sys.platform == "win32",
+    reason="dir-fd anchoring and POSIX symlinks",
+)
+async def test_plan_checkpoint_replan_refuses_a_worktree_mount_swapped_for_a_link(
+    project, monkeypatch
+):
+    """DW-423 end-to-end: the isolated run's mount is replaced by a link to an outside
+    tree carrying the same spec subpath while the review modal is open. The replan
+    must refuse — error notice, no resume — and the outside spec copy is unchanged.
+
+    Ablation: pass `None` instead of `_paused_spec_root_identity(state)` from `done()`
+    (or drop the forward to `reset_spec_for_replan`) and the replan resets the outside
+    copy to draft and resumes."""
+    import shutil
+
+    calls: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    wt = _unit_worktree(project.project)
+    _run_dir, spec = _stories_paused_run(
+        project.project,
+        stage="plan-checkpoint",
+        worktree_path=str(wt),
+        blocked_result="stale terminal result",
+    )
+    outside = project.project.parent / "outside-mount"
+    outside_spec = outside / spec.relative_to(wt)
+    monkeypatch.chdir(project.project)
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        shutil.copytree(wt, outside)
+        wt.rename(wt.with_name(wt.name + "-aside"))
+        wt.symlink_to(outside, target_is_directory=True)
+        untouched = outside_spec.read_bytes()
+        await pilot.click(await ready(pilot, "#act-replan"))
+        await until(pilot, lambda: any("replan failed" in m for m in notifications(app)))
+    assert calls == []
+    assert outside_spec.read_bytes() == untouched
 
 
 async def test_plan_checkpoint_replan_confines_on_the_project_for_an_out_of_mount_spec(

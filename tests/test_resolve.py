@@ -296,7 +296,7 @@ def test_set_frontmatter_field_write_failure_raises_and_keeps_the_spec(tmp_path,
     spec.write_text(SPEC, encoding="utf-8")
     before = spec.read_bytes()
 
-    def boom(path, data, *, confine_root, require_writable_target=False):
+    def boom(path, data, *, confine_root, require_writable_target=False, root_identity=None):
         raise OSError("no space left on device")
 
     monkeypatch.setattr(verify, "atomic_write_bytes_confined", boom)
@@ -329,7 +329,7 @@ def test_set_frontmatter_field_hands_the_helper_bytes_not_text(tmp_path, monkeyp
     seen: list[bytes | str] = []
     real = verify.atomic_write_bytes_confined
 
-    def record(path, data, *, confine_root, require_writable_target=False):
+    def record(path, data, *, confine_root, require_writable_target=False, root_identity=None):
         seen.append(data)
         blob = data if isinstance(data, bytes) else data.encode("utf-8")
         real(
@@ -337,6 +337,7 @@ def test_set_frontmatter_field_hands_the_helper_bytes_not_text(tmp_path, monkeyp
             blob,
             confine_root=confine_root,
             require_writable_target=require_writable_target,
+            root_identity=root_identity,
         )
 
     monkeypatch.setattr(verify, "atomic_write_bytes_confined", record)
@@ -1982,7 +1983,7 @@ def test_rearm_restores_the_spec_when_the_result_strip_faults(tmp_path, monkeypa
     before = spec.read_bytes()
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))
 
-    def boom(spec_path, *, confine_root):
+    def boom(spec_path, *, confine_root, root_identity=None):
         raise OSError(28, "No space left on device")
 
     # patched on the module under test, so the flip runs for real and PUBLISHES
@@ -2030,7 +2031,7 @@ def test_rearm_restores_an_isolated_tasks_spec_that_sits_outside_the_worktree(
     before = spec.read_bytes()
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec), worktree_path=str(wt))
 
-    def boom(spec_path, *, confine_root):
+    def boom(spec_path, *, confine_root, root_identity=None):
         raise OSError(28, "No space left on device")
 
     monkeypatch.setattr(runs.devcontract, "strip_auto_run_result", boom)

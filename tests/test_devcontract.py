@@ -1873,7 +1873,7 @@ def test_repair_write_failure_never_truncates_spec(tmp_path, monkeypatch, writer
     simply never fire, a silent false green. `pytest.raises` is what catches it."""
     sp = _write(tmp_path, "spec-a.md", original)
 
-    def boom(path, data, *, confine_root, require_writable_target=False):
+    def boom(path, data, *, confine_root, require_writable_target=False, root_identity=None):
         raise OSError("no space left on device")
 
     monkeypatch.setattr(devcontract, "atomic_write_bytes_confined", boom)
@@ -1906,7 +1906,7 @@ def test_atomic_write_spec_hands_the_helper_bytes_not_text(tmp_path, monkeypatch
     seen: list[bytes | str] = []
     real = devcontract.atomic_write_bytes_confined
 
-    def record(path, data, *, confine_root, require_writable_target=False):
+    def record(path, data, *, confine_root, require_writable_target=False, root_identity=None):
         seen.append(data)
         blob = data if isinstance(data, bytes) else data.encode("utf-8")
         real(
@@ -1914,6 +1914,7 @@ def test_atomic_write_spec_hands_the_helper_bytes_not_text(tmp_path, monkeypatch
             blob,
             confine_root=confine_root,
             require_writable_target=require_writable_target,
+            root_identity=root_identity,
         )
 
     # the CONFINED binding (#593) — the arm an in-tree spec takes. Patching
@@ -2085,7 +2086,7 @@ def test_operator_confirmation_write_failure_raises_and_keeps_the_spec(tmp_path,
     never made."""
     sp = _write(tmp_path, "spec-a.md", _PARKED)
 
-    def boom(path, data, *, confine_root, require_writable_target=False):
+    def boom(path, data, *, confine_root, require_writable_target=False, root_identity=None):
         raise OSError("no space left on device")
 
     # the CONFINED binding: `sp` is under `tmp_path`, so the chokepoint takes that
@@ -2538,3 +2539,105 @@ def test_harvest_fingerprint_marks_sha1_as_non_security_use(monkeypatch):
     monkeypatch.setattr(devcontract.hashlib, "sha1", recording_sha1)
     assert devcontract.harvest_fingerprint("a", "b") == "4a3dec2d1f82"
     assert seen == [False]
+
+
+# --------------------------------------------- worktree-mount pin (DW-423)
+#
+# `root_identity=` threads through `_atomic_write_spec` for the writers a
+# `live_spec_root` caller reaches. The swap: the mount renamed aside and a link
+# planted at its name to an outside tree carrying the same spec subpath.
+
+requires_symlinked_mount_swap = pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES or sys.platform == "win32",
+    reason="dir-fd anchoring and POSIX symlinks",
+)
+
+_MOUNT_SPEC = "---\nstatus: done\n---\n\n## Intent\n\nbody\n\n## Auto Run Result\n\nStatus: done\n"
+
+
+def _mount_swap_pair(tmp_path: Path) -> tuple[Path, Path, os.stat_result]:
+    """(mount, outside spec, the mount's accepted identity), the swap already made."""
+    mount = tmp_path / "project" / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    (mount / "specs").mkdir(parents=True)
+    (mount / "specs" / "6-4.md").write_text(_MOUNT_SPEC, encoding="utf-8")
+    identity = os.lstat(mount)
+    outside = tmp_path / "outside"
+    (outside / "specs").mkdir(parents=True)
+    (outside / "specs" / "6-4.md").write_text(_MOUNT_SPEC, encoding="utf-8")
+    mount.rename(mount.with_name("1-aside"))
+    mount.symlink_to(outside, target_is_directory=True)
+    return mount, outside / "specs" / "6-4.md", identity
+
+
+@requires_symlinked_mount_swap
+def test_strip_auto_run_result_pinned_mount_refuses_a_mount_swapped_for_a_link(tmp_path):
+    """The pinned strip refuses a swapped mount; outside bytes unchanged. The unpinned
+    control shows the same swap really strips the outside copy.
+
+    Ablation: drop the `root_identity=` forward in `strip_auto_run_result` (or in
+    `_atomic_write_spec`) and the pinned call strips the outside copy instead."""
+    mount, outside_spec, identity = _mount_swap_pair(tmp_path)
+    spec = mount / "specs" / "6-4.md"
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        devcontract.strip_auto_run_result(spec, confine_root=mount, root_identity=identity)
+    assert outside_spec.read_text(encoding="utf-8") == _MOUNT_SPEC
+
+    assert devcontract.strip_auto_run_result(spec, confine_root=mount)  # control
+    assert "## Auto Run Result" not in outside_spec.read_text(encoding="utf-8")
+
+
+@requires_symlinked_mount_swap
+def test_reset_spec_for_replan_pinned_mount_refuses_a_mount_swapped_for_a_link(tmp_path):
+    """The pinned replan refuses a swapped mount at its first write; outside bytes
+    unchanged. The unpinned control shows the same swap really replans the outside
+    copy.
+
+    Ablation: drop the `root_identity=` forward from `reset_spec_for_replan` to
+    `reset_spec_status` and the pinned call resets the outside copy to draft."""
+    mount, outside_spec, identity = _mount_swap_pair(tmp_path)
+    spec = mount / "specs" / "6-4.md"
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        devcontract.reset_spec_for_replan(spec, confine_root=mount, root_identity=identity)
+    assert outside_spec.read_text(encoding="utf-8") == _MOUNT_SPEC
+
+    assert devcontract.reset_spec_for_replan(spec, confine_root=mount)  # control
+    replanned = outside_spec.read_text(encoding="utf-8")
+    assert "status: draft" in replanned and "## Auto Run Result" not in replanned
+
+
+@requires_symlinked_mount_swap
+def test_reset_spec_for_replan_pinned_restore_refuses_a_mount_swapped_mid_replan(
+    tmp_path, monkeypatch
+):
+    """The replan's RESTORE is pinned too: a mount swapped after the reset landed
+    fails the strip, and the undo then refuses to write through the link rather
+    than landing the preimage outside.
+
+    Ablation: drop the `root_identity=` forward on the restore `_atomic_write_spec`
+    call and the undo writes the preimage into the outside copy."""
+    mount = tmp_path / "project" / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    (mount / "specs").mkdir(parents=True)
+    spec = mount / "specs" / "6-4.md"
+    spec.write_text(_MOUNT_SPEC, encoding="utf-8")
+    identity = os.lstat(mount)
+    outside = tmp_path / "outside"
+    (outside / "specs").mkdir(parents=True)
+    outside_spec = outside / "specs" / "6-4.md"
+    real_strip = devcontract.strip_auto_run_result
+
+    def swap_then_strip(path, **kwargs):
+        # The reset has landed in the real mount; swap the mount for a link to a
+        # copy of what is there now, so the strip and the undo both hit the link.
+        outside_spec.write_bytes(spec.read_bytes())
+        mount.rename(mount.with_name("1-aside"))
+        mount.symlink_to(outside, target_is_directory=True)
+        return real_strip(path, **kwargs)
+
+    monkeypatch.setattr(devcontract, "strip_auto_run_result", swap_then_strip)
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        devcontract.reset_spec_for_replan(spec, confine_root=mount, root_identity=identity)
+    swapped_in = outside_spec.read_text(encoding="utf-8")
+    assert "status: draft" in swapped_in  # the reset's bytes, never the undo's preimage
+    assert swapped_in != _MOUNT_SPEC
