@@ -52,6 +52,8 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- Amend the AGENTS.md doctrine: an observation degrade must be journaled or counted, never
+  folded silently into a healthy-looking empty value (DW-347).
 - Commit hooks in the exact-path candidate worktree now see a worktree holding only the
   target: a hook that reads other tracked files (whole-tree lint or tests) sees them missing
   and may fail the publication, and one that stages the rest of the tree is refused by scope
@@ -73,6 +75,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Journal `spec-reconcile-skipped-status` (`story_key`, `spec`, `status`) when terminal-status
+  reconcile refuses a frontmatter status outside `RECONCILABLE_FROM` (e.g. `blocked`), and write a
+  `session-probe-failed` crumb to `session-lifecycle.jsonl` when the #489 `has_session` probe
+  raises `MultiplexerError`; both degrades were silent (DW-382).
 - Refuse every sweep-migration recovery or retry reset over a HEAD that moved past the task
   baseline, pausing at `escalation` (`story-gate` for a `done` migration) with a converging
   remedy (keep HEAD, make the tree clean, resume) instead of rewinding a landed migration

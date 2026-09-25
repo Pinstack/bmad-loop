@@ -79,6 +79,7 @@ These rules apply to code you are already touching — do not initiate refactors
 - Split by responsibility, never by line count: a cohesive state machine stays whole (`statemachine.py`); size thresholds are review heuristics, not lint gates.
 - Strict typing lives in the pure core, not the I/O edges (the staged pyright config in pyproject.toml is deliberate). Do NOT ratchet ruff stricter than CI — the `[tool.ruff.lint]` comment documents why.
 - Fail loud at boundaries: typed escalation over bare except; observation may degrade, repair writes must raise.
+  A degrade must be visible: journal it or count it, and never fold a fault silently into a healthy-looking empty value (`None`, `[]`, `False`, `""`) that a caller cannot tell from a real answer.
 
 ## Docs index
 

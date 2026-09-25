@@ -3782,6 +3782,16 @@ def test_window_death_distinguishes_a_destroyed_session_from_an_exited_cli(
     if expect_vanished:
         assert crumbs[0]["session"] == adapter.session_name
         assert crumbs[0]["status"] == "crashed"
+    # DW-382: the couldn't-ask arm degrades to "not vanished" VISIBLY — a crumb
+    # separates it from a mux that answered "still here". Exactly one, and only
+    # on the fault arm.
+    probe_failed = _lifecycle_events(adapter, "session-probe-failed")
+    if isinstance(has_session, Exception):
+        assert len(probe_failed) == 1
+        assert probe_failed[0]["session"] == adapter.session_name
+        assert probe_failed[0]["error"] == "MultiplexerError: server wedged"
+    else:
+        assert probe_failed == []
 
 
 def test_session_probe_is_skipped_for_non_crash_verdicts(tmp_path, monkeypatch):

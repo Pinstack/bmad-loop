@@ -5544,6 +5544,62 @@ def test_generic_reconcile_leaves_unknown_custom_status(project):
     assert sp.read_bytes() == before  # the deliberate token survives
     assert rj["status"] == "needs-triage"  # result dict untouched
     assert "spec-status-reconciled" not in [e["kind"] for e in engine.journal.entries()]
+    # DW-382: the refusal is journaled, not silent.
+    skipped = [e for e in engine.journal.entries() if e["kind"] == "spec-reconcile-skipped-status"]
+    assert len(skipped) == 1
+    assert skipped[0]["story_key"] == "1-1-a"
+    assert skipped[0]["spec"] == str(sp)
+    assert skipped[0]["status"] == "needs-triage"
+
+
+def test_generic_reconcile_journals_blocked_refusal(project):
+    """DW-382: a `blocked` frontmatter is never reconciled (it must still route to
+    PAUSE), even under a prose `done`. The refusal used to leave no journal row, so
+    a spec stuck at a status the repair cannot move was indistinguishable from a
+    reconcile that never ran. Its sibling, a reconcilable status that IS repaired,
+    emits no skip row."""
+    from bmad_loop.policy import DevPolicy, ReviewPolicy
+
+    sp = spec_path(project, "1-1-a")
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    sp.write_text(
+        "---\ntitle: 'x'\nstatus: blocked\n---\n\n## Auto Run Result\n\n- Status: done\n",
+        encoding="utf-8",
+    )
+    before = sp.read_bytes()
+
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    engine, _ = make_engine(project, [generic_dev_effect(project, "1-1-a")], policy=pol)
+    task = StoryTask(story_key="1-1-a", epic=1)
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "status": "blocked"}
+
+    engine._reconcile_generic_terminal_status(task, rj)
+
+    assert sp.read_bytes() == before
+    assert rj["status"] == "blocked"
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert kinds.count("spec-reconcile-skipped-status") == 1
+    assert "spec-status-reconciled" not in kinds
+    skipped = next(
+        e for e in engine.journal.entries() if e["kind"] == "spec-reconcile-skipped-status"
+    )
+    assert skipped["status"] == "blocked" and skipped["story_key"] == "1-1-a"
+
+    # A reconcilable status takes the repair arm, never the refusal row.
+    sp.write_text(
+        "---\ntitle: 'x'\nstatus: in-progress\n---\n\n## Auto Run Result\n\n- Status: done\n",
+        encoding="utf-8",
+    )
+    engine._reconcile_generic_terminal_status(task, {"spec_file": str(sp)})
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert kinds.count("spec-reconcile-skipped-status") == 1  # unchanged
+    assert kinds.count("spec-status-reconciled") == 1
 
 
 def test_generic_reconcile_skips_out_of_tree_spec(project, tmp_path):

@@ -507,14 +507,16 @@ class _ResultFileMixin:
             pass
         return False
 
-    def _session_vanished(self) -> bool:
+    def _session_vanished(self, task_id: str) -> bool:
         """Whether the whole multiplexer session is gone, asked only once a
         crash verdict has already been reached (#489). Base: False — an adapter
         with no session to lose (opencode-http) never vanishes. Overridden by
         `GenericAdapter`.
 
         Same failure convention as `_window_alive`: `MultiplexerError` is the
-        seam's declared "couldn't ask" and the override swallows it to False.
+        seam's declared "couldn't ask" and the override degrades it to False —
+        visibly, with a ``session-probe-failed`` crumb under ``task_id``
+        (DW-382), so "not vanished" and "could not ask" stay distinguishable.
         Anything else propagates, exactly as it does from the liveness probe —
         this is a label on a verdict already made, so it degrades rather than
         second-guessing the verdict, but it does not swallow unknown faults."""
@@ -574,7 +576,7 @@ class _ResultFileMixin:
         # its own exit rather than the window dying — the label stays truthful
         # there because it reports what the mux answered, not how the window
         # ended.
-        vanished = status == "crashed" and self._session_vanished()
+        vanished = status == "crashed" and self._session_vanished(handle.task_id)
         if vanished:
             # Evidence rides along like every neighbouring crumb: which session
             # went missing (several runs share a host) and what verdict it lands.
@@ -1653,7 +1655,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             return None
         return None
 
-    def _session_vanished(self) -> bool:
+    def _session_vanished(self, task_id: str) -> bool:
         # The disambiguating probe (#489): `list_window_ids` returns [] for a
         # dead window AND for a session that no longer exists, so a plain
         # window-death verdict cannot tell an exited CLI from a session destroyed
@@ -1672,8 +1674,16 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # gone stays gone.
         try:
             return not self.mux.has_session(self.session_name)
-        except MultiplexerError:
-            # Unknown is not vanished — the same rule the liveness probe follows.
+        except MultiplexerError as e:
+            # Unknown is not vanished — the same rule the liveness probe follows —
+            # but the degrade leaves a crumb (DW-382): without it a mux that could
+            # not answer reads exactly like a session that answered "still here".
+            self._note_lifecycle(
+                task_id,
+                "session-probe-failed",
+                session=self.session_name,
+                error=f"{type(e).__name__}: {e}",
+            )
             return False
 
     def send_text(self, handle: SessionHandle, text: str) -> None:

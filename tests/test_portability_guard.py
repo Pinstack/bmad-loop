@@ -1219,6 +1219,7 @@ JOURNAL_KINDS = frozenset(
         "spec-marker-repaired",
         "spec-read-failed",
         "spec-reconcile-skipped-out-of-tree",
+        "spec-reconcile-skipped-status",
         "spec-status-reconciled",
         "sprint-status-unknown-keys",
         "stop-request-discarded",

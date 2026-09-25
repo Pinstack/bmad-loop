@@ -4268,7 +4268,18 @@ class Engine:
                     )
             return success_status
         if fm_status not in devcontract.RECONCILABLE_FROM:
-            return fm_status  # blocked / unknown custom status: never override a deliberate one
+            # blocked / unknown custom status: never override a deliberate one. The
+            # refusal is journaled (DW-382) so a spec left at a status the repair
+            # cannot move is attributable rather than indistinguishable from a
+            # reconcile that never ran. Only the bookkeeping path reaches this
+            # arm — the harvest caller pre-filters on the same allowlist.
+            self.journal.append(
+                "spec-reconcile-skipped-status",
+                story_key=task.story_key,
+                spec=str(spec_path),
+                status=fm_status,
+            )
+            return fm_status
         try:
             text = spec_path.read_text(encoding="utf-8")
         except OSError as e:
