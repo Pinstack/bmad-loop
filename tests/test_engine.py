@@ -822,17 +822,17 @@ def _dev_then_fix_run(project, monkeypatch, capture):
     the repair session's verify passes and the story commits. Both legs emit
     `post_dev_verify`, which is what the callers need.
 
-    FOUR scripted returns, FOUR journalled sequences, TWO hook emits — and the
-    inequality that remains is the documented scope boundary, not a miscount to
-    "fix". Returns 1 and 3 are the dev and repair verifications; returns 2 and 4
-    are the two `_skip_review_and_commit` review gates (the second runs after the
-    repair). All four are journalled now that the review gates carry a sink, but
-    only the dev and repair legs publish `post_dev_verify` — the review leg still
-    reaches no hook, which is the half of #656 that stays open (see the boundary
-    section in `docs/plugin-authoring-guide.md`). The count is load-bearing, not
-    padding: dropping the fourth value leaves the post-repair gate with nothing to
-    consume and the run ends `crashed=True, crash_error='StopIteration: '`
-    (measured), so a reader who trims the list finds out immediately.
+    FOUR scripted returns, FOUR journalled sequences, TWO `post_dev_verify` emits
+    — the other two passes are not a miscount to "fix". Returns 1 and 3 are the
+    dev and repair verifications; returns 2 and 4 are the two
+    `_skip_review_and_commit` review gates (the second runs after the repair).
+    All four are journalled, but only the dev and repair legs publish
+    `post_dev_verify`; the two review gates publish on their own stage,
+    `post_review_verify` (DW-357), which a capture bus bound to that stage sees.
+    The count is load-bearing, not padding: dropping the fourth value leaves the
+    post-repair gate with nothing to consume and the run ends
+    `crashed=True, crash_error='StopIteration: '` (measured), so a reader who
+    trims the list finds out immediately.
     """
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     engine, _ = make_engine(
@@ -908,6 +908,369 @@ def test_post_dev_verify_discriminates_a_dev_emit_from_a_fix_emit(project, monke
         assert [e["command_index"] for e in matched] == list(range(len(ctx.command_results)))
         assert [e["returncode"] for e in matched] == [r.returncode for r in ctx.command_results]
         assert [e["command"] for e in matched] == [r.command for r in ctx.command_results]
+
+
+class _StageCaptureBus:
+    """Hook-bus double binding an explicit set of stages.
+
+    Records every context it receives and, alongside it, the journal kinds that
+    had landed at emit time — what an ordering assertion ("emitted before the
+    engine routed the failure") needs, and what the context alone cannot say.
+    """
+
+    def __init__(self, *stages):
+        self.stages = frozenset(stages)
+        self.contexts = []
+        self.journal_at_emit = []
+        self.engine = None
+
+    def active(self, stage):
+        return stage in self.stages
+
+    def emit(self, stage, ctx):
+        self.contexts.append(ctx)
+        journal = self.engine.journal.entries() if self.engine is not None else []
+        self.journal_at_emit.append([e["kind"] for e in journal])
+        return ctx
+
+    def of(self, stage):
+        return [c for c in self.contexts if c.stage == stage]
+
+
+def _review_records(engine, sequence):
+    return [
+        e
+        for e in engine.journal.entries()
+        if e["kind"] == "verify-command-result"
+        and e["verification_stage"] == "review"
+        and e["verification_sequence"] == sequence
+    ]
+
+
+def test_post_review_verify_publishes_a_passing_review_gate(project, monkeypatch):
+    """A converged review pass publishes its verify gate to `post_review_verify`.
+
+    Exactly one context per gate visit, carrying the review session's status and
+    result plus the gate's own command records under `verification_stage ==
+    "review"`, joinable to the journalled `verify-command-result` entry through
+    `verification_sequence`. `post_dev_verify` stays the dev leg's alone.
+
+    Ablation: delete the `_emit("post_review_verify", ...)` call in
+    `Engine._review_verify_gate` and `review_ctx` below finds nothing; drop the
+    holder assignment in `_review_command_sink` and the stage/sequence/results
+    read back as `NO_VERIFY_COMMANDS`.
+    """
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            verify=VerifyPolicy(commands=("pytest -q",)),
+        ),
+    )
+    capture = _StageCaptureBus("post_dev_verify", "post_review_verify")
+    capture.engine = engine
+    engine._bus = capture
+    result = verify.CommandResult("pytest -q", 0, "out\nerr\n", "out\n", "err\n")
+    monkeypatch.setattr(
+        verify,
+        "run_verify_commands",
+        scripted_verify_runner(project.repo_root, lambda: [result]),
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    (dev_ctx,) = capture.of("post_dev_verify")
+    assert dev_ctx.verification_stage == "dev"
+    (review_ctx,) = capture.of("post_review_verify")
+    assert review_ctx.story_key == "1-1-a"
+    assert review_ctx.session_status == "completed"
+    assert review_ctx.result_json is not None and review_ctx.result_json["status"] == "done"
+    assert review_ctx.command_results == (result,)
+    assert review_ctx.verification_stage == "review"
+    # the join: story + stage + sequence names exactly this context's record
+    (entry,) = _review_records(engine, review_ctx.verification_sequence)
+    assert entry["story_key"] == "1-1-a"
+    assert entry["command"] == "pytest -q" and entry["returncode"] == 0
+    assert review_ctx.verification_sequence > dev_ctx.verification_sequence
+
+
+def test_post_review_verify_fires_before_a_failed_gate_is_routed(project, monkeypatch):
+    """A red review gate is published before the engine routes it, unaltered.
+
+    The first review gate's command fails (rc 1): the context carries the
+    failure's `verify_reason` and the failing records, and lands BEFORE the
+    `review-verify-failed` entry the engine journals for it. The repair and the
+    second review cycle then run exactly as they do without a plugin, and the
+    second gate publishes its own green pass under a later sequence.
+
+    Ablation: emit after the caller's `review-verify-failed` journal append
+    (e.g. move the `_emit` out of `_review_verify_gate` to just below that append
+    in the converged loop) and `journal_at_emit[0]` contains it, reddening the
+    ordering assertion.
+    """
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=True),
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=True),
+        ],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            verify=VerifyPolicy(commands=("pytest -q",)),
+        ),
+    )
+    capture = _StageCaptureBus("post_review_verify")
+    capture.engine = engine
+    engine._bus = capture
+    failing = verify.CommandResult("pytest -q", 1, "review fail", "", "review fail")
+    calls = iter(
+        [
+            [verify.CommandResult("pytest -q", 0, "dev", "dev-out", "")],
+            [failing],
+            [verify.CommandResult("pytest -q", 0, "fix", "fix-out", "")],
+            [verify.CommandResult("pytest -q", 0, "final", "final-out", "")],
+        ]
+    )
+    monkeypatch.setattr(
+        verify,
+        "run_verify_commands",
+        scripted_verify_runner(project.repo_root, lambda: next(calls)),
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert [s.role for s in adapter.sessions] == ["dev", "review", "dev", "review"]
+    red, green = capture.contexts
+    (failed,) = [e for e in engine.journal.entries() if e["kind"] == "review-verify-failed"]
+    assert red.verify_reason and red.verify_reason == failed["reason"]
+    assert red.command_results == (failing,)
+    assert red.verification_stage == "review"
+    assert [e["returncode"] for e in _review_records(engine, red.verification_sequence)] == [1]
+    # emitted before the engine journalled (and so routed) the failure
+    assert "review-verify-failed" not in capture.journal_at_emit[0]
+    assert green.verification_stage == "review"
+    assert [r.stdout for r in green.command_results] == ["final-out"]
+    assert green.verification_sequence > red.verification_sequence
+
+
+def test_post_review_verify_marks_a_gate_that_failed_before_its_commands(project):
+    """A gate refused at the sprint-status check publishes "no pass ran".
+
+    `verification_stage`/`verification_sequence` stay `None` and
+    `command_results` empty — the exact taxonomy `post_dev_verify` uses — while
+    `verify_reason` names why. The run's routing (escalate on the revoked
+    sign-off) is unchanged, and the emit precedes it.
+
+    This is the run's first review gate, so it cannot pin the holder reset —
+    `test_post_review_verify_does_not_republish_an_earlier_gates_records` does.
+    """
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            _signoff_revoking_review(project, "1-1-a", clean=True),
+        ],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            verify=VerifyPolicy(commands=(_OK,)),
+        ),
+    )
+    capture = _StageCaptureBus("post_review_verify")
+    capture.engine = engine
+    engine._bus = capture
+
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1
+    assert [s.role for s in adapter.sessions] == ["dev", "review"]
+    (ctx,) = capture.contexts
+    assert ctx.verification_stage is None and ctx.verification_sequence is None
+    assert ctx.command_results == ()
+    assert ctx.verify_reason and "revoked the sprint sign-off" in ctx.verify_reason
+    assert ctx.session_status == "completed"
+    assert "review-verify-failed" not in capture.journal_at_emit[0]
+    assert not [
+        e
+        for e in engine.journal.entries()
+        if e["kind"] == "verify-command-result" and e["verification_stage"] == "review"
+    ]
+
+
+def test_post_review_verify_covers_both_skip_review_gates(project, monkeypatch):
+    """The skip-review path publishes each of its two gates, with no session.
+
+    `_dev_then_fix_run` drives `_skip_review_and_commit` through a red gate, a
+    repair, and a green re-check: two `post_review_verify` contexts, both with
+    `session_status`/`result_json` `None` (no review session ran), carrying
+    sequences 2 and 4 — interleaved with the dev (1) and fix (3) passes that
+    `post_dev_verify` publishes.
+    """
+    capture = _StageCaptureBus("post_dev_verify", "post_review_verify")
+    engine, summary = _dev_then_fix_run(project, monkeypatch, capture)
+
+    assert summary.done == 1
+    assert [(c.stage, c.verification_sequence) for c in capture.contexts] == [
+        ("post_dev_verify", 1),
+        ("post_review_verify", 2),
+        ("post_dev_verify", 3),
+        ("post_review_verify", 4),
+    ]
+    first, second = capture.of("post_review_verify")
+    for ctx in (first, second):
+        assert ctx.session_status is None and ctx.result_json is None
+        assert ctx.verification_stage == "review"
+    assert [r.returncode for r in first.command_results] == [1]
+    assert first.verify_reason
+    assert [r.stdout for r in second.command_results] == ["final-out"]
+
+
+def test_post_review_verify_does_not_republish_an_earlier_gates_records(project):
+    """A gate that fails before its commands publishes `NO_VERIFY_COMMANDS`, even
+    right after a gate that did record — never the earlier gate's records.
+
+    Ablation: delete the `self._review_verify_records = NO_VERIFY_COMMANDS` reset
+    at the top of `Engine._review_verify_gate` and the second context carries the
+    first gate's stage, sequence and results.
+    """
+    engine, _ = make_engine(
+        project,
+        [],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            verify=VerifyPolicy(commands=(_OK,)),
+        ),
+    )
+    capture = _StageCaptureBus("post_review_verify")
+    engine._bus = capture
+    task = StoryTask(story_key="1-1-a", epic=1)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "done", verify.rev_parse_head(project.project))
+    task.spec_file = str(sp)
+
+    write_sprint(project, {"1-1-a": "done"})
+    assert engine._review_verify_gate(task).ok
+    write_sprint(project, {"1-1-a": "in-progress"})
+    assert not engine._review_verify_gate(task).ok
+
+    recorded, refused = capture.contexts
+    assert recorded.verification_stage == "review" and recorded.verification_sequence == 1
+    assert [r.command for r in recorded.command_results] == [_OK]
+    assert refused.verification_stage is None and refused.verification_sequence is None
+    assert refused.command_results == ()
+    assert refused.verify_reason and "revoked the sprint sign-off" in refused.verify_reason
+
+
+def test_post_review_verify_publishes_the_budget_rescue_gate(project, monkeypatch):
+    """The budget-exhaustion rescue gate publishes to `post_review_verify`.
+
+    Every review cycle recommends its own follow-up, so no in-loop gate runs:
+    the ONE context is the rescue's, carrying the last completed review
+    session's status and a sequence that joins its journal record. Scenario
+    from `test_budget_exhausted_finalized_work_commits`.
+    """
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a")]
+        + [review_effect(project, "1-1-a", clean=False, patched=1) for _ in range(3)],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            scm=ScmPolicy(rollback_on_failure=True),
+            limits=LimitsPolicy(max_followup_reviews=99),
+            verify=VerifyPolicy(commands=("pytest -q",)),
+        ),
+    )
+    capture = _StageCaptureBus("post_review_verify")
+    engine._bus = capture
+    result = verify.CommandResult("pytest -q", 0, "ok", "ok", "")
+    monkeypatch.setattr(
+        verify,
+        "run_verify_commands",
+        scripted_verify_runner(project.repo_root, lambda: [result]),
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert [e for e in engine.journal.entries() if e["kind"] == "review-budget-committed"]
+    (ctx,) = capture.contexts
+    assert ctx.verification_stage == "review"
+    assert ctx.session_status == "completed"
+    assert ctx.command_results == (result,)
+    (entry,) = _review_records(engine, ctx.verification_sequence)
+    assert entry["story_key"] == "1-1-a" and entry["command"] == "pytest -q"
+
+
+def test_post_review_verify_publishes_the_timeout_salvage_gate(project, monkeypatch):
+    """The review-timeout salvage gate publishes to `post_review_verify`, with the
+    timed-out review session's status. Scenario from
+    `test_review_timeout_salvage_commits_and_refiles`."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), SessionResult(status="timeout")],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            scm=ScmPolicy(rollback_on_failure=True),
+            review=ReviewPolicy(on_timeout="salvage-if-done"),
+            verify=VerifyPolicy(commands=("pytest -q",)),
+        ),
+    )
+    capture = _StageCaptureBus("post_review_verify")
+    engine._bus = capture
+    result = verify.CommandResult("pytest -q", 0, "ok", "ok", "")
+    monkeypatch.setattr(
+        verify,
+        "run_verify_commands",
+        scripted_verify_runner(project.repo_root, lambda: [result]),
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert [e for e in engine.journal.entries() if e["kind"] == "review-timeout-salvage"]
+    (ctx,) = capture.contexts
+    assert ctx.verification_stage == "review"
+    assert ctx.session_status == "timeout"
+    assert ctx.result_json is None
+    assert ctx.command_results == (result,)
+    (entry,) = _review_records(engine, ctx.verification_sequence)
+    assert entry["story_key"] == "1-1-a" and entry["command"] == "pytest -q"
+
+
+def test_post_review_verify_with_no_commands_configured(project):
+    """Zero `[verify] commands`: the gate's command pass ran and executed
+    nothing — stage `"review"`, sequence `None`, results empty."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=Policy(gates=GatesPolicy(mode="none"), notify=QUIET),
+    )
+    capture = _StageCaptureBus("post_review_verify")
+    engine._bus = capture
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    (ctx,) = capture.contexts
+    assert ctx.verification_stage == "review"
+    assert ctx.verification_sequence is None
+    assert ctx.command_results == ()
 
 
 def _critical(inner):
@@ -20081,7 +20444,11 @@ def test_hard_stop_during_review_verify_stops_without_commit(project, monkeypatc
     `interrupted=True` and stops the run before the gate classifies it.
 
     Ablation: delete the sink's `_stop_if_verify_interrupted` and the gate's
-    `VerifyInterrupted` backstop crashes the run instead."""
+    `VerifyInterrupted` backstop crashes the run instead.
+
+    The interrupted pass is also never published to `post_review_verify` (DW-357),
+    though the stage is bound. Ablation: emit from a `RunStopped` handler around
+    `_verify_review` in `Engine._review_verify_gate` and `capture.contexts` fills."""
     monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
@@ -20095,9 +20462,12 @@ def test_hard_stop_during_review_verify_stops_without_commit(project, monkeypatc
         [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
         policy=policy,
     )
+    capture = _StageCaptureBus("post_review_verify")
+    engine._bus = capture
 
     engine.run()
 
+    assert capture.contexts == []
     entries = _assert_stopped_via_stop_request(engine)
     records = [e for e in entries if e["kind"] == "verify-command-result"]
     assert [r["verification_stage"] for r in records] == ["dev", "review"]

@@ -9,6 +9,10 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Add a `post_review_verify` plugin hook stage: every review verify gate (converged
+  pass, budget rescue, timeout salvage, each skip-review pass; all run modes) publishes
+  its `[verify] commands` results with the `post_dev_verify` payload shape under
+  `verification_stage: "review"`. Observe-only (DW-357, was #656).
 - Add a free-form `effort` key to `[adapter]` and every `[adapter.<stage>]` table,
   inherited like `model`; `opencode-http` sends it as the per-prompt `variant` on
   every turn, and `validate` warns (`policy.effort-unsupported`) when a tmux stage

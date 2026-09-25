@@ -487,6 +487,9 @@ two but names neither.
 | `ctx.verification_stage`    | `"dev"` for the initial dev verification, `"fix"` for a repair one, `None` if none ran |
 | `ctx.verification_sequence` | the story's 1-based ordinal for that pass, or `None` if it recorded nothing            |
 
+The review gate publishes the same pair on its own stage, [`post_review_verify`](#review),
+always as `"review"` (or `None`).
+
 Together they are the join key: the `verify-command-result` entries carrying this
 `story_key` + `verification_stage` + `verification_sequence` are exactly this
 context's results, one per record, ordered by `command_index`. The sequence is
@@ -525,12 +528,12 @@ carries the reason. A plugin reading these pointers must therefore treat both
 file holds a command's whole output. Treat verifier output as potentially sensitive and store, upload, sign,
 or act on it only from an explicitly configured plugin.
 
-**The dev phase is the whole of this HOOK, not of the journal.** `[verify]
-commands` also run at the _review_ gate — `verify_review` /
-`verify_review_stories` / `verify_review_bundle` end on the same core classifier
-— and those runs **are journalled** (`verification_stage: "review"`, sharing the
-story's one `verification_sequence` counter with the dev and fix passes) but are
-**not published to any hook.** They run in `repo_root`, the same root
+**`post_dev_verify` covers the dev phase only.** `[verify] commands` also run at
+the _review_ gate — `verify_review` / `verify_review_stories` /
+`verify_review_bundle` end on the same core classifier — and those runs are
+journalled (`verification_stage: "review"`, sharing the story's one
+`verification_sequence` counter with the dev and fix passes) and published on
+their own stage, [`post_review_verify`](#review). They run in `repo_root`, the same root
 the dev phase uses (#695); only the gates' own artifact reads — the spec, the
 sprint board, the deferred-work ledger — stay project-rooted. Five engine gates reach them: the
 converged review pass, the review-budget-exhaustion rescue, the review-timeout
@@ -562,11 +565,6 @@ Two consequences a handler has to be written for:
   `review-result`, `review-skipped*`, `review-timeout-salvage*`,
   `review-budget-committed`, or `review-followup-damped` event described above.
 
-The hook boundary is deliberate, not an oversight — the review leg would need its
-own stage rather than a second meaning for one named `post_dev_verify` — and is
-tracked as a follow-up in [#656](https://github.com/bmad-code-org/bmad-loop/issues/656),
-which now narrows to that stage: the journalling half of it has landed.
-
 ### Review
 
 | Stage                 | When                           | Mutable surface                                   |
@@ -575,11 +573,38 @@ which now narrows to that stage: the journalling half of it has landed.
 | `pre_review_session`  | before each review session     | `proposed_prompt`, `proposed_env`, veto           |
 | `post_review_session` | after each review session      | —                                                 |
 | `post_review_result`  | after a review verdict         | a [workflow injection point](#workflows-provides) |
+| `post_review_verify`  | after each review verify gate  | —                                                 |
 | `pre_fix_session`     | before a verify-repair session | `proposed_prompt`, `proposed_env`, veto           |
 
-None of these carries the review gate's `[verify] commands` results — that gate
-journals every command it runs, stream captures included, but publishes nothing to
-a hook context. See the boundary note above `### Review`.
+`post_review_verify` is the review leg's counterpart of `post_dev_verify`: its own
+stage, not a second meaning for that one. It fires once per review verify gate
+visit — the converged review pass, the review-budget-exhaustion rescue, the
+review-timeout salvage, and each of the (up to two) passes inside the skip-review
+commit path — in every run mode (sprint, stories, sweep). A gate visit ended by
+an exception (a hard stop, a repair pause, an engine error) is never published. A
+story can therefore see it **several times** (once per review cycle that reached
+the gate, plus a re-check after a verify-repair), so write handlers to be
+idempotent and key on `verification_sequence` when it is set (it is `None` when no
+commands ran). It fires after the gate itself has finished — including its own
+acceptance bookkeeping (binding the review artifact source, a sweep's ledger
+reclose) — and before the engine routes on the outcome (journals
+`review-verify-failed`, escalates, repairs, or commits). It is observation only: a
+handler cannot change the gate's outcome, the routing, or the journal.
+
+The context carries the same payload as `post_dev_verify`:
+
+| Field                       | Value                                                                                                                                                                                                                                                                                  |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ctx.session_status`        | the status of the review session whose product was gated — the timeout-class status on the review-timeout salvage visit; `None` on the skip-review path, where no review session ran                                                                                                   |
+| `ctx.result_json`           | that review session's result (a copy) — often `None` on the timeout-salvage visit; `None` on the skip-review path                                                                                                                                                                      |
+| `ctx.verify_reason`         | the gate's outcome reason (the failure reason on a red gate)                                                                                                                                                                                                                           |
+| `ctx.command_results`       | the `CommandResult` records the gate's command pass ran, in order                                                                                                                                                                                                                      |
+| `ctx.verification_stage`    | `"review"` whenever the gate reached its command pass (including zero commands); `None` when one of the gate's artifact checks refused first — the spec, the operator-action list, the sprint board, or a sweep's ledger (stories mode checks the spec only); `verify_reason` names it |
+| `ctx.verification_sequence` | the story's ordinal for that pass (joins the `verify-command-result` entries), or `None` if it recorded nothing (no `[verify] commands`, or no pass)                                                                                                                                   |
+
+Read `command_results == ()` with `verification_stage` exactly as for
+`post_dev_verify`. A review pass cut short by a hard `bmad-loop stop` stops the run
+before the gate is classified, so it is never published.
 
 ### Commit
 

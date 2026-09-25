@@ -232,12 +232,14 @@ def _bounded_stream_tail(text: str, max_bytes: int) -> tuple[str, int, int]:
 
 @dataclass(frozen=True)
 class VerifyCommandRecords:
-    """What one verify-command pass published to ``post_dev_verify``.
+    """What one verify-command pass published to ``post_dev_verify`` /
+    ``post_review_verify``.
 
     The records themselves plus the two keys that say WHICH pass they are:
-    ``stage`` (``"dev"`` | ``"fix"``) and the story's ``sequence`` ordinal. Both
-    already ride the journal's ``verify-command-result`` entries; carrying them
-    on the hook context too is what lets a plugin tell the two legs apart and
+    ``stage`` (``"dev"`` | ``"fix"`` on ``post_dev_verify``, ``"review"`` on
+    ``post_review_verify``) and the story's ``sequence`` ordinal. Both already
+    ride the journal's ``verify-command-result`` entries; carrying them on the
+    hook context too is what lets a plugin tell the dev and repair legs apart and
     join back to those entries — neither of which the results alone can do,
     since both legs emit the same stage from the same phase on one shared
     ``attempt`` counter.
@@ -887,6 +889,12 @@ class Engine:
         # far. None until the first verify pass seeds it from the journal — see
         # _next_verification_sequence, which owns the whole invariant.
         self._verification_sequences: dict[str, int] | None = None
+        # The records the most recent review-gate verifier pass handed its sink
+        # (`_review_command_sink`), read back by `_review_verify_gate` for the
+        # `post_review_verify` emit. Reset to NO_VERIFY_COMMANDS before every gate
+        # so a gate that fails before reaching its commands publishes "no pass
+        # ran", never a previous gate's records.
+        self._review_verify_records: VerifyCommandRecords = NO_VERIFY_COMMANDS
         # Per-unit worktree isolation + integration flow (issue #244 F-3/F-9a).
         # Built from narrow deps + engine callbacks; the same-name Engine._* worktree
         # methods below delegate to it. `emit` is late-bound (a lambda, not the bound
@@ -3440,7 +3448,9 @@ class Engine:
             if self._run_workflows("post_review_result", task, task.review_cycle):
                 return
             if status == "done" and (not followup or damped):
-                outcome = self._verify_review(task)
+                outcome = self._review_verify_gate(
+                    task, session_status=result.status, result_json=result.result_json
+                )
                 if outcome.ok:
                     if damped:
                         # Verify-green here is the same authority as the converged /
@@ -3522,7 +3532,11 @@ class Engine:
             # and patch preserved for review. A defer under a mount already keeps
             # both, so there is nothing to rescue there.
             if refileable_followup and not (self._isolated or task.worktree_path):
-                rescue = self._verify_review(task)
+                # `result` is the last COMPLETED pass's: `refileable_followup`
+                # is reset at the top of every cycle and only that pass sets it.
+                rescue = self._review_verify_gate(
+                    task, session_status=result.status, result_json=result.result_json
+                )
                 if rescue.ok:
                     self._journal_review_budget_spent(task)
                     self._commit(task)
@@ -3648,7 +3662,9 @@ class Engine:
             self._defer(task, exhausted.reason)
             return True
 
-        outcome = self._verify_review(task)
+        outcome = self._review_verify_gate(
+            task, session_status=result.status, result_json=result.result_json
+        )
         if not outcome.ok:
             self.journal.append(
                 "review-timeout-salvage-failed",
@@ -3797,7 +3813,8 @@ class Engine:
         repair-once, same commit; only the reason the review was skipped differs,
         and the journal says which."""
         self.journal.append(kind, story_key=task.story_key)
-        outcome = self._verify_review(task)
+        # No review session ran on this path: session_status/result_json stay None.
+        outcome = self._review_verify_gate(task)
         if not outcome.ok and outcome.fixable:
             fix = self._fix_phase(task, outcome.reason)
             if fix.action == Action.PAUSE:
@@ -3808,7 +3825,7 @@ class Engine:
                     fix.reason or f"verify failed with review disabled: {outcome.reason}",
                 )
                 return
-            outcome = self._verify_review(task)
+            outcome = self._review_verify_gate(task)
         if not outcome.ok:
             # same event kind as the review-enabled loop so journal consumers
             # see the structured env_fault flag on this path too
@@ -6430,9 +6447,14 @@ class Engine:
         ``verification_sequence`` with the dev and fix passes, and reading them in
         ordinal order replays the story's verifications in the order they ran.
 
-        Deliberately NOT a ``VerifyCommandRecords`` producer: that payload exists
-        for ``post_dev_verify``, which stays dev/fix only (#656 tracks the review
-        hook stage). Journalled, not published.
+        Also the ``post_review_verify`` capture point: the records land in
+        ``self._review_verify_records`` for ``_review_verify_gate`` to publish.
+        Captured here rather than threaded through ``_verify_review`` so the
+        mode-specific ``_verify_review`` overrides (``StoriesEngine``,
+        ``SweepEngine``), which all build their sink through this method, need
+        no change of their own. Stored BEFORE the hard-stop check: an
+        interrupted pass raises ``RunStopped`` out of the gate, so the wrapper
+        never reaches its emit and the stored records are never published.
 
         WHICH gate ran is not on the record and is not meant to be: five engine
         call sites reach these gates, and the neighbouring ``review-result`` /
@@ -6442,12 +6464,53 @@ class Engine:
         """
 
         def sink(results: tuple[verify.CommandResult, ...]) -> None:
-            self._journal_verify_command_results(task, "review", results)
+            sequence = self._journal_verify_command_results(task, "review", results)
+            self._review_verify_records = VerifyCommandRecords(
+                results=results, stage="review", sequence=sequence
+            )
             # Same boundary as the dev side: an interrupted review pass stops the
             # run before the gate classifies it (DW-353).
             self._stop_if_verify_interrupted(results)
 
         return sink
+
+    def _review_verify_gate(
+        self,
+        task: StoryTask,
+        *,
+        session_status: str | None = None,
+        result_json: object = None,
+    ) -> VerifyOutcome:
+        """Evaluate the review verify gate and publish it to ``post_review_verify``.
+
+        Every engine visit to the review gate goes through here (converged pass,
+        budget-exhaustion rescue, review-timeout salvage, both passes of
+        ``_skip_review_and_commit``), so the one emit covers the base engine and
+        every ``_verify_review`` override alike. Observe-only: the outcome is
+        returned untouched, and the caller routes on it exactly as before.
+
+        ``session_status`` / ``result_json`` describe the review session whose
+        product the gate verified; both stay ``None`` on the skip-review path,
+        where no review session ran. The command records come from
+        ``_review_command_sink`` — reset first, so a gate that fails before its
+        command pass publishes ``NO_VERIFY_COMMANDS`` (stage/sequence ``None``,
+        no results) rather than a previous gate's. A hard stop mid-pass raises
+        ``RunStopped`` out of the sink, so an interrupted pass is never emitted.
+        """
+        self._review_verify_records = NO_VERIFY_COMMANDS
+        outcome = self._verify_review(task)
+        records = self._review_verify_records
+        self._emit(
+            "post_review_verify",
+            task,
+            session_status=session_status,
+            result_json=result_json,
+            verify_reason=outcome.reason,
+            command_results=records.results,
+            verification_stage=records.stage,
+            verification_sequence=records.sequence,
+        )
+        return outcome
 
     def _verify_review(self, task: StoryTask):
         # `not _dev_review_enabled()` is exactly the case where _post_dev_state_sync

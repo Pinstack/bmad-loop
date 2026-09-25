@@ -592,8 +592,9 @@ def test_post_dev_verify_reaches_a_real_plugin_through_the_bus(project, monkeypa
     registered plugin, so the plumbing itself is covered end to end.
 
     Ablation: drop `command_results`, `verification_stage` or
-    `verification_sequence` from the engine's `post_dev_verify` emit and the
-    plugin observes that field's default (`()` / `None`) instead.
+    `verification_sequence` from the engine's `post_dev_verify` (or
+    `post_review_verify`) emit and the plugin observes that field's default
+    (`()` / `None`) instead.
     """
     from bmad_loop import verify
 
@@ -601,6 +602,9 @@ def test_post_dev_verify_reaches_a_real_plugin_through_the_bus(project, monkeypa
 
     class P(Plugin):
         def on_post_dev_verify(self, c):
+            seen.append((c.verification_stage, c.verification_sequence, c.command_results))
+
+        def on_post_review_verify(self, c):
             seen.append((c.verification_stage, c.verification_sequence, c.command_results))
 
     result = verify.CommandResult("pytest -q", 0, "tail", "out", "err")
@@ -614,18 +618,20 @@ def test_post_dev_verify_reaches_a_real_plugin_through_the_bus(project, monkeypa
     summary = engine.run()
 
     assert summary.done == 1
-    assert seen == [("dev", 1, (result,))]
-    # and the keys the plugin was handed are the ones its journal record carries,
-    # which is the correlation the whole surface exists for. Scoped to the dev
-    # stage: the review gate journals its own pass now, and that one deliberately
-    # reaches no plugin — the single `seen` entry above is the other half of that.
-    (entry,) = [
-        e
-        for e in engine.journal.entries()
-        if e["kind"] == "verify-command-result" and e["verification_stage"] == "dev"
-    ]
-    assert entry["verification_sequence"] == 1
-    assert entry["story_key"] == "1-1-a" and entry["command"] == "pytest -q"
+    # the dev pass on `post_dev_verify`, then the review gate's own pass on
+    # `post_review_verify` (DW-357), sharing the story's one sequence counter
+    assert seen == [("dev", 1, (result,)), ("review", 2, (result,))]
+    # and the keys the plugin was handed are the ones its journal records carry,
+    # which is the correlation the whole surface exists for.
+    for stage, sequence, _ in seen:
+        (entry,) = [
+            e
+            for e in engine.journal.entries()
+            if e["kind"] == "verify-command-result"
+            and e["verification_stage"] == stage
+            and e["verification_sequence"] == sequence
+        ]
+        assert entry["story_key"] == "1-1-a" and entry["command"] == "pytest -q"
 
 
 def _resume_committing(project, engine, registry):

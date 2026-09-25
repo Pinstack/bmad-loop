@@ -138,7 +138,9 @@ class HookContext:
         # The journal correlation keys for the pass those records came from —
         # `verification_stage` is also the dev-vs-repair discriminator, which
         # neither `stage` (both legs emit `post_dev_verify`) nor `phase` (both
-        # are DEV_VERIFY) nor `attempt` (one counter, shared) can supply.
+        # are DEV_VERIFY) nor `attempt` (one counter, shared) can supply. The
+        # review gate publishes the same pair on `post_review_verify`, always
+        # under `"review"` when its command pass ran.
         self._verification_stage = verification_stage
         self._verification_sequence = verification_sequence
         self._decision_action = decision_action
@@ -224,7 +226,8 @@ class HookContext:
     def command_results(self) -> tuple[CommandResult, ...]:
         """The verifier ``CommandResult`` records from this attempt's verify pass,
         in the order the commands ran. Read-only observability for
-        ``post_dev_verify``; nothing here feeds an engine decision.
+        ``post_dev_verify`` (dev and repair legs) and ``post_review_verify``
+        (review verify gate); nothing here feeds an engine decision.
 
         Each record carries ``command``, ``returncode``, the merged bounded
         ``output_tail``, the separate ``stdout`` / ``stderr`` streams with their
@@ -259,20 +262,30 @@ class HookContext:
           empty. No journal record exists for it either.
         * ``verification_stage`` set with an int ``verification_sequence`` — those
           commands ran, and each has a matching journal entry (see that property).
+
+        On ``post_review_verify`` the ``None``-stage case has a single cause: one
+        of the gate's artifact checks refused before the command pass ran, and
+        ``verify_reason`` names it. There ``session_status`` describes the review
+        session whose product was gated, and is ``None`` on the skip-review path,
+        where no review session ran. The other two cases read as above.
         """
         return self._command_results
 
     @property
     def verification_stage(self) -> str | None:
         """Which leg produced :attr:`command_results` — ``"dev"`` for the initial
-        dev verification, ``"fix"`` for a feedback-driven repair one, ``None``
-        when no verify pass ran (see :attr:`command_results`).
+        dev verification, ``"fix"`` for a feedback-driven repair one, ``"review"``
+        for a review verify gate (``post_review_verify``), ``None`` when no
+        verify pass ran (see :attr:`command_results`).
 
-        This is the ONLY discriminator between the two. ``stage`` and ``phase``
-        are literally identical across them (``post_dev_verify`` from
-        ``Phase.DEV_VERIFY``), and ``attempt`` is one per-story counter the
-        repair leg CONTINUES rather than restarts — so its value orders the two
-        but never names either, and a human re-arm reuses the numbers outright.
+        On ``post_dev_verify`` this is the ONLY discriminator between dev and
+        fix. ``stage`` and ``phase`` are literally identical across them
+        (``post_dev_verify`` from ``Phase.DEV_VERIFY``), and ``attempt`` is one
+        per-story counter the repair leg CONTINUES rather than restarts — so its
+        value orders the two but never names either, and a human re-arm reuses
+        the numbers outright. ``post_review_verify`` only ever carries
+        ``"review"`` or ``None``; which of its gate visits fired is told by the
+        neighbouring journal entries, not by this field.
         """
         return self._verification_stage
 
