@@ -15213,13 +15213,25 @@ def test_review_timeout_salvage_nonterminal_spec_falls_back(project):
 
 def test_review_timeout_salvage_skipped_under_isolation(project):
     """Worktree isolation: a defer already preserves the unit's worktree + diff,
-    and committing into the main repo would be wrong — salvage never applies."""
+    and committing into the main repo would be wrong — salvage never applies.
+
+    The spec reads ``done`` and no ``worktree_path`` is recorded, so every other
+    applicability leg would admit salvage: only the ``self._isolated`` arm of the
+    guard decides this outcome (DW-378)."""
     policy = dataclasses.replace(
         _salvage_policy(), scm=ScmPolicy(rollback_on_failure=True, isolation="worktree")
     )
+    write_sprint(project, {"1-1-a": "done"})
     engine, _ = make_engine(project, [], policy=policy)
-    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(spec_path(project, "1-1-a")))
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "done", rev_parse_head(project.project))
+    before = sp.read_bytes()
+    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.REVIEW_VERIFY, spec_file=str(sp))
     assert engine._salvage_review_timeout(task, SessionResult(status="timeout")) is False
+    assert sp.read_bytes() == before
+    assert not [
+        e for e in engine.journal.entries() if e["kind"].startswith("review-timeout-salvage")
+    ]
 
 
 def test_review_timeout_salvage_requires_spec_file(project):
