@@ -79,6 +79,12 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Stop worktree teardown from silently deleting a story's edit to a tracked hook config pinned
+  `skip-worktree`: success teardown and the run-end GC now compare it with the recorded relay
+  rewrite and, on any non-relay difference, journal `pinned-config-edit-refused` and pause with
+  the worktree kept (DW-368).
+- Keep a run resumable when its run-end worktree GC pauses (a pinned-config edit, or an incomplete
+  artifact publication): the GC now runs before the run is recorded finished, which `resume` refuses.
 - Stop charging an attempt for a session of any role that times out having consumed zero tokens (a
   provider quota stall): a `timeout` with tracked zero usage is now an environment fault, so the
   run pauses and re-arm restores the attempt. `claude-jsonl` and `opencode-http` usage with no

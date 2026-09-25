@@ -395,6 +395,12 @@ _JOURNAL_DROP_FIELDS = frozenset(
         # correlation beyond the record's story key, so every kind gets the same
         # presence-only treatment.
         "path",
+        # `pinned-config-edit-refused`'s (DW-368) per-file descriptions of a story's
+        # edit to a pinned hook config: each quotes the worktree-relative config
+        # path, the changed top-level keys of the operator's settings, and an
+        # OSError/JSON error text. Free text under this set's rule; `story_key`
+        # already correlates the record, so presence-only.
+        "edits",
     }
 )
 # Journal fields whose value is a LIST of identifiers, aliased element-wise rather

@@ -300,6 +300,8 @@ REFUSAL_HELPER_DEFS = {
     ("win32_at.py", "_refuse_link"),  # ELOOP for a symlink/junction under O_NOFOLLOW
     ("workspace.py", "_refuse_foreign_checkout"),
     ("worktree_flow.py", "_refuse_integrated_artifacts"),
+    # DW-368: a story's edit to a pinned tracked hook config; test_worktree_flow.py
+    ("worktree_flow.py", "_refuse_pinned_config_edits"),
     ("worktree_flow.py", "_refuse_refused_residue"),
 }
 
@@ -1712,6 +1714,7 @@ JOURNAL_KINDS = frozenset(
         "merge-target-cleaned",
         "merge-target-preserved",
         "merge-target-tolerated",
+        "pinned-config-edit-refused",
         "scm-failed-diff-unlimited",
         "target-branch",
         "target-branch-checkout",

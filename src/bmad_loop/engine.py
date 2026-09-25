@@ -1054,8 +1054,11 @@ class Engine:
                 if read_stop_request_mode(self.run_dir) == "hard":
                     clear_graceful_stop(self.run_dir)
                     raise RunStopped(via="stop-request")
-                self.state.finished = True
+                # GC first: it can pause (a pinned-config edit, DW-368, or an
+                # unpublished bundle source), and a run recorded finished refuses
+                # `bmad-loop resume`, the very remedy the pause names.
                 self._gc_run_worktrees()
+                self.state.finished = True
                 self._emit("post_run")
                 self.journal.append("run-complete")
                 # tear down the run's agent session now that it finished. Only

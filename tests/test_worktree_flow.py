@@ -8,6 +8,8 @@ under a real Engine stays covered by test_engine_worktree.py.
 
 from __future__ import annotations
 
+import json
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,6 +30,7 @@ from bmad_loop.workspace import (
 )
 from bmad_loop.worktree_flow import (
     WorktreeFlow,
+    _pinned_config_edits,
     _setup_mcp_agent_id,
     _uncarried_ledger_changes,
     provision_worktree,
@@ -665,6 +668,411 @@ def test_payload_replay_drops_the_snapshot_once_the_worktree_is_gone(tmp_path):
     assert task.ledger_seed_text is None
     assert flow.calls.saves == 1
     assert flow.journal.entries == []
+
+
+# --------------------------------------------------------------- pinned config edits
+# DW-368: a pinned (skip-worktree) tracked hook config hides a story's own edit from
+# the unit commit, so success teardown compares it with the recorded rewrite and
+# pauses rather than delete the edit with the worktree.
+
+_LEGACY_RELAY = 'python3 "$CLAUDE_PROJECT_DIR"/.bmad-loop/bmad_loop_hook.py Stop'
+
+
+def _pinned_rewrite(tmp_path: Path, profile_name: str = "claude") -> tuple[str, str, str]:
+    """A realistic provisioning rewrite: the operator's settings plus this
+    installation's relay registrations, written as provisioning writes it."""
+    from bmad_loop.adapters.profile import get_profile
+    from bmad_loop.install import _hook_command, merge_hooks
+
+    profile = get_profile(profile_name)
+    registrations = {
+        native: _hook_command(tmp_path, profile, canonical)
+        for native, canonical in profile.hooks.events.items()
+    }
+    config, _ = merge_hooks(
+        {"permissions": {"allow": ["Bash(ls)"]}}, registrations, profile.hooks.dialect
+    )
+    return profile.hooks.config_path, profile.hooks.dialect, json.dumps(config, indent=2) + "\n"
+
+
+def _write_pinned(tmp_path: Path, profile_name: str = "claude"):
+    wt = tmp_path / "wt"
+    rel, dialect, text = _pinned_rewrite(tmp_path, profile_name)
+    (wt / rel).parent.mkdir(parents=True, exist_ok=True)
+    (wt / rel).write_text(text, encoding="utf-8")
+    return wt, rel, {rel: {"dialect": dialect, "text": text}}
+
+
+def _edit_json(path: Path, mutate) -> None:
+    cfg = json.loads(path.read_text(encoding="utf-8"))
+    mutate(cfg)
+    path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+
+
+def _swap_relay_for_legacy(cfg: dict) -> None:
+    for groups in cfg["hooks"].values():
+        for group in groups:
+            for hook in group["hooks"]:
+                hook["command"] = _LEGACY_RELAY
+
+
+def _add_lint_hook(cfg: dict) -> None:
+    cfg["hooks"]["Stop"].append({"hooks": [{"type": "command", "command": "make lint"}]})
+
+
+def _hook_only(path: Path, how: str) -> None:
+    if how == "reformatted":
+        path.write_text(json.dumps(json.loads(path.read_text(encoding="utf-8"))), encoding="utf-8")
+    elif how == "relay-changed":
+        _edit_json(path, _swap_relay_for_legacy)
+    else:  # relay-removed: the emptied hooks container is dropped too
+        _edit_json(path, lambda cfg: cfg.pop("hooks"))
+
+
+@pytest.mark.parametrize("how", ["reformatted", "relay-changed", "relay-removed"])
+def test_pinned_config_hook_only_difference_is_not_an_edit(tmp_path, how):
+    """Relay-hook entries and formatting are orchestrator-owned. Ablation: skip the
+    `strip_relay_hooks` normalization and the relay rows report an edit; skip the
+    empty-container drop and `relay-removed` does."""
+    wt, rel, pins = _write_pinned(tmp_path)
+    _hook_only(wt / rel, how)
+    assert _pinned_config_edits(wt, pins) == []
+
+
+def test_pinned_config_antigravity_relay_group_removal_is_not_an_edit(tmp_path):
+    """agy keys the relay under its own top-level group, not "hooks"; the emptied
+    group is dropped the same way. Ablation: normalize under "hooks" for every
+    dialect and this reports an edit to the `bmad-loop` key."""
+    wt, rel, pins = _write_pinned(tmp_path, "antigravity")
+    from bmad_loop.install import ANTIGRAVITY_HOOK_GROUP
+
+    _edit_json(wt / rel, lambda cfg: cfg.pop(ANTIGRAVITY_HOOK_GROUP))
+    assert _pinned_config_edits(wt, pins) == []
+
+
+def test_pinned_config_untouched_file_is_not_an_edit(tmp_path):
+    wt, _rel, pins = _write_pinned(tmp_path)
+    assert _pinned_config_edits(wt, pins) == []
+    assert _pinned_config_edits(wt, {}) == []
+
+
+@pytest.mark.parametrize(
+    ("mutate", "key"),
+    [
+        (lambda cfg: cfg["permissions"]["allow"].append("Bash(rm -rf build)"), "permissions"),
+        (_add_lint_hook, "hooks"),
+        (lambda cfg: cfg.update(model=None), "model"),
+        (lambda cfg: cfg.pop("permissions"), "permissions"),
+        (lambda cfg: cfg.update(flag=True), "flag"),
+    ],
+    ids=["permissions-allow", "non-relay-hook", "null-key-added", "key-removed", "bool-to-int"],
+)
+def test_pinned_config_story_edit_is_reported(tmp_path, mutate, key):
+    """A story's own change — including a non-relay hook it adds — is an edit.
+    Ablation: compare after stripping the whole hook container and the
+    `non-relay-hook` row passes as untouched."""
+    wt, rel, pins = _write_pinned(tmp_path)
+    if key == "flag":
+        # the record holds `"flag": 1`; the story wrote `true`. Python's `==` reads
+        # them equal. Ablation: compare parsed dicts with `==` and this returns [].
+        recorded = json.loads(pins[rel]["text"])
+        recorded["flag"] = 1
+        pins[rel]["text"] = json.dumps(recorded, indent=2) + "\n"
+    _edit_json(wt / rel, mutate)
+    assert _pinned_config_edits(wt, pins) == [
+        f"{rel}: changed outside the relay hooks (keys: {key})"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("recorded", "fault"),
+    [
+        ("{not json", "the recorded rewrite cannot be parsed"),
+        ("[]\n", "the recorded rewrite is not"),
+    ],
+    ids=["unparseable", "non-object"],
+)
+def test_pinned_config_unprovable_record_counts_as_an_edit(tmp_path, recorded, fault):
+    """A record that cannot be compared refuses too. Ablation: `continue` on
+    either fault and its row returns []."""
+    wt, rel, pins = _write_pinned(tmp_path)
+    _hook_only(wt / rel, "reformatted")  # skip the byte-equal fast path
+    pins[rel]["text"] = recorded
+    (edit,) = _pinned_config_edits(wt, pins)
+    assert edit.startswith(f"{rel}: {fault}")
+
+
+@pytest.mark.parametrize(
+    ("damage", "fault"),
+    [
+        (lambda p: p.unlink(), "deleted while pinned"),
+        (lambda p: p.write_text("{not json", encoding="utf-8"), "no longer parses as JSON"),
+        (lambda p: p.write_text("[]\n", encoding="utf-8"), "no longer a JSON object"),
+        (lambda p: p.write_bytes(b'{"a": "\xff"}'), "not valid UTF-8"),
+    ],
+    ids=["deleted", "unparseable", "non-object", "undecodable"],
+)
+def test_pinned_config_unprovable_file_counts_as_an_edit(tmp_path, damage, fault):
+    """Teardown is irreversible, so a pinned config that cannot be proven
+    unedited refuses, the description naming the fault. Ablation: `continue` on
+    any of these faults and its row returns []."""
+    wt, rel, pins = _write_pinned(tmp_path)
+    damage(wt / rel)
+    (edit,) = _pinned_config_edits(wt, pins)
+    assert edit.startswith(f"{rel}: {fault}")
+
+
+def test_pinned_config_unreadable_file_counts_as_an_edit(tmp_path, monkeypatch):
+    wt, rel, pins = _write_pinned(tmp_path)
+    real = Path.read_bytes
+
+    def read_bytes(self):
+        if self == wt / rel:
+            raise PermissionError(13, "denied")
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    (edit,) = _pinned_config_edits(wt, pins)
+    assert edit.startswith(f"{rel}: unreadable while pinned")
+    assert "denied" in edit
+
+
+def _pinned_flow(tmp_path, monkeypatch, *, story_edit: bool):
+    """A DONE unit whose worktree holds a pinned config, with teardown recorded
+    instead of run."""
+    import bmad_loop.worktree_flow as worktree_flow
+
+    flow = _artifact_flow(tmp_path)
+    flow.state.target_branch = "main"
+    unit = _teardown_unit(tmp_path, flow)
+    wt, rel, pins = _write_pinned(tmp_path)
+    assert wt == unit.path
+    if story_edit:
+        _edit_json(wt / rel, lambda cfg: cfg["permissions"]["allow"].append("Bash(make)"))
+    else:
+        _hook_only(wt / rel, "relay-changed")
+    task = StoryTask(
+        story_key="1-1",
+        epic=1,
+        phase=Phase.DONE,
+        branch="bmad-loop/run-1/1-1",
+        worktree_path=str(wt),
+        pinned_config_rewrites=pins,
+    )
+    closed: list[UnitWorkspace] = []
+
+    def close(u, **_k):
+        closed.append(u)
+        shutil.rmtree(u.path)
+
+    monkeypatch.setattr(worktree_flow, "close_unit_workspace", close)
+    return flow, unit, task, rel, closed
+
+
+def test_finish_publication_refuses_to_tear_down_a_pinned_config_edit(tmp_path, monkeypatch):
+    """The acceptance path: the merge landed, the story edited the pinned config,
+    so the run pauses (phase stays DONE) with the row journaled and the worktree —
+    edit included — still on disk; a retry refuses again while the edit remains.
+    Ablation: drop the `_refuse_pinned_config_edits` call in `finish_publication`
+    and teardown runs (`closed` is non-empty, no `_Pause`)."""
+    flow, unit, task, rel, closed = _pinned_flow(tmp_path, monkeypatch, story_edit=True)
+
+    with pytest.raises(_Pause) as excinfo:
+        flow.finish_publication(task, unit)
+
+    assert closed == []
+    assert "Bash(make)" in (unit.path / rel).read_text(encoding="utf-8")
+    assert task.phase is Phase.DONE
+    assert flow.journal.fields("pinned-config-edit-refused") == {
+        "story_key": "1-1",
+        "worktree": str(unit.path),
+        "edits": [f"{rel}: changed outside the relay hooks (keys: permissions)"],
+    }
+    reason = excinfo.value.reason
+    for needle in (
+        rel,
+        str(unit.path),
+        "DW-368",
+        "main",
+        "git worktree remove --force",
+        "delete branch bmad-loop/run-1/1-1",
+        f"git -C {unit.path} show HEAD:",
+        "relay hook entries out",
+    ):
+        assert needle in reason
+    assert "bmad-loop resume run-1" in reason
+    assert excinfo.value.story_key == "1-1"
+
+    with pytest.raises(_Pause):
+        flow.finish_publication(task, unit)
+    assert closed == []
+    assert flow.journal.events().count("pinned-config-edit-refused") == 2
+    assert task.pinned_config_rewrites  # kept while mounted, so retries refuse
+
+
+def test_finish_publication_tears_down_a_hook_only_pinned_diff(tmp_path, monkeypatch):
+    """Only the relay command moved, so teardown proceeds and nothing is journaled;
+    with the worktree gone the settings-text record is dropped from state.
+    Ablation: compare raw text instead of normalized configs and this pauses; drop
+    the post-teardown clear and the record survives."""
+    flow, unit, task, _rel, closed = _pinned_flow(tmp_path, monkeypatch, story_edit=False)
+
+    flow.finish_publication(task, unit)
+
+    assert closed == [unit]
+    assert flow.calls.pauses == []
+    assert "pinned-config-edit-refused" not in flow.journal.events()
+    assert task.pinned_config_rewrites == {}
+    assert flow.calls.saves >= 1
+
+
+def test_finish_publication_keeps_the_record_while_teardown_leaves_the_mount(tmp_path, monkeypatch):
+    """A degraded teardown can leave the worktree mounted; the record must stay so
+    a later pass still checks it. Ablation: drop the mounted guard in
+    `_drop_pinned_config_record` and the record is cleared."""
+    import bmad_loop.worktree_flow as worktree_flow
+
+    flow, unit, task, _rel, _closed = _pinned_flow(tmp_path, monkeypatch, story_edit=False)
+    monkeypatch.setattr(worktree_flow, "close_unit_workspace", lambda *_a, **_k: None)
+
+    flow.finish_publication(task, unit)
+
+    assert unit.path.is_dir()
+    assert task.pinned_config_rewrites
+
+
+def test_gc_run_worktrees_drops_the_record_of_a_worktree_removed_by_hand(tmp_path, monkeypatch):
+    """The refusal's remedy removes the worktree by hand, so the GC never discards
+    it; the settings-text record is still dropped. Ablation: drop the clear after
+    the mounted leg and the record survives."""
+    import bmad_loop.worktree_flow as worktree_flow
+
+    flow, unit, task, _rel, _closed = _pinned_flow(tmp_path, monkeypatch, story_edit=True)
+    flow.state.tasks = {task.story_key: task}
+    shutil.rmtree(unit.path)
+    monkeypatch.setattr(
+        worktree_flow, "discard_worktree", lambda *_a, **_k: pytest.fail("nothing to discard")
+    )
+    monkeypatch.setattr(worktree_flow.verify, "worktree_prune", lambda *_: None)
+
+    flow.gc_run_worktrees()
+
+    assert flow.calls.pauses == []
+    assert task.pinned_config_rewrites == {}
+
+
+def test_pinned_config_check_is_a_noop_once_the_worktree_is_gone(tmp_path):
+    """Removing the worktree is the operator's acknowledgement. Ablation: drop the
+    mounted guard and the missing file reads as "deleted while pinned"."""
+    flow = _artifact_flow(tmp_path)
+    _rel, dialect, text = _pinned_rewrite(tmp_path)
+    task = StoryTask(
+        story_key="1-1",
+        epic=1,
+        pinned_config_rewrites={".claude/settings.json": {"dialect": dialect, "text": text}},
+    )
+    flow._refuse_pinned_config_edits(task, tmp_path / "gone")
+    assert flow.journal.entries == []
+
+
+def test_gc_run_worktrees_drops_the_record_after_discarding_an_unedited_pin(tmp_path, monkeypatch):
+    """A hook-only diff lets the GC discard the worktree, after which the
+    settings-text record is dropped. Ablation: drop the post-discard clear."""
+    import bmad_loop.worktree_flow as worktree_flow
+
+    flow, unit, task, _rel, _closed = _pinned_flow(tmp_path, monkeypatch, story_edit=False)
+    flow.state.tasks = {task.story_key: task}
+    monkeypatch.setattr(
+        worktree_flow, "discard_worktree", lambda _repo, path, *_a, **_k: shutil.rmtree(path)
+    )
+    monkeypatch.setattr(worktree_flow.verify, "worktree_prune", lambda *_: None)
+
+    flow.gc_run_worktrees()
+
+    assert not unit.path.exists()
+    assert task.pinned_config_rewrites == {}
+
+
+class _StopAfterProvisioning(Exception):
+    pass
+
+
+def test_run_isolated_records_every_pinned_rewrite(tmp_path, monkeypatch):
+    """The seam that arms the teardown guard: `run_isolated` hands provisioning an
+    `on_pinned` recorder and stores what it reported on the task, last write per
+    path winning. Ablation: drop `on_pinned=_record_pin` or the
+    `task.pinned_config_rewrites` assignment and the record stays empty."""
+    import bmad_loop.worktree_flow as worktree_flow
+
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    repo.mkdir()
+    wt.mkdir()
+    paths = ProjectPaths(
+        project=repo,
+        implementation_artifacts=repo / "_bmad-output/implementation-artifacts",
+        planning_artifacts=repo / "_bmad-output/planning-artifacts",
+    )
+    unit = UnitWorkspace(
+        workspace=Workspace(root=wt, paths=paths.rebased(wt)),
+        repo_root=repo,
+        branch="bmad-loop/run-1/1-1",
+        path=wt,
+        baseline="abc123",
+    )
+
+    def provision(*_args, on_pinned=None, **_kwargs):
+        assert on_pinned is not None
+        on_pinned(".claude/settings.json", "claude-settings-json", "first\n")
+        on_pinned(".claude/settings.json", "claude-settings-json", "second\n")
+        on_pinned(".gemini/settings.json", "gemini-settings-json", "{}\n")
+        return []
+
+    def stop(*_args, **_kwargs):
+        raise _StopAfterProvisioning
+
+    monkeypatch.setattr(worktree_flow, "provision_worktree", provision)
+    monkeypatch.setattr(worktree_flow, "worktree_seed_undelivered", stop)
+    state = SimpleNamespace(target_branch="main", run_id="run-1", source="sprint", tasks={})
+    flow = _make_flow(
+        tmp_path,
+        paths=paths,
+        state=state,
+        open_unit_workspace=lambda *_args, **_kwargs: unit,
+    )
+    task = StoryTask(
+        story_key="1-1",
+        epic=1,
+        pinned_config_rewrites={"stale.json": {"dialect": "x", "text": "y"}},
+    )
+
+    with pytest.raises(_StopAfterProvisioning):
+        flow.run_isolated(task, lambda _t: pytest.fail("drive must not run"))
+
+    assert task.pinned_config_rewrites == {
+        ".claude/settings.json": {"dialect": "claude-settings-json", "text": "second\n"},
+        ".gemini/settings.json": {"dialect": "gemini-settings-json", "text": "{}\n"},
+    }
+
+
+def test_gc_run_worktrees_refuses_to_discard_a_pinned_config_edit(tmp_path, monkeypatch):
+    """A resume replays `finish_publication` only for bundles, so the run-end GC is
+    where a still-mounted DONE worktree would otherwise be discarded with the edit.
+    Ablation: drop the check in `gc_run_worktrees` and `discard_worktree` runs."""
+    import bmad_loop.worktree_flow as worktree_flow
+
+    flow, unit, task, _rel, _closed = _pinned_flow(tmp_path, monkeypatch, story_edit=True)
+    flow.state.tasks = {task.story_key: task}
+    discarded: list[str] = []
+    monkeypatch.setattr(
+        worktree_flow, "discard_worktree", lambda _repo, path, *_a, **_k: discarded.append(path)
+    )
+
+    with pytest.raises(_Pause, match="DW-368"):
+        flow.gc_run_worktrees()
+
+    assert discarded == []
+    assert unit.path.is_dir()
+    assert "pinned-config-edit-refused" in flow.journal.events()
 
 
 # --------------------------------------------------------------- profiles / agents

@@ -1213,6 +1213,25 @@ def test_patch_and_stash_path_fields_are_dropped_at_the_routing_seam(kind, field
         assert canary not in legend, f"LEAK via legend: {canary!r}"
 
 
+def test_pinned_config_edit_descriptions_are_dropped_at_the_routing_seam():
+    """`pinned-config-edit-refused` (DW-368) lists free-text edit descriptions that
+    quote config paths, the operator's settings keys and error text; a dump keeps
+    only their presence. Ablation: remove `edits` from ``_JOURNAL_DROP_FIELDS`` and
+    the absence assertion fails."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    edits = [f".claude/settings.json: changed outside the relay hooks (keys: {PROPRIETARY})"]
+    scrubbed = diagnostics._scrub_entry(
+        {"ts": 2.0, "kind": "pinned-config-edit-refused", "story_key": STORY_KEY, "edits": edits},
+        pseudo,
+        {},
+        1.0,
+    )
+
+    assert "edits" not in scrubbed
+    assert scrubbed["edits_present"] is True
+    assert PROPRIETARY not in json.dumps(scrubbed)
+
+
 def test_patch_and_stash_paths_are_absent_from_public_diagnostic_renders(project):
     """Journal records flow through collect and both public renderers.
 

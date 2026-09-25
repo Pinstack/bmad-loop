@@ -35,6 +35,7 @@ from . import artifact_publication, codex_trust, deferredwork, gates, verify
 from .adapters.profile import ProfileError
 from .install import (
     _REVIEW_LAYER_SKILLS,
+    ANTIGRAVITY_HOOK_GROUP,
     BASE_SKILLS,
     BMAD_DIR,
     BMAD_SCRIPTS_SEED_REL,
@@ -439,7 +440,7 @@ def _reconcile_tracked_patterns(
     return kept, (" ".join(reasons) if reasons else None)
 
 
-def _pin_tracked_config_rewrite(worktree: Path, rel: str) -> str | None:
+def _pin_tracked_config_rewrite(worktree: Path, rel: str) -> tuple[bool, str | None]:
     """Keep a rewritten TRACKED hook config out of the unit's story commits.
 
     The worktree-local exclude cannot: git consults ignore rules only for
@@ -452,11 +453,19 @@ def _pin_tracked_config_rewrite(worktree: Path, rel: str) -> str | None:
     (it is the sparse-checkout mechanism) and that dies with the worktree, so
     the rewrite stays session-local.
 
-    While the pin holds, the config is orchestrator-owned: a story's own edit to
-    the pinned file stays session-local and is discarded with the worktree. That
-    is deliberate — before this pin the tracked case stalled outright (#352), so
-    there is no prior working behavior to preserve, and any file-level hiding
-    that keeps OUR rewrite out of `add -A` hides a story's edit with it.
+    While the pin holds, a story's own edit to the pinned file is hidden from
+    `add -A` along with OUR rewrite — any file-level hiding hides both — so it
+    never reaches the unit commit. Rather than let teardown delete it with the
+    worktree, the caller records each pinned rewrite (``provision_worktree``'s
+    ``on_pinned``) and success teardown compares the file on disk against that
+    record with relay hooks ignored: any other difference journals
+    ``pinned-config-edit-refused`` and pauses the run with the worktree kept
+    (DW-368, ``WorktreeFlow._refuse_pinned_config_edits``). The edit is not
+    carried anywhere; the operator does that by hand.
+
+    Returns ``(pinned, degrade)``: ``pinned`` is True only when the skip-worktree
+    bit was actually set, so a caller can tell a pin from "not tracked" / "not a
+    repo" (both ``(False, None)``); ``degrade`` is the observation fault below.
 
     NOT-A-REPO IS SILENT for the same reason the shield's tracked-probe is:
     provisioning a plain directory is ordinary, and there is no index and no
@@ -470,14 +479,14 @@ def _pin_tracked_config_rewrite(worktree: Path, rel: str) -> str | None:
     """
     try:
         if verify.git_bytes(worktree, "rev-parse", "--absolute-git-dir").returncode != 0:
-            return None
+            return False, None
     except (verify.GitError, OSError):
-        return None
+        return False, None
     try:
         if not verify.path_tracked_file(worktree, rel):
-            return None
+            return False, None
     except (verify.GitError, OSError) as e:
-        return (
+        return False, (
             f"could not check whether the rewritten hook config {rel} is tracked "
             f"({e}); if the project tracks it, the worktree's machine-specific relay "
             "command may be committed and merged back (#352)"
@@ -489,7 +498,94 @@ def _pin_tracked_config_rewrite(worktree: Path, rel: str) -> str | None:
             "config is tracked, so without the pin its machine-specific relay rewrite "
             "would reach story commits and merge back (#352)"
         )
-    return None
+    return True, None
+
+
+def _normalized_pinned_config(parsed: dict[str, Any], dialect: str) -> dict[str, Any]:
+    """A parsed hook config with the orchestrator-owned relay hooks removed.
+
+    Drops exactly what ``strip_relay_hooks`` drops, plus the hook container once
+    that leaves it empty — provisioning may have created it only to hold the relay.
+    Works on a deep copy: the strip mutates.
+    """
+    cfg = copy.deepcopy(parsed)
+    strip_relay_hooks(cfg, dialect)
+    key = ANTIGRAVITY_HOOK_GROUP if dialect == "antigravity-hooks-json" else "hooks"
+    if cfg.get(key) == {}:
+        del cfg[key]
+    return cfg
+
+
+def _json_canonical(value: Any) -> str:
+    """JSON text with sorted keys: equal only for the same JSON value. Python's
+    ``==`` alone is not — it reads ``true`` as ``1`` and ``1`` as ``1.0``."""
+    return json.dumps(value, sort_keys=True)
+
+
+def _pinned_config_edits(worktree: Path, pins: dict[str, dict[str, str]]) -> list[str]:
+    """Describe every story edit to a pinned hook config, or ``[]`` for none (DW-368).
+
+    ``pins`` is ``StoryTask.pinned_config_rewrites``: worktree-relative path ->
+    ``{"dialect", "text"}`` as provisioning wrote it. A file byte-identical to its
+    record is untouched; otherwise both sides are parsed and compared with relay
+    hooks and an emptied hook container ignored, so a changed or removed relay
+    command, or a reformat, is not an edit. A non-relay hook a story or user added
+    IS one. Deterministic, and conservative because teardown is irreversible: a
+    config that is missing, unreadable, undecodable, unparseable or not a JSON
+    object while pinned counts as an edit, its description naming the fault.
+    """
+    edits: list[str] = []
+    for rel in sorted(pins):
+        entry = pins[rel]
+        recorded_text = str(entry.get("text", ""))
+        dialect = str(entry.get("dialect", ""))
+        path = worktree / rel
+        try:
+            raw = path.read_bytes()
+        except FileNotFoundError:
+            edits.append(f"{rel}: deleted while pinned")
+            continue
+        except OSError as e:
+            edits.append(f"{rel}: unreadable while pinned ({e})")
+            continue
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as e:
+            edits.append(f"{rel}: not valid UTF-8 ({e})")
+            continue
+        if text == recorded_text:
+            continue
+        try:
+            current = json.loads(text)
+        except json.JSONDecodeError as e:
+            edits.append(f"{rel}: no longer parses as JSON ({e})")
+            continue
+        if not isinstance(current, dict):
+            edits.append(f"{rel}: no longer a JSON object ({type(current).__name__})")
+            continue
+        try:
+            recorded = json.loads(recorded_text)
+        except json.JSONDecodeError as e:
+            edits.append(f"{rel}: the recorded rewrite cannot be parsed ({e})")
+            continue
+        if not isinstance(recorded, dict):
+            edits.append(f"{rel}: the recorded rewrite is not a JSON object")
+            continue
+        now = _normalized_pinned_config(current, dialect)
+        was = _normalized_pinned_config(recorded, dialect)
+        if _json_canonical(now) == _json_canonical(was):
+            continue
+        # keys on one side only (even with a null value) plus keys whose values differ
+        changed = sorted(
+            (now.keys() ^ was.keys())
+            | {
+                k
+                for k in now.keys() & was.keys()
+                if _json_canonical(now[k]) != _json_canonical(was[k])
+            }
+        )
+        edits.append(f"{rel}: changed outside the relay hooks (keys: {', '.join(changed)})")
+    return edits
 
 
 def _seed_bmad_tree(worktree: Path, repo_root: Path) -> tuple[list[str], list[str]]:
@@ -850,6 +946,7 @@ def provision_worktree(
     seed_globs: Sequence[str] = (),
     *,
     on_degraded: Callable[[str], None] | None = None,
+    on_pinned: Callable[[str, str, str], None] | None = None,
 ) -> list[str]:
     """Make a freshly-created git worktree a self-sufficient bmad-loop project.
 
@@ -917,6 +1014,14 @@ def provision_worktree(
     whichever source supplied those bytes — read from the per-path record of what
     seeding actually wrote, never inferred from the seed entry that covers the path
     (#592).
+
+    A TRACKED hook config the hook step rewrites is pinned skip-worktree in the
+    worktree's index so the machine-specific relay command stays out of story
+    commits (#352). After each successful pin, ``on_pinned`` is called with
+    ``(rel, dialect, text)`` — the worktree-relative config path, the profile's hook
+    dialect, and the exact text written — so the caller can later tell a story's
+    own edit to the pinned file from our rewrite (DW-368). It is not called for an
+    untracked config, a non-repo worktree, or a config the hook step left alone.
 
     The repo's `_bmad/` surface is also merge-seeded, excluding generated render
     output. Renderer and upstream-skill completeness failures share the return
@@ -1302,14 +1407,15 @@ def provision_worktree(
             # reading `0444`. This is the operator's own settings file, round-tripped
             # through the parse above, so a read-only one earns the `PermissionError`
             # the `write_text` this replaced raised.
-            atomic_write_text(
-                config_path,
-                json.dumps(config, indent=2) + "\n",
-                require_writable_target=True,
-            )
-            pin_degrade = _pin_tracked_config_rewrite(worktree, profile.hooks.config_path)
+            written_text = json.dumps(config, indent=2) + "\n"
+            atomic_write_text(config_path, written_text, require_writable_target=True)
+            pinned, pin_degrade = _pin_tracked_config_rewrite(worktree, profile.hooks.config_path)
             if pin_degrade is not None and on_degraded is not None:
                 on_degraded(pin_degrade)
+            if pinned and on_pinned is not None:
+                # Profiles may share a config_path: a later pass rewrites the same
+                # file, so its call supersedes the earlier one (last write wins).
+                on_pinned(profile.hooks.config_path, profile.hooks.dialect, written_text)
 
     # Shield exactly the paths we wrote (skill trees + hook configs + seeded
     # configs) from the unit's `git add -A`, in case a project doesn't gitignore
@@ -2168,6 +2274,11 @@ class WorktreeFlow:
         seeds.extend(self._registry.seed_files())
         seed_files = list(dict.fromkeys(seeds))  # dedupe, preserve order
         seed_globs = self._registry.seed_globs()
+        pinned_rewrites: dict[str, dict[str, str]] = {}
+
+        def _record_pin(rel: str, dialect: str, text: str) -> None:
+            pinned_rewrites[rel] = {"dialect": dialect, "text": text}
+
         try:
             skipped_seeds = provision_worktree(
                 unit.path,
@@ -2176,6 +2287,7 @@ class WorktreeFlow:
                 seed_files=seed_files,
                 seed_globs=seed_globs,
                 on_degraded=lambda msg: self._exclude_degraded(task.story_key, msg),
+                on_pinned=_record_pin,
             )
         except verify.GitError as e:
             # Every provisioning refusal carries its own cause — an unresolvable
@@ -2194,6 +2306,11 @@ class WorktreeFlow:
             if ledger_seed
             else None
         )
+        # Each tracked hook config provisioning rewrote and pinned, with the exact
+        # text written, for the success-path teardown check (DW-368): the pin hides
+        # a story's own edit to that file from the unit commit. A fresh open, so
+        # always overwritten.
+        task.pinned_config_rewrites = pinned_rewrites
         if skipped_seeds:
             # A seed entry whose destination already exists is a no-op. Harmless for
             # a file the checkout legitimately carries, but a directory entry is
@@ -4248,6 +4365,7 @@ class WorktreeFlow:
                 self._save()
             return
         self._warn_isolated_ledger_uncarried(task, unit)
+        self._refuse_pinned_config_edits(task, unit.path)
         scm = self.policy.scm
         close_unit_workspace(
             unit,
@@ -4260,6 +4378,25 @@ class WorktreeFlow:
                 "worktree-teardown-degraded", story_key=task.story_key, error=msg
             ),
         )
+        self._drop_pinned_config_record(task)
+
+    def _drop_pinned_config_record(self, task: StoryTask) -> None:
+        """Forget the pinned-config record once the worktree is really gone.
+
+        It holds a full copy of the operator's settings text, so it must not sit in
+        state.json for every finished unit; while the worktree is still mounted
+        (teardown degraded or kept it) it stays, so a later pass still refuses.
+        """
+        if not task.pinned_config_rewrites:
+            return
+        try:
+            mounted = Path(task.worktree_path).is_dir() if task.worktree_path else False
+        except OSError:
+            mounted = True
+        if mounted:
+            return
+        task.pinned_config_rewrites = {}
+        self._save()
 
     def _warn_isolated_ledger_uncarried(self, task: StoryTask, unit: UnitWorkspace) -> None:
         """Journal the seeded-ledger writes the post-merge carry will not bring back.
@@ -4324,6 +4461,57 @@ class WorktreeFlow:
         task.ledger_seed_text = None
         self._save()
 
+    def _refuse_pinned_config_edits(self, task: StoryTask, worktree: Path) -> None:
+        """Pause rather than tear down a worktree holding an edit to a pinned config.
+
+        Provisioning pins a rewritten TRACKED hook config skip-worktree
+        (``_pin_tracked_config_rewrite``), which hides a story's own edit to that
+        file from ``git add -A``: it never reaches the unit commit, and removing
+        the worktree would delete it silently (DW-368). Recorded decision: detect
+        and refuse. Each pinned file is compared with the rewrite recorded on the
+        task, relay hooks ignored (``_pinned_config_edits``); any other difference
+        journals ``pinned-config-edit-refused`` and pauses with the worktree kept.
+
+        The merge has already landed, so the phase stays DONE (never ESCALATED —
+        that would skip the resume ledger carry) and nothing here carries, commits
+        or copies the edit, nor touches the pin. The record is never cleared, so the
+        refusal fires again on every retry while the edit remains; removing the
+        worktree is the operator's acknowledgement, after which this is a no-op.
+        """
+        pins = task.pinned_config_rewrites
+        if not pins:
+            return
+        try:
+            mounted = worktree.is_dir()
+        except OSError:
+            # teardown is irreversible: an unprovable "gone" checks, and the
+            # read below reports whatever fault stands in the way
+            mounted = True
+        if not mounted:
+            return
+        edits = _pinned_config_edits(worktree, pins)
+        if not edits:
+            return
+        self.journal.append(
+            "pinned-config-edit-refused",
+            story_key=task.story_key,
+            worktree=str(worktree),
+            edits=edits,
+        )
+        self._save()
+        self._pause(
+            f"{task.story_key} left an edit to a pinned hook config in its worktree "
+            f"{worktree}, outside the bmad-loop relay hooks; the skip-worktree pin kept it "
+            "out of the unit commit, so tearing the worktree down would delete it "
+            f"(DW-368): {'; '.join(edits)}. Carry the change into "
+            f"{self.state.target_branch} by hand — the pin hides it from `git diff`, so "
+            f"compare the file with `git -C {worktree} show HEAD:<file>`, and leave the "
+            "bmad-loop relay hook entries out (#352) — then `git worktree remove --force "
+            f"{worktree}`, delete branch {task.branch} if you do not keep it, and "
+            f"`bmad-loop resume {self.state.run_id}`",
+            task.story_key,
+        )
+
     def keep_branch_and_escalate(self, task: StoryTask, unit: UnitWorkspace, reason: str) -> None:
         """Preserve a DONE unit's branch (no delete, kept for manual merge) and
         escalate. Shared by every merge-back failure path: a target dirtied with
@@ -4384,7 +4572,12 @@ class WorktreeFlow:
                             f"artifact publication incomplete; source retained at {task.worktree_path}",
                             task.story_key,
                         )
+                    # a resume does not replay finish_publication for every merged
+                    # unit, so this is where a pinned-config edit would be lost
+                    self._refuse_pinned_config_edits(task, wt)
                     discard_worktree(repo, task.worktree_path, task.branch, run_dir=self.run_dir)
+                # also once the operator removed a refused worktree by hand
+                self._drop_pinned_config_record(task)
             elif task.terminal and task.worktree_path and Path(task.worktree_path).is_dir():
                 # kept on purpose (keep_failed): leave it, but surface where.
                 self.journal.append(

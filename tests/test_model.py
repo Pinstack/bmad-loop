@@ -809,11 +809,12 @@ _DEFERRED_STATE_KEYS = (
     "harvest_carry_commit_pending",
     "isolated_ledger_carried",
     "ledger_seed_text",
+    "pinned_config_rewrites",
 )
 
 
 def test_deferred_work_state_fields_round_trip_through_json():
-    """All twelve fields are hand-enumerated in both serializers. Non-default
+    """All thirteen fields are hand-enumerated in both serializers. Non-default
     values make a missing line on either side observable, while the JSON leg pins
     the on-disk container shape rather than only an in-memory dataclass copy."""
     task = StoryTask(
@@ -831,6 +832,9 @@ def test_deferred_work_state_fields_round_trip_through_json():
         harvest_carry_commit_pending=True,
         isolated_ledger_carried=True,
         ledger_seed_text="# Deferred Work\n",
+        pinned_config_rewrites={
+            ".claude/settings.json": {"dialect": "claude-settings-json", "text": "{}\n"}
+        },
     )
     restored = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
 
@@ -847,10 +851,13 @@ def test_deferred_work_state_fields_round_trip_through_json():
     assert restored.harvest_carry_commit_pending is True
     assert restored.isolated_ledger_carried is True
     assert restored.ledger_seed_text == "# Deferred Work\n"
+    assert restored.pinned_config_rewrites == {
+        ".claude/settings.json": {"dialect": "claude-settings-json", "text": "{}\n"}
+    }
 
 
 def test_deferred_work_state_fields_default_for_one_old_state_dict():
-    """A state.json written before this package has none of the twelve keys.
+    """A state.json written before this package has none of the thirteen keys.
     Every load must use ``d.get`` so resume reaches the old behavior instead of
     raising KeyError; one shared old document prevents testing only a subset."""
     doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
@@ -870,6 +877,7 @@ def test_deferred_work_state_fields_default_for_one_old_state_dict():
     assert restored.harvest_carry_commit_pending is False
     assert restored.isolated_ledger_carried is False
     assert restored.ledger_seed_text is None
+    assert restored.pinned_config_rewrites == {}
 
 
 def test_pre_harvest_ledger_preserves_absent_empty_and_text_states():

@@ -14025,15 +14025,24 @@ def test_run_crash_after_finish_clears_finished(project, monkeypatch):
     from bmad_loop import runs
 
     monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
-    engine, _ = make_engine(project, [])  # loop completes → sets finished=True
+    # a board with nothing left to pick, so the loop completes and sets finished=True
+    write_sprint(project, {"1-1-a": "done"})
+    engine, _ = make_engine(project, [])
+    original_emit = engine._emit
 
-    def boom():
-        raise RuntimeError("post-run boom")
+    # post_run fires after finished=True (the run-end GC now runs before it, so a
+    # GC fault would never reach the masking flag). Ablation: drop the crash arm's
+    # `finished = False` reset and this classifies FINISHED.
+    def boom_on_post_run(stage, *args, **kwargs):
+        if stage == "post_run":
+            raise RuntimeError("post-run boom")
+        return original_emit(stage, *args, **kwargs)
 
-    monkeypatch.setattr(engine, "_gc_run_worktrees", boom)
+    engine._emit = boom_on_post_run
 
     summary = engine.run()  # does not raise
 
+    assert "post-run boom" in (engine.run_dir / "crash.txt").read_text()
     state = load_state(engine.run_dir)
     assert state.crashed is True
     assert state.finished is False  # the masking flag was cleared
@@ -14045,6 +14054,30 @@ def test_run_crash_after_finish_clears_finished(project, monkeypatch):
         runs._classify(state.finished, state.paused, state.stopped, state.crashed, engine.run_dir)
         == runs.CRASHED
     )
+
+
+def test_run_end_gc_pause_leaves_the_run_resumable(project, monkeypatch):
+    """The run-end worktree GC can pause (DW-368's pinned-config edit, or an
+    unpublished bundle source), and its remedy is `bmad-loop resume` — which a run
+    recorded `finished` refuses. So the GC runs before `finished` is set.
+    Ablation: set `finished = True` ahead of `_gc_run_worktrees()` again and the
+    `finished is False` assertion fails."""
+    engine, _ = make_engine(project, [])
+    _stub_run_side_effects(engine, monkeypatch)
+
+    def pause():
+        raise RunPaused("pinned config edited (DW-368)", "worktree-gc", "1-1")
+
+    monkeypatch.setattr(engine, "_gc_run_worktrees", pause)
+
+    engine.run()
+
+    state = load_state(engine.run_dir)
+    assert state.finished is False
+    assert state.paused_reason == "pinned config edited (DW-368)"
+    assert state.paused_story_key == "1-1"
+    assert "run-paused" in (engine.run_dir / "journal.jsonl").read_text()
+    assert "run-complete" not in (engine.run_dir / "journal.jsonl").read_text()
 
 
 def test_top_level_crash_without_signal_handlers_still_records(project, monkeypatch):

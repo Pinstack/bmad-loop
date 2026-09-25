@@ -367,6 +367,13 @@ class StoryTask:
     # whatever the engine-recorded writes above do not explain; persisted, like
     # `pre_harvest_ledger`, so a resume replaying the merge still has it.
     ledger_seed_text: str | None = None
+    # Every tracked hook config provisioning rewrote AND pinned skip-worktree in
+    # this unit's worktree (DW-368): worktree-relative path -> {"dialect", "text"},
+    # the text being exactly what was written. The pin hides a story's own edit to
+    # that file from `git add -A`, so success teardown compares the file on disk
+    # with this record (relay hooks ignored) and pauses instead of discarding an
+    # edit. A fresh provision overwrites it; persisted so a resume re-checks it.
+    pinned_config_rewrites: dict[str, dict[str, str]] = field(default_factory=dict)
     # The sprint-status stage `_post_dev_state_sync` REQUESTED for this story, or
     # None when it never ran (sweep bundles, stories mode, the legacy path). Same
     # isolation problem as the ledger payloads above, one file over: under
@@ -606,6 +613,7 @@ class StoryTask:
             "bundle_closes_intended": self.bundle_closes_intended,
             "story_closes_intended": self.story_closes_intended,
             "ledger_seed_text": self.ledger_seed_text,
+            "pinned_config_rewrites": deepcopy(self.pinned_config_rewrites),
             "board_advance_intended": self.board_advance_intended,
             "accepted_dev_session_index": self.accepted_dev_session_index,
             "harvest_carry_commit_pending": self.harvest_carry_commit_pending,
@@ -858,6 +866,10 @@ class StoryTask:
             ledger_seed_text=(
                 str(d.get("ledger_seed_text")) if d.get("ledger_seed_text") is not None else None
             ),
+            pinned_config_rewrites={
+                str(rel): {str(k): str(v) for k, v in dict(entry).items()}
+                for rel, entry in dict(d.get("pinned_config_rewrites") or {}).items()
+            },
             board_advance_intended=(
                 str(d["board_advance_intended"])
                 if d.get("board_advance_intended") is not None

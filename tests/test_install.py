@@ -1384,7 +1384,9 @@ def test_provision_worktree_tracked_config_rewrite_stays_out_of_commits(project,
     the skip-worktree pin, `git add -A` folds it into the story commit and the
     merge-back hands every other checkout a relay path that does not exist there.
     Asserted through git's own staging answer, since that is what finalize_commit
-    and the skill's own commits run."""
+    and the skill's own commits run. The pin is reported to `on_pinned` with the
+    exact text written, the record success teardown checks a story's edit against
+    (DW-368). Ablation: drop the `on_pinned` call and `pins` stays empty."""
     repo = project.project
     claude = get_profile("claude")
     hook_rel = claude.hooks.config_path
@@ -1399,9 +1401,12 @@ def test_provision_worktree_tracked_config_rewrite_stays_out_of_commits(project,
     git(repo, "commit", "-q", "-m", "track the hook config")
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
+    pins: list[tuple[str, str, str]] = []
 
-    provision_worktree(wt, [claude], repo)
+    provision_worktree(wt, [claude], repo, on_pinned=lambda *a: pins.append(a))
 
+    assert pins == [(hook_rel, claude.hooks.dialect, (wt / hook_rel).read_text(encoding="utf-8"))]
+    assert claude.hooks.dialect == "claude-settings-json"
     cmd = json.loads((wt / hook_rel).read_text(encoding="utf-8"))["hooks"]["Stop"][0]["hooks"][0][
         "command"
     ]
@@ -1419,7 +1424,8 @@ def test_provision_worktree_tracked_portable_config_is_left_alone(project, tmp_p
     carrying exactly the command provisioning would register: strip-then-merge
     nets to zero. No write may happen and no skip-worktree pin may be set —
     pinning claims orchestrator ownership of a file this run never modified,
-    hiding a story's own edit to it for no benefit."""
+    hiding a story's own edit to it for no benefit. Nor is `on_pinned` called, so
+    teardown has nothing to check (DW-368)."""
     repo = project.project
     codex = get_profile("codex")
     hook_rel = codex.hooks.config_path
@@ -1430,8 +1436,10 @@ def test_provision_worktree_tracked_portable_config_is_left_alone(project, tmp_p
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
 
-    provision_worktree(wt, [codex], repo)
+    pins: list[tuple[str, str, str]] = []
+    provision_worktree(wt, [codex], repo, on_pinned=lambda *a: pins.append(a))
 
+    assert pins == []
     assert (wt / hook_rel).read_bytes() == committed  # no rewrite happened
     assert not git(wt, "ls-files", "-t", "--", hook_rel).startswith("S")  # and no pin
     # a story's own edit to the un-pinned tracked config stays stageable
