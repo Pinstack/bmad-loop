@@ -2041,6 +2041,19 @@ class SweepEngine(Engine):
                 # uncommitted rewrite. Retry the idempotent tail on intact
                 # evidence, or keep the escalation paused.
                 self._resume_escalated_migration_commit(migrate_task)
+            elif (
+                cycle == 1
+                and migrate_task is not None
+                and migrate_task.phase == Phase.ESCALATED
+                and not migrate_task.migration_commit_escalated
+                and migrate_task.migration_recovery_format != 0
+            ):
+                # DW-426: every other marked escalation (TRIAGE_VERIFY,
+                # TRIAGE_RUNNING) is also outside `migration_resume`, so without
+                # this arm a non-legacy ledger would be triaged and an unreadable
+                # one would finish the run. Keep it paused unless the operator
+                # restored the legacy ledger.
+                self._hold_escalated_migration(migrate_task)
             if (
                 cycle == 1
                 and migrate_task is not None
@@ -3442,6 +3455,46 @@ class SweepEngine(Engine):
         task.migration_commit_escalated = False
         self._save()
         self._finish_migration_commit(task, baseline, manifest, rewrite)
+
+    def _hold_escalated_migration(self, task: StoryTask) -> None:
+        """Keep a marked migration ESCALATED outside COMMITTING paused (DW-426).
+
+        ESCALATED is outside ``migration_resume``, so a marked escalation from
+        ``TRIAGE_VERIFY`` or ``TRIAGE_RUNNING`` (the diverged-rival and
+        unreadable-ledger refusals included) would otherwise fall through to the
+        cycle reader: a non-legacy live ledger is triaged as text this migration
+        never accepted, and an unreadable one takes the generic ledger-fault stop
+        and finishes the run. Once ESCALATED, only an operator action may move
+        the task, and both exits bypass this arm: a restored ``has_legacy``
+        ledger returns here so the existing restart path re-enters the
+        migration, and ``bmad-loop resolve`` re-arms the task out of ESCALATED.
+        Anything else — non-legacy, absent or unreadable — re-pauses through
+        ``_escalate``'s already-ESCALATED arm. No record is re-validated and no
+        git, ledger or task state is touched.
+        """
+        remedy = (
+            "restore the pre-migration ledger, delete the migrate-* records in "
+            f"{self.run_dir}, then resume to re-enter the migration — or resolve "
+            "the escalation explicitly"
+        )
+        ledger = self.workspace.paths.deferred_work
+        try:
+            live = deferredwork.read_for_write(ledger)
+        except (deferredwork.LedgerReadError, OSError):
+            self._migration_evidence_failure(
+                task,
+                "live ledger cannot be read, so a plain resume cannot tell whether "
+                f"the pre-migration ledger was restored; {remedy}",
+                own_remedy=True,
+            )
+        if live is not None and deferredwork.has_legacy(live):
+            return
+        self._migration_evidence_failure(
+            task,
+            "live ledger holds no legacy entries, so a plain resume would triage over "
+            f"text this escalated migration never accepted; {remedy}",
+            own_remedy=True,
+        )
 
     def _migration_record_text(
         self, task: StoryTask, path: Path, label: str, *, optional: bool = False

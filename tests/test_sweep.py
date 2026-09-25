@@ -35103,3 +35103,270 @@ def test_marked_triage_running_restores_a_ledger_the_session_deleted(project, le
     assert len(adapter.sessions) == 2 and "--migrate" in adapter.sessions[0].prompt
     assert resumed.state.tasks["sweep-migrate"].phase == Phase.DONE
     assert _records(resumed, "sweep-migration-restore-diverged") == []
+
+
+# ------------------- DW-426: a marked non-commit escalation stays paused
+#
+# A migrate task ESCALATED from TRIAGE_VERIFY or TRIAGE_RUNNING is outside
+# `migration_resume`, so a plain resume used to fall through to the cycle
+# reader: a non-legacy ledger was triaged, an unreadable one finished the run.
+# The pre-reader arm re-pauses unless the operator restored the legacy ledger.
+
+
+def _dw426_remedy(run_dir) -> str:
+    return (
+        "restore the pre-migration ledger, delete the migrate-* records in "
+        f"{run_dir}, then resume to re-enter the migration — or resolve the "
+        "escalation explicitly"
+    )
+
+
+def _dw426_non_legacy_detail(run_dir) -> str:
+    return (
+        "live ledger holds no legacy entries, so a plain resume would triage over "
+        f"text this escalated migration never accepted; {_dw426_remedy(run_dir)}"
+    )
+
+
+def _dw426_unreadable_detail(run_dir) -> str:
+    return (
+        "live ledger cannot be read, so a plain resume cannot tell whether the "
+        f"pre-migration ledger was restored; {_dw426_remedy(run_dir)}"
+    )
+
+
+def _escalate_from_fallback_triage_verify(project, monkeypatch):
+    """ESCALATED via the fallback TRIAGE_VERIFY refusal, live == accepted rewrite."""
+    monkeypatch.setattr(sweep_mod, "DIR_FD_ANCHORED_WRITES", False)
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, _ = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
+    real_write = sweep_mod.atomic_write_text_confined
+
+    def fail_result(path, text, **kwargs):
+        if path.name == "migrate-result.json":
+            raise OSError("result publication fault")
+        return real_write(path, text, **kwargs)
+
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", fail_result)
+    assert engine.run().crashed
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", real_write)
+    assert load_state(engine.run_dir).tasks["sweep-migrate"].phase == Phase.TRIAGE_VERIFY
+    escalating, adapter = resume_sweep(project, engine, [])
+    assert escalating.run().paused and adapter.sessions == []
+    task = load_state(engine.run_dir).tasks["sweep-migrate"]
+    assert task.phase == Phase.ESCALATED and task.migration_recovery_format == 1
+    assert task.migration_commit_escalated is False
+    assert project.deferred_work.read_text(encoding="utf-8") == migrated_ledger()
+    return engine
+
+
+def _escalate_unreadable_triage_running(project, monkeypatch, fault: str):
+    """ESCALATED from TRIAGE_RUNNING on a still-unreadable ledger (DW-314)."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    if fault == "undecodable":
+        engine = _crash_in_triage_running(project, b"# Deferred Work\n\n### DW-1: bad \xff byte\n")
+    else:
+        engine = _crash_in_triage_running(project)
+        fault_read_text(monkeypatch, project.deferred_work)
+    escalating, adapter = resume_sweep(project, engine, [])
+    assert escalating.run().paused and adapter.sessions == []
+    task = load_state(engine.run_dir).tasks["sweep-migrate"]
+    assert task.phase == Phase.ESCALATED and task.migration_recovery_format == 1
+    assert _records(escalating, "sweep-migration-recovery-invalid")[-1]["detail"] == (
+        "live ledger cannot be read for interrupted-session recovery"
+    )
+    return engine
+
+
+def _escalate_on_a_non_legacy_rival(project, monkeypatch):
+    """ESCALATED from TRIAGE_RUNNING after the restore refused a NON-legacy rival."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine = _crash_in_triage_running(project)
+    escalating, adapter = resume_sweep(project, engine, [])
+    real_reset = escalating._safe_reset
+
+    def reset_then_rival(task, **kwargs):
+        real_reset(task, **kwargs)
+        project.deferred_work.write_text(migrated_ledger(), encoding="utf-8")
+
+    monkeypatch.setattr(escalating, "_safe_reset", reset_then_rival)
+    assert escalating.run().paused and adapter.sessions == []
+    task = load_state(engine.run_dir).tasks["sweep-migrate"]
+    assert task.phase == Phase.ESCALATED and task.migration_ledger_rival is True
+    assert len(_records(escalating, "sweep-migration-restore-diverged")) == 1
+    assert project.deferred_work.read_text(encoding="utf-8") == migrated_ledger()
+    return engine
+
+
+def _assert_escalation_held(project, engine, detail: str):
+    """A plain resume re-pauses the ESCALATED task and touches nothing (DW-426)."""
+    head = git(project.project, "rev-parse", "HEAD")
+    live = project.deferred_work.read_bytes() if project.deferred_work.exists() else None
+    attention_before = _attention_text(engine)
+    before = load_state(engine.run_dir).tasks["sweep-migrate"]
+    restarts_before = len(_records(engine, "resume-restart"))
+    invalid_before = len(_records(engine, "sweep-migration-recovery-invalid"))
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    resumed, adapter = resume_sweep(project, engine, [triage_effect(plan)])
+
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed and adapter.sessions == []
+    persisted = load_state(resumed.run_dir)
+    assert persisted.paused_stage == PAUSE_ESCALATION
+    assert persisted.paused_story_key == "sweep-migrate"
+    assert persisted.paused_reason == f"migration recovery evidence is invalid: {detail}"
+    assert persisted.tasks["sweep-migrate"] == before  # no task field mutated
+    invalid = _records(resumed, "sweep-migration-recovery-invalid")
+    assert len(invalid) == invalid_before + 1 and invalid[-1]["detail"] == detail
+    _assert_repaused_with_remedy(resumed, attention_before)
+    assert len(_records(resumed, "resume-restart")) == restarts_before
+    assert git(project.project, "rev-parse", "HEAD") == head
+    if live is None:
+        assert not project.deferred_work.exists()
+    else:
+        assert project.deferred_work.read_bytes() == live
+    return resumed
+
+
+def test_escalation_from_triage_verify_holds_over_a_non_legacy_ledger(project, monkeypatch):
+    """DW-426: a format-1 migration ESCALATED from TRIAGE_VERIFY, whose live
+    ledger is the accepted-but-uncommitted rewrite, stays paused on a plain
+    resume: no triage over text the migration never accepted.
+
+    Ablation, performed: drop the DW-426 `elif` in `_loop` and this reddens:
+    the cycle reader triages the migrated ledger with the task still ESCALATED."""
+    engine = _escalate_from_fallback_triage_verify(project, monkeypatch)
+
+    _assert_escalation_held(project, engine, _dw426_non_legacy_detail(engine.run_dir))
+
+
+def test_escalation_holds_over_an_absent_ledger(project, monkeypatch):
+    """DW-426: a vanished ledger is not the restored legacy text, so it refuses
+    like a non-legacy one instead of reaching the cycle reader.
+
+    Ablation, performed: return on `live is None` in `_hold_escalated_migration`
+    and this reddens: the run ends on `sweep-nothing-open`, stamped finished."""
+    engine = _escalate_from_fallback_triage_verify(project, monkeypatch)
+    project.deferred_work.unlink()
+
+    resumed = _assert_escalation_held(project, engine, _dw426_non_legacy_detail(engine.run_dir))
+
+    assert _records(resumed, "sweep-nothing-open") == []
+
+
+def test_escalation_with_an_unknown_marker_holds(project, monkeypatch):
+    """DW-426 gates on `format != 0`, not the current format: an unknown marker
+    fails closed and re-pauses instead of reaching the cycle reader.
+
+    Ablation, performed: narrow the gate to `== _MIGRATION_RECOVERY_FORMAT` and
+    this reddens: the migrated ledger is triaged."""
+    engine = _escalate_from_fallback_triage_verify(project, monkeypatch)
+    state = load_state(engine.run_dir)
+    state.tasks["sweep-migrate"].migration_recovery_format = 7
+    save_state(engine.run_dir, state)
+
+    _assert_escalation_held(project, engine, _dw426_non_legacy_detail(engine.run_dir))
+
+
+@needs_dir_fd_recovery
+@pytest.mark.parametrize("fault", ["undecodable", "os-fault"])
+def test_escalation_from_triage_running_holds_over_an_unreadable_ledger(
+    project, monkeypatch, fault
+):
+    """DW-426: the second plain resume over a still-unreadable ledger re-pauses
+    at `escalation` with a typed refusal instead of taking the generic cycle
+    stop, which would finish the run.
+
+    Ablation, performed: drop the DW-426 `elif` and this reddens: the run ends
+    through `sweep-cycle-ledger-refused`, neither paused nor escalated."""
+    engine = _escalate_unreadable_triage_running(project, monkeypatch, fault)
+
+    resumed = _assert_escalation_held(project, engine, _dw426_unreadable_detail(engine.run_dir))
+
+    assert _records(resumed, "sweep-cycle-ledger-refused") == []
+    assert _records(resumed, "sweep-repeat-done") == []
+
+
+@needs_dir_fd_recovery
+def test_escalation_on_a_non_legacy_rival_holds_and_keeps_the_rival(project, monkeypatch):
+    """DW-426: a refused non-legacy rival (`migration_ledger_rival` latched) is
+    not the operator remedy; the next plain resume re-pauses and the rival bytes
+    and the latch survive.
+
+    Ablation, performed: drop the DW-426 `elif` and this reddens: the rival is
+    triaged as if it were an accepted DW ledger."""
+    engine = _escalate_on_a_non_legacy_rival(project, monkeypatch)
+
+    _assert_escalation_held(project, engine, _dw426_non_legacy_detail(engine.run_dir))
+
+    assert project.deferred_work.read_text(encoding="utf-8") == migrated_ledger()
+    assert load_state(engine.run_dir).tasks["sweep-migrate"].migration_ledger_rival is True
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "triage-verify",
+        pytest.param("unreadable", marks=needs_dir_fd_recovery),
+        pytest.param("rival", marks=needs_dir_fd_recovery),
+    ],
+)
+def test_held_escalation_re_enters_the_migration_once_the_legacy_ledger_returns(
+    project, monkeypatch, scenario
+):
+    """DW-426 operator remedy: after the re-pause, restoring the legacy ledger
+    (and deleting the migrate-* records, as the remedy says) makes the arm
+    return, and the existing ESCALATED restart re-migrates to DONE."""
+    if scenario == "triage-verify":
+        engine = _escalate_from_fallback_triage_verify(project, monkeypatch)
+        detail = _dw426_non_legacy_detail(engine.run_dir)
+    elif scenario == "unreadable":
+        engine = _escalate_unreadable_triage_running(project, monkeypatch, "undecodable")
+        detail = _dw426_unreadable_detail(engine.run_dir)
+    else:
+        engine = _escalate_on_a_non_legacy_rival(project, monkeypatch)
+        detail = _dw426_non_legacy_detail(engine.run_dir)
+    _assert_escalation_held(project, engine, detail)
+    project.deferred_work.write_text(LEGACY_LEDGER, encoding="utf-8")
+    for record in engine.run_dir.glob("migrate-*"):
+        record.unlink()
+    mapping = _valid_migration_mapping()
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    resumed, adapter = resume_sweep(
+        project,
+        engine,
+        [migrate_effect(project, migrated_ledger(), mapping), triage_effect(plan)],
+    )
+
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert len(adapter.sessions) == 2 and "--migrate" in adapter.sessions[0].prompt
+    assert resumed.state.tasks["sweep-migrate"].phase == Phase.DONE
+    assert _records(resumed, "resume-restart")[-1]["phase"] == str(Phase.ESCALATED)
+    assert "chore(sweep): migrate legacy" in git(project.project, "log", "--oneline")
+
+
+def test_format_zero_escalation_keeps_the_cycle_reader_route(project, monkeypatch):
+    """DW-426 is gated on a recovery marker: a pre-upgrade (format 0) escalation
+    keeps its routing and reaches the cycle reader, which triages the live
+    ledger as before.
+
+    Ablation, performed: drop the `migration_recovery_format != 0` gate and this reddens:
+    the format-0 task is re-paused instead of triaged."""
+    engine = _escalate_from_fallback_triage_verify(project, monkeypatch)
+    state = load_state(engine.run_dir)
+    state.tasks["sweep-migrate"].migration_recovery_format = 0
+    save_state(engine.run_dir, state)
+    invalid_before = len(_records(engine, "sweep-migration-recovery-invalid"))
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    resumed, adapter = resume_sweep(project, engine, [triage_effect(plan)])
+
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert len(adapter.sessions) == 1 and "--migrate" not in adapter.sessions[0].prompt
+    assert len(_records(resumed, "sweep-migration-recovery-invalid")) == invalid_before
+    assert resumed.state.tasks["sweep-migrate"].phase == Phase.ESCALATED

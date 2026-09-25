@@ -103,6 +103,14 @@ breaking changes may land in a minor release.
   over an uncommitted migrated ledger. A restored legacy ledger still takes the
   restore-delete-resume remedy, as does an escalation recorded before this upgrade, which
   is not retried (DW-405, DW-407).
+- Keep any marked sweep-migration escalation the commit-tail arm does not own (including a
+  pre-flag `committing` escalation and an unknown marker) paused on a plain cycle-one
+  resume unless the live ledger is legacy again: a non-legacy, absent or unreadable ledger
+  re-pauses at `escalation` (`sweep-migration-recovery-invalid`) instead of triaging over
+  text the migration never accepted or finishing the run. The resume gate normally refuses
+  an unreadable ledger first; this covers one that becomes unreadable after it. Restore the
+  legacy ledger to re-enter the migration, or resolve the escalation; unmarked pre-upgrade
+  escalations are unchanged (DW-426).
 - Restore a marked migration interrupted in `triage-running` from its durable baseline
   snapshot, not Git cleanliness, so an ignored or untracked ledger's partial session bytes
   are never re-baselined; a rival write, an unreadable ledger, an unknown marker, or a
