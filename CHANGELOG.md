@@ -93,6 +93,12 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Honour `launch_args` before `serve` in the `opencode-http` server argv, so a wrapper
+  profile (`npx -y opencode-ai`) starts; `validate` warns on unservable shapes
+  (`adapter.launch-args-unservable`); `--dry-run` shows `launch_args` before `serve` (DW-374).
+- Report a deeply nested `env_fault_patterns`/`parked_prompt_patterns` entry as a
+  `ProfileError` naming the field instead of letting `RecursionError` escape
+  `load_profiles` (DW-373).
 - Stop worktree teardown from silently deleting a story's edit to a tracked hook config pinned
   `skip-worktree`: success teardown and the run-end GC now compare it with the recorded relay
   rewrite and, on any non-relay difference, journal `pinned-config-edit-refused` and pause with

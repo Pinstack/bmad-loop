@@ -159,8 +159,8 @@ def config_digest(
       ``binary`` / ``launch_args`` / ``bypass_args`` / ``model_flag`` /
       ``prompt_template`` / ``env`` on the *resolved* profile, or to
       ``extra_args`` on the resolved adapter. The opencode-http builder reads a
-      strict SUBSET of those — ``_serve_argv`` takes ``binary`` and the adapter's
-      ``extra_args`` and nothing else, and ``_session_env`` layers
+      strict SUBSET of those — ``_serve_argv`` takes ``binary``, ``launch_args``
+      and the adapter's ``extra_args`` and nothing else, and ``_session_env`` layers
       ``profile.env`` plus one *generated* variable, which the ``skill_tree``
       bullet below accounts for. See the union paragraph on why the subset does
       not narrow what is hashed.
@@ -195,12 +195,14 @@ def config_digest(
     the argument for ``adapter``, since ``hookless`` selected the builder only
     until the registry took that job over: *a hard-coded argv token is not the
     same thing as a safe one.* Flipping ``hooks.dialect`` to ``"none"``
-    does not add a token — it swaps the whole builder, dropping ``launch_args``,
-    the prompt and the ``bypass_args`` fallback and putting the literal ``"serve"``
-    at argv[1], which ``_spawn_server`` then runs with ``cwd`` at the workspace
-    root. To a CLI that is a subcommand and a bad one dies in the health poll. To
-    an *interpreter* — a profile whose ``binary`` is ``python``/``sh``/``node``
-    with the real program in ``launch_args``, which nothing forbids — argv[1] is a
+    does not add a token — it swaps the whole builder, dropping the prompt and
+    the ``bypass_args`` fallback and putting the literal ``"serve"`` right after
+    ``binary`` + ``launch_args``, which ``_spawn_server`` then runs with ``cwd`` at
+    the workspace root. To a CLI that is a subcommand and a bad one dies in the
+    health poll. To an *interpreter* ``binary`` (``python``/``sh``/``node``) with
+    an empty or options-only ``launch_args`` (e.g. ``python3 -u``) — which nothing
+    forbids; validate only warns (``adapter.launch-args-unservable``) —
+    ``"serve"`` lands in the script slot as a
     **script path resolved against the agent-writable tree**, and the exec happens
     before the health poll it fails (three times: ``SPAWN_ATTEMPTS``). ``binary``
     being pinned does not save it: the attacker inherits whichever binary the
@@ -214,8 +216,9 @@ def config_digest(
     ``adapter.extra_args`` REPLACES ``bypass_args`` rather than extending it, so
     for a role that sets it the hashed ``bypass_args`` is dead, and rewriting the
     dead field alone moves this digest without moving one token of the launched
-    argv. Under ``hookless``, ``bypass_args`` / ``launch_args`` / ``model_flag``
-    are dead the same way. Hashing the effective projection instead means
+    argv. Under ``hookless``, ``bypass_args`` / ``model_flag`` are dead the same
+    way (``launch_args`` is not: the opencode builder places it before
+    ``serve``). Hashing the effective projection instead means
     restating two builders' precedence rules inside the control that polices
     them, where drift is silent and lands in the UNDER-covering direction — the
     failure this function has already made four times by reasoning from one
@@ -397,10 +400,11 @@ def config_digest(
             "adapter": prof.adapter,
             # The transport. It no longer selects the builder (`adapter` does),
             # but it still rewrites what the opencode builder emits WHOLESALE
-            # rather than adding a token: hookless drops launch_args/prompt/
-            # bypass_args and substitutes `serve --port … --print-logs`, whose
-            # literal "serve" an interpreter binary reads as a cwd-relative
-            # script path.
+            # rather than adding a token: hookless drops prompt/bypass_args and
+            # appends `serve --port … --print-logs` after binary + launch_args,
+            # whose literal "serve" an interpreter binary with an empty or
+            # options-only launch_args (e.g. `python3 -u`) reads as a
+            # cwd-relative script path.
             "hookless": prof.hookless,
             # None (inherit profile.bypass_args) is NOT the same state as () (an
             # explicit override to no flags at all); json.dumps keeps them apart.

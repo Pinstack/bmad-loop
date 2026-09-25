@@ -1229,6 +1229,104 @@ def test_dry_run_previews_argv_for_a_hookless_profile_of_another_kind(
     assert "hermes" in line and "--model m1" in line
 
 
+# --------------------------------------------------------------------------- #
+# DW-374 — opencode-http launch_args shapes the serve argv cannot serve
+
+
+def _write_launch_profile(project, name, *, binary, launch_args, adapter="opencode-http"):
+    """A profile overlay with an explicit binary + launch_args. Hookless for the
+    opencode kind; a hook dialect for generic (a hookless generic profile is not
+    the shape under test)."""
+    d = project / ".bmad-loop" / "profiles"
+    d.mkdir(parents=True, exist_ok=True)
+    hooks = (
+        '[hooks]\ndialect = "none"\n'
+        if adapter == "opencode-http"
+        else '[hooks]\ndialect = "claude-settings-json"\n'
+        'config_path = ".hermes/settings.json"\n[hooks.events]\nStop = "Stop"\n'
+    )
+    (d / f"{name}.toml").write_text(
+        f'name = "{name}"\nbinary = "{binary}"\nadapter = "{adapter}"\n'
+        f"launch_args = {json.dumps(list(launch_args))}\n{hooks}",
+        encoding="utf-8",
+    )
+    _write_policy(project, f'[adapter]\nname = "{name}"\n')
+
+
+def _unservable(findings):
+    return [f for f in findings if f["check"] == "adapter.launch-args-unservable"]
+
+
+@pytest.mark.parametrize(
+    "binary, launch_args, needle",
+    [
+        pytest.param("opencode", ["--port", "4096"], "'--port'", id="owned-token"),
+        pytest.param("npx", ["-y", "opencode-ai", "serve"], "'serve'", id="owned-serve"),
+        pytest.param("opencode", ["--hostname=0.0.0.0"], "'--hostname=0.0.0.0'", id="owned-eq"),
+        pytest.param("python3", [], "needs a program", id="interpreter-no-program"),
+        pytest.param("npx", [], "needs a program", id="package-runner-no-program"),
+        pytest.param("python3", ["-u"], "needs a program", id="interpreter-options-only"),
+    ],
+)
+def test_validate_warns_on_an_unservable_opencode_launch_args(
+    fresh_adapter_registry, project, capsys, binary, launch_args, needle
+):
+    """The serve argv is `[binary, *launch_args, "serve", <owned flags>]`: a
+    launch_args token colliding with an owned one, or an interpreter with nothing
+    to run, cannot start a server — and would otherwise surface only at run start
+    as SPAWN_ATTEMPTS failed health polls. A WARNING: validate's exit code is a
+    compatibility contract.
+
+    ABLATION: drop the `report.warn` block in `cmd_validate` and this reddens."""
+    install_bmad_config(project)
+    _write_launch_profile(project.project, "ocwrap", binary=binary, launch_args=launch_args)
+
+    found = _unservable(_validate_findings(project.project, capsys))
+    assert [f["severity"] for f in found] == ["warning"], found
+    assert needle in found[0]["message"] and "ocwrap" in found[0]["message"]
+    assert found[0]["detail"]["launch_args"] == launch_args
+
+
+def test_validate_is_silent_on_an_npx_wrapper(fresh_adapter_registry, project, capsys):
+    """The DW-374 motivating shape is legitimate and draws nothing.
+
+    The `adapter.httpx` finding is the control: the opencode-kind branch ran for
+    this profile, so the absent warning is the predicate, not a skipped branch."""
+    install_bmad_config(project)
+    _write_launch_profile(
+        project.project, "ocwrap", binary="npx", launch_args=["-y", "opencode-ai"]
+    )
+    findings = _validate_findings(project.project, capsys)
+    assert _unservable(findings) == []
+    assert any(f["check"] == "adapter.httpx" for f in findings)
+
+
+def test_validate_launch_args_check_keys_on_the_opencode_kind(
+    fresh_adapter_registry, project, capsys
+):
+    """The same unservable shapes on a `generic` profile are none of this check's
+    business: the generic builder never emits `serve`.
+
+    ABLATION: hoist the check out of the `OPENCODE_HTTP` branch and this reddens."""
+    install_bmad_config(project)
+    _write_launch_profile(
+        project.project, "gen", binary="python3", launch_args=[], adapter="generic"
+    )
+    findings = _validate_findings(project.project, capsys)
+    assert _unservable(findings) == []
+    assert [f["severity"] for f in findings if f["check"] == "adapter.kind"] == ["ok"]
+
+
+def test_dry_run_previews_launch_args_before_serve(fresh_adapter_registry, project, capsys):
+    """The dry-run preview renders what `_serve_argv` launches: a wrapper profile
+    previews `npx -y opencode-ai serve …`, not `npx serve …`."""
+    _write_launch_profile(
+        project.project, "ocwrap", binary="npx", launch_args=["-y", "opencode-ai"]
+    )
+    line = _dry_run_dev_line(project, capsys)
+    assert "npx -y opencode-ai serve --hostname 127.0.0.1 --port <auto>" in line
+
+
 def test_validate_flags_an_unregistered_adapter_kind(fresh_adapter_registry, project, capsys):
     """`adapter.kind` is resolved against the live registry, so a profile naming a
     kind no installed package provides is a FAIL that names the known set."""

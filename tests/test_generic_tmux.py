@@ -3159,9 +3159,22 @@ def test_classify_env_fault_inert_without_patterns(tmp_path):
     adapter.profile = dataclasses.replace(adapter.profile, env_fault_patterns=())
     assert adapter._env_fault_patterns == ()
     _write_task_log(adapter, b"API Error: Connection closed mid-response\n")
+    # DW-373: an empty pattern set matches nothing anyway, so the verdict alone
+    # cannot tell the guard from a full scan. Pin the guard itself: the log is
+    # never even located. ABLATION: drop `not self._env_fault_patterns` from the
+    # guard and `opened` records the task.
+    opened: list[str] = []
+    real_log_path = adapter._env_fault_log_path
+
+    def recording_log_path(task_id: str):
+        opened.append(task_id)
+        return real_log_path(task_id)
+
+    adapter._env_fault_log_path = recording_log_path
     result = _classify(adapter, "timeout")
     assert result.env_fault is False
     assert _lifecycle_lines(adapter, _ENV_FAULT_TASK) == []
+    assert opened == []
 
 
 def test_classify_env_fault_no_match_leaves_verdict(tmp_path):
@@ -6309,6 +6322,26 @@ def test_classify_env_fault_marks_a_dropped_suffix(tmp_path):
     assert ev.startswith("…") and ev.endswith("…")
     assert len(ev) <= generic.ENV_FAULT_EVIDENCE_MAX
     assert "API Error: Connection closed mid-response" in ev
+
+
+def test_classify_env_fault_slides_left_when_the_match_is_near_the_line_end(tmp_path):
+    """DW-373: a match within ENV_FAULT_EVIDENCE_LEAD of the end of a long line —
+    opencode's logfmt shape, where ~250 chars of metadata precede the error — is
+    quoted with a FULL window slid left over the metadata, not a short stub
+    starting LEAD chars before the match.
+
+    ABLATION: replace the clamp with `max(0, match_pos - ENV_FAULT_EVIDENCE_LEAD)`
+    and the excerpt shrinks to ~LEAD + match chars, reddening the length assert."""
+    adapter = make_adapter(tmp_path)
+    fault = "API Error: 529 Overloaded"
+    assert len(fault) < env_fault.ENV_FAULT_EVIDENCE_LEAD  # match starts within LEAD of the end
+    _write_task_log(adapter, f"{'m' * 400}{fault}\n".encode())
+    result = _classify(adapter, "timeout")
+    assert result.env_fault is True
+    ev = result.env_fault_evidence
+    assert len(ev) == env_fault.ENV_FAULT_EVIDENCE_MAX
+    assert ev.startswith("…") and not ev.endswith("…")
+    assert ev.endswith(fault)
 
 
 def test_classify_env_fault_drops_the_partial_line_at_the_tail_seek(tmp_path):

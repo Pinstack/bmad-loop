@@ -11,6 +11,7 @@ Everything binds 127.0.0.1; no real opencode binary or network access anywhere.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import inspect
 import json
 import os
@@ -499,6 +500,180 @@ def test_session_env_carries_contract(tmp_path):
     assert env["OPENCODE_SERVER_PASSWORD"] == "sekrit"
     assert env["OPENCODE_DISABLE_EXTERNAL_SKILLS"] == "1"
     json.loads(env["OPENCODE_CONFIG_CONTENT"])  # valid JSON
+
+
+# ------------------------------------------------------- serve argv (DW-374)
+
+
+def _wrapper_adapter(tmp_path: Path, launch_args: tuple[str, ...], **kwargs) -> OpencodeHttpAdapter:
+    profile = dataclasses.replace(get_profile("opencode"), launch_args=launch_args)
+    return OpencodeHttpAdapter(
+        run_dir=tmp_path / "run", policy=_policy(), profile=profile, binary="npx", **kwargs
+    )
+
+
+def test_serve_argv_default_profile_is_unchanged(tmp_path):
+    """The shipped profile has no launch_args: the argv is exactly the pinned one."""
+    adapter = make_adapter(tmp_path, extra_args=("--x", "1"))
+    assert adapter._serve_argv("/bin/opencode", 4242) == [
+        "/bin/opencode",
+        "serve",
+        "--port",
+        "4242",
+        "--hostname",
+        "127.0.0.1",
+        "--print-logs",
+        "--x",
+        "1",
+    ]
+
+
+def test_serve_argv_puts_launch_args_between_binary_and_serve(tmp_path):
+    """DW-374: a wrapper profile (`npx -y opencode-ai`) must launch
+    `npx -y opencode-ai serve …`, not `npx serve …`; extra_args stay last."""
+    adapter = _wrapper_adapter(tmp_path, ("-y", "opencode-ai"), extra_args=("--x",))
+    assert adapter._serve_argv("/usr/bin/npx", 7) == [
+        "/usr/bin/npx",
+        "-y",
+        "opencode-ai",
+        "serve",
+        "--port",
+        "7",
+        "--hostname",
+        "127.0.0.1",
+        "--print-logs",
+        "--x",
+    ]
+
+
+def test_spawn_hands_popen_the_wrapper_argv(tmp_path, monkeypatch):
+    """End to end through `_spawn_server`: Popen receives the resolved wrapper
+    binary, then launch_args, then `serve` and the adapter-owned flags."""
+    adapter = _wrapper_adapter(tmp_path, ("-y", "opencode-ai"))
+    seen: list[list[str]] = []
+
+    class _Stop(Exception):
+        pass
+
+    def fake_popen(argv, **_kw):
+        seen.append(list(argv))
+        raise _Stop
+
+    monkeypatch.setattr(opencode_http.shutil, "which", lambda name: f"/resolved/{name}")
+    monkeypatch.setattr(opencode_http.subprocess, "Popen", fake_popen)
+    spec = SessionSpec(task_id="t", role="triage", prompt="p", cwd=tmp_path)
+    with pytest.raises(_Stop):
+        adapter._spawn_server(spec)
+    assert len(seen) == 1
+    argv = seen[0]
+    assert argv[:4] == ["/resolved/npx", "-y", "opencode-ai", "serve"]
+    assert argv[4:6] == ["--port", argv[5]] and argv[5].isdigit()
+    assert argv[6:] == ["--hostname", "127.0.0.1", "--print-logs"]
+
+
+def test_spawn_give_up_error_names_the_wrapper_launch(tmp_path, monkeypatch):
+    """When every SPAWN_ATTEMPTS spawn dies, the give-up OpencodeServerError names
+    what was actually launched — `npx -y opencode-ai serve`, not `npx serve` — so
+    the operator reading it is not sent chasing the wrong command.
+
+    ABLATION: revert the message to `{self.binary} serve` and this reddens."""
+    adapter = _wrapper_adapter(tmp_path, ("-y", "opencode-ai"))
+    spawned: list[list[str]] = []
+
+    class _DeadProcess:
+        returncode = 1
+
+        def poll(self):
+            return 1
+
+    def fake_popen(argv, **_kw):
+        spawned.append(list(argv))
+        return _DeadProcess()
+
+    monkeypatch.setattr(opencode_http.shutil, "which", lambda name: f"/resolved/{name}")
+    monkeypatch.setattr(opencode_http.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(adapter, "_await_healthy", lambda _sess: False)
+    spec = SessionSpec(task_id="t", role="triage", prompt="p", cwd=tmp_path)
+    with pytest.raises(opencode_http.OpencodeServerError) as excinfo:
+        adapter._spawn_server(spec)
+    assert len(spawned) == opencode_http.SPAWN_ATTEMPTS
+    message = str(excinfo.value)
+    assert (
+        f"could not start `npx -y opencode-ai serve` after {opencode_http.SPAWN_ATTEMPTS}"
+        in message
+    )
+    assert "rc=1" in message
+
+
+@pytest.mark.parametrize(
+    "binary, launch_args, needle",
+    [
+        pytest.param("opencode", ("serve",), "'serve'", id="serve"),
+        pytest.param("npx", ("-y", "opencode-ai", "--port"), "'--port'", id="port"),
+        pytest.param("opencode", ("--port=4096",), "'--port=4096'", id="port-eq"),
+        pytest.param("opencode", ("--hostname",), "'--hostname'", id="hostname"),
+        pytest.param("opencode", ("--hostname=0.0.0.0",), "'--hostname=0.0.0.0'", id="host-eq"),
+        pytest.param("opencode", ("--print-logs",), "'--print-logs'", id="print-logs"),
+        pytest.param(
+            "opencode", ("--print-logs=false",), "'--print-logs=false'", id="print-logs-eq"
+        ),
+        pytest.param("python3", (), "needs a program", id="python3"),
+        pytest.param("python", (), "needs a program", id="python"),
+        pytest.param("/usr/bin/python3.12", (), "needs a program", id="python-path"),
+        pytest.param("C:\\Py\\PYTHON.EXE", (), "needs a program", id="win-exe"),
+        pytest.param("pythonw", (), "needs a program", id="pythonw"),
+        pytest.param("py", (), "needs a program", id="py"),
+        pytest.param("pypy", (), "needs a program", id="pypy"),
+        pytest.param("pypy3", (), "needs a program", id="pypy3"),
+        pytest.param("sh", (), "needs a program", id="sh"),
+        pytest.param("bash", (), "needs a program", id="bash"),
+        pytest.param("zsh", (), "needs a program", id="zsh"),
+        pytest.param("dash", (), "needs a program", id="dash"),
+        pytest.param("node", (), "needs a program", id="node"),
+        pytest.param("nodejs", (), "needs a program", id="nodejs"),
+        pytest.param("bun", (), "needs a program", id="bun"),
+        pytest.param("deno", (), "needs a program", id="deno"),
+        pytest.param("perl", (), "needs a program", id="perl"),
+        pytest.param("ruby", (), "needs a program", id="ruby"),
+        pytest.param("env", (), "needs a program", id="env"),
+        pytest.param("npx", (), "needs a program", id="npx"),
+        pytest.param("bunx", (), "needs a program", id="bunx"),
+        pytest.param("pnpx", (), "needs a program", id="pnpx"),
+        pytest.param("C:\\nodejs\\npx.cmd", (), "needs a program", id="win-cmd-shim"),
+        pytest.param("C:\\tools\\py.bat", (), "needs a program", id="win-bat-shim"),
+        pytest.param("C:\\x\\node.com", (), "needs a program", id="win-com"),
+        # Options only: `serve` still lands in the script/module slot.
+        pytest.param("python3", ("-u",), "needs a program", id="python-u"),
+        pytest.param("python3", ("-m",), "needs a program", id="python-m-no-module"),
+        pytest.param("node", ("--inspect",), "needs a program", id="node-inspect"),
+        pytest.param("npx", ("-y",), "needs a program", id="npx-y-no-package"),
+    ],
+)
+def test_launch_args_unservable_flags_unservable_shapes(binary, launch_args, needle):
+    reason = opencode_http.launch_args_unservable(binary, launch_args)
+    assert reason is not None and needle in reason
+
+
+@pytest.mark.parametrize(
+    "binary, launch_args",
+    [
+        pytest.param("opencode", (), id="default"),
+        pytest.param("npx", ("-y", "opencode-ai"), id="npx-wrapper"),
+        pytest.param("bunx", ("opencode-ai",), id="bunx"),
+        pytest.param("pnpx", ("opencode-ai",), id="pnpx"),
+        pytest.param("C:\\nodejs\\npx.cmd", ("-y", "opencode-ai"), id="win-npx-shim"),
+        pytest.param("env", ("opencode",), id="env-program"),
+        pytest.param("node", ("/opt/opencode/bin/opencode.js",), id="node-script"),
+        pytest.param("python3", ("-m", "some_launcher"), id="python-with-program"),
+        pytest.param("pythonic", (), id="not-an-interpreter"),
+        pytest.param("/opt/sh/opencode", (), id="interpreter-dir-not-basename"),
+        pytest.param("opencode", ("--portal",), id="port-prefix-not-flag"),
+        pytest.param("pyenv", (), id="py-prefix-not-interpreter"),
+        pytest.param("opencode.cmd", (), id="win-opencode-shim"),
+    ],
+)
+def test_launch_args_unservable_is_silent_on_servable_shapes(binary, launch_args):
+    assert opencode_http.launch_args_unservable(binary, launch_args) is None
 
 
 def test_sse_parser_accumulates_and_tolerates_junk():

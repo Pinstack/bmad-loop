@@ -203,11 +203,12 @@ def test_digest_moves_when_the_transport_flips_to_hookless(pinned):
     token in it. (Since the adapter registry the field that picks the BUILDER is
     `profile.adapter` — pinned by its own test; `hookless` still decides what the
     opencode builder emits, which is what this row covers.) That builder's
-    `_serve_argv` drops
-    `launch_args`, the prompt and the `bypass_args` fallback and puts the literal
-    "serve" at argv[1] — run with `cwd` at the workspace root. Against an
-    interpreter `binary` (python/sh/node, the real program in `launch_args` —
-    nothing forbids that shape) argv[1] is a script path resolved out of the tree
+    `_serve_argv` drops the prompt and the `bypass_args` fallback and puts the
+    literal "serve" right after `binary` + `launch_args` — run with `cwd` at the
+    workspace root. Against an interpreter `binary` (python/sh/node) with an
+    empty or options-only `launch_args` (e.g. `python3 -u`) — nothing forbids
+    that shape; validate only warns — "serve" lands in the script slot, a
+    script path resolved out of the tree
     every driven session can write, and the spawn precedes the health poll it
     fails. Pinning `binary` does not cover it, because the attacker inherits the
     binary rather than choosing it. None of the hook fields deleted here are

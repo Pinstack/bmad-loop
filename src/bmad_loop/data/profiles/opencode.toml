@@ -49,6 +49,12 @@ env_fault_patterns = [
   'error[.]error="AI_APICallError: [^"]{0,400}?(?i:usage limit reached|429|too many requests|rate[ _-]?limit|quota|overloaded)',
   'error[.]error="AI_APICallError: [^"]{0,400}?(?i:cannot connect to api|socket connection was closed|connection ?(error|refused|reset|timed ?out)|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN)',
 ]
+# AI_RetryError (ai-sdk's wrapper once its own retries are exhausted) is
+# deliberately NOT seeded. ai-sdk documents the class
+# (https://ai-sdk.dev/docs/reference/ai-sdk-errors/ai-retry-error — properties
+# only, no example message), but no documented or captured opencode server-log
+# line carrying it exists, and a pattern is seeded only from a real line
+# (tests/test_env_fault_patterns.py).
 
 [hooks]
 dialect = "none"

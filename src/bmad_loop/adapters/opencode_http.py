@@ -140,6 +140,7 @@ import atexit
 import json
 import os
 import queue
+import re
 import secrets
 import shutil
 import socket
@@ -240,6 +241,61 @@ _SESSIONLESS_TYPES = frozenset({"file.edited"})
 
 # Fixed basic-auth username in OPENCODE_SERVER_PASSWORD mode (Bearer is rejected).
 AUTH_USER = "opencode"
+
+# The argv tokens `_serve_argv` owns: the subcommand and the three flags it
+# appends. A `launch_args` token equal to one of these (or the `--flag=value`
+# spelling of one) collides with what the adapter assigns — a second `serve`
+# becomes a positional, a second `--port` fights the port the health poll dials,
+# a `--print-logs=false` silences the server log the env-fault classifier reads.
+# Kept beside `_serve_argv` so the two cannot drift apart.
+SERVE_OWNED_TOKENS = frozenset({"serve", "--port", "--hostname", "--print-logs"})
+_SERVE_OWNED_VALUED = ("--port=", "--hostname=", "--print-logs=")
+
+# Binaries that need a PROGRAM before `serve`: interpreters and package runners,
+# matched on the basename (split on `/` and `\`, lowercased, one of
+# `.exe`/`.cmd`/`.bat`/`.com` stripped). Given no program in `launch_args`,
+# `_serve_argv` hands them `serve` as the program — an interpreter reads it as a
+# script path resolved against the workspace cwd (see `runsetup.config_digest`),
+# a package runner fetches the package named `serve`. A closed name set, never a
+# probe: `bmad-loop validate` must not execute a project-controlled binary.
+_NEEDS_PROGRAM_BASENAME = re.compile(
+    r"python(?:\d+(?:\.\d+)?)?|pythonw|py|pypy(?:\d+(?:\.\d+)?)?"
+    r"|sh|bash|zsh|dash|node|nodejs|bun|deno|perl|ruby|env|npx|bunx|pnpx"
+)
+_WINDOWS_LAUNCHER_SUFFIXES = (".exe", ".cmd", ".bat", ".com")
+
+
+def launch_args_unservable(binary: str, launch_args: tuple[str, ...] | list[str]) -> str | None:
+    """Why ``[binary, *launch_args, "serve", …]`` cannot run an opencode server,
+    or None when the shape is servable. Pure: `bmad-loop validate` reports the
+    reason as ``adapter.launch-args-unservable`` (warning) for opencode-http
+    profiles.
+
+    Two shapes are unservable: a ``launch_args`` token repeating an adapter-owned
+    one (:data:`SERVE_OWNED_TOKENS`, or a ``--flag=`` spelling), and an
+    interpreter / package-runner ``binary`` with no program — ``launch_args``
+    empty or options only (``python3 -u``, ``python3 -m``, ``node --inspect``
+    still leave ``serve`` in the script/module slot). Wrappers that name a
+    program (``npx -y opencode-ai``, ``node /opt/x.js``, ``python3 -m
+    launcher``) are servable."""
+    for token in launch_args:
+        if token in SERVE_OWNED_TOKENS or token.startswith(_SERVE_OWNED_VALUED):
+            return (
+                f"launch_args token {token!r} collides with the `serve --port … "
+                "--hostname 127.0.0.1 --print-logs` argv the adapter assigns"
+            )
+    base = re.split(r"[\\/]", binary)[-1].lower()
+    for suffix in _WINDOWS_LAUNCHER_SUFFIXES:
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    no_program = all(token.startswith("-") for token in launch_args)
+    if no_program and _NEEDS_PROGRAM_BASENAME.fullmatch(base):
+        return (
+            f"binary {binary!r} needs a program in launch_args — 'serve' would run "
+            "as the program (a script from the workspace, or a package named serve)"
+        )
+    return None
 
 
 class OpencodeServerError(Exception):
@@ -486,11 +542,18 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
     # ------------------------------------------------------------- spawning
 
     def _serve_argv(self, resolved_binary: str, port: int) -> list[str]:
-        """argv for one server. A seam: tests monkeypatch it to launch the
-        FakeOpencode sidecar wrapper-free."""
+        """argv for one server: ``[binary, *launch_args, "serve", <owned flags>,
+        *extra_args]``. ``launch_args`` sits between the binary and ``serve`` so a
+        wrapper profile (``binary = "npx"``, ``launch_args = ["-y",
+        "opencode-ai"]``) launches ``npx -y opencode-ai serve …``. The adapter owns
+        ``serve`` and the three flags (:data:`SERVE_OWNED_TOKENS`); validate warns
+        on launch_args shapes that collide with them (:func:`launch_args_unservable`).
+        A seam: tests monkeypatch it to launch the FakeOpencode sidecar
+        wrapper-free."""
         extra = self.extra_args or ()
         return [
             resolved_binary,
+            *self.profile.launch_args,
             "serve",
             "--port",
             str(port),
@@ -610,8 +673,9 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             self._close_spawn_sinks(log_fh, server_fh, event_fh)
             raise
         self._close_spawn_sinks(log_fh, server_fh, event_fh)
+        launched = " ".join((self.binary, *self.profile.launch_args))
         raise OpencodeServerError(
-            f"could not start `{self.binary} serve` after {SPAWN_ATTEMPTS} attempts "
+            f"could not start `{launched} serve` after {SPAWN_ATTEMPTS} attempts "
             f"({last_error}); server log: {server_path}"
         )
 

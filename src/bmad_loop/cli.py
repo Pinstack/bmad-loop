@@ -721,6 +721,27 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     f"run `pip install 'bmad-loop[opencode]'`",
                     {"profile": profile.name},
                 )
+            # The serve argv is `[binary, *launch_args, "serve", <owned flags>]`
+            # (`_serve_argv`). A shape it cannot serve would otherwise surface
+            # only at run start, as SPAWN_ATTEMPTS failed health polls. A pure
+            # shape check — never a probe: `binary` is project-controlled (#294).
+            # `warning`: validate's exit code is a compatibility contract.
+            # Imported here, not at the top of cmd_validate, so a project with no
+            # opencode-kind profile never imports the opencode module (the import
+            # itself is httpx-free: `_require_httpx` is lazy).
+            from .adapters.opencode_http import launch_args_unservable
+
+            unservable = launch_args_unservable(profile.binary, profile.launch_args)
+            if unservable is not None:
+                report.warn(
+                    "adapter.launch-args-unservable",
+                    f"{profile.name} (opencode-http): {unservable}",
+                    {
+                        "profile": profile.name,
+                        "binary": profile.binary,
+                        "launch_args": list(profile.launch_args),
+                    },
+                )
         if profile.hookless:
             report.ok(
                 "adapter.hookless",
@@ -2507,8 +2528,10 @@ def _render_invocation(pol, project: Path, role: str, prompt: str) -> str:
         # effort rides the prompt_async body as `variant` (#643); shown under the
         # policy's own key so the preview distinguishes the configurations.
         effort = f" effort={cfg.effort}" if cfg.effort else ""
+        # launch_args sits between binary and `serve`, as `_serve_argv` builds it.
+        launcher = " ".join((profile.binary, *profile.launch_args))
         return (
-            f"{profile.binary} serve --hostname 127.0.0.1 --port <auto> "
+            f"{launcher} serve --hostname 127.0.0.1 --port <auto> "
             f'(cwd=<worktree>) → POST /session → prompt_async "{profile.render_prompt(prompt)}"'
             f"{model}{effort}"
         )

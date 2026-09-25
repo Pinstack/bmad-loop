@@ -154,6 +154,28 @@ def test_env_fault_patterns_parse_from_overlay(tmp_path):
     assert prof.env_fault_patterns == ("API Error.*refused", "socket hang up")
 
 
+@pytest.mark.parametrize("field", ["env_fault_patterns", "parked_prompt_patterns"])
+def test_deeply_nested_pattern_is_a_profile_error_not_a_bare_recursion_error(tmp_path, field):
+    """DW-373: `regex.compile` answers a deeply nested pattern with RecursionError,
+    not `regex.error` — it must still surface as a ProfileError naming the field,
+    never escape `load_profiles` bare.
+
+    ABLATION: narrow either loop's except back to `regex.error` and its case
+    reddens with a bare RecursionError."""
+    depth = 5000  # empirically raises RecursionError under regex.compile
+    pattern = "(" * depth + ")" * depth
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(
+        MINIMAL_PROFILE.replace("[hooks]", f"{field} = ['{pattern}']\n[hooks]")
+    )
+    with pytest.raises(ProfileError, match=f"{field} entry is not a valid regex") as excinfo:
+        load_profiles(tmp_path)
+    # The RecursionError path specifically — not a plain `regex.error`, which the
+    # pre-fix `except` already caught and would pass this test for another reason.
+    assert isinstance(excinfo.value.__cause__, RecursionError)
+
+
 def test_parked_signal_fields_default_empty_when_unset(tmp_path):
     # MINIMAL_PROFILE declares neither -> both inert (DW-348/DW-350)
     (tmp_path / ".bmad-loop" / "profiles").mkdir(parents=True)

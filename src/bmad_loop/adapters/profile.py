@@ -429,13 +429,13 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
     for pattern in profile.env_fault_patterns:
         try:
             regex.compile(pattern)  # same engine the adapter matches with (timeout-guarded)
-        except regex.error as e:
+        except (regex.error, RecursionError) as e:
             raise fail(f"env_fault_patterns entry is not a valid regex: {pattern!r} ({e})") from e
 
     for pattern in profile.parked_prompt_patterns:
         try:
             regex.compile(pattern)  # same engine the stall gate matches with (timeout-guarded)
-        except regex.error as e:
+        except (regex.error, RecursionError) as e:
             raise fail(
                 f"parked_prompt_patterns entry is not a valid regex: {pattern!r} ({e})"
             ) from e
