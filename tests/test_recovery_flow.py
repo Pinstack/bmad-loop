@@ -4658,6 +4658,182 @@ def test_pause_preserve_failed_wording(project, tmp_path):
     assert "could not be auto-preserved" in excinfo.value.reason
 
 
+def test_pause_committed_wording_offers_accept_baseline(project, tmp_path):
+    """DW-371: shape (c) names `resume --accept-baseline` for commits that are
+    the operator's own."""
+    repo = project.project
+    flow = _make_flow(workspace=Workspace.default(project), run_dir=tmp_path)
+    task = _task(repo)
+    _commit_something(repo)
+
+    with pytest.raises(_Pause) as excinfo:
+        flow.pause_for_manual_recovery(task, task.baseline_commit)
+
+    assert "bmad-loop resume run-1 --accept-baseline" in excinfo.value.reason
+
+
+# ------------------------------------------ DW-371: restart park notice / adoption
+
+
+def _attention_lines(run_dir: Path) -> list[str]:
+    attention = run_dir / ATTENTION_FILE
+    return attention.read_text().splitlines() if attention.exists() else []
+
+
+def test_restart_rollback_notifies_parked_commits(project, tmp_path):
+    repo = project.project
+    flow = _make_flow(
+        workspace=Workspace.default(project),
+        policy=_policy(rollback_on_failure=True),
+        run_dir=tmp_path,
+    )
+    task = _task(repo)
+    for n in range(2):
+        (repo / "src.txt").write_text(f"commit {n}\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", f"above baseline {n}")
+
+    flow.rollback_or_pause(task, restart=True)
+
+    assert rev_parse_head(repo) == task.baseline_commit  # the reset proceeded
+    ref = flow.journal.fields("attempt-commits-preserved")["ref"]
+    lines = _attention_lines(tmp_path)
+    assert len(lines) == 1
+    line = lines[0]
+    assert ref in line and task.baseline_commit[:12] in line
+    assert "2 commits" in line
+    assert f"log --oneline {task.baseline_commit[:12]}..refs/heads/{ref}" in line
+    assert f'git -C "{repo}" cherry-pick <sha>' in line
+    assert "bmad-loop resume run-1 --accept-baseline" in line
+    # attribution-neutral: never claims the commits are the human's
+    assert "made while the run was down" in line and "the interrupted attempt's" in line
+
+
+def test_restart_rollback_notice_waits_for_the_completed_reset(project, tmp_path, monkeypatch):
+    """The parked-commits notice claims a reset, so it is sent only after
+    `safe_reset` completes: commits parked, then the dirty snapshot fails and the
+    #340 gate pauses — the pause propagates and no parked-commits notice exists.
+
+    Ablation: move the notify to right after `preserve_attempt_commits` and this
+    reddens on the notice line."""
+    repo = project.project
+    flow = _make_flow(
+        workspace=Workspace.default(project),
+        policy=_policy(rollback_on_failure=True),
+        run_dir=tmp_path,
+    )
+    task = _task(repo)
+    _commit_something(repo)
+    (repo / "src.txt").write_text("uncommitted work\n")
+    _fail_snapshot(monkeypatch)
+
+    with pytest.raises(_Pause):
+        flow.rollback_or_pause(task, restart=True)
+
+    assert "attempt-commits-preserved" in flow.journal.events()  # commits were parked
+    assert (repo / "src.txt").read_text() == "uncommitted work\n"  # no reset ran
+    assert not any("commits parked on resume" in line for line in _attention_lines(tmp_path))
+
+
+def test_restart_rollback_dirty_only_sends_no_parked_notice(project, tmp_path):
+    """Nothing above the baseline ⇒ nothing parked ⇒ no notice, even on restart."""
+    repo = project.project
+    flow = _make_flow(
+        workspace=Workspace.default(project),
+        policy=_policy(rollback_on_failure=True),
+        run_dir=tmp_path,
+    )
+    task = _task(repo)
+    (repo / "dirty.txt").write_text("uncommitted\n")
+
+    flow.rollback_or_pause(task, restart=True)
+
+    assert not (repo / "dirty.txt").exists()  # the rollback ran
+    assert "attempt-commits-preserved" not in flow.journal.events()
+    assert _attention_lines(tmp_path) == []
+
+
+def test_in_run_rollback_parks_commits_without_notice(project, tmp_path):
+    """A retry/defer rollback (no ``restart``) journals the park but never notifies.
+
+    Ablation: drop `restart and` from the notice gate and this reddens."""
+    repo = project.project
+    flow = _make_flow(
+        workspace=Workspace.default(project),
+        policy=_policy(rollback_on_failure=True),
+        run_dir=tmp_path,
+    )
+    task = _task(repo)
+    _commit_something(repo)
+
+    flow.rollback_or_pause(task)
+
+    assert "attempt-commits-preserved" in flow.journal.events()
+    assert rev_parse_head(repo) == task.baseline_commit
+    assert _attention_lines(tmp_path) == []
+
+
+def test_accept_current_baseline_restamps_and_skips_the_reset(project, tmp_path):
+    repo = project.project
+    flow = _make_flow(
+        workspace=Workspace.default(project),
+        policy=_policy(rollback_on_failure=True),
+        run_dir=tmp_path,
+    )
+    task = _task(repo)
+    previous_baseline = task.baseline_commit
+    _commit_something(repo)
+    human = rev_parse_head(repo)
+    (repo / "notes.txt").write_text("operator's own untracked file\n")
+
+    flow.accept_current_baseline(task)
+    flow.rollback_or_pause(task, restart=True)
+
+    assert flow.journal.fields("baseline-accepted") == {
+        "story_key": "1-1-a",
+        "previous_baseline": previous_baseline,
+        "baseline": human,
+    }
+    assert task.baseline_commit == human
+    assert task.baseline_untracked == ["notes.txt"]
+    assert rev_parse_head(repo) == human  # nothing reset past the commit
+    assert (repo / "notes.txt").exists()
+    assert "rollback-skipped-clean" in flow.journal.events()
+    assert "attempt-commits-preserved" not in flow.journal.events()
+    assert _attention_lines(tmp_path) == []
+
+
+def test_accept_current_baseline_git_fault_pauses_without_reset(project, tmp_path, monkeypatch):
+    repo = project.project
+    flow = _make_flow(
+        workspace=Workspace.default(project),
+        policy=_policy(rollback_on_failure=True),
+        run_dir=tmp_path,
+    )
+    task = _task(repo)
+    previous = task.baseline_commit
+    untracked_before = list(task.baseline_untracked)
+
+    def boom(root):
+        raise GitError("rev-parse timed out")
+
+    monkeypatch.setattr(verify, "rev_parse_head", boom)
+
+    with pytest.raises(_Pause) as excinfo:
+        flow.accept_current_baseline(task)
+
+    assert flow.journal.fields("baseline-accept-failed") == {
+        "story_key": "1-1-a",
+        "error": "rev-parse timed out",
+    }
+    assert "baseline-accepted" not in flow.journal.events()
+    assert task.baseline_commit == previous
+    assert task.baseline_untracked == untracked_before
+    assert flow.calls.saves == 1
+    assert "could not accept the current baseline" in excinfo.value.reason
+    assert "baseline accept failed for 1-1-a" in (tmp_path / ATTENTION_FILE).read_text()
+
+
 # --------------------------------------------------------------- restore_patch
 
 

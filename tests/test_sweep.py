@@ -23581,7 +23581,7 @@ def test_sweep_restart_clears_a_latched_salvage_before_rollback(project, monkeyp
     engine.state.tasks[task.story_key] = task
     seen_latched: list[bool] = []
 
-    def pause_after_looking(_task, cause):
+    def pause_after_looking(_task, cause, restart=False):
         seen_latched.append(_task.salvage_refile_pending)
         if pauses:
             raise RunPaused("manual recovery", PAUSE_STORY_GATE, _task.story_key)
@@ -23599,6 +23599,84 @@ def test_sweep_restart_clears_a_latched_salvage_before_rollback(project, monkeyp
     assert seen_latched == [False]  # already cleared when the rollback/pause ran
     assert task.salvage_refile_pending is False
     assert "resume-restart" in [e["kind"] for e in engine.journal.entries()]
+
+
+@pytest.mark.parametrize("accept", [True, False], ids=["accept-baseline", "plain"])
+def test_sweep_restart_accept_baseline_parity(project, accept):
+    """DW-371 sweep parity: the bundle restart leg adopts HEAD under the
+    `--accept-baseline` latch (the commit above the baseline survives, nothing is
+    parked), and without it parks the commit and sends the restart notice.
+
+    Ablation: drop the leg's `self._accept_current_baseline(task)` and the accept row
+    reddens on the parked commit; drop `restart=True` and the plain row reddens on
+    the missing ATTENTION line."""
+    from bmad_loop.gates import ATTENTION_FILE
+
+    engine, _ = make_sweep(
+        project,
+        [],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            scm=ScmPolicy(isolation="none", rollback_on_failure=True),
+        ),
+    )
+    repo = project.project
+    baseline = verify.rev_parse_head(repo)
+    task = StoryTask(
+        "dw-fix",
+        0,
+        phase=Phase.DEV_RUNNING,
+        baseline_commit=baseline,
+        baseline_untracked=sorted(verify.untracked_files(repo)),
+    )
+    engine.state.tasks[task.story_key] = task
+    engine.state.accept_baseline = accept
+    (repo / "human.txt").write_text("made while the run was down\n")
+    git(repo, "add", "human.txt")
+    git(repo, "commit", "-q", "-m", "human work")
+    human = verify.rev_parse_head(repo)
+
+    assert engine._recover_inflight_bundle(task) is False
+
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    attention = engine.run_dir / ATTENTION_FILE
+    notices = [
+        line
+        for line in (attention.read_text().splitlines() if attention.exists() else [])
+        if "attempt-preserve/" in line
+    ]
+    if accept:
+        assert "baseline-accepted" in kinds
+        assert "attempt-commits-preserved" not in kinds
+        assert task.baseline_commit == human
+        assert verify.rev_parse_head(repo) == human
+        assert notices == []
+    else:
+        assert "baseline-accepted" not in kinds
+        assert "attempt-commits-preserved" in kinds
+        assert verify.rev_parse_head(repo) == baseline
+        assert len(notices) == 1
+
+
+@pytest.mark.parametrize("withheld", [False, True], ids=["recovery-pass", "withheld"])
+def test_sweep_loop_consumes_the_accept_baseline_latch(project, withheld):
+    """DW-371: `SweepEngine._loop` clears the one-resume `--accept-baseline` latch
+    after its in-flight recovery pass — on the withheld (ledger-in-doubt) arm too,
+    so no later cycle's `_run_bundle` recovery can adopt a baseline.
+
+    Ablation: replace the loop's `self._clear_accept_baseline()` with `pass` and
+    both rows redden on the persisted latch."""
+    engine, adapter = make_sweep(project, [])
+    engine.state.accept_baseline = True
+    engine.state.sweep_ledger_in_doubt = withheld
+    engine._save()
+
+    summary = engine.run()
+
+    assert not summary.crashed
+    assert adapter.sessions == []
+    assert load_state(engine.run_dir).accept_baseline is False
 
 
 def test_sweep_isolation_flip_restart_releases_mount_state_without_main_rollback(

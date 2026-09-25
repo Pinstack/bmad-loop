@@ -1941,6 +1941,10 @@ class SweepEngine(Engine):
                 )
         else:
             recovered = self._finish_inflight_bundles()
+        # The `--accept-baseline` latch (DW-371) covers this resume's recovery pass
+        # only — consumed on both arms, so a withheld pass cannot leave it armed for
+        # a later cycle's `_run_bundle` recovery.
+        self._clear_accept_baseline()
         # ...and the same verdict gates the publish that follows either trigger,
         # at the call site inside the arm (the DW-246 withhold below), so a
         # trigger added later cannot reach the publisher around it.
@@ -3301,7 +3305,13 @@ class SweepEngine(Engine):
             # the policy pause regardless of scm.rollback_on_failure. Unsafe
             # attempt-owned authority may still require manual recovery.
             task.resolved_redrive = task.resolved_redrive or task.rearmed
-            self._rollback_or_pause(task, cause="resolved" if task.rearmed else "stopped")
+            if self.state.accept_baseline:
+                # `resume --accept-baseline` (DW-371), mirroring the base restart
+                # arm: adopt the current checkout before the rollback.
+                self._accept_current_baseline(task)
+            self._rollback_or_pause(
+                task, cause="resolved" if task.rearmed else "stopped", restart=True
+            )
         task.rearmed = False  # past rollback (only reached when not paused)
         task.phase = Phase.PENDING  # deliberate reset, not a normal transition
         return False

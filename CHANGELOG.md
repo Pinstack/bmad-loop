@@ -9,6 +9,17 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Add `bmad-loop resume <run> --accept-baseline`: every in-place story the resume
+  restarts adopts the current HEAD as its baseline before rolling back, so commits
+  above the old baseline are kept instead of parked and reset over
+  (`baseline-accepted`; a git fault pauses as `baseline-accept-failed`). It adopts
+  everything at HEAD — the attempt's own commits included — and every current
+  untracked file as pre-existing; check `git log <baseline>..HEAD` first.
+  Uncommitted tracked changes still follow the normal rollback. One resume only
+  (DW-371).
+- Notify (`ATTENTION`) when a resume restart's rollback parks commits above the
+  baseline on `attempt-preserve/*`, naming the ref, baseline, count and a `git log`
+  hint (DW-371).
 - Add a `post_review_verify` plugin hook stage: every review verify gate (converged
   pass, budget rescue, timeout salvage, each skip-review pass; all run modes) publishes
   its `[verify] commands` results with the `post_dev_verify` payload shape under

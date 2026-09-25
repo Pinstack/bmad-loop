@@ -1276,6 +1276,9 @@ JOURNAL_KINDS = frozenset(
         "plugin-untrusted",
         # recovery_flow.py
         "attempt-commits-preserved",
+        # DW-371: `resume --accept-baseline` adoption on the restart arm.
+        "baseline-accept-failed",
+        "baseline-accepted",
         "attempt-preserve-enumerate-failed",
         "attempt-preserve-failed",
         "attempt-restore-failed",

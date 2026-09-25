@@ -161,6 +161,10 @@ _JOURNAL_ALIAS_FIELDS = {
     # benign inventory follows from that inventory's own rule: a name carrying a sha
     # belongs in a `diagnostics` table.
     "old_baseline": "commit",
+    # The baseline `resume --accept-baseline` replaced (`baseline-accepted`, DW-371),
+    # journaled beside the adopted `baseline` — both shas aliased so the comparison
+    # the record exists for survives a dump.
+    "previous_baseline": "commit",
     # A spec name IS the customer's feature name — `Pseudonymizer`'s own docstring
     # has always listed "spec filenames" among what it exists to alias, so the
     # omission here was a routing gap, not a policy. A producer that journals a

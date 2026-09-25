@@ -1431,6 +1431,7 @@ class Engine:
 
     def _loop(self) -> None:
         self._finish_inflight()
+        self._clear_accept_baseline()
         while True:
             # First statement of the loop body: one site covers every story
             # boundary this base loop reaches — between stories, right after
@@ -1643,8 +1644,13 @@ class Engine:
     def _retry_preserve_notice(self, task: StoryTask) -> str:
         return self._recovery_flow.retry_preserve_notice(task)
 
-    def _rollback_or_pause(self, task: StoryTask, *, cause: str = "stopped") -> None:
-        self._recovery_flow.rollback_or_pause(task, cause=cause)
+    def _rollback_or_pause(
+        self, task: StoryTask, *, cause: str = "stopped", restart: bool = False
+    ) -> None:
+        self._recovery_flow.rollback_or_pause(task, cause=cause, restart=restart)
+
+    def _accept_current_baseline(self, task: StoryTask) -> None:
+        self._recovery_flow.accept_current_baseline(task)
 
     def _discard_unit_for_restart(self, task: StoryTask) -> None:
         """Drop a half-built unit worktree and the four fields that LOCATE it.
@@ -1750,8 +1756,10 @@ class Engine:
     def _prune_preserve_refs(self) -> None:
         self._recovery_flow.prune_preserve_refs()
 
-    def _preserve_attempt_commits(self, task: StoryTask, *, allow_pause: bool) -> None:
-        self._recovery_flow.preserve_attempt_commits(task, allow_pause=allow_pause)
+    def _preserve_attempt_commits(
+        self, task: StoryTask, *, allow_pause: bool
+    ) -> tuple[str, int] | None:
+        return self._recovery_flow.preserve_attempt_commits(task, allow_pause=allow_pause)
 
     def _preserve_attempt_worktree(self, task: StoryTask, *, allow_pause: bool) -> None:
         self._recovery_flow.preserve_attempt_worktree(task, allow_pause=allow_pause)
@@ -2042,6 +2050,15 @@ class Engine:
             ) from exc
         return True
 
+    def _clear_accept_baseline(self) -> None:
+        """Consume the one-resume ``--accept-baseline`` latch (DW-371) once in-flight
+        recovery has returned normally, so no later rollback of this run adopts a
+        baseline. A pause inside recovery leaves it set; the next resume's
+        `_prepare_resume_locked` overwrites it either way."""
+        if self.state.accept_baseline:
+            self.state.accept_baseline = False
+            self._save()
+
     def _finish_inflight(self) -> None:
         """Complete or roll back tasks interrupted by a pause or crash."""
         for task in list(self.state.tasks.values()):
@@ -2187,7 +2204,14 @@ class Engine:
                     # latch resolved_redrive so the corrected spec stays protected
                     # through every reset of this re-drive, not just this first one
                     task.resolved_redrive = task.resolved_redrive or task.rearmed
-                    self._rollback_or_pause(task, cause="resolved" if task.rearmed else "stopped")
+                    if self.state.accept_baseline:
+                        # `resume --accept-baseline` (DW-371): adopt the current
+                        # checkout BEFORE the rollback so the reset targets HEAD
+                        # instead of parking commits made while the run was down.
+                        self._accept_current_baseline(task)
+                    self._rollback_or_pause(
+                        task, cause="resolved" if task.rearmed else "stopped", restart=True
+                    )
                 task.rearmed = False  # past rollback (only reached when not paused)
                 task.phase = Phase.PENDING  # deliberate reset, not a normal transition
                 self._save()

@@ -948,6 +948,15 @@ class RunState:
     # row that names no root. Deliberately absent from `documents.py`'s `--json`
     # projection (schema 1), like `rearmed` / `resolved_redrive`.
     code_root_restamp_pending: bool = False
+    # One-resume latch for `bmad-loop resume --accept-baseline` (DW-371). Written
+    # True or False by `cli._prepare_resume_locked` on EVERY resume, so a plain,
+    # TUI, or `resolve` re-arm resume clears a stale latch; the engine also clears
+    # it once in-flight recovery returns normally. While set, the restart arms
+    # re-stamp each restarted in-place task's baseline from the current checkout
+    # BEFORE the rollback, so commits made while the run was down become the new
+    # baseline instead of being parked and reset over. Deliberately absent from
+    # `documents.py`'s `--json` projection (schema 1).
+    accept_baseline: bool = False
     policy_snapshot: dict[str, Any] = field(default_factory=dict)
     # SECONDARY copy of the host-exec baseline (#498) — runsetup.config_digest over
     # the agent-writable config that reaches HOST code execution: verify commands,
@@ -1148,6 +1157,7 @@ class RunState:
             "project": self.project,
             "repo_root": self.repo_root,
             "code_root_restamp_pending": self.code_root_restamp_pending,
+            "accept_baseline": self.accept_baseline,
             "started_at": self.started_at,
             "policy_snapshot": self.policy_snapshot,
             "trusted_config_digest": self.trusted_config_digest,
@@ -1187,6 +1197,7 @@ class RunState:
             project=d["project"],
             repo_root=str(d.get("repo_root", "")),
             code_root_restamp_pending=bool(d.get("code_root_restamp_pending", False)),
+            accept_baseline=bool(d.get("accept_baseline", False)),
             started_at=d["started_at"],
             policy_snapshot=d.get("policy_snapshot", {}),
             trusted_config_digest=str(d.get("trusted_config_digest", "")),

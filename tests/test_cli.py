@@ -7085,7 +7085,7 @@ def test_resume_liveness_and_publication_share_one_lock_acquisition(tmp_path, mo
         assert active
         return "dead"
 
-    def prepare(_project, _run_dir):
+    def prepare(_project, _run_dir, *, accept_baseline=False):
         assert active
         return 1
 
@@ -16915,3 +16915,38 @@ def test_sweep_archive_routes_a_locked_ledger_os_read_fault(
         assert archive.read_bytes() == archive_before
     else:
         assert not archive.exists()
+
+
+def test_resume_accept_baseline_latches_for_one_resume_only(project, monkeypatch):
+    """DW-371: `resume --accept-baseline` persists `state.accept_baseline=True` before
+    the engine starts; a later plain resume (the path `resolve` and the TUI also take)
+    overwrites it with False, so a stale latch from a paused accept-resume cannot
+    adopt on the next one.
+
+    Ablation: drop the `state.accept_baseline = accept_baseline` write in
+    `_prepare_resume_locked` and the first assertion reddens; make it conditional on
+    the flag and the second one does."""
+    from bmad_loop.journal import load_state, save_state
+
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    seen: list[bool] = []
+
+    class _LatchEngine(_StubEngine):
+        def __init__(self, **kwargs):
+            seen.append(kwargs["state"].accept_baseline)
+
+    monkeypatch.setattr(cli, "Engine", _LatchEngine)
+    argv = ["resume", "--project", str(project.project), run_dir.name]
+
+    assert cli.main([*argv, "--accept-baseline"]) == 0
+    assert seen == [True]
+    assert load_state(run_dir).accept_baseline is True  # persisted before the engine ran
+
+    # the accept-resume paused mid-recovery: the latch is still on disk
+    state = load_state(run_dir)
+    state.paused_reason, state.paused_stage = "escalation", "escalation"
+    save_state(run_dir, state)
+
+    assert cli.main(argv) == 0
+    assert seen == [True, False]
+    assert load_state(run_dir).accept_baseline is False

@@ -20858,3 +20858,92 @@ def test_nested_verify_command_is_interrupted_by_owner_or_own_hard_request(
     assert len(records) == 1 and records[0]["interrupted"] is True
     assert len(adapter.sessions) == 1
     assert not load_state(engine.run_dir).tasks["1-1-a"].commit_sha
+
+
+# ------------------------------------------------ DW-371: resume --accept-baseline
+
+
+def _restart_with_human_commit(project, *, rollback: bool, accept: bool):
+    """A DEV_RUNNING in-place task interrupted at baseline B, then a human commit C
+    landed while the run was down. Returns (resumed engine, summary, B, C)."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(rollback_on_failure=rollback),
+    )
+    engine, _ = make_engine(project, [], policy=policy)
+    repo = project.project
+    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEV_RUNNING, attempt=1)
+    task.baseline_commit = rev_parse_head(repo)
+    task.baseline_untracked = sorted(verify.untracked_files(repo))
+    engine.state.tasks[task.story_key] = task
+    engine._save()
+    baseline = task.baseline_commit
+    (repo / "human.txt").write_text("made while the run was down\n")
+    git(repo, "add", "human.txt")
+    git(repo, "commit", "-q", "-m", "human work")
+    human = rev_parse_head(repo)
+    state = load_state(engine.run_dir)
+    state.accept_baseline = accept  # what `resume --accept-baseline` persists
+    save_state(engine.run_dir, state)
+    resumed, _ = resume_engine(
+        project,
+        engine,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=policy,
+    )
+    return resumed, resumed.run(), baseline, human
+
+
+@pytest.mark.parametrize("rollback", [True, False])
+def test_resume_accept_baseline_keeps_a_human_commit(project, rollback):
+    """DW-371: with the latch set the restart arm re-stamps the baseline to HEAD
+    before its rollback, so nothing is parked or reset, no manual-recovery pause
+    fires (rollback OFF), and the human commit stays on the branch.
+
+    Ablation: delete the `self._accept_current_baseline(task)` call in the restart
+    arm and rollback ON parks + resets past the commit, rollback OFF pauses."""
+    resumed, summary, baseline, human = _restart_with_human_commit(
+        project, rollback=rollback, accept=True
+    )
+
+    assert summary.done == 1 and not summary.paused
+    entries = resumed.journal.entries()
+    kinds = [e["kind"] for e in entries]
+    accepted = next(e for e in entries if e["kind"] == "baseline-accepted")
+    assert accepted["previous_baseline"] == baseline and accepted["baseline"] == human
+    assert "attempt-commits-preserved" not in kinds
+    assert "rollback-manual-required" not in kinds
+    git(project.project, "merge-base", "--is-ancestor", human, "HEAD")  # still reachable
+    assert not git(project.project, "for-each-ref", "refs/heads/attempt-preserve/")
+    # consumed once in-flight recovery returned
+    assert load_state(resumed.run_dir).accept_baseline is False
+
+
+def test_resume_restart_park_notifies_once_without_accept(project):
+    """DW-371: a plain resume with rollback ON parks the commit above the baseline,
+    resets, and leaves ONE ATTENTION line naming the attempt-preserve ref.
+
+    Ablation: drop `restart=True` at the restart arm's `_rollback_or_pause` and the
+    ATTENTION file carries no such line."""
+    resumed, summary, baseline, human = _restart_with_human_commit(
+        project, rollback=True, accept=False
+    )
+
+    assert summary.done == 1
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "baseline-accepted" not in kinds
+    assert "attempt-commits-preserved" in kinds
+    lines = [
+        line
+        for line in (resumed.run_dir / gates.ATTENTION_FILE).read_text().splitlines()
+        if "attempt-preserve/" in line
+    ]
+    assert len(lines) == 1
+    assert baseline[:12] in lines[0] and "--accept-baseline" in lines[0]
+    parked = next(e for e in resumed.journal.entries() if e["kind"] == "attempt-commits-preserved")[
+        "ref"
+    ]
+    assert parked in lines[0]
+    git(project.project, "merge-base", "--is-ancestor", human, f"refs/heads/{parked}")

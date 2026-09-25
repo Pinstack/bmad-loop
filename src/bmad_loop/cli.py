@@ -3173,8 +3173,12 @@ def _sweep_dry_run(
     return 0
 
 
-def _prepare_resume_locked(project: Path, run_dir: Path):
-    """Publish resume state while the caller holds this run's state lock."""
+def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: bool = False):
+    """Publish resume state while the caller holds this run's state lock.
+
+    ``accept_baseline`` is `resume --accept-baseline` (DW-371). It is written onto
+    ``state.accept_baseline`` on EVERY resume — False included — so a plain, TUI,
+    or `resolve` resume clears a latch a paused `--accept-baseline` resume left."""
     # An id that aliases a control session (`ctl` / `ctl-<16hex>` —
     # runs.run_id_aliases_control_session; NOT the mint's broader reservation,
     # since a historical `ctl-foo` run has a genuine agent session and resumes
@@ -3473,6 +3477,10 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
     # the run owing a record it has already written, or clear the marker for a record
     # that never landed.
     state.code_root_restamp_pending = False
+    # The one-resume `--accept-baseline` latch (DW-371): overwritten, never merged,
+    # and only here — past every refusal above — on the write that persists this
+    # resume, so a refused resume cannot arm it and a plain one always clears it.
+    state.accept_baseline = accept_baseline
     state.clear_pause()
     runs.write_pid(run_dir)
     # Persist before the engine starts: status, the TUI and diagnose only ever
@@ -3489,8 +3497,11 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
     return paths, state, pol, journal, new_digest, profiles, sweep_options
 
 
-def _resume_paused_run(project: Path, run_dir: Path) -> int:
-    """Resume a paused/interrupted run without holding its lock across execution."""
+def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = False) -> int:
+    """Resume a paused/interrupted run without holding its lock across execution.
+
+    Also resolve's re-arm path, which never passes ``accept_baseline`` — its re-arm
+    (`runs.rearm_escalation`) already advances the baseline to HEAD."""
     with state_lock(run_dir):
         # Cleanup removes the run under this same hold. A resume that resolved the
         # path before cleanup won must not let Journal/save_state recreate it after
@@ -3507,7 +3518,7 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
                 file=sys.stderr,
             )
             return 1
-        prepared = _prepare_resume_locked(project, run_dir)
+        prepared = _prepare_resume_locked(project, run_dir, accept_baseline=accept_baseline)
     if isinstance(prepared, int):
         return prepared
     paths, state, pol, journal, new_digest, profiles, sweep_options = prepared
@@ -3597,7 +3608,9 @@ def cmd_resume(args: argparse.Namespace) -> int:
     # bmad-loop-resolve skill). A clean-tree gate would refuse exactly that resume.
     # Anything else the operator changed while the run sat paused is theirs to
     # commit or stash first.
-    return _resume_paused_run(project, run_dir)
+    return _resume_paused_run(
+        project, run_dir, accept_baseline=bool(getattr(args, "accept_baseline", False))
+    )
 
 
 def _confirm(question: str) -> bool:
@@ -5942,6 +5955,20 @@ def main(argv: list[str] | None = None) -> int:
 
     resume_p = add("resume", cmd_resume, "resume a paused run")
     resume_p.add_argument("run_id")
+    resume_p.add_argument(
+        "--accept-baseline",
+        action="store_true",
+        help="adopt the current HEAD as the new baseline of every in-place story this "
+        "resume restarts, so commits above the old baseline are kept instead of being "
+        "parked on attempt-preserve/* and reset over. It adopts EVERYTHING at HEAD, "
+        "including any commits the interrupted attempt made, and treats every current "
+        "untracked file as pre-existing (never cleaned) — check "
+        "`git log <baseline>..HEAD` first. Uncommitted tracked changes still follow "
+        "the normal rollback. The flag applies to this resume only, but an adopted "
+        "baseline stays adopted if that resume then pauses. Not needed right after "
+        "`resolve`, whose re-arm already advances the baseline; commits made after a "
+        "`resolve --no-resume` re-arm still need it",
+    )
 
     resolve_p = add(
         "resolve", cmd_resolve, "resolve a CRITICAL escalation interactively, then re-arm + resume"

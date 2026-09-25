@@ -894,7 +894,9 @@ class RecoveryFlow:
         self._save()
         self._pause(notice, task.story_key)
 
-    def rollback_or_pause(self, task: StoryTask, *, cause: str = "stopped") -> None:
+    def rollback_or_pause(
+        self, task: StoryTask, *, cause: str = "stopped", restart: bool = False
+    ) -> None:
         """Recover from an attempt that won't proceed.
 
         No-op when the real tree is proven to be at the attempt's baseline:
@@ -953,7 +955,14 @@ class RecoveryFlow:
         ``"paused"`` when one of the pauses above propagates, or ``"failed"`` when
         any other exception escapes (it propagates unchanged after the emit). The
         clean short-circuits, the early owned-spec pauses and the policy-OFF manual
-        pause emit neither stage."""
+        pause emit neither stage.
+
+        ``restart`` marks the call as a resume restart arm (``Engine._finish_inflight``
+        or the sweep bundle restart leg) rather than an in-run retry/defer rollback.
+        Only then, and only once commits above the baseline were parked AND
+        ``safe_reset`` completed, does the rollback send a parked-commits notice
+        (DW-371): on resume those commits may have been made while the run was
+        down, and a file-only journal entry is too quiet for that."""
         workspace = self._workspace_get()
         resolved = cause == "resolved"
         # preserve the corrected spec for the whole re-drive, not just the first
@@ -1468,7 +1477,7 @@ class RecoveryFlow:
                 # A re-drive ordinarily preserves best-effort, but restoration of a
                 # changed bound spec is destructive unless both its committed and
                 # uncommitted child state can be parked first.
-                self.preserve_attempt_commits(
+                parked = self.preserve_attempt_commits(
                     task,
                     allow_pause=not redrive or bool(force_owned_snapshot),
                 )
@@ -1518,6 +1527,10 @@ class RecoveryFlow:
                         )
                     owned_snapshot_restored = True
                 self.safe_reset(task, preserve=protected)
+                if restart and parked is not None:
+                    # After the reset, never inside preserve_attempt_commits: the
+                    # notice must not claim a reset a later snapshot pause refused.
+                    self._notify_restart_commits_parked(task, *parked)
                 if restore_attempt_snapshot and owned_spec and owned_exclude and not redrive:
                     assert task.dispatched_spec_snapshot is not None
                     self._restore_attempt_owned_spec_bytes_or_pause(
@@ -1776,7 +1789,9 @@ class RecoveryFlow:
             if deleted:
                 self.journal.append(f"{family}-pruned", count=len(deleted), refs=deleted)
 
-    def preserve_attempt_commits(self, task: StoryTask, *, allow_pause: bool) -> None:
+    def preserve_attempt_commits(
+        self, task: StoryTask, *, allow_pause: bool
+    ) -> tuple[str, int] | None:
         """Before an auto-rollback's hard reset, park any commits the attempt made
         above its baseline under a named recovery ref, so `reset --hard baseline`
         can't silently orphan committed work (it survives `git gc` and is
@@ -1792,10 +1807,15 @@ class RecoveryFlow:
         write is unsafe until the child commit is parked. The two failures journal under distinct events
         (``attempt-preserve-enumerate-failed`` vs ``attempt-preserve-failed``) so a
         post-mortem can tell "could not count the work" from "counted it but could
-        not park it" — only the latter can report a HEAD."""
+        not park it" — only the latter can report a HEAD.
+
+        Returns ``(ref, count)`` — the commits branch and how many commits it
+        parked — on a successful park, else None (nothing above baseline, or a
+        non-pausing preservation failure). ``task.preserve_ref`` may later be
+        overwritten by the worktree snapshot; the returned branch still exists."""
         baseline = task.baseline_commit
         if not baseline:
-            return
+            return None
         workspace = self._workspace_get()
         # Enumerating the range is what decides whether the reset is safe, so a
         # fault here is not a no-op: an un-determinable range must read as "there
@@ -1811,7 +1831,7 @@ class RecoveryFlow:
             head = verify.rev_parse_head(workspace.root)
             commits = verify.commits_above(workspace.root, baseline, head)
             if not commits:
-                return
+                return None
         except (verify.GitError, OSError) as exc:
             self.journal.append(
                 "attempt-preserve-enumerate-failed", story_key=task.story_key, error=str(exc)
@@ -1820,7 +1840,7 @@ class RecoveryFlow:
                 # Same refusal as an un-parked ref: the notice must not tell the
                 # operator to `reset --hard` past work we could not even count.
                 self.pause_for_manual_recovery(task, baseline, preserve_failed=True)
-            return  # re-drive: never pause — proceed to the (human-directed) reset
+            return None  # re-drive: never pause — proceed to the (human-directed) reset
         # run_id can be an arbitrary user `--run-id`; ref-sanitize it (same
         # identity-for-clean-ids / digest-for-dirty contract as the unit branches) so
         # an exotic/overlong id can't blow the ref-name limit, fail `git branch`, and
@@ -1843,10 +1863,82 @@ class RecoveryFlow:
                 # the commits at HEAD could not be parked — the notice must NOT tell
                 # the operator to blindly `reset --hard` (that would discard them).
                 self.pause_for_manual_recovery(task, baseline, preserve_failed=True)
-            return  # re-drive: never pause — proceed to the (human-directed) reset
+            return None  # re-drive: never pause — proceed to the (human-directed) reset
         task.preserve_ref = ref
         self.journal.append(
             "attempt-commits-preserved", story_key=task.story_key, ref=ref, count=len(commits)
+        )
+        return ref, len(commits)
+
+    def _notify_restart_commits_parked(self, task: StoryTask, ref: str, count: int) -> None:
+        """One-line ATTENTION notice that a resume restart parked commits above the
+        task baseline and reset over them (DW-371). Attribution-neutral on purpose:
+        `commits_above` is a pure range park, so the commits may be the interrupted
+        attempt's or ones a human made while the run was down. Best-effort
+        (`gates.notify` never raises); the `attempt-commits-preserved` journal entry
+        is the durable record."""
+        root = self._workspace_get().root
+        short = (task.baseline_commit or "")[:12]
+        plural = "commit" if count == 1 else "commits"
+        gates.notify(
+            self.policy,
+            self.run_dir,
+            f"commits parked on resume for {task.story_key}",
+            f"resume reset {task.story_key} to its baseline {short}; {count} {plural} "
+            "above it (the interrupted attempt's, or commits made while the run was "
+            f"down) were parked on `{ref}` first. Inspect: "
+            f'`git -C "{root}" log --oneline {short}..refs/heads/{ref}`. To restore '
+            "the ones you want to keep once this run has stopped or finished (it is "
+            f're-running the story in this checkout now): `git -C "{root}" cherry-pick '
+            f"<sha>`. Next time, `bmad-loop resume {self.state.run_id} --accept-baseline` keeps "
+            "everything at HEAD as the new baseline instead (check the log first).",
+        )
+
+    def accept_current_baseline(self, task: StoryTask) -> None:
+        """Adopt the current checkout as ``task``'s baseline (``bmad-loop resume
+        --accept-baseline``, DW-371): the restart arm calls this right before its
+        rollback, so the reset targets HEAD instead of rewinding past commits the
+        operator made while the run was down.
+
+        Both fields are re-stamped together, from values measured before either is
+        assigned (the `_dev_phase` / `runs.rearm_escalation` pattern), and journaled
+        ``baseline-accepted``. A git fault fails loud: ``baseline-accept-failed`` is
+        journaled and the run pauses with a notice, the baseline unchanged — never
+        a fall-through to the reset the operator explicitly asked to avoid."""
+        root = self._workspace_get().root
+        previous_baseline = task.baseline_commit or ""
+        try:
+            head = verify.rev_parse_head(root)
+            untracked = sorted(verify.untracked_files(root))
+        except (verify.GitError, OSError) as exc:
+            self.journal.append("baseline-accept-failed", story_key=task.story_key, error=str(exc))
+            notice = (
+                "**ACTION REQUIRED — could not accept the current baseline**\n"
+                f"`--accept-baseline` was requested for story **{task.story_key}**, but "
+                f"reading the current HEAD / untracked files of `{root}` failed "
+                f"({exc}). The baseline was left unchanged and no rollback ran, so "
+                "nothing was reset.\n"
+                "Fix the git fault, then run "
+                f"`bmad-loop resume {self.state.run_id} --accept-baseline` again. A "
+                f"plain `bmad-loop resume {self.state.run_id}` (without the flag) "
+                "rolls the story back to the old baseline instead."
+            )
+            gates.notify(
+                self.policy,
+                self.run_dir,
+                f"ACTION REQUIRED: baseline accept failed for {task.story_key}",
+                notice,
+                multiline=True,
+            )
+            self._save()
+            self._pause(notice, task.story_key)
+        task.baseline_commit = head
+        task.baseline_untracked = untracked
+        self.journal.append(
+            "baseline-accepted",
+            story_key=task.story_key,
+            previous_baseline=previous_baseline,
+            baseline=head,
         )
 
     def preserve_attempt_worktree(
@@ -2142,7 +2234,13 @@ class RecoveryFlow:
                 "  3. Only if you decide to discard the attempt: "
                 f'`git -C "{root}" reset --hard {short}`, then review/remove leftover '
                 "untracked files.\n"
-                f"Then run `bmad-loop resume {self.state.run_id}`."
+                f"Then run `bmad-loop resume {self.state.run_id}`. Alternatively, "
+                f"`bmad-loop resume {self.state.run_id} --accept-baseline` (no reset "
+                "needed) adopts EVERYTHING at HEAD as the new baseline — any commits "
+                "the attempt made included — and every current untracked file as "
+                "pre-existing (never cleaned); uncommitted tracked changes still "
+                "follow the normal rollback. Check "
+                f'`git -C "{root}" log --oneline {short}..HEAD` first.'
             )
         else:
             why = (
