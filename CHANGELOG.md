@@ -75,6 +75,9 @@ breaking changes may land in a minor release.
   produced it; commits-only preservation is labelled, and nothing is replayed (#777).
 - Name every mux session's window 0 `shell` (`new-session -n`) on tmux and psmux, so no
   window bmad-loop creates is left for the multiplexer to (auto-)name (DW-351).
+- Fail the test suite on `DeprecationWarning` and `PendingDeprecationWarning`
+  (`filterwarnings` in `[tool.pytest.ini_options]`); third-party offenders get targeted
+  ignores only — none are needed today (DW-370, was #548).
 - Document the live-session removal guard's measured ceiling (#732): `delete`, `archive` and `clean` still remove a run directory when a listing omits a live session. Behavior unchanged; the psmux half is reported upstream (psmux/psmux#622), its retirement tracked in #754.
 
 ### Fixed

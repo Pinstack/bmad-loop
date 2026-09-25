@@ -79,6 +79,16 @@ asyncio_mode = "auto"
 # `dev`-group dependency, so `uv sync` covers it; a bare `pytest` from outside the uv
 # environment is how you would hit that message.
 addopts = "--dist loadgroup"
+# DW-370: a deprecation fails the test that triggers it, so a new one (first-party, a
+# dependency's, or one a new Python leg introduces) cannot pass the matrix green.
+# pytest's own PytestDeprecationWarning subclasses DeprecationWarning and errors too.
+# Expecting one is `pytest.warns(DeprecationWarning)`. A third-party warning we cannot
+# fix gets a targeted entry — `ignore:<message regex>:DeprecationWarning:<module>` —
+# appended below these (later entries win), never a blanket category ignore.
+filterwarnings = [
+  "error::DeprecationWarning",
+  "error::PendingDeprecationWarning",
+]
 
 [tool.ruff]
 line-length = 100

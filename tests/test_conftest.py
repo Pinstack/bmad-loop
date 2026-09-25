@@ -24,6 +24,7 @@ import shlex
 import subprocess
 import sys
 import tomllib
+import warnings
 from dataclasses import replace
 from pathlib import Path
 
@@ -1812,6 +1813,25 @@ def test_pyproject_addopts_selects_the_loadgroup_scheduler():
         "pyproject.toml's [tool.pytest.ini_options] must pass `--dist loadgroup`; "
         f"without it every xdist_group mark is silently inert (got {addopts!r})"
     )
+
+
+@pytest.mark.parametrize("category", [DeprecationWarning, PendingDeprecationWarning])
+def test_pyproject_filterwarnings_turns_deprecations_into_errors(request, category):
+    """DW-370: without the `filterwarnings` posture a new deprecation — first-party,
+    a dependency's, or one a new Python leg introduces — is a line in the warnings
+    summary and the matrix stays green. Asserted twice: the loaded ini carries the
+    entry, and a warning emitted inside a test actually raises, which is the fact that
+    matters (a later blanket `ignore` would leave the entry present but inert).
+
+    Ablation: delete the pyproject `filterwarnings` line and the `getini` assert fails;
+    keep it but append a blanket `"ignore::DeprecationWarning"` after it and the
+    `DeprecationWarning` row fails on `pytest.raises` (DID NOT RAISE)."""
+    entry = f"error::{category.__name__}"
+    assert entry in request.config.getini(
+        "filterwarnings"
+    ), f"pyproject.toml's [tool.pytest.ini_options] filterwarnings must carry {entry!r}"
+    with pytest.raises(category):
+        warnings.warn("DW-370 posture probe", category, stacklevel=1)
 
 
 _MECHANISM_MODULE = """
