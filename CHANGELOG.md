@@ -154,6 +154,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- On Windows, stop a DW bundle from pausing at baseline capture when the artifacts root
+  reports no inode (DW-444). Each degraded read is journaled as
+  `artifact-observation-unpinned` with the filesystem. A bundle with artifact
+  deliverables is still refused, now before merge.
 - Stop an escalated sweep migration restart from republishing an older kept rival over
   a ledger write that landed before its reset. The restart reads the ledger back from
   the worktree snapshot parked just before the reset. If it differs, the restart skips

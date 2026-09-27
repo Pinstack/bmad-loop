@@ -12,7 +12,10 @@ without descriptor-relative reads, source and destination reads plus destination
 pathname-identity observations use the checked fallback: pinned to the accepted
 root identity by an ``lstat`` compare after each lookup, it still retains its
 check/read race. Destination parents, and a missing artifacts root, are created
-anchored and without following links (``_make_parents``).
+anchored and without following links (``_make_parents``). A root whose ``lstat``
+carries no inode (DW-444) pins those fallback reads only weakly, and ``capture``
+alone also accepts identity-less files under it; each such degrade is counted for
+the engine to journal, while ``publish`` refuses that root outright.
 """
 
 from __future__ import annotations
@@ -150,6 +153,57 @@ def _confined(root: Path, path: Path) -> os.stat_result | None:
     return root_identity
 
 
+_unpinned_observations: dict[str, tuple[str, int]] = {}
+"""Per artifacts root, the zero-inode degrades granted since the last
+:func:`drain_unpinned_observations`: root -> (filesystem, count). Module state
+because the pin sits under four helpers reached from four public entry points
+(``capture``, ``bind_armed``, ``prepare``, ``publish``), and the engine runs one
+process per run (DW-444)."""
+
+
+def drain_unpinned_observations() -> list[tuple[str, str, int]]:
+    """Return and clear the counted zero-inode degrades as
+    ``(root, filesystem, count)``, one per root, in first-degrade order.
+
+    The engine's worktree flow journals each as ``artifact-observation-unpinned``;
+    a degrade from an entry point that does not drain stays counted until the
+    next drain."""
+    drained = [(root, fs, count) for root, (fs, count) in _unpinned_observations.items()]
+    _unpinned_observations.clear()
+    return drained
+
+
+def _count_unpinned(root: Path) -> None:
+    """Count one degrade against ``root``; its filesystem is named on the first."""
+    key = str(root)
+    counted = _unpinned_observations.get(key)
+    if counted is None:
+        _unpinned_observations[key] = (platform_util.filesystem_name(root), 1)
+    else:
+        _unpinned_observations[key] = (counted[0], counted[1] + 1)
+
+
+def _weak_root_pin(root: Path, root_identity: os.stat_result) -> bool:
+    """The zero-inode root's weak pin, uncounted: a fresh ``lstat`` of ``root``
+    is a non-link directory on the accepted ``st_dev`` that STILL reads zero.
+
+    CPython's win32 ``FindFirstFile`` stat fallback zeroes ``st_dev`` as well as
+    ``st_ino``, so on that path the same-device compare matches trivially; that
+    is accepted (DW-444) — the ``S_ISDIR`` and link checks carry the weight
+    there, and refusing on ``st_dev == 0`` would undo the fix on exactly that
+    path."""
+    try:
+        current = os.lstat(root)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(current.st_mode)
+        and not link_like_stat(current)
+        and current.st_dev == root_identity.st_dev
+        and current.st_ino == 0
+    )
+
+
 def _still_pinned(root: Path, root_identity: os.stat_result | None) -> bool:
     """The path-based fallback's pin (DW-422): whether ``root`` is still the
     directory ``_confined`` accepted. No identity never pins — a fallback that
@@ -157,8 +211,27 @@ def _still_pinned(root: Path, root_identity: os.stat_result | None) -> bool:
 
     An ``lstat`` compare taken after the fallback's own path lookup, so a root
     swapped for a link before that lookup is caught; a swap landing after it is
-    the check-then-read residual the module docstring names."""
-    return root_identity is not None and platform_util._root_still_pinned(root, root_identity)
+    the check-then-read residual the module docstring names.
+
+    A root accepted with a zero inode (a filesystem that reports no identity,
+    DW-444) cannot be compared, so the pin degrades — recorded decision "Degrade
+    observation, journaled" — to :func:`_weak_root_pin` (still a non-link
+    directory on the accepted ``st_dev`` that still reads zero; a root that now
+    reports an inode refuses), and every such degrade is counted
+    (:func:`drain_unpinned_observations`), never a silent True. A symlink or
+    junction swapped in still refuses; a same-device plain-directory swap is the
+    accepted residual, which is why only these read-only observations degrade:
+    ``platform_util._root_still_pinned`` stays strict, so the confined writers and
+    :func:`_create_directories` keep refusing, and :func:`publish` refuses a
+    zero-inode root before any of them runs."""
+    if root_identity is None:
+        return False
+    if root_identity.st_ino != 0:
+        return platform_util._root_still_pinned(root, root_identity)
+    if not _weak_root_pin(root, root_identity):
+        return False
+    _count_unpinned(root)
+    return True
 
 
 def _read_bytes(stream: BinaryIO, max_bytes: int | None) -> bytes:
@@ -312,8 +385,67 @@ def _destination_still_names(root: Path, path: Path, opened: os.stat_result) -> 
     return opened_identity is not None and _destination_path_identity(root, path) == opened_identity
 
 
-def _probe_destination(root: Path, path: Path, expected: bytes | None = None) -> _DestinationProbe:
-    """Bound one destination probe to its opened size plus one growth check."""
+def _degraded_leaf_still_names(
+    root: Path, path: Path, opened: os.stat_result, streamed: int
+) -> bool:
+    """``capture``'s weak leaf check under a degraded root (DW-444, resolved
+    2026-09-27): whether an opened regular file with NO inode is still the file
+    ``path`` names. A filesystem that reports no inode for its root reports none
+    for the files under it, so the strict :func:`_destination_still_names` can
+    never hold there and every non-empty artifacts dir would pause.
+
+    Holds only on the path-based fallback, only for an opened file with no
+    identity, and only when :func:`_still_pinned` takes its zero-inode degrade
+    branch for this root; then a fresh ``lstat`` of the leaf must be a regular
+    non-link file on the opened ``st_dev`` that still has no inode, whose size
+    equals both the opened size and the bytes streamed. Each accepted leaf is
+    counted like a root degrade. Unlike the root's two ``lstat``s, this compares
+    a path ``lstat`` against a handle ``fstat``: when the ``lstat`` takes
+    CPython's win32 ``FindFirstFile`` fallback it reports ``st_dev`` 0 while the
+    ``fstat`` reads the handle's real volume serial, so a leaf ``st_dev`` of 0
+    is accepted too (the spec's "do not refuse on ``st_dev == 0``"); any other
+    mismatch refuses.
+
+    Capture-only by construction: :func:`_destination_equals`, the ``publish``
+    probes and ``prepare``/``bind`` binding stay strict — this relaxes the
+    comparison baseline, never a write or its authority."""
+    if DIR_FD_ANCHORED_WRITES or _file_identity(opened) is not None:
+        return False
+    try:
+        root_identity = _confined(root, path)
+    except PublicationError:
+        return False
+    if root_identity is None or root_identity.st_ino != 0:
+        return False
+    try:
+        leaf = os.lstat(path)  # not Path.lstat (via os.stat): the test seam
+    except OSError:
+        return False
+    if not _still_pinned(root, root_identity):
+        return False
+    if not (
+        stat.S_ISREG(leaf.st_mode)
+        and not link_like_stat(leaf)
+        and leaf.st_dev in (opened.st_dev, 0)
+        and _file_identity(leaf) is None
+        and leaf.st_size == opened.st_size == streamed
+    ):
+        return False
+    _count_unpinned(root)
+    return True
+
+
+def _probe_destination(
+    root: Path,
+    path: Path,
+    expected: bytes | None = None,
+    *,
+    degraded_leaf_ok: bool = False,
+) -> _DestinationProbe:
+    """Bound one destination probe to its opened size plus one growth check.
+
+    ``degraded_leaf_ok`` is ``capture``'s alone: it also accepts an
+    identity-less leaf under a degraded root (:func:`_degraded_leaf_still_names`)."""
     with _open_regular(root, path) as stream:
         if stream is None:
             return _DestinationProbe(observation=None, matches_expected=False)
@@ -344,7 +476,10 @@ def _probe_destination(root: Path, path: Path, expected: bytes | None = None) ->
             remaining == 0
             and not extra
             and os.fstat(stream.fileno()).st_size == size
-            and _destination_still_names(root, path, opened)
+            and (
+                _destination_still_names(root, path, opened)
+                or (degraded_leaf_ok and _degraded_leaf_still_names(root, path, opened, size))
+            )
         )
         observation = _DestinationObservation(
             size=size,
@@ -466,7 +601,8 @@ def capture(task: StoryTask, paths: ProjectPaths) -> None:
                         inventory[rel] = "directory"
                         walk(path)
                     elif stat.S_ISREG(mode):
-                        observed = _destination_observation(root, path)
+                        # The one probe allowed the identity-less leaf degrade (DW-444).
+                        observed = _probe_destination(root, path, degraded_leaf_ok=True).observation
                         if observed is None:
                             raise PublicationError(f"artifact disappeared during inventory: {path}")
                         if not observed.complete:
@@ -960,6 +1096,10 @@ def prepare(
             "tracked artifact deliverables changed since accepted verification: "
             + ", ".join(differing)
         )
+    if selected.contents:
+        # DW-444: refuse a zero-inode target root here, before merge, not only
+        # at `publish` after the unit has already been integrated.
+        _refuse_zero_inode_root(_root(paths))
     task.artifact_payload = {
         rel: base64.b64encode(data).decode("ascii") for rel, data in selected.contents.items()
     }
@@ -1058,6 +1198,27 @@ def _make_parents(root: Path, path: Path, repo_root: Path) -> os.stat_result:
     return root_identity
 
 
+def _refuse_zero_inode_root(root: Path) -> None:
+    """Refuse publication into an artifacts root whose ``lstat`` carries no
+    inode (DW-444), on EVERY arm and before any probe, directory or write.
+
+    Observation degrades on such a root (:func:`_still_pinned`); writes never
+    do, because nothing can pin it. The strict writers would refuse anyway, but
+    each arm with its own message ("replaced", "could not be opened"); stating
+    it here, ahead of the arm split, names the real reason. A missing root has
+    nothing to refuse: ``_make_parents`` creates it and the strict pins refuse
+    an identity-less new one."""
+    try:
+        metadata = os.lstat(root)
+    except FileNotFoundError:
+        return
+    if metadata.st_ino == 0:
+        raise PublicationError(
+            f"artifacts root has no inode identity on {platform_util.filesystem_name(root)}, "
+            f"so it cannot be pinned; publication is refused: {root}"
+        )
+
+
 def publish(task: StoryTask, paths: ProjectPaths) -> None:
     """Compare each destination against pre-execution evidence, then replace."""
     if task.artifact_publication_complete:
@@ -1069,6 +1230,7 @@ def publish(task: StoryTask, paths: ProjectPaths) -> None:
         raise PublicationError("artifact publication intent is missing")
     if task.artifact_payload:
         _root(paths)
+        _refuse_zero_inode_root(root)
     for rel, encoded in task.artifact_payload.items():
         path = root / _relative(rel)
         intended = base64.b64decode(encoded, validate=True)

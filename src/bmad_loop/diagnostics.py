@@ -405,6 +405,15 @@ _JOURNAL_DROP_FIELDS = frozenset(
         # OSError/JSON error text. Free text under this set's rule; `story_key`
         # already correlates the record, so presence-only.
         "edits",
+        # `artifact-observation-unpinned` (DW-444): the absolute artifacts root
+        # whose fallback observation ran on a degraded pin, and the full
+        # filesystem label (`platform_util.filesystem_name`: `"<fs> at <volume>"`,
+        # or `"unknown (<reason>)"`, whose reason may quote a path). Both are host
+        # paths for `repo`'s reason; `story_key` already correlates the record, so
+        # presence-only. The filesystem TYPE stays visible through the record's
+        # separate `fs_type` field, routed as a value in `_scrub_entry`.
+        "root",
+        "filesystem",
     }
 )
 # Journal fields whose value is a LIST of identifiers, aliased element-wise rather
@@ -1085,6 +1094,12 @@ def _scrub_entry(
             out[k] = v if type(v) is int and v >= 0 else None
         elif kind == "artifact-publication-refused" and k == "measurement_is_lower_bound":
             out[k] = v if type(v) is bool else None
+        elif kind == "artifact-observation-unpinned" and k == "fs_type":
+            # DW-444: the filesystem type alone (`NTFS`, `ReFS`, `unknown`) —
+            # `platform_util.filesystem_type` already stripped the volume path.
+            # Kept only while identifier-shaped, so a label that somehow still
+            # carries a path or prose never ships.
+            out[k] = v if isinstance(v, str) and sanitize.looks_like_identifier(v) else None
         elif declared is not None and k not in declared and k not in SELF_MINTED_FIELDS:
             # A kind with a declared schema (`_JOURNAL_KIND_SCHEMAS`) replaces the
             # `scrub_json` fallback with a fail-closed one, because on such a kind an

@@ -68,7 +68,7 @@ from .install import (
 )
 from .model import Phase
 from .mountpaths import rebased_project
-from .platform_util import atomic_write_text
+from .platform_util import atomic_write_text, filesystem_type
 from .workspace import (
     UnitWorkspace,
     Workspace,
@@ -2357,7 +2357,10 @@ class WorktreeFlow:
         task.branch = unit.branch
         if task.dw_ids:
             try:
-                artifact_publication.capture(task, self.paths)
+                try:
+                    artifact_publication.capture(task, self.paths)
+                finally:
+                    self._journal_unpinned_artifact_observations(task.story_key)
             except (artifact_publication.PublicationError, OSError, ValueError) as exc:
                 self._save()
                 self._pause(f"artifact baseline capture failed: {exc}", task.story_key, cause=exc)
@@ -4356,17 +4359,42 @@ class WorktreeFlow:
         self._emit("post_merge", task)
         self.finish_publication(task, unit)
 
+    def _journal_unpinned_artifact_observations(self, story_key: str) -> None:
+        """Journal each artifacts root whose fallback observation ran unpinned.
+
+        DW-444, recorded decision "Degrade observation, journaled": on a host
+        without descriptor-relative reads, an artifacts root whose ``lstat``
+        carries no inode is pinned only weakly, and ``artifact_publication``
+        counts each such read (and each identity-less leaf ``capture`` accepts
+        under it). One ``artifact-observation-unpinned`` event per root keeps the
+        degrade visible: ``filesystem`` is the full label (volume path included),
+        ``fs_type`` its type alone. Draining clears the count, so a later drain
+        journals only newer degrades — including any counted from an entry point
+        that does not drain itself."""
+        for root, filesystem, count in artifact_publication.drain_unpinned_observations():
+            self.journal.append(
+                "artifact-observation-unpinned",
+                story_key=story_key,
+                root=root,
+                filesystem=filesystem,
+                fs_type=filesystem_type(filesystem),
+                count=count,
+            )
+
     def prepare_publication(self, task: StoryTask, source: ProjectPaths) -> None:
         """Persist accepted bytes before merge can consume the unit."""
         try:
             limits = self.policy.limits
-            artifact_publication.prepare(
-                task,
-                self.paths,
-                source,
-                file_max_bytes=limits.artifact_file_max_mb * 1_048_576,
-                payload_max_bytes=limits.artifact_payload_max_mb * 1_048_576,
-            )
+            try:
+                artifact_publication.prepare(
+                    task,
+                    self.paths,
+                    source,
+                    file_max_bytes=limits.artifact_file_max_mb * 1_048_576,
+                    payload_max_bytes=limits.artifact_payload_max_mb * 1_048_576,
+                )
+            finally:
+                self._journal_unpinned_artifact_observations(task.story_key)
             self._save()
         except artifact_publication.PublicationSizeError as exc:
             self.journal.append(
@@ -4420,12 +4448,15 @@ class WorktreeFlow:
             artifact_publication.arm_binding(task, acceptance_identity)
             self._save()
             limits = self.policy.limits
-            artifact_publication.bind_armed(
-                task,
-                source,
-                file_max_bytes=limits.artifact_file_max_mb * 1_048_576,
-                payload_max_bytes=limits.artifact_payload_max_mb * 1_048_576,
-            )
+            try:
+                artifact_publication.bind_armed(
+                    task,
+                    source,
+                    file_max_bytes=limits.artifact_file_max_mb * 1_048_576,
+                    payload_max_bytes=limits.artifact_payload_max_mb * 1_048_576,
+                )
+            finally:
+                self._journal_unpinned_artifact_observations(task.story_key)
             self._save()
         except artifact_publication.PublicationSizeError as exc:
             self.journal.append(
@@ -4449,7 +4480,10 @@ class WorktreeFlow:
     def validate_staged_publication(self, task: StoryTask, source: ProjectPaths) -> dict[str, str]:
         """Validate final staged Git deliverables or retain the unit mount."""
         try:
-            return artifact_publication.validate_staged(task, source)
+            try:
+                return artifact_publication.validate_staged(task, source)
+            finally:
+                self._journal_unpinned_artifact_observations(task.story_key)
         except (artifact_publication.PublicationError, verify.GitError, OSError, ValueError) as exc:
             self.journal.append(
                 "artifact-publication-refused", story_key=task.story_key, error=str(exc)
@@ -4477,7 +4511,10 @@ class WorktreeFlow:
                 raise artifact_publication.PublicationError(
                     "validated staged artifact snapshot is missing or malformed"
                 )
-            artifact_publication.validate_committed(task, source, revision, staged_snapshot)
+            try:
+                artifact_publication.validate_committed(task, source, revision, staged_snapshot)
+            finally:
+                self._journal_unpinned_artifact_observations(task.story_key)
         except (artifact_publication.PublicationError, verify.GitError, OSError, ValueError) as exc:
             self.journal.append(
                 "artifact-publication-refused", story_key=task.story_key, error=str(exc)
@@ -4493,7 +4530,10 @@ class WorktreeFlow:
         """Publish and latch before successful teardown, including merge replay."""
         if task.dw_ids:
             try:
-                artifact_publication.publish(task, self.paths)
+                try:
+                    artifact_publication.publish(task, self.paths)
+                finally:
+                    self._journal_unpinned_artifact_observations(task.story_key)
                 self._save()
             except (
                 artifact_publication.PublicationError,

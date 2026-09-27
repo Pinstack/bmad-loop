@@ -1120,6 +1120,49 @@ def test_unrelated_raw_presence_field_is_not_suppressed():
     assert scrubbed["patch_present"] is False
 
 
+def test_unpinned_artifact_observation_keeps_the_fs_type_and_drops_the_paths():
+    """`artifact-observation-unpinned` (DW-444) names the absolute artifacts root
+    and a filesystem label that embeds its volume path — both host paths, routed
+    presence-only for `repo`'s reason. The filesystem TYPE rides its own
+    `fs_type` field and survives as a value; `count` is a benign integer.
+
+    Graded on ABSENCE, as `stories_root` is: the canary sweep alone is a false
+    green because `scrub_json` already collapses a separator-bearing path.
+
+    Ablation: drop `root` or `filesystem` from `_JOURNAL_DROP_FIELDS` and the
+    matching presence assertion reddens; drop the `fs_type` branch in
+    `_scrub_entry` and the path-shaped `fs_type` row ships redacted-by-accident
+    rather than None, while a route that returns None unconditionally loses
+    `NTFS`."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+
+    def scrub(fs_type):
+        return diagnostics._scrub_entry(
+            {
+                "ts": 2.0,
+                "kind": "artifact-observation-unpinned",
+                "story_key": STORY_KEY,
+                "root": f"{HOME_PATH}/_bmad-output/implementation-artifacts",
+                "filesystem": f"NTFS at {HOME_PATH}",
+                "fs_type": fs_type,
+                "count": 3,
+            },
+            pseudo,
+            {},
+            1.0,
+        )
+
+    scrubbed = scrub("NTFS")
+    assert "root" not in scrubbed and scrubbed["root_present"] is True
+    assert "filesystem" not in scrubbed and scrubbed["filesystem_present"] is True
+    assert scrubbed["fs_type"] == "NTFS"
+    assert scrubbed["count"] == 3
+    rendered = json.dumps(scrubbed)
+    for canary in (HOME_PATH, *CANARIES):
+        assert canary not in rendered, f"LEAK: {canary!r}"
+    assert scrub(f"NTFS at {HOME_PATH}")["fs_type"] is None
+
+
 def test_sentinel_upstream_record_drops_the_stories_root_it_names():
     """`rearm-upstream-write-unreachable` carries an absolute host path naming the
     folder a sentinel's upstream correction has to land in.

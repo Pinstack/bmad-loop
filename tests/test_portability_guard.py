@@ -290,6 +290,8 @@ RUN_STATE_TRANSACTIONS = {
 # refusals, and deliberately adds no runtime abstraction (no RefusalError, no
 # registry): the inventory is the test file's, not the product's.
 REFUSAL_HELPER_DEFS = {
+    # DW-444: publish into a zero-inode artifacts root; test_artifact_publication.py
+    ("artifact_publication.py", "_refuse_zero_inode_root"),
     ("cli.py", "_reject_bad_run_id"),
     ("cli.py", "_reject_isolation_conflict"),
     ("cli.py", "_reject_under_floor_git"),
@@ -433,6 +435,10 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     # DW-439: a closed slug (`restored` | `no-dir-fd` | `no-snapshot`), never
     # authored text; declared on this kind alone because `outcome` is generic.
     "sweep-migration-snapshot-restore": frozenset({"outcome"}),
+    # DW-444: the filesystem TYPE (`platform_util.filesystem_type` — `NTFS`,
+    # `ReFS`, `unknown`), the volume path already stripped; `_scrub_entry` keeps
+    # it only while identifier-shaped. Kind-scoped because `fs_type` is generic.
+    "artifact-observation-unpinned": frozenset({"fs_type"}),
 }
 
 # Every OTHER field name journalled today: a declared inventory, not a per-name
@@ -1795,6 +1801,11 @@ JOURNAL_KINDS = frozenset(
         "worktree-trust-seeded",
         "worktree-trust-unseeded",
         "artifact-publication-refused",
+        # DW-444: a zero-inode artifacts root's degraded fallback observation.
+        # `root` and `filesystem` are presence-only in
+        # `diagnostics._JOURNAL_DROP_FIELDS`; `fs_type` is kind-scoped benign and
+        # value-checked in `_scrub_entry`; `count` is benign.
+        "artifact-observation-unpinned",
     }
 )
 

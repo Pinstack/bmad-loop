@@ -3422,3 +3422,60 @@ def test_confined_writable_target_probe_answers_a_planted_fifo_without_blocking(
     assert failures == []
     assert stat.S_ISREG(target.lstat().st_mode)  # the FIFO name was replaced
     assert target.read_bytes() == b"payload"
+
+
+# ------------------------------------------------------------ filesystem_name
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the non-win32 arm")
+def test_filesystem_name_off_win32_is_unknown_with_the_platform(tmp_path):
+    """DW-444: off win32 the label is `unknown (<platform>)` — no mount-table
+    arm, because the only caller is the path-based fallback no POSIX host takes
+    (every one has `O_DIRECTORY`). Never `""`.
+
+    Ablation: return `""` (or restore a `/proc/self/mounts` arm) and this fails."""
+    assert platform_util.filesystem_name(tmp_path) == f"unknown ({sys.platform})"
+
+
+def test_filesystem_name_reports_a_ctypes_fault_as_unknown(tmp_path, monkeypatch):
+    """Never `""` and never a raise: a fault inside the win32 volume query
+    (here a ctypes failure, on any host) becomes an `unknown (<reason>)` label a
+    reader can tell from a real answer.
+
+    Ablation: drop the `except` in `filesystem_name` and this raises."""
+    import ctypes
+
+    def refuse(*_args, **_kwargs):
+        raise OSError("simulated ctypes fault")
+
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    monkeypatch.setattr(ctypes, "WinDLL", refuse, raising=False)
+    label = platform_util.filesystem_name(tmp_path)
+    assert label.startswith("unknown (") and "simulated ctypes fault" in label
+    assert platform_util.filesystem_type(label) == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("label", "expected"),
+    [
+        ("NTFS at C:\\", "NTFS"),
+        ("ReFS at D:\\mnt\\vol\\", "ReFS"),
+        ("unknown (linux)", "unknown"),
+        ("unknown (GetVolumeInformationW failed on C:\\: winerror 5)", "unknown"),
+    ],
+)
+def test_filesystem_type_strips_the_volume_path(label, expected):
+    """DW-444: the diagnostics-safe type of a label — the volume path (and any
+    reason an `unknown` label quotes) never survives."""
+    assert platform_util.filesystem_type(label) == expected
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="win32 volume information")
+def test_filesystem_name_labels_a_win32_volume(tmp_path):
+    """DW-444's host: `GetVolumePathNameW` + `GetVolumeInformationW` name the
+    volume's filesystem (`NTFS at C:\\`, `ReFS at D:\\`, ...)."""
+    label = platform_util.filesystem_name(tmp_path)
+    assert not label.startswith("unknown"), label
+    fs_name, sep, volume = label.partition(" at ")
+    assert sep and fs_name and volume.endswith("\\")
+    assert str(tmp_path).casefold().startswith(volume.casefold().rstrip("\\"))

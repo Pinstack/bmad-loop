@@ -1092,6 +1092,73 @@ def _root_still_pinned(root: Path, root_identity: os.stat_result) -> bool:
     return _same_dir_identity(root_identity, current)
 
 
+def _win32_filesystem_name(path: Path) -> str:
+    """``GetVolumePathNameW`` then ``GetVolumeInformationW``'s file-system name
+    buffer, as ``"<fs> at <volume>"``; a failed call answers ``unknown (...)``."""
+    if sys.platform != "win32":
+        raise OSError(errno.ENOSYS, "volume information is a win32 API")
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    import ctypes.wintypes as wt
+
+    get_volume_path = kernel32.GetVolumePathNameW
+    get_volume_path.argtypes = [wt.LPCWSTR, wt.LPWSTR, wt.DWORD]
+    get_volume_path.restype = wt.BOOL
+    get_volume_info = kernel32.GetVolumeInformationW
+    get_volume_info.argtypes = [
+        wt.LPCWSTR,
+        wt.LPWSTR,
+        wt.DWORD,
+        ctypes.POINTER(wt.DWORD),
+        ctypes.POINTER(wt.DWORD),
+        ctypes.POINTER(wt.DWORD),
+        wt.LPWSTR,
+        wt.DWORD,
+    ]
+    get_volume_info.restype = wt.BOOL
+    size = 32768  # the extended-length path ceiling, in UTF-16 units
+    volume = ctypes.create_unicode_buffer(size)
+    if not get_volume_path(os.path.abspath(path), volume, size):
+        error = ctypes.get_last_error()
+        return f"unknown (GetVolumePathNameW failed: winerror {error})"
+    fs_name = ctypes.create_unicode_buffer(261)  # MAX_PATH + 1
+    if not get_volume_info(volume.value, None, 0, None, None, None, fs_name, len(fs_name)):
+        error = ctypes.get_last_error()
+        return f"unknown (GetVolumeInformationW failed on {volume.value}: winerror {error})"
+    if not fs_name.value:
+        return f"unknown (no filesystem name reported for {volume.value})"
+    return f"{fs_name.value} at {volume.value}"
+
+
+def filesystem_name(path: Path) -> str:
+    """A diagnostic label for the filesystem holding ``path``:
+    ``"<fs> at <volume>"`` (DW-444's ``artifact-observation-unpinned`` event).
+
+    Diagnostic only — it never gates a decision. win32 asks the volume
+    (``GetVolumePathNameW`` then ``GetVolumeInformationW``). Every other host
+    answers ``unknown (<platform>)``: the only caller is the path-based fallback
+    of ``artifact_publication``, which a host with ``O_DIRECTORY`` (every POSIX
+    host) never takes, so a mount-table arm there would be unreachable. Never
+    ``""`` and never raises: any fault answers ``unknown (<reason>)``, which a
+    reader can tell from a real answer (:func:`filesystem_type`)."""
+    try:
+        if sys.platform == "win32":
+            return _win32_filesystem_name(path)
+        return f"unknown ({sys.platform})"
+    except Exception as exc:  # a diagnostic label must never fault its caller
+        return f"unknown ({type(exc).__name__}: {exc})"
+
+
+def filesystem_type(label: str) -> str:
+    """The filesystem TYPE of a :func:`filesystem_name` label, without the
+    volume path: ``"NTFS at C:\\\\"`` -> ``"NTFS"``, and every ``unknown (...)``
+    label (whose reason may quote a path) -> ``"unknown"``. Never ``""``."""
+    if label.startswith("unknown"):
+        return "unknown"
+    return label.partition(" at ")[0] or "unknown"
+
+
 def walk_files_unlinked(top: Path) -> Iterator[Path]:
     """Every non-directory entry under ``top``, never crossing a redirect out of it.
 

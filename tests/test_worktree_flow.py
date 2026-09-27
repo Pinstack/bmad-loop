@@ -9,6 +9,7 @@ under a real Engine stays covered by test_engine_worktree.py.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,7 +17,7 @@ from types import SimpleNamespace
 import pytest
 from conftest import NUL_PATH_RESOLVE_FAULTS, git, refuse_to_resolve
 
-from bmad_loop import verify
+from bmad_loop import artifact_publication, platform_util, verify
 from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.gates import ATTENTION_FILE
 from bmad_loop.install import provision_worktree as install_provision_worktree
@@ -212,6 +213,147 @@ def _artifact_flow(tmp_path, *, artifacts: Path | None = None) -> WorktreeFlow:
         planning_artifacts=repo / "_bmad-output" / "planning-artifacts",
     )
     return _make_flow(tmp_path, paths=paths, policy=_policy(isolation="worktree"))
+
+
+class _ZeroInodeStat:
+    """A directory `lstat` from a filesystem that reports no inode (DW-444)."""
+
+    def __init__(self, real):
+        self._real = real
+        self.st_ino = 0
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+@pytest.fixture
+def drained_unpinned():
+    """An empty zero-inode degrade counter before and after each test."""
+    artifact_publication.drain_unpinned_observations()
+    yield
+    artifact_publication.drain_unpinned_observations()
+
+
+def _degrade_artifacts_root(monkeypatch, root: Path, times: int) -> None:
+    """Drive ``times`` real zero-inode degrades of ``root``'s fallback pin."""
+    real_lstat = os.lstat
+
+    def lstat(path, *args, **kwargs):
+        real = real_lstat(path, *args, **kwargs)
+        return _ZeroInodeStat(real) if str(path) == str(root) else real
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    identity = os.lstat(root)
+    for _ in range(times):
+        assert artifact_publication._still_pinned(root, identity)
+    monkeypatch.setattr(os, "lstat", real_lstat)
+
+
+def test_unpinned_artifact_observations_journal_once_per_drain(
+    tmp_path, monkeypatch, drained_unpinned
+):
+    """DW-444, decision "Degrade observation, journaled": each artifacts root
+    whose fallback reads ran on a zero-inode pin becomes ONE
+    `artifact-observation-unpinned` event naming the root, its filesystem (and
+    its type alone) and the count; the drain clears the counter, so a second
+    drain journals nothing.
+
+    Ablation: make `_journal_unpinned_artifact_observations` a no-op and the
+    first assertion fails; drop the `clear()` in `drain_unpinned_observations`
+    and the second drain journals the same root again."""
+    flow = _artifact_flow(tmp_path)
+    root = flow.paths.implementation_artifacts
+    _degrade_artifacts_root(monkeypatch, root, times=3)
+
+    flow._journal_unpinned_artifact_observations("dw-fix")
+
+    assert flow.journal.events() == ["artifact-observation-unpinned"]
+    fields = flow.journal.fields("artifact-observation-unpinned")
+    label = platform_util.filesystem_name(root)
+    assert fields == {
+        "story_key": "dw-fix",
+        "root": str(root),
+        "filesystem": label,
+        "fs_type": platform_util.filesystem_type(label),
+        "count": 3,
+    }
+
+    flow._journal_unpinned_artifact_observations("dw-fix")
+    assert flow.journal.events() == ["artifact-observation-unpinned"]
+
+
+_DRAIN_SITES = {
+    # site -> (artifact_publication function the site wraps, the flow call)
+    "capture": ("capture", lambda flow, task, source: flow.run_isolated(task, lambda _t: None)),
+    "prepare": ("prepare", lambda flow, task, source: flow.prepare_publication(task, source)),
+    "bind": ("bind_armed", lambda flow, task, source: flow.bind_publication(task, source, "dev:0")),
+    "validate_staged": (
+        "validate_staged",
+        lambda flow, task, source: flow.validate_staged_publication(task, source),
+    ),
+    "validate_committed": (
+        "validate_committed",
+        lambda flow, task, source: flow.validate_committed_publication(task, source, "rev", {}),
+    ),
+    "finish": ("publish", lambda flow, task, source: flow.finish_publication(task, None)),
+}
+
+
+@pytest.mark.parametrize(
+    ("site", "refused"),
+    [
+        (site, refused)
+        for site in sorted(_DRAIN_SITES)
+        for refused in (False, True)
+        # capture's success path continues into worktree provisioning, not this seam
+        if refused or site != "capture"
+    ],
+)
+def test_every_publication_site_journals_its_unpinned_observations(
+    tmp_path, monkeypatch, drained_unpinned, site, refused
+):
+    """DW-444: each of the six DW-bundle publication entries — baseline capture
+    in `run_isolated`, then prepare, bind, validate_staged, validate_committed
+    and finish — drains the degrade counter in a `finally`, so the degrades a
+    call counted are journaled whether it succeeds or refuses (and, when it
+    refuses, ahead of the `artifact-publication-refused` record and the pause).
+
+    Capture is driven only on its refusal path: its success continues into
+    worktree provisioning, which is not this seam.
+
+    Ablation: drop the drain from any one site and its cases fail."""
+    flow = _artifact_flow(tmp_path)
+    flow.state.target_branch = "main"
+    flow._open_unit_workspace = lambda *_a, **_k: SimpleNamespace(
+        path=tmp_path / "wt", branch="bmad-loop/dw-fix"
+    )
+    root = flow.paths.implementation_artifacts
+    task = StoryTask(story_key="dw-fix", epic=0, dw_ids=["DW-1"])
+    function, call = _DRAIN_SITES[site]
+
+    def degrading(*_args, **_kwargs):
+        _degrade_artifacts_root(monkeypatch, root, times=2)
+        if refused:
+            raise artifact_publication.PublicationError("refused after observing")
+        return {}
+
+    monkeypatch.setattr(artifact_publication, function, degrading)
+
+    if refused:
+        with pytest.raises(_Pause):
+            call(flow, task, flow.paths)
+    else:
+        call(flow, task, flow.paths)
+
+    events = flow.journal.events()
+    assert events.count("artifact-observation-unpinned") == 1, events
+    fields = flow.journal.fields("artifact-observation-unpinned")
+    assert (fields["story_key"], fields["root"], fields["count"]) == ("dw-fix", str(root), 2)
+    if refused and site != "capture":
+        assert events.index("artifact-observation-unpinned") < events.index(
+            "artifact-publication-refused"
+        )
+    assert artifact_publication.drain_unpinned_observations() == []
 
 
 @pytest.mark.parametrize("fault_target", ["spec", "root"])
