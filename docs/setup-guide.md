@@ -317,9 +317,18 @@ them to whoever owns the machine:
   - **Trust is exact-path.** `settings.json` `trustedWorkspaces` matches whole paths —
     trusting a parent does _not_ cover its subdirectories, and
     `--dangerously-skip-permissions` does not bypass the dialog (it covers tool
-    permissions only). So antigravity needs `isolation = "none"` (the default);
-    **`isolation = "worktree"` will hang**, because each worktree is a fresh untrusted
-    path under `.bmad-loop/runs/`. See [#169](https://github.com/bmad-code-org/bmad-loop/issues/169).
+    permissions only). `isolation = "none"` (the default) works once the project root
+    is trusted. **`isolation = "worktree"` works too**, as long as the project root is
+    trusted: after provisioning each unit worktree, bmad-loop appends its path to
+    `~/.gemini/antigravity-cli/settings.json` `trustedWorkspaces` before any session
+    launches (journaled `worktree-trust-seeded`). It only ever extends a grant you
+    already made — with the root untrusted nothing is written
+    (`worktree-trust-unseeded`) and the session will hang on the dialog. Check a path
+    with `bmad-loop probe-adapter antigravity --workspace <path>` (exit `0` = trusted).
+    **Known limitation:** entries are never removed when a worktree is torn down, so
+    `trustedWorkspaces` accumulates one entry per unit — prune stale
+    `.bmad-loop/runs/` paths by hand if the list grows. See
+    [#169](https://github.com/bmad-code-org/bmad-loop/issues/169) / DW-390.
   - **Token usage is not recorded** (`usage_parser = "none"`) — and this is permanent,
     not a gap: agy's transcript carries no usage data at all (it counts tokens only in
     an internal SQLite/protobuf store). Runs work; the token columns stay empty.

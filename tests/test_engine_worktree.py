@@ -8,6 +8,7 @@ adapter (no tmux, no LLM).
 
 from __future__ import annotations
 
+import json
 import shutil
 import sys
 from dataclasses import replace
@@ -10572,3 +10573,164 @@ def test_nested_relocated_accepted_spec_is_found_at_the_mount_project(project):
     assert observed["snapshot"] == b"ignored accepted bytes\n"
     assert task.phase != Phase.ESCALATED
     assert "story-escalated" not in journal_kinds(engine)
+
+
+# ---------------------------------------- workspace-trust seeding (DW-390)
+
+
+def _trust_home(tmp_path, monkeypatch) -> Path:
+    home = tmp_path / "trust-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    return home
+
+
+def _attach_trust_profile(adapter):
+    """The real claude profile plus a declared `[workspace_trust]` — the seam is
+    per-profile, and claude drives the mock engine without the agy skill tree."""
+    from bmad_loop.adapters.profile import WorkspaceTrustSpec, get_profile
+
+    spec = WorkspaceTrustSpec(settings_path="~/.agy-test/settings.json", key="trustedWorkspaces")
+    adapter.profile = replace(get_profile("claude"), workspace_trust=spec)
+    return spec
+
+
+def test_worktree_trust_is_seeded_before_the_dev_session(project, tmp_path, monkeypatch):
+    home = _trust_home(tmp_path, monkeypatch)
+    settings = home / ".agy-test" / "settings.json"
+    settings.parent.mkdir()
+    settings.write_text(
+        json.dumps({"theme": "dark", "trustedWorkspaces": [str(project.repo_root)]}),
+        encoding="utf-8",
+    )
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    dev = wt_dev_effect(project, "1-1-a")
+    seen_at_launch: list[list[str]] = []
+
+    def dev_checking_trust(spec):
+        seen_at_launch.append(json.loads(settings.read_text(encoding="utf-8"))["trustedWorkspaces"])
+        assert str(Path(spec.cwd).resolve()) in seen_at_launch[-1]
+        return dev(spec)
+
+    engine, adapter = make_engine(
+        project, [dev_checking_trust, wt_review_effect(project, "1-1-a", clean=True)]
+    )
+    _attach_trust_profile(adapter)
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    wt = Path(engine.state.tasks["1-1-a"].worktree_path or "")
+    assert seen_at_launch == [[str(project.repo_root), str(wt.resolve())]]
+    kinds = journal_kinds(engine)
+    assert kinds.count("worktree-trust-seeded") == 1
+    assert kinds.index("worktree-opened") < kinds.index("worktree-trust-seeded")
+    assert list(json.loads(settings.read_text(encoding="utf-8"))) == ["theme", "trustedWorkspaces"]
+
+
+def test_worktree_trust_unseeded_when_the_root_is_untrusted(project, tmp_path, monkeypatch):
+    home = _trust_home(tmp_path, monkeypatch)
+    settings = home / ".agy-test" / "settings.json"
+    settings.parent.mkdir()
+    settings.write_text('{"trustedWorkspaces": []}', encoding="utf-8")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+    )
+    _attach_trust_profile(adapter)
+    notified: list[tuple[str, str]] = []
+    real_notify = worktree_flow.gates.notify
+
+    def spy(policy, run_dir, title, body, *a, **k):
+        notified.append((title, body))
+        return real_notify(policy, run_dir, title, body, *a, **k)
+
+    monkeypatch.setattr(worktree_flow.gates, "notify", spy)
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused  # a degrade, not a pause
+    assert settings.read_text(encoding="utf-8") == '{"trustedWorkspaces": []}'
+    rows = [e for e in engine.journal.entries() if e["kind"] == "worktree-trust-unseeded"]
+    assert len(rows) == 1 and "project root is not listed" in rows[0]["reason"]
+    trust_notes = [(t, b) for t, b in notified if t == "workspace trust not seeded: 1-1-a"]
+    assert len(trust_notes) == 1
+    body = trust_notes[0][1]
+    assert "project root is not listed" in body
+    assert "run `claude` once in the project root and trust it" in body
+
+
+def test_reopen_seeds_trust_the_root_gained_after_provisioning(project, tmp_path, monkeypatch):
+    """Resume-in-place: a unit provisioned while the root was untrusted picks up the
+    grant when reopened. Ablation: drop the `seed_workspace_trust` call in
+    `reopen_unit` and the worktree never lands in the list."""
+    home = _trust_home(tmp_path, monkeypatch)
+    settings = home / ".agy-test" / "settings.json"
+    settings.parent.mkdir()
+    settings.write_text(
+        json.dumps({"trustedWorkspaces": [str(project.repo_root)]}), encoding="utf-8"
+    )
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(project, [])
+    _attach_trust_profile(adapter)
+    from bmad_loop.workspace import open_unit_workspace
+
+    unit = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    task = StoryTask("1-1-a", 1, phase=Phase.DEV_VERIFY)
+    task.worktree_path = str(unit.path)
+    task.branch = unit.branch
+
+    engine._reopen_unit(task)
+
+    listed = json.loads(settings.read_text(encoding="utf-8"))["trustedWorkspaces"]
+    assert listed == [str(project.repo_root), str(unit.path.resolve())]
+    assert "worktree-trust-seeded" in journal_kinds(engine)
+
+
+def test_malformed_trust_settings_escalate_before_any_session(project, tmp_path, monkeypatch):
+    home = _trust_home(tmp_path, monkeypatch)
+    settings = home / ".agy-test" / "settings.json"
+    settings.parent.mkdir()
+    settings.write_text('{"trustedWorkspaces": "not-a-list"}', encoding="utf-8")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+    )
+    _attach_trust_profile(adapter)
+
+    summary = engine.run()
+
+    task = engine.state.tasks["1-1-a"]
+    assert summary.paused and adapter.sessions == []
+    assert task.phase == Phase.ESCALATED
+    reason = engine.state.paused_reason or ""
+    assert "cannot seed workspace trust" in reason and "not a list of strings" in reason
+    assert settings.read_text(encoding="utf-8") == '{"trustedWorkspaces": "not-a-list"}'
+    assert "worktree-trust-seeded" not in journal_kinds(engine)
+
+
+def test_profile_without_workspace_trust_never_touches_home(project, tmp_path, monkeypatch):
+    home = _trust_home(tmp_path, monkeypatch)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+    )
+    attach_profile(adapter)
+    monkeypatch.setattr(
+        worktree_flow.workspace_trust,
+        "seed",
+        lambda *_a, **_k: pytest.fail("no [workspace_trust] declared: must not seed"),
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert list(home.iterdir()) == []
+    kinds = journal_kinds(engine)
+    assert "worktree-trust-seeded" not in kinds and "worktree-trust-unseeded" not in kinds

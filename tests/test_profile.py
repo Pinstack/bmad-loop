@@ -1199,3 +1199,102 @@ def test_a_valid_entry_point_profile_still_lands(profile_scan):
     )
     assert load_profiles()["acme"].env_fault_patterns == ("API Error.*Connection refused",)
     assert profile_mod.external_profile_errors() == {}
+
+
+# ------------------------------------------------ [workspace_trust] (DW-390)
+
+
+def _write_trust_profile(tmp_path: Path, table: str) -> Path:
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True, exist_ok=True)
+    (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE + table, encoding="utf-8")
+    return tmp_path
+
+
+def test_packaged_antigravity_declares_workspace_trust():
+    from bmad_loop.adapters.profile import WorkspaceTrustSpec
+
+    profiles = load_profiles()
+    assert profiles["antigravity"].workspace_trust == WorkspaceTrustSpec(
+        settings_path="~/.gemini/antigravity-cli/settings.json", key="trustedWorkspaces"
+    )
+    # every other shipped profile leaves home untouched
+    for name in sorted(set(profiles) - {"antigravity"}):
+        assert profiles[name].workspace_trust is None, name
+
+
+def test_workspace_trust_parses_from_an_overlay(tmp_path):
+    project = _write_trust_profile(
+        tmp_path, '\n[workspace_trust]\nsettings_path = "~/.mycli/settings.json"\nkey = "trusted"\n'
+    )
+    spec = load_profiles(project)["mycli"].workspace_trust
+    assert spec is not None
+    assert (spec.settings_path, spec.key) == ("~/.mycli/settings.json", "trusted")
+
+
+def test_workspace_trust_absent_is_none(tmp_path):
+    assert load_profiles(_write_trust_profile(tmp_path, ""))["mycli"].workspace_trust is None
+
+
+@pytest.mark.parametrize(
+    "table",
+    [
+        'workspace_trust = "~/.x.json"\n',
+        '\n[workspace_trust]\nsettings_path = ["~/.x.json"]\nkey = "k"\n',
+        '\n[workspace_trust]\nsettings_path = "~/.x.json"\nkey = 3\n',
+        '\n[workspace_trust]\nkey = "k"\n',
+        '\n[workspace_trust]\nsettings_path = "~/.x.json"\nkey = "k"\nextra = 1\n',
+    ],
+    ids=["not-a-table", "path-not-str", "key-not-str", "path-missing", "unknown-key"],
+)
+def test_workspace_trust_shape_rejections(tmp_path, table):
+    # a bare `workspace_trust = ...` must sit above [hooks] to be top-level
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    text = table + MINIMAL_PROFILE if not table.startswith("\n") else MINIMAL_PROFILE + table
+    (profiles_dir / "mycli.toml").write_text(text, encoding="utf-8")
+    with pytest.raises(ProfileError, match="workspace_trust"):
+        load_profiles(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("settings_path", "key"),
+    [
+        (".gemini/settings.json", "k"),  # not ~/-prefixed
+        ("/etc/settings.json", "k"),
+        ("~settings.json", "k"),
+        ("~/../other-user/settings.json", "k"),
+        ("~/.gemini/../../x.json", "k"),
+        ("~//etc/passwd", "k"),  # joins to an absolute path
+        ("~/", "k"),  # names home itself
+        ("~/.", "k"),
+        ("~/C:/x.json", "k"),
+        ("~/NUL/settings.json", "k"),
+        ("~/.gemini/settings.json. ", "k"),
+        ("~/.gemini/settings.json", ""),
+        ("~/.gemini/settings.json", "   "),
+        ("~/.gemini/settings.json", " trustedWorkspaces"),
+    ],
+)
+def test_workspace_trust_value_rejections_on_both_routes(tmp_path, settings_path, key):
+    """Value rules live in `_validate_profile`, so the TOML route and the
+    entry-point (constructed dataclass) route refuse the same set."""
+    from dataclasses import replace
+
+    from bmad_loop.adapters.profile import WorkspaceTrustSpec
+
+    project = _write_trust_profile(
+        tmp_path,
+        f"\n[workspace_trust]\nsettings_path = {settings_path!r}\nkey = {key!r}\n".replace(
+            "'", '"'
+        ),
+    )
+    with pytest.raises(ProfileError, match="workspace_trust"):
+        load_profiles(project)
+
+    constructed = replace(
+        get_profile("claude"),
+        workspace_trust=WorkspaceTrustSpec(settings_path=settings_path, key=key),
+    )
+    with pytest.raises(ProfileError, match="workspace_trust"):
+        profile_mod._validate_profile(constructed, "entry point test")

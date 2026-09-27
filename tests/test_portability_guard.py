@@ -1772,6 +1772,10 @@ JOURNAL_KINDS = frozenset(
         "worktree-seed-dropped",
         "worktree-seed-skipped",
         "worktree-teardown-degraded",
+        # DW-390 workspace-trust seeding: `key` is benign, `path` and `reason`
+        # are presence-only in `diagnostics._JOURNAL_DROP_FIELDS`.
+        "worktree-trust-seeded",
+        "worktree-trust-unseeded",
         "artifact-publication-refused",
     }
 )

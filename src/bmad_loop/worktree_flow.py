@@ -32,7 +32,7 @@ from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, NoReturn
 
-from . import artifact_publication, codex_trust, deferredwork, gates, verify
+from . import artifact_publication, codex_trust, deferredwork, gates, verify, workspace_trust
 from .adapters.profile import ProfileError
 from .install import (
     _REVIEW_LAYER_SKILLS,
@@ -81,7 +81,7 @@ if TYPE_CHECKING:
     from importlib.resources.abc import Traversable
 
     from .adapters.base import CodingCLIAdapter
-    from .adapters.profile import CLIProfile
+    from .adapters.profile import CLIProfile, WorkspaceTrustSpec
     from .bmadconfig import ProjectPaths
     from .journal import Journal
     from .model import RunState, StoryTask
@@ -2441,6 +2441,10 @@ class WorktreeFlow:
             # "why" to the inner message rather than asserting one of the three.
             reason = f"cannot safely provision the worktree for {task.story_key}: {e}"
             self.escalate_unit(task, reason)  # always raises RunPaused
+        # Before any session launches in the worktree: a CLI that gates sessions
+        # on a home-level exact-path allowlist would otherwise block on its trust
+        # dialog in this fresh path until the session timeout (DW-390).
+        self.seed_workspace_trust(task, unit.path, profiles)
         # The seeded ledger's text as it landed, for the success-path teardown
         # check (DW-375): the carry brings back only the writes the engine
         # recorded, so anything else a session appends to this copy vanishes with
@@ -4682,6 +4686,64 @@ class WorktreeFlow:
         )
         self.escalate_unit(task, reason)  # always raises RunPaused
 
+    def seed_workspace_trust(
+        self, task: StoryTask, worktree: Path, profiles: Sequence[CLIProfile]
+    ) -> None:
+        """Extend the operator's workspace-trust grant for the main checkout to
+        ``worktree``, for every loaded profile declaring ``[workspace_trust]``
+        (DW-390). See :mod:`bmad_loop.workspace_trust` for the confinement and the
+        root-trust rule. Profiles without the table touch nothing under ``~``.
+
+        Seeded → ``worktree-trust-seeded``; root not trusted or file/key missing →
+        ``worktree-trust-unseeded`` with the reason (a degrade, the run goes on —
+        the session will meet the CLI's trust dialog); a malformed settings file or
+        a write fault escalates the unit (repair writes raise)."""
+        # spec -> the first declaring profile's binary, named in the remedy
+        specs: dict[WorkspaceTrustSpec, str] = {}
+        for p in profiles:
+            if p.workspace_trust is not None:
+                specs.setdefault(p.workspace_trust, p.binary)
+        for spec, binary in specs.items():
+            try:
+                outcome, detail = workspace_trust.seed(
+                    spec, worktree, trusted_root=self.paths.repo_root
+                )
+            except workspace_trust.WorkspaceTrustError as e:
+                self.escalate_unit(  # always raises RunPaused
+                    task,
+                    f"cannot seed workspace trust for {task.story_key} in "
+                    f"{spec.settings_path} ({spec.key}): {e}; resolve that fault, then "
+                    "re-arm this escalation with `bmad-loop resolve <run-id> "
+                    "--no-interactive`: ESCALATED is terminal",
+                )
+                raise  # unreachable: escalate_unit always raises RunPaused
+            if outcome == "seeded":
+                self.journal.append(
+                    "worktree-trust-seeded",
+                    story_key=task.story_key,
+                    key=spec.key,
+                    path=str(worktree),
+                )
+            elif outcome == "root-untrusted":
+                self.journal.append(
+                    "worktree-trust-unseeded",
+                    story_key=task.story_key,
+                    key=spec.key,
+                    path=str(worktree),
+                    reason=detail,
+                )
+                # The run goes on, but the session will sit on the CLI's trust
+                # dialog until timeout — tell the operator now, not after.
+                gates.notify(
+                    self.policy,
+                    self.run_dir,
+                    f"workspace trust not seeded: {task.story_key}",
+                    f"{detail}. The worktree session will block on the {binary} trust "
+                    f"dialog: run `{binary}` once in the project root and trust it — "
+                    "every later worktree (and a resumed in-flight one) is seeded "
+                    "from that grant.",
+                )
+
     def escalate_unit(self, task: StoryTask, reason: str) -> None:
         """Mark a unit ESCALATED, notify, and pause the run.
 
@@ -4782,6 +4844,9 @@ class WorktreeFlow:
         # lives on the class that creates the relative spelling, so this and
         # `Engine._finish_inflight`'s pre-discard re-anchor cannot drift apart.
         task.rebase_spec_paths_on(self._mount_project(wt))
+        # A unit first provisioned while the root was untrusted (or whose entry
+        # the operator pruned) must pick up the grant on resume (DW-390).
+        self.seed_workspace_trust(task, wt, self.worktree_profiles())
         return UnitWorkspace(
             workspace=Workspace(root=wt, paths=self.paths.rebased(wt)),
             repo_root=self.paths.repo_root,

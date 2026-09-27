@@ -5658,11 +5658,26 @@ def cmd_probe(args: argparse.Namespace) -> int:
             print(f"FAIL: {prefix}{e}", file=sys.stderr)
             return 1
         # Human-facing notice — stderr in JSON mode, where stdout is the document.
-        if not codex_profile_error:
+        # Withheld under --workspace: an unknown profile cannot answer it, and the
+        # FAIL below would contradict an `ok:` printed first.
+        if not codex_profile_error and args.workspace is None:
             print(
                 f"  ok: unknown profile {args.cli!r}; reduced {noun} from --binary {args.binary}",
                 file=sys.stderr if args.json else sys.stdout,
             )
+
+    # --workspace asks a question only a declared [workspace_trust] table can
+    # answer; an unknown profile (reduced --binary report) cannot either (DW-390).
+    if args.workspace is not None and (profile is None or profile.workspace_trust is None):
+        if profile is None:
+            detail = f"no loadable profile for {args.cli!r}"
+        else:
+            detail = f"profile {profile.name!r} declares none"
+        print(
+            f"FAIL: --workspace needs a profile declaring [workspace_trust]; {detail}",
+            file=sys.stderr,
+        )
+        return 1
 
     if profile is not None and profile.hookless:
         print(
@@ -5709,6 +5724,8 @@ def cmd_probe(args: argparse.Namespace) -> int:
         finding = probe_mod.scan(
             cli=args.cli, profile=profile, project=project, hints=hints, pseudo=pseudo
         )
+    if args.workspace is not None and profile is not None:
+        probe_mod.check_workspace_trust(finding, profile, Path(args.workspace))
     if codex_profile_error:
         finding.hook_trust = "unverifiable"
         finding.warnings.append("Codex hook trust unverifiable: profile cannot be loaded")
@@ -5754,7 +5771,10 @@ def cmd_probe(args: argparse.Namespace) -> int:
     # Every `ok:` trailer is human-facing chatter, so in JSON mode it goes to
     # stderr — stdout is the document alone, or empty when --out took it.
     trailers = sys.stderr if args.json else sys.stdout
-    trust_ok = finding.hook_trust is None or finding.hook_trust == "trusted"
+    trust_ok = finding.hook_trust in (None, "trusted") and finding.workspace_trust in (
+        None,
+        "trusted",
+    )
     trailer_prefix = "ok" if trust_ok else "FAIL"
     if args.out:
         out_path = Path(args.out)
@@ -6041,6 +6061,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     probe_p.add_argument("--binary", help="binary name for a CLI with no profile yet")
     probe_p.add_argument("--model", help="model passed to the probe turn (probe mode)")
+    probe_p.add_argument(
+        "--workspace",
+        metavar="PATH",
+        help="also report (read-only) whether PATH is in the profile's declared "
+        "workspace-trust list ([workspace_trust]); exit 1 unless trusted",
+    )
     probe_p.add_argument(
         "--timeout", type=float, default=90, help="probe turn timeout (default: 90s)"
     )

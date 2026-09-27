@@ -9,6 +9,16 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Seed agy workspace trust per worktree: a profile may declare `[workspace_trust]`
+  (`~/` JSON settings file + top-level list key; `antigravity` ships
+  `~/.gemini/antigravity-cli/settings.json` `trustedWorkspaces`). Each provisioned or
+  resumed unit worktree is appended, only when the main checkout root is already
+  listed. Journals `worktree-trust-seeded` / `worktree-trust-unseeded` (the latter also
+  notifies); a malformed file escalates. `isolation = "worktree"` now works with
+  antigravity; entries are not removed on teardown (DW-390).
+- Add `probe-adapter --workspace PATH`: read-only workspace-trust verdict for profiles
+  declaring `[workspace_trust]`; exit 1 unless trusted; additive `--json` key
+  `workspace_trust` (DW-390).
 - Implement `[gates] retrospective = "auto"`: at each epic boundary, run one headless
   `/bmad-retrospective -H <epic>` session on the new `retro` adapter role
   (`[adapter.retro]`; unset keys inherit from `[adapter]`), before the per-epic auto-sweep.

@@ -163,6 +163,8 @@ class ProfileFinding:
     declared_events: dict = field(default_factory=dict)  # native -> canonical
     registered: bool | None = None  # scan: hooks present in the CLI's config?
     hook_trust: str | None = None  # trusted | untrusted | unverifiable (Codex only)
+    # trusted | untrusted | unverifiable — only when --workspace was requested
+    workspace_trust: str | None = None
     captured_events: list[EventCapture] = field(default_factory=list)  # probe
     transcript: TranscriptFinding | None = None
     tokens: TokenSchema | None = None
@@ -504,6 +506,34 @@ def _check_hook_trust(
             )
         else:
             finding.next_steps.append("Resolve the Codex hook trust diagnostic and re-run the scan")
+
+
+def check_workspace_trust(finding: ProfileFinding, profile: CLIProfile, workspace: Path) -> None:
+    """Read-only: is ``workspace`` in the profile's declared workspace-trust list
+    (DW-390)? Sets ``finding.workspace_trust``; a non-trusted verdict adds a
+    warning and a next step. The workspace path itself is never rendered — the
+    reasons from :func:`workspace_trust.trust_status` are path-free, and the
+    settings file is named by its ``~/`` spelling only."""
+    from . import workspace_trust
+
+    spec = profile.workspace_trust
+    if spec is None:
+        return
+    status, reason = workspace_trust.trust_status(spec, workspace)
+    finding.workspace_trust = status
+    if status == "trusted":
+        return
+    finding.warnings.append(f"workspace trust {status} for the requested workspace: {reason}")
+    if status == "unverifiable":
+        finding.next_steps.append(
+            f"Repair {spec.settings_path}: it must be a JSON object whose "
+            f"{spec.key!r} is a list of path strings"
+        )
+    else:
+        finding.next_steps.append(
+            f"Run `{profile.binary}` in the project root and trust it; bmad-loop seeds "
+            "each worktree from that grant (or trust this workspace directly)"
+        )
 
 
 # ----------------------------------------------------------------- SCAN mode
@@ -895,6 +925,8 @@ def render_markdown(
         out.append(_fmt_kv("hooks registered", "yes" if f.registered else "no"))
     if f.hook_trust is not None:
         out.append(_fmt_kv("Codex hook trust", f.hook_trust))
+    if f.workspace_trust is not None:
+        out.append(_fmt_kv("workspace trust", f.workspace_trust))
     out.append(_fmt_kv("warnings", str(len(f.warnings))))
     out.append("")
 
@@ -1046,6 +1078,7 @@ def render_json(
         "usage_parser": f.parser,
         "hooks_registered": f.registered,
         "hook_trust": f.hook_trust,
+        "workspace_trust": f.workspace_trust,
         "declared_events": f.declared_events,
         "version": f.flags.version if f.flags else None,
         "help": f.flags.help if f.flags else None,

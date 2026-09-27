@@ -112,6 +112,26 @@ class HookSpec:
 
 
 @dataclass(frozen=True)
+class WorkspaceTrustSpec:
+    """Where a CLI records the workspaces it trusts (DW-390).
+
+    Some CLIs gate every workspace on an exact-path allowlist in a home-level
+    settings file (agy: ``~/.gemini/antigravity-cli/settings.json``
+    ``trustedWorkspaces``), so a freshly provisioned worktree blocks on an
+    interactive trust dialog no spawned session can answer. Declaring the file
+    and its top-level list key lets :mod:`bmad_loop.workspace_trust` extend the
+    grant the operator already gave the project root to each unit worktree.
+
+    ``settings_path`` must be ``~/``-anchored (home-relative, no ``..``, no
+    Windows-alias component) and ``key`` names ONE top-level key — never a nested
+    path. Both are validated in :func:`_validate_profile`, so both profile routes
+    enforce the same shape."""
+
+    settings_path: str  # "~/"-prefixed, e.g. "~/.gemini/antigravity-cli/settings.json"
+    key: str  # a top-level key holding a list of path strings
+
+
+@dataclass(frozen=True)
 class CLIProfile:
     name: str
     binary: str
@@ -218,6 +238,11 @@ class CLIProfile:
     # Provenance is that boundary; it answers "who wrote this", which is the
     # question actually being asked.
     packaged: bool = False
+    # Home-level workspace-trust allowlist this CLI gates sessions on (DW-390);
+    # None = the CLI has none, and provisioning never reads or writes under `~`.
+    # APPENDED with a default so every positional CLIProfile construction stays
+    # valid.
+    workspace_trust: WorkspaceTrustSpec | None = None
 
     @property
     def hookless(self) -> bool:
@@ -426,6 +451,35 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
                 f"in a period or space: got {seed!r}"
             )
 
+    trust = profile.workspace_trust
+    if trust is not None:
+        settings_path = trust.settings_path
+        rest = settings_path[2:]
+        # Home-anchored and nothing else: the file lives outside the project, so
+        # the confinement is "under ~", and the remainder must name something
+        # inside home — not home itself, not an absolute path smuggled after the
+        # prefix (`~//etc/passwd` joins to `/etc/passwd`), not a `..` climb out.
+        if (
+            not settings_path.startswith("~/")
+            or names_tree_root(rest)
+            or is_absolute_path(rest)
+            or has_parent_ref(rest)
+        ):
+            raise fail(
+                "workspace_trust.settings_path must be a '~/'-prefixed path inside the "
+                f"home directory: got {settings_path!r}"
+            )
+        if names_win32_alias(rest):
+            raise fail(
+                "workspace_trust.settings_path must not name a Windows device or end a "
+                f"component in a period or space: got {settings_path!r}"
+            )
+        if not trust.key.strip() or trust.key != trust.key.strip():
+            raise fail(
+                "workspace_trust.key must name one top-level key (non-empty, no "
+                f"surrounding whitespace): got {trust.key!r}"
+            )
+
     for pattern in profile.env_fault_patterns:
         try:
             regex.compile(pattern)  # same engine the adapter matches with (timeout-guarded)
@@ -498,6 +552,22 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
     ):
         raise fail("hooks.notification_types must map notification subtypes to parked kinds")
 
+    # Optional table; SHAPE here (a table of two strings), values in
+    # `_validate_profile`. A bare `str()` coercion would turn an array into the
+    # literal "['x']" and carry it to the filesystem as a path.
+    trust_d = doc.get("workspace_trust")
+    workspace_trust: WorkspaceTrustSpec | None = None
+    if trust_d is not None:
+        if not isinstance(trust_d, dict):
+            raise fail("workspace_trust must be a table")
+        unknown = sorted(set(trust_d) - {"settings_path", "key"})
+        if unknown:
+            raise fail(f"workspace_trust has unknown keys: {unknown}")
+        settings_path, key = trust_d.get("settings_path"), trust_d.get("key")
+        if not isinstance(settings_path, str) or not isinstance(key, str):
+            raise fail("workspace_trust.settings_path and workspace_trust.key must be strings")
+        workspace_trust = WorkspaceTrustSpec(settings_path=settings_path, key=key)
+
     # A dedicated shape check rather than the `str()` coercion the neighbouring
     # scalars get, because `adapter` has no parse-time membership test to land in
     # afterwards: `str(["x"])` would coerce a TOML array to the literal `"['x']"`
@@ -539,6 +609,7 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         seed_files=str_list("seed_files"),
         env_fault_patterns=str_list("env_fault_patterns"),
         parked_prompt_patterns=str_list("parked_prompt_patterns"),
+        workspace_trust=workspace_trust,
     )
     _validate_profile(profile, source)
     return profile
