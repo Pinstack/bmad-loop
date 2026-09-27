@@ -8860,7 +8860,108 @@ def test_board_advance_carried_twice_by_a_crash_before_its_latch_is_a_no_op(proj
     assert load_state(resumed.run_dir).tasks["1-1-a"].isolated_ledger_carried
 
 
-def test_unmerged_terminal_unit_does_not_replay_a_board_advance(project):
+@pytest.mark.parametrize(
+    ("final_status", "phase", "actions"),
+    [
+        ("done", Phase.DONE, None),
+        ("awaiting-operator", Phase.AWAITING_OPERATOR, ["publish the DNS record"]),
+    ],
+)
+def test_unmerged_terminal_unit_is_re_merged_once_on_resume(project, final_status, phase, actions):
+    """DW-385: a unit saved DONE before its merge started is merged on resume.
+
+    `_finalize_commit_phase` persists DONE, then `integrate_unit` merges. A host
+    lost between the two leaves a finished commit on the still-mounted unit branch
+    and no `unit-merge-started` row. The replay used to skip it (only a bundle
+    integrated there), and the resumed run's GC then force-discarded the worktree
+    AND the branch, stranding the work. The resume now runs the first-integration
+    merge from `commit_sha`, then the board carry.
+
+    Idempotence is graded across a second resume: the first one is killed in the
+    merge-to-carry window, so the second finds the `unit-merged` row and carries
+    without merging again — one started row and one merged row across all three
+    processes.
+
+    Ablation: restore the `if not publication_pending: continue` skip and the first
+    resume finishes with the commit off the target and the board at
+    `ready-for-dev`.
+
+    The board is gitignored so only the carry can advance it on main — a tracked
+    board would ride the unit commit through the merge and hide the carry.
+    """
+    ignored_sprint(project, {"1-1-a": "ready-for-dev"})
+    effect = wt_dev_effect(
+        project,
+        "1-1-a",
+        final_status=final_status,
+        followup_review=False,
+        operator_actions=actions,
+    )
+    engine, _ = make_engine(project, [effect])
+    crash_at_merge_back(engine, after="commit")
+
+    assert engine.run().crashed
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed.phase == phase and not crashed.isolated_ledger_carried
+    assert crashed.commit_sha and crashed.board_advance_intended == final_status
+    assert Path(crashed.worktree_path).is_dir()
+    kinds = journal_kinds(engine)
+    assert "unit-merge-started" not in kinds and "unit-merged" not in kinds
+    assert not verify.is_ancestor(project.project, crashed.commit_sha, "main")
+
+    first, _ = resume_engine(project, engine)
+    crash_at_merge_back(first, after="merge")
+    assert first.run().crashed
+    # the merge ran from the recorded commit; the carry was cut short
+    assert verify.is_ancestor(project.project, crashed.commit_sha, "main")
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "ready-for-dev"
+
+    second, _ = resume_engine(project, first)
+    summary = second.run()
+
+    assert not summary.crashed and not summary.paused
+    assert (summary.done, summary.awaiting_operator) == ((1, 0) if actions is None else (0, 1))
+    assert verify.is_ancestor(project.project, crashed.commit_sha, "main")
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == final_status
+    assert load_state(second.run_dir).tasks["1-1-a"].isolated_ledger_carried
+    kinds = journal_kinds(second)
+    assert kinds.count("unit-merge-started") == 1
+    assert kinds.count("unit-merged") == 1
+    assert "resume-ledger-carry" in kinds
+    assert [(e["target"], e["status"]) for e in _board_carry_events(second)] == [
+        (final_status, final_status)
+    ]
+
+
+def test_unmerged_terminal_unit_with_a_removed_worktree_escalates_on_resume(project):
+    """DW-385's re-merge needs the unit mounted: `merge_local` checks the unit HEAD
+    still equals `commit_sha` before merging it. A worktree removed by hand in the
+    DONE-before-merge window cannot be checked, so the resume escalates naming it —
+    never merges unverified bytes, never carries onto a target the unit did not
+    reach, and leaves the branch holding the commit for the operator.
+    """
+    ignored_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [wt_dev_effect(project, "1-1-a", followup_review=False)])
+    crash_at_merge_back(engine, after="commit")
+    assert engine.run().crashed
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    git(project.project, "worktree", "remove", "--force", crashed.worktree_path)
+
+    resumed, _ = resume_engine(project, engine)
+    summary = resumed.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.done == 0
+    assert "gone or unopenable" in summary.paused_reason
+    task = load_state(resumed.run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED and not task.isolated_ledger_carried
+    assert not verify.is_ancestor(project.project, crashed.commit_sha, "main")
+    assert git(project.project, "rev-parse", crashed.branch).strip() == crashed.commit_sha
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "ready-for-dev"
+    kinds = journal_kinds(resumed)
+    assert "unit-merge-started" not in kinds and "resume-ledger-carry" not in kinds
+
+
+def test_terminal_unit_without_a_commit_does_not_replay_a_board_advance(project):
     """Merge evidence still gates the replay now that nearly every story has a
     payload.
 
@@ -8868,8 +8969,10 @@ def test_unmerged_terminal_unit_does_not_replay_a_board_advance(project):
     disjunct and never reached the merge-evidence check at all; the board record
     puts it there on the ordinary path, so the guard that used to be shadowed is now
     the only thing standing between a terminal phase and a carry onto a branch that
-    never landed. A tracked board makes the refusal legible: the carry would advance
-    it, so `ready-for-dev` is proof the body did not run.
+    never landed. With no recorded `commit_sha` there is nothing to re-merge
+    (DW-385 merges only a recorded commit), so the replay skips. A tracked board
+    makes the refusal legible: the carry would advance it, so `ready-for-dev` is
+    proof the body did not run.
     """
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
     engine, _ = make_engine(project, [])
@@ -8890,7 +8993,9 @@ def test_unmerged_terminal_unit_does_not_replay_a_board_advance(project):
 
     assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "ready-for-dev"
     assert task.isolated_ledger_carried is False
-    assert "resume-ledger-carry" not in journal_kinds(engine)
+    assert task.phase == Phase.DONE
+    kinds = journal_kinds(engine)
+    assert "resume-ledger-carry" not in kinds and "unit-merge-started" not in kinds
     assert _board_carry_events(engine) == []
 
 

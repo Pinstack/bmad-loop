@@ -1924,10 +1924,14 @@ class Engine:
                 else:
                     replay_strategy = started_units.get(started_key)
                 if not merged and (not source or replay_strategy is None):
-                    if not publication_pending:
+                    if not source and not publication_pending:
                         continue
-                    # Terminal bundle persisted before merge intent: integrate it
+                    # Terminal unit persisted before merge intent (DW-385): the
+                    # recorded commit is finished, verified work, so integrate it
+                    # now — skipping would let GC force-discard the branch holding
+                    # it. A bundle with publication pending integrates here too,
                     # before sweep can re-triage or GC can remove its sources.
+                    # With neither there is nothing to merge; the carry stays gated.
                     self._merge_local(
                         task, self._reopen_unit(task), replay=True, first_integration=True
                     )

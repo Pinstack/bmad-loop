@@ -1963,11 +1963,13 @@ def ignore_before_commit(project: ProjectPaths, *patterns: str) -> None:
 
 
 def crash_at_merge_back(engine, *, after: str = "merge") -> None:
-    """Kill the host inside the isolated DONE arm, in one of its two windows.
+    """Kill the host inside the isolated DONE arm, in one of its three windows.
 
     `WorktreeFlow.integrate_unit`'s DONE arm runs merge -> carry -> latch, and each
     gap has its own recovery contract:
 
+    - ``"commit"``: after the DONE save, before `merge_local` (DW-385). The unit
+      commit exists on its mounted branch; no `unit-merge-started` row was written.
     - ``"merge"``: after `merge_local`, before `_carry_isolated_ledger_writes`. The
       branch landed and the worktree is gone; no ledger write happened.
     - ``"carry"``: after the whole carry, before `isolated_ledger_carried` is set
@@ -1981,10 +1983,18 @@ def crash_at_merge_back(engine, *, after: str = "merge") -> None:
     Replaces a method on the engine INSTANCE rather than monkeypatching the class.
     `WorktreeFlow` is handed `carry_isolated_ledger_writes=lambda task:
     self._carry_isolated_ledger_writes(task)`, a late-binding lambda, so instance
-    assignment is what the callback sees.
+    assignment is what the callback sees. ``"commit"`` replaces `merge_local` on
+    the engine's `WorktreeFlow` instance, which `integrate_unit` calls via `self`.
     """
-    if after not in ("merge", "carry"):
+    if after not in ("commit", "merge", "carry"):
         raise ValueError(f"unknown crash window: {after!r}")
+    if after == "commit":
+
+        def crash_before_merge(*_args, **_kwargs) -> None:
+            raise RuntimeError("host died after the DONE save, before the merge")
+
+        engine._worktree_flow.merge_local = crash_before_merge
+        return
     if after == "merge":
 
         def crash_before_carry(_task) -> None:

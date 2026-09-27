@@ -93,6 +93,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Re-merge on resume a worktree story saved DONE (or awaiting-operator) before its
+  merge started: the replay merges the recorded `commit_sha`, then carries the ledger
+  and board writes, instead of skipping it and letting GC discard the unit branch
+  (DW-385, was #299).
 - Honour `launch_args` before `serve` in the `opencode-http` server argv, so a wrapper
   profile (`npx -y opencode-ai`) starts; `validate` warns on unservable shapes
   (`adapter.launch-args-unservable`); `--dry-run` shows `launch_args` before `serve` (DW-374).
