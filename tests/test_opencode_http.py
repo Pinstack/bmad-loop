@@ -676,6 +676,46 @@ def test_launch_args_unservable_is_silent_on_servable_shapes(binary, launch_args
     assert opencode_http.launch_args_unservable(binary, launch_args) is None
 
 
+@pytest.mark.parametrize(
+    "extra_args, needle",
+    [
+        pytest.param(("--port", "5000"), "'--port'", id="port"),
+        pytest.param(("--model", "x", "--hostname", "0.0.0.0"), "'--hostname'", id="hostname"),
+        pytest.param(("--print-logs",), "'--print-logs'", id="print-logs"),
+        pytest.param(("--port=1",), "'--port=1'", id="port-eq"),
+        pytest.param(("--hostname=0.0.0.0",), "'--hostname=0.0.0.0'", id="hostname-eq"),
+        pytest.param(("--print-logs=false",), "'--print-logs=false'", id="print-logs-eq"),
+    ],
+)
+def test_extra_args_unservable_flags_owned_flags(extra_args, needle):
+    """DW-483: extra_args land AFTER the owned flags in `_serve_argv`, so a repeat
+    overrides the port the health poll dials."""
+    reason = opencode_http.extra_args_unservable(extra_args)
+    assert reason is not None and needle in reason and "extra_args" in reason
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        pytest.param((), id="empty"),
+        pytest.param(("serve",), id="serve-is-a-positional-here"),
+        pytest.param(("--portal",), id="port-prefix-not-flag"),
+        pytest.param(("--model", "anthropic/claude"), id="unrelated-flag"),
+    ],
+)
+def test_extra_args_unservable_is_silent_on_non_colliding_args(extra_args):
+    assert opencode_http.extra_args_unservable(extra_args) is None
+
+
+def test_extra_args_unservable_owns_every_serve_argv_flag(tmp_path):
+    """The owned flags are read off `_serve_argv` itself, so a flag added there
+    without widening the predicate reddens here."""
+    argv = make_adapter(tmp_path)._serve_argv("/bin/opencode", 4242)
+    flags = {token for token in argv[argv.index("serve") + 1 :] if token.startswith("--")}
+    for flag in flags:
+        assert opencode_http.extra_args_unservable((flag,)) is not None, flag
+
+
 def test_sse_parser_accumulates_and_tolerates_junk():
     lines = [
         "data: " + json.dumps({"type": "server.connected", "properties": {}}),

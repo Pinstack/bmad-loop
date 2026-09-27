@@ -154,6 +154,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Warn in `validate` (`policy.extra-args-unservable`) when a role's resolved
+  `extra_args` under an `opencode-http` profile repeat an adapter-owned serve flag
+  (`--port`/`--hostname`/`--print-logs`, or a `--flag=` spelling): they land after the
+  owned flags, so a later `--port` overrides the port the health poll dials (DW-483).
 - Read the pane for `parked_prompt_patterns` at every stall-grace expiry, not only when a
   wake nudge is due: a final stall (nudges spent, or `dev_stall_nudges = 0`) on a parked
   dialog now pauses as parked instead of retrying (DW-433).

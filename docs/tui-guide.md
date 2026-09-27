@@ -734,7 +734,9 @@ default flags" (off — the key stays absent) from "replace them with exactly
 this list" (on — the input is parsed shell-style; an empty list is a valid
 override and is not the same as unset). Because an override replaces the
 profile's `bypass_args`, it must repeat the permission-bypass flags;
-`bmad-loop validate` warns (`policy.bypass-dropped`) when it does not.
+`bmad-loop validate` warns (`policy.bypass-dropped`) when it does not. Under an
+`opencode-http` profile the list lands after the adapter-owned `--port`/`--hostname`/
+`--print-logs`, so repeating one is warned too (`policy.extra-args-unservable`).
 
 `ctrl+s` validates the whole document through the engine's own parser
 (`policy.loads()`) before writing; errors land in a red strip above the

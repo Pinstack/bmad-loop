@@ -1014,6 +1014,26 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     f"{prof.name} expects e.g. 'anthropic/claude-haiku-4-5'",
                     {"role": role, "model": cfg.model, "profile": prof.name},
                 )
+            # DW-483: `_serve_argv` appends extra_args AFTER the adapter-owned
+            # `--port`/`--hostname`/`--print-logs`, so a repeat overrides them and
+            # the health poll dials a port the server is not on. Per role, because
+            # extra_args resolve per stage; the launch_args twin above is per
+            # profile. Advisory, like `adapter.launch-args-unservable`: validate's
+            # exit code is a compatibility contract. Lazy import: a project with no
+            # opencode-kind profile never imports the opencode module.
+            if (
+                prof is not None
+                and prof.adapter == adapter_registry.OPENCODE_HTTP
+                and cfg.extra_args
+            ):
+                from .adapters.opencode_http import extra_args_unservable
+
+                if (unservable := extra_args_unservable(cfg.extra_args)) is not None:
+                    report.warn(
+                        "policy.extra-args-unservable",
+                        f"{role} adapter.extra_args for {prof.name} (opencode-http): {unservable}",
+                        {"role": role, "profile": prof.name, "extra_args": list(cfg.extra_args)},
+                    )
             # Reasoning effort (#643) has exactly one carrier: the opencode-http
             # kind sends it as the per-prompt `variant`. The tmux generic family
             # has no channel for it — no profile flag, no hook field — so a stage

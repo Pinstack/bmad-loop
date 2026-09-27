@@ -49,6 +49,8 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "policy.model-qualified",
         "policy.effort-unsupported",
         "policy.bypass-dropped",
+        # opencode-http: a role's extra_args repeating an adapter-owned serve flag (DW-483)
+        "policy.extra-args-unservable",
         # worktree isolation beside a project that is NOT inside repo_root (a
         # disjoint layout, #414); a nested project is supported since DW-379
         "policy.isolation-repo-root",

@@ -247,8 +247,12 @@ AUTH_USER = "opencode"
 # spelling of one) collides with what the adapter assigns — a second `serve`
 # becomes a positional, a second `--port` fights the port the health poll dials,
 # a `--print-logs=false` silences the server log the env-fault classifier reads.
+# `extra_args` land AFTER the owned flags, so there only the flags collide (a
+# later `--port` wins over the adapter's; a trailing `serve` is a positional to
+# `serve`, not a second subcommand) — DW-483.
 # Kept beside `_serve_argv` so the two cannot drift apart.
-SERVE_OWNED_TOKENS = frozenset({"serve", "--port", "--hostname", "--print-logs"})
+_SERVE_OWNED_FLAGS = frozenset({"--port", "--hostname", "--print-logs"})
+SERVE_OWNED_TOKENS = _SERVE_OWNED_FLAGS | {"serve"}
 _SERVE_OWNED_VALUED = ("--port=", "--hostname=", "--print-logs=")
 
 # Binaries that need a PROGRAM before `serve`: interpreters and package runners,
@@ -278,12 +282,9 @@ def launch_args_unservable(binary: str, launch_args: tuple[str, ...] | list[str]
     still leave ``serve`` in the script/module slot). Wrappers that name a
     program (``npx -y opencode-ai``, ``node /opt/x.js``, ``python3 -m
     launcher``) are servable."""
-    for token in launch_args:
-        if token in SERVE_OWNED_TOKENS or token.startswith(_SERVE_OWNED_VALUED):
-            return (
-                f"launch_args token {token!r} collides with the `serve --port … "
-                "--hostname 127.0.0.1 --print-logs` argv the adapter assigns"
-            )
+    collision = _owned_collision("launch_args", launch_args, SERVE_OWNED_TOKENS)
+    if collision is not None:
+        return collision
     base = re.split(r"[\\/]", binary)[-1].lower()
     for suffix in _WINDOWS_LAUNCHER_SUFFIXES:
         if base.endswith(suffix):
@@ -295,6 +296,34 @@ def launch_args_unservable(binary: str, launch_args: tuple[str, ...] | list[str]
             f"binary {binary!r} needs a program in launch_args — 'serve' would run "
             "as the program (a script from the workspace, or a package named serve)"
         )
+    return None
+
+
+def extra_args_unservable(extra_args: tuple[str, ...] | list[str]) -> str | None:
+    """Why a role's resolved ``extra_args`` collide with the serve argv, or None.
+    Pure: `bmad-loop validate` reports the reason as
+    ``policy.extra-args-unservable`` (warning), per role, for opencode-http
+    profiles (DW-483).
+
+    ``_serve_argv`` appends ``extra_args`` after the owned flags, so a repeated
+    ``--port`` / ``--hostname`` / ``--print-logs`` (or a ``--flag=`` spelling)
+    overrides what the adapter assigns — the health poll then dials a port the
+    server is not on. ``serve`` is not owned here: after the subcommand it is a
+    positional, not a second subcommand."""
+    return _owned_collision("extra_args", extra_args, _SERVE_OWNED_FLAGS)
+
+
+def _owned_collision(
+    field: str, tokens: tuple[str, ...] | list[str], owned: frozenset[str]
+) -> str | None:
+    """The first token of ``tokens`` repeating one of ``owned`` (or a ``--flag=``
+    spelling of an owned flag), worded for ``field``; None when there is none."""
+    for token in tokens:
+        if token in owned or token.startswith(_SERVE_OWNED_VALUED):
+            return (
+                f"{field} token {token!r} collides with the `serve --port … "
+                "--hostname 127.0.0.1 --print-logs` argv the adapter assigns"
+            )
     return None
 
 
@@ -547,7 +576,9 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         wrapper profile (``binary = "npx"``, ``launch_args = ["-y",
         "opencode-ai"]``) launches ``npx -y opencode-ai serve …``. The adapter owns
         ``serve`` and the three flags (:data:`SERVE_OWNED_TOKENS`); validate warns
-        on launch_args shapes that collide with them (:func:`launch_args_unservable`).
+        on launch_args shapes that collide with them (:func:`launch_args_unservable`)
+        and on a role's extra_args repeating an owned flag
+        (:func:`extra_args_unservable`).
         A seam: tests monkeypatch it to launch the FakeOpencode sidecar
         wrapper-free."""
         extra = self.extra_args or ()

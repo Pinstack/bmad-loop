@@ -1324,6 +1324,89 @@ def test_validate_launch_args_check_keys_on_the_opencode_kind(
     assert [f["severity"] for f in findings if f["check"] == "adapter.kind"] == ["ok"]
 
 
+# DW-483 — opencode-http extra_args repeating the adapter-owned serve flags
+
+
+def _extra_args_unservable(findings):
+    return [f for f in findings if f["check"] == "policy.extra-args-unservable"]
+
+
+def test_validate_warns_per_role_on_opencode_extra_args_repeating_owned_flags(
+    fresh_adapter_registry, project, capsys
+):
+    """`_serve_argv` appends extra_args AFTER `--port`/`--hostname`/`--print-logs`,
+    so a repeat overrides the port the health poll dials. extra_args resolve per
+    stage: only the role whose resolved args collide is named. A WARNING:
+    validate's exit code is a compatibility contract.
+
+    ABLATION: drop the `report.warn` block in `cmd_validate` and this reddens."""
+    install_bmad_config(project)
+    _write_policy(
+        project.project,
+        '[adapter]\nname = "opencode"\n' '[adapter.review]\nextra_args = ["--hostname=0.0.0.0"]\n',
+    )
+    found = _extra_args_unservable(_validate_findings(project.project, capsys))
+    assert [(f["severity"], f["detail"]["role"]) for f in found] == [("warning", "review")]
+    assert "'--hostname=0.0.0.0'" in found[0]["message"]
+    assert found[0]["detail"]["extra_args"] == ["--hostname=0.0.0.0"]
+
+
+def test_validate_names_every_role_inheriting_colliding_extra_args(
+    fresh_adapter_registry, project, capsys
+):
+    """A base `[adapter] extra_args` is inherited by every same-client stage."""
+    install_bmad_config(project)
+    _write_policy(
+        project.project, '[adapter]\nname = "opencode"\nextra_args = ["--port", "5000"]\n'
+    )
+    found = _extra_args_unservable(_validate_findings(project.project, capsys))
+    assert sorted(f["detail"]["role"] for f in found) == sorted(runsetup.ROLES)
+    assert all("'--port'" in f["message"] for f in found)
+
+
+def test_validate_is_silent_on_opencode_without_extra_args(fresh_adapter_registry, project, capsys):
+    """Unset extra_args (the profile defaults) have nothing to collide with.
+
+    ABLATION: drop the `cfg.extra_args` gate and this reddens (the predicate is
+    then handed None)."""
+    install_bmad_config(project)
+    _write_policy(project.project, '[adapter]\nname = "opencode"\n')
+    findings = _validate_findings(project.project, capsys)
+    assert _extra_args_unservable(findings) == []
+    assert any(f["check"] == "adapter.httpx" for f in findings)
+
+
+def test_validate_is_silent_on_non_colliding_opencode_extra_args(
+    fresh_adapter_registry, project, capsys
+):
+    """`serve` after the owned flags is a positional, not a second subcommand.
+
+    The `adapter.httpx` finding is the control: the opencode-kind profile was
+    loaded, so the absent warning is the predicate, not a skipped branch."""
+    install_bmad_config(project)
+    _write_policy(
+        project.project, '[adapter]\nname = "opencode"\nextra_args = ["serve", "--portal"]\n'
+    )
+    findings = _validate_findings(project.project, capsys)
+    assert _extra_args_unservable(findings) == []
+    assert any(f["check"] == "adapter.httpx" for f in findings)
+
+
+def test_validate_extra_args_check_keys_on_the_opencode_kind(
+    fresh_adapter_registry, project, capsys
+):
+    """The generic builder never emits `serve --port …`, so the same extra_args on
+    a generic-kind profile are none of this check's business.
+
+    ABLATION: drop the `OPENCODE_HTTP` kind test from the check and this reddens."""
+    install_bmad_config(project)
+    _write_launch_profile(project.project, "gen", binary="gen", launch_args=[], adapter="generic")
+    _write_policy(project.project, '[adapter]\nname = "gen"\nextra_args = ["--port", "1"]\n')
+    findings = _validate_findings(project.project, capsys)
+    assert _extra_args_unservable(findings) == []
+    assert [f["severity"] for f in findings if f["check"] == "adapter.kind"] == ["ok"]
+
+
 def test_dry_run_previews_launch_args_before_serve(fresh_adapter_registry, project, capsys):
     """The dry-run preview renders what `_serve_argv` launches: a wrapper profile
     previews `npx -y opencode-ai serve …`, not `npx serve …`."""

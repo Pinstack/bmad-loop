@@ -750,7 +750,8 @@ decisions worth stealing:
   port can never impersonate it. The server argv is
   `[binary, *launch_args, "serve", "--port", <free port>, "--hostname", "127.0.0.1", "--print-logs", *extra_args]`,
   so a wrapper profile (`binary = "npx"`, `launch_args = ["-y", "opencode-ai"]`)
-  works; `validate` warns on launch_args shapes that argv cannot serve. Reasoning effort (`SessionSpec.effort`) is the
+  works; `validate` warns on launch_args shapes that argv cannot serve, and on a role's
+  `extra_args` repeating an owned flag (`policy.extra-args-unservable`). Reasoning effort (`SessionSpec.effort`) is the
   one knob that does NOT go through the config: it is a per-call `variant` on
   every `prompt_async` body instead, because the config has no top-level
   `variant` and its `agent.<name>.variant` is inert unless that agent pins a model.
