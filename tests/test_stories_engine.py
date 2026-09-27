@@ -47,6 +47,7 @@ from bmad_loop.plugins.model import LoadedPlugin, PluginManifest, WorkflowSpec
 from bmad_loop.policy import (
     GatesPolicy,
     NotifyPolicy,
+    OperatorPolicy,
     Policy,
     ReviewPolicy,
     ScmPolicy,
@@ -768,6 +769,30 @@ def test_plan_halt_env_only_on_leg_one(project):
     assert engine._extra_session_env(task, "dev")["BMAD_LOOP_PLAN_HALT"] == "1"
     # review sessions never carry it
     assert "BMAD_LOOP_PLAN_HALT" not in engine._extra_session_env(task, "review")
+
+
+def test_review_demotion_park_is_inert_in_stories_mode(project):
+    """`[operator] on_review_demotion = "park"` with parking itself ENABLED: stories
+    mode still never takes a review demotion, because `_review_demotion_parks` keys
+    on the mode's `_operator_park_enabled` seam (False here), not on
+    `policy.operator.enabled` — and so its review prompt never offers the park.
+
+    Ablation: key `_review_demotion_parks` on `policy.operator.enabled` and both
+    assertions redden."""
+    setup_stories(project, [entry("1")])
+    engine, _ = make_engine(
+        project,
+        [],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            operator=OperatorPolicy(enabled=True, on_review_demotion="park"),
+        ),
+    )
+    task = StoryTask(story_key="1", epic=0, spec_file=str(story_spec(project, "1")))
+
+    assert engine._review_demotion_parks() is False
+    assert "awaiting-operator" not in engine._review_prompt(task)
 
 
 def test_review_prompt_carries_no_sprint_board_clause(project):

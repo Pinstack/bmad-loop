@@ -1965,9 +1965,12 @@ def test_verify_review_awaiting_operator_board_is_a_regression(project):
     therefore a deliberate regression — not the unknown token it used to be.
 
     This is the one behavior the vocabulary PR changes, and it is the intended
-    one: until the park path exists, nothing legitimately writes this token, so a
-    review that writes it has revoked a sign-off the same way `in-progress` does.
-    When the park path lands, `operator.on_review_demotion` is what re-routes it.
+    one: a review session never legitimately writes the board, so a review that
+    writes this token onto it has revoked a sign-off the same way `in-progress`
+    does. The park path (`operator.on_review_demotion = "park"`, DW-383) routes a
+    SPEC-declared demotion through the engine, which moves the board itself; a
+    board-only write with the spec still at `done` — this case — still escalates
+    under both modes.
     """
     task = _signoff_regression_task(project, sprint_status="awaiting-operator")
 

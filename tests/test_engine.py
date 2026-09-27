@@ -50,7 +50,7 @@ from conftest import (
 )
 
 from bmad_loop import deferredwork, devcontract, gates, platform_util, runs, verify
-from bmad_loop.adapters.base import ZERO_TOKEN_TIMEOUT_EVIDENCE, SessionResult
+from bmad_loop.adapters.base import ZERO_TOKEN_TIMEOUT_EVIDENCE, SessionResult, SessionSpec
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import (
     _UNREADABLE_LEDGER_DIGEST,
@@ -5011,6 +5011,463 @@ def test_park_notice_keeps_its_numbered_action_list_on_separate_lines(project):
     for n, action in enumerate(ACTIONS, 1):
         assert lines[header + n] == f"  {n}. {action}"
     assert lines[header + len(ACTIONS) + 1].startswith("run `bmad-loop confirm 1-1-a`")
+
+
+# ------------------------ review demotion -> park (DW-383, on_review_demotion)
+
+
+def _demotion_policy(mode="park", **kw):
+    return _park_policy(operator=OperatorPolicy(on_review_demotion=mode), **kw)
+
+
+def _review_pass(paths, story_key, status, *, operator_actions=None, on_entry=None):
+    """A review pass that finalizes the spec at ``status`` and — like the real
+    skill, which is told never to write the board — leaves sprint-status alone.
+    (``review_effect`` writes the board to ``done`` itself, which would mask the
+    orchestrator's own board writes these tests are about.) ``on_entry`` runs
+    first, to observe the state the pass was launched into."""
+
+    def effect(spec: SessionSpec) -> SessionResult:
+        if on_entry is not None:
+            on_entry()
+        sp = spec_path(paths, story_key)
+        baseline = _spec_baseline(sp)
+        write_spec(sp, status, baseline, operator_actions=operator_actions)
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": story_key,
+                "spec_file": str(sp),
+                "baseline_commit": baseline,
+                "status": status,
+                "followup_review_recommended": False,
+                "escalations": [],
+            },
+        )
+
+    return effect
+
+
+def test_review_demotion_parks_under_park_policy_and_the_run_continues(project):
+    """The DW-383 path end to end: dev finalizes `done` (board -> done), the review
+    pass concludes the story owes a human action and finalizes `awaiting-operator`.
+    Under `on_review_demotion = "park"` the board regresses through the one
+    allowlisted pair, the gate clears, the story commits and parks, and the run
+    moves on.
+
+    Ablation: delete the demotion branch in `_review_and_commit` and this fails —
+    the pass reads as non-terminal, the loop asks for an unscripted review session
+    and the story never parks."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev", "1-2-b": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [
+            generic_dev_effect(project, "1-1-a"),
+            _review_pass(project, "1-1-a", "awaiting-operator", operator_actions=ACTIONS),
+            generic_dev_effect(project, "1-2-b"),
+            review_effect(project, "1-2-b", clean=True),
+        ],
+        policy=_demotion_policy(),
+    )
+
+    summary = engine.run()
+
+    parked = engine.state.tasks["1-1-a"]
+    assert parked.phase == Phase.AWAITING_OPERATOR
+    assert parked.operator_actions == ACTIONS
+    assert parked.board_advance_intended == "awaiting-operator"
+    assert parked.commit_sha and parked.commit_sha != parked.baseline_commit
+    assert story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+    assert engine.state.tasks["1-2-b"].phase == Phase.DONE
+    assert summary.awaiting_operator == 1 and summary.done == 1 and not summary.paused
+    assert summary.deferred == 0 and summary.escalated == 0
+    assert len([s for s in adapter.sessions if s.role == "review"]) == 2
+
+    entries = engine.journal.entries()
+    review_results = [
+        e for e in entries if e["kind"] == "review-result" and e["story_key"] == "1-1-a"
+    ]
+    assert [e["status"] for e in review_results] == ["awaiting-operator"]
+    parked_entry = next(e for e in entries if e["kind"] == "story-awaiting-operator")
+    assert parked_entry["actions"] == ACTIONS and parked_entry["commit"] == parked.commit_sha
+    assert "review-verify-failed" not in [e["kind"] for e in entries]
+    # the park record for `bmad-loop confirm` rides the story's own commit
+    assert ".bmad-loop/operator/1-1-a.json" in git(
+        project.project, "ls-tree", "-r", "--name-only", parked.commit_sha
+    )
+
+
+def test_review_demotion_is_not_taken_under_the_default_escalate(project):
+    """The same scripting under the default `escalate`: nothing changes from before
+    DW-383 — the demotion is a non-terminal status, the loop cycles to the budget,
+    the board is never regressed, and nothing parks.
+
+    Ablation: drop the `== "park"` check from `_review_demotion_parks` and the
+    story parks — the board reads `awaiting-operator`, not `done`."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    policy = _park_policy()
+    assert policy.operator.on_review_demotion == "escalate"
+    demote = _review_pass(project, "1-1-a", "awaiting-operator", operator_actions=ACTIONS)
+    engine, adapter = make_engine(
+        project,
+        [generic_dev_effect(project, "1-1-a")] + [demote] * policy.limits.max_review_cycles,
+        policy=policy,
+    )
+
+    summary = engine.run()
+
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DEFERRED and task.operator_actions == []
+    assert summary.awaiting_operator == 0
+    assert story_status(project.sprint_status, "1-1-a") == "done"
+    assert task.board_advance_intended == "done"
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "story-awaiting-operator" not in kinds
+    assert "non-terminal status 'awaiting-operator'" in (task.defer_reason or "")
+    # and no review prompt offered the park
+    assert all(PARK_HEAD not in s.prompt for s in adapter.sessions if s.role == "review")
+
+
+def test_failed_review_demotion_restores_the_board_and_latches_nothing(project):
+    """A demotion the gate refuses (here: no usable operator_actions — fixable)
+    unwinds the orchestrator's own board write before the failure is routed like
+    a failed `done` gate: the repair session sees the board back at `done` and no
+    actions latched, and a later pass that finalizes `done` commits DONE.
+
+    Neither the repair nor the final pass writes the board, so the restore is load-
+    bearing. Ablation: drop the re-advance to `done` and the final pass trips the
+    sign-off-regression escalation (board `awaiting-operator`, spec `done`); drop
+    the `board_advance_intended` restore and the final assertion on it fails;
+    latch before the gate and the repair observes the actions."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    seen: list[tuple[str | None, list[str], str | None]] = []
+
+    def observe():
+        task = engine.state.tasks["1-1-a"]
+        seen.append(
+            (
+                story_status(project.sprint_status, "1-1-a"),
+                list(task.operator_actions),
+                task.board_advance_intended,
+            )
+        )
+
+    repair = generic_dev_effect(project, "1-1-a")
+
+    def observed_repair(spec: SessionSpec) -> SessionResult:
+        observe()
+        return repair(spec)
+
+    engine, adapter = make_engine(
+        project,
+        [
+            generic_dev_effect(project, "1-1-a"),
+            _review_pass(project, "1-1-a", "awaiting-operator", operator_actions=[]),
+            observed_repair,
+            _review_pass(project, "1-1-a", "done"),
+        ],
+        policy=_demotion_policy(),
+    )
+
+    summary = engine.run()
+
+    assert seen == [("done", [], "done")]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE and task.operator_actions == []
+    assert task.board_advance_intended == "done"
+    assert story_status(project.sprint_status, "1-1-a") == "done"
+    assert summary.done == 1 and summary.awaiting_operator == 0 and not summary.paused
+    entries = engine.journal.entries()
+    failed = [e for e in entries if e["kind"] == "review-verify-failed"]
+    assert len(failed) == 1 and "operator_actions" in failed[0]["reason"]
+    assert "story-awaiting-operator" not in [e["kind"] for e in entries]
+    assert [s.role for s in adapter.sessions] == ["dev", "review", "dev", "review"]
+
+
+def test_replayed_failed_review_demotion_still_restores_the_board(project):
+    """The crash-replay shape: the demotion's board write landed, the host died
+    before the gate's failure could unwind it, and the replayed pass re-enters
+    the branch with the row ALREADY at `awaiting-operator` while the recorded
+    sign-off (`board_advance_intended`, never saved mid-demotion) still reads
+    `done`. That row is the orchestrator's own unrestored write, so a failed gate
+    must still put it back — or the next pass finalizing `done` escalates a
+    sign-off regression on a board nobody but the orchestrator touched.
+
+    Ablation: restrict the restore to a row that read `done` and the repair
+    observes `awaiting-operator`."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    seen: list[tuple[str | None, str | None]] = []
+    repair = generic_dev_effect(project, "1-1-a")
+
+    def observed_repair(spec: SessionSpec) -> SessionResult:
+        task = engine.state.tasks["1-1-a"]
+        seen.append((story_status(project.sprint_status, "1-1-a"), task.board_advance_intended))
+        return repair(spec)
+
+    engine, _ = make_engine(
+        project,
+        [
+            generic_dev_effect(project, "1-1-a"),
+            _review_pass(
+                project,
+                "1-1-a",
+                "awaiting-operator",
+                operator_actions=[],
+                on_entry=lambda: set_sprint(project, "1-1-a", "awaiting-operator"),
+            ),
+            observed_repair,
+            _review_pass(project, "1-1-a", "done"),
+        ],
+        policy=_demotion_policy(),
+    )
+
+    summary = engine.run()
+
+    assert seen == [("done", "done")]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE and not summary.paused
+    assert story_status(project.sprint_status, "1-1-a") == "done"
+
+
+@pytest.mark.parametrize("board_at_death", ["done", "awaiting-operator"])
+def test_resume_replays_a_review_demotion_through_the_review_loop(project, board_at_death):
+    """A host death in the review decision window of a demoting pass (REVIEW_VERIFY
+    persisted with the completed review record, before or after the demotion's
+    board write) resumes by REPLAYING that pass into the review loop's demotion
+    branch — the same park as the uncrashed run, with the park-stage intent — not
+    through the dev-declared park's skip-review path, which reads the review's own
+    `awaiting-operator` spec as a dev park: a `done` board then fails its gate
+    and the verified work is deferred, and an already-regressed board parks with
+    the intent still `done`.
+
+    Ablation: drop the replay exemption from `_review_and_commit`'s
+    `_park_awaiting_operator` intercept and both cases redden."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            generic_dev_effect(project, "1-1-a"),
+            _review_pass(project, "1-1-a", "awaiting-operator", operator_actions=ACTIONS),
+        ],
+        policy=_demotion_policy(),
+    )
+
+    def crashing_emit(stage, *args, **kwargs):
+        if stage == "post_review_result":
+            raise RuntimeError("host died in the review decision window")
+        return original_emit(stage, *args, **kwargs)
+
+    original_emit = engine._emit
+    engine._emit = crashing_emit
+    assert engine.run().crashed
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed.phase == Phase.REVIEW_VERIFY
+    assert crashed.board_advance_intended == "done"
+    set_sprint(project, "1-1-a", board_at_death)
+
+    resumed, adapter = resume_engine(project, engine, [], policy=_demotion_policy())
+    summary = resumed.run()
+
+    assert summary.awaiting_operator == 1 and not summary.crashed and not summary.paused
+    final = load_state(resumed.run_dir).tasks["1-1-a"]
+    assert final.phase == Phase.AWAITING_OPERATOR
+    assert final.operator_actions == ACTIONS
+    assert final.board_advance_intended == "awaiting-operator"
+    assert final.review_cycle == 1  # the replay burned no review-budget slot
+    assert story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+    assert adapter.sessions == []
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "resume-verify" in kinds and "story-awaiting-operator" in kinds
+    assert "review-skipped-awaiting-operator" not in kinds
+    assert "review-verify-failed" not in kinds
+
+
+def test_a_hard_stop_inside_the_demotion_gate_unwinds_before_it_travels(project, monkeypatch):
+    """A raise out of the demotion gate — here a hard stop's `RunStopped`, as the
+    review command sink raises it — must not leave the orchestrator's own board
+    regression behind. The run's trailing save would otherwise persist the
+    park-stage intent over a regressed board, the replay unwind (which keys on a
+    persisted `done` intent) would no longer recognize the write, and a later `done`
+    pass would escalate a false sign-off regression.
+
+    Ablation: drop the `except BaseException` unwind in `_park_review_demotion` and
+    both the persisted intent and the board read `awaiting-operator`."""
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            generic_dev_effect(project, "1-1-a"),
+            _review_pass(project, "1-1-a", "awaiting-operator", operator_actions=ACTIONS),
+        ],
+        policy=_demotion_policy(),
+    )
+
+    def stop(*_a, **_kw):
+        raise RunStopped()  # hard (graceful=False), as the command sink raises
+
+    monkeypatch.setattr(engine, "_review_verify_gate", stop)
+
+    engine.run()
+
+    persisted = load_state(engine.run_dir)
+    assert persisted.stopped
+    for task in (engine.state.tasks["1-1-a"], persisted.tasks["1-1-a"]):
+        assert task.board_advance_intended == "done"
+        assert task.operator_actions == []
+    assert story_status(project.sprint_status, "1-1-a") == "done"
+
+
+def test_a_demotion_whose_actions_vanish_after_the_gate_is_not_parked(project, monkeypatch):
+    """The post-gate re-read fallback: the gate passed, but re-reading the spec for
+    the actions to latch finds none (here: the read degrades to None, as
+    `_observed_frontmatter` does on an OSError). Committing then would file a park
+    that owes nothing — `_finalize_commit_phase` would land it DONE over a board at
+    `awaiting-operator` — so the pass is routed as a failed gate: board back at
+    `done`, intent restored, no latch, a `review-verify-failed` naming the actions,
+    and the loop runs another pass.
+
+    Ablation: latch whatever the re-read returned and return the passing outcome,
+    and the story commits on the demotion pass instead of reaching the next one."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    seen: list[tuple[str | None, list[str], str | None]] = []
+    real_observed = Engine._observed_frontmatter
+
+    def observed(self, spec_path, story_key, site):
+        if site == "review-demotion":
+            return None
+        return real_observed(self, spec_path, story_key, site)
+
+    monkeypatch.setattr(Engine, "_observed_frontmatter", observed)
+
+    def observe():
+        task = engine.state.tasks["1-1-a"]
+        seen.append(
+            (
+                story_status(project.sprint_status, "1-1-a"),
+                list(task.operator_actions),
+                task.board_advance_intended,
+            )
+        )
+
+    engine, adapter = make_engine(
+        project,
+        [
+            generic_dev_effect(project, "1-1-a"),
+            _review_pass(project, "1-1-a", "awaiting-operator", operator_actions=ACTIONS),
+            _review_pass(project, "1-1-a", "done", on_entry=observe),
+        ],
+        policy=_demotion_policy(),
+    )
+
+    summary = engine.run()
+
+    assert seen == [("done", [], "done")]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE and task.operator_actions == []
+    assert task.board_advance_intended == "done"
+    assert story_status(project.sprint_status, "1-1-a") == "done"
+    assert summary.done == 1 and summary.awaiting_operator == 0 and not summary.paused
+    entries = engine.journal.entries()
+    failed = [e for e in entries if e["kind"] == "review-verify-failed"]
+    assert len(failed) == 1 and "operator_actions" in failed[0]["reason"]
+    assert "story-awaiting-operator" not in [e["kind"] for e in entries]
+    assert [s.role for s in adapter.sessions] == ["dev", "review", "review"]
+
+
+def test_red_verify_on_a_review_demotion_unwinds_before_the_repair(project, monkeypatch):
+    """The other gate failure: a well-formed demotion (actions declared) whose
+    verify commands are red. The failure is fixable, so a repair runs — and it must
+    find the board back at `done` and NO actions latched, or a later `done` commit
+    would be silently turned into a park.
+
+    Ablation: latch `task.operator_actions` before the gate (as the dev-side park
+    does before `_commit`) and the repair observes the actions — and the story that
+    the final pass finalized `done` lands AWAITING_OPERATOR."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    red = {"on": False}
+    seen: list[tuple[str | None, list[str], str | None]] = []
+
+    def run_verify(_policy, cwd):
+        ok = verify.CommandResult("check", 0, "", "", "")
+        bad = verify.CommandResult("check", 1, "boom\n", "boom\n", "")
+        return [bad if red["on"] else ok]
+
+    monkeypatch.setattr(verify, "run_verify_commands", run_verify)
+
+    def arm():
+        red["on"] = True
+
+    repair = generic_dev_effect(project, "1-1-a")
+
+    def observed_repair(spec: SessionSpec) -> SessionResult:
+        task = engine.state.tasks["1-1-a"]
+        seen.append(
+            (
+                story_status(project.sprint_status, "1-1-a"),
+                list(task.operator_actions),
+                task.board_advance_intended,
+            )
+        )
+        red["on"] = False
+        return repair(spec)
+
+    engine, _ = make_engine(
+        project,
+        [
+            generic_dev_effect(project, "1-1-a"),
+            _review_pass(
+                project, "1-1-a", "awaiting-operator", operator_actions=ACTIONS, on_entry=arm
+            ),
+            observed_repair,
+            _review_pass(project, "1-1-a", "done"),
+        ],
+        policy=_demotion_policy(),
+    )
+
+    summary = engine.run()
+
+    assert seen == [("done", [], "done")]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE and task.operator_actions == []
+    assert story_status(project.sprint_status, "1-1-a") == "done"
+    assert summary.done == 1 and summary.awaiting_operator == 0 and not summary.paused
+
+
+def test_review_demotion_is_inert_when_parking_is_disabled(project):
+    """`on_review_demotion = "park"` needs parking itself to be live: with
+    `[operator] enabled = false` the knob is documented-inert, not an error, and the
+    review prompt carries no park clause."""
+    engine, _ = make_engine(
+        project,
+        [],
+        policy=_park_policy(operator=OperatorPolicy(enabled=False, on_review_demotion="park")),
+    )
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(spec_path(project, "1-1-a")))
+
+    assert engine._review_demotion_parks() is False
+    assert PARK_HEAD not in engine._review_prompt(task)
+
+
+def test_review_prompt_carries_the_park_clause_only_under_park(project):
+    """The review prompt offers the park only in the one mode that accepts it, and
+    appends it LAST (board clauses first, as on the dev seam). The default prompt
+    is byte-identical to the pre-DW-383 one."""
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(spec_path(project, "1-1-a")))
+    default_engine, _ = make_engine(project, [], policy=_park_policy())
+    park_engine, _ = make_engine(project, [], policy=_demotion_policy())
+
+    default = default_engine._review_prompt(task)
+    parked = park_engine._review_prompt(task)
+
+    assert PARK_HEAD not in default
+    assert default.endswith("the board is not.")
+    assert parked == f"{default} {park_engine._operator_park_instruction()}"
+    assert parked.endswith(PARK_TAIL)
+    assert parked.index(BOARD_OWNED) < parked.index(BLOCKED_INVITE) < parked.index(PARK_HEAD)
+    assert "append" not in parked.lower()
+    assert "  " not in parked
 
 
 def test_run_summary_render_labels_both_units(project):

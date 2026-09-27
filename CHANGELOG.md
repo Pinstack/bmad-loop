@@ -9,6 +9,12 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Add `[operator] on_review_demotion = "escalate" | "park"` (default `escalate`,
+  unchanged behavior). Under `park` the review prompt offers the park, and a review
+  pass that finalizes a `done` story at `awaiting-operator` moves the board
+  `done -> awaiting-operator` (the one allowlisted board regression), clears the
+  review gate, commits and parks. A failed demotion gate restores the board to
+  `done`. Sprint mode with parking enabled only (DW-383).
 - Add `bmad-loop resolve <run> --adopt-branch`: finish an escalated worktree story
   from its kept branch instead of re-driving it. The task moves to COMMITTING
   (`escalation-adopted`); on resume (`resume-adopt`) the spec is set to `done` (or

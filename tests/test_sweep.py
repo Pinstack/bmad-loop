@@ -72,6 +72,7 @@ from bmad_loop.policy import (
     GatesPolicy,
     LimitsPolicy,
     NotifyPolicy,
+    OperatorPolicy,
     Policy,
     ReviewPolicy,
     ScmPolicy,
@@ -7843,6 +7844,33 @@ def test_bundle_dev_prompt_has_no_board_clause_but_the_review_prompt_does(projec
     assert "sprint-status.yaml is owned by the orchestrator" in review
     assert "done or awaiting-operator" in review
     assert "status: blocked and say why" in review
+
+
+def test_review_demotion_park_is_inert_in_a_sweep(project):
+    """`on_review_demotion = "park"` with parking ENABLED is still inert for a sweep:
+    `_review_demotion_parks` keys on `SweepEngine._operator_park_enabled` (False),
+    not on `policy.operator.enabled`, so a bundle's review prompt never offers the
+    park. (It still NAMES `awaiting-operator` in the board clause — see the test
+    above — so the park clause's own head is what is asserted absent.)"""
+    engine, _ = make_sweep(
+        project,
+        [],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            scm=ScmPolicy(rollback_on_failure=True),
+            operator=OperatorPolicy(enabled=True, on_review_demotion="park"),
+        ),
+    )
+    task = StoryTask(
+        story_key="dw-fix", epic=0, dw_ids=["DW-1"], bundle_file="/run/bundles/fix/intent.md"
+    )
+    task.spec_file = str(project.implementation_artifacts / "spec-dw-fix.md")
+
+    assert engine._review_demotion_parks() is False
+    review = engine._review_prompt(task)
+    assert "If this story's acceptance criteria include actions only a HUMAN" not in review
+    assert "operator_actions" not in review
 
 
 def test_generic_bundle_prompt_spells_the_post_rename_primitive(project):

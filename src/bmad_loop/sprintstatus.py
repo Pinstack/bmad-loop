@@ -6,6 +6,14 @@ The dev primitive `bmad-build-auto` deliberately does not touch sprint-status
 otherwise only re-reads this file to pick the next story and verify what a
 session claims.
 
+Never-regress has exactly one kind of exception, and it is opt-in per call:
+``advance(..., allow_regression=True)`` may move a row backward only through a
+pair allowlisted in :data:`~bmad_loop.statemachine.BOARD_REGRESSIONS` (today
+``done -> awaiting-operator``, a review pass demoting a finished story to a park,
+DW-383). Any other regressing pair raises
+:class:`~bmad_loop.statemachine.IllegalTransition` and writes nothing, so legal
+board moves still live only in ``statemachine.py``.
+
 Concurrency (#286/#469): being the sole writer is not on its own mutual
 exclusion — a second orchestrator process (another `bmad-loop run`, a sweep, the
 TUI) runs the same sole writer, and :func:`advance` is a read-modify-write of the
@@ -32,6 +40,7 @@ from pathlib import Path
 import yaml
 
 from .platform_util import atomic_write_bytes, file_lock
+from .statemachine import check_board_regression
 
 EPIC_RE = re.compile(r"^epic-(\d+)$")
 RETRO_RE = re.compile(r"^epic-(\d+)-retrospective$")
@@ -43,12 +52,15 @@ SHORT_REF_RE = re.compile(r"^(\d+)[-.](\d+)([a-z]?)$")  # short story ref: 3-1, 
 BARE_NUM_RE = re.compile(r"^(\d+)([a-z]?)$")  # a lone story number, needs --epic
 
 # Lifecycle order, earliest -> latest. `advance` never moves a story backward
-# through this sequence (matches sync-sprint-status's "never regress"), and it is
-# the only ordering any caller may use — a token absent from it cannot be ordered
-# at all, so every consumer treats "unknown" conservatively rather than guessing.
+# through this sequence (matches sync-sprint-status's "never regress") — save the
+# single allowlisted opt-in regression `done -> awaiting-operator` (DW-383,
+# `statemachine.BOARD_REGRESSIONS`, `allow_regression=True`) — and it is the only
+# ordering any caller may use: a token absent from it cannot be ordered at all, so
+# every consumer treats "unknown" conservatively rather than guessing.
 # `awaiting-operator` sits immediately before `done`: parking is the last stop on
 # the way to finished, so confirming a parked story is a legal forward advance
-# through the sole writer, while nothing can ever regress `done` back into it.
+# through the sole writer, while `done` regresses back into it only through that
+# explicit opt-in (a review demotion under `on_review_demotion = "park"`).
 STATUS_ORDER = (
     "backlog",
     "ready-for-dev",
@@ -298,7 +310,14 @@ def _row_at_or_past(current: str, target: str) -> bool:
     )
 
 
-def advance(path: Path, story_key: str, target: str, *, now: str | None = None) -> str | None:
+def advance(
+    path: Path,
+    story_key: str,
+    target: str,
+    *,
+    now: str | None = None,
+    allow_regression: bool = False,
+) -> str | None:
     """Advance a story's sprint-status to `target` for the generic-skill path.
 
     Mirrors sync-sprint-status.md: skip when the file is missing or the story is
@@ -381,6 +400,17 @@ def advance(path: Path, story_key: str, target: str, *, now: str | None = None) 
     unlocked. :func:`advanced_bytes` deliberately does NOT come through
     here: it calls :func:`_advance_locked` against a private throwaway copy, so it
     neither contends on the real board's sidecar nor mints one of its own.
+
+    ``allow_regression=True`` is the one allowlisted exception to never-regress
+    (DW-383). A row strictly PAST ``target`` is then moved back to it when the
+    ``(current, target)`` pair is in
+    :data:`~bmad_loop.statemachine.BOARD_REGRESSIONS`; any other regressing pair
+    raises :class:`~bmad_loop.statemachine.IllegalTransition` and writes nothing.
+    Forward moves, a row already AT ``target``, and absent rows behave exactly as
+    without the flag. The advisory probe never answers a regression the flag asks
+    for — it falls through to the lock, and the allowlist check runs there, under
+    the hold, because the probe swallows every exception it meets.
+    :func:`advanced_bytes` never passes the flag.
     """
     if not path.is_file():
         return None  # no board, nothing to serialize against — take no lock
@@ -388,7 +418,7 @@ def advance(path: Path, story_key: str, target: str, *, now: str | None = None) 
         current = story_status(path, story_key)
         if current is None:
             return None  # absent row — nothing this call would write
-        if _row_at_or_past(current, target):
+        if _row_at_or_past(current, target) and not (allow_regression and current != target):
             return current  # already at or past target — never regress, no write
     except Exception:  # nosec B110 - ADVISORY probe: a fault here must decide nothing
         # Broad by design, and the swallow is the point: narrowing the catch would
@@ -398,11 +428,16 @@ def advance(path: Path, story_key: str, target: str, *, now: str | None = None) 
         # function's raises through.
         pass
     with _board_lock(path):
-        return _advance_locked(path, story_key, target, now=now)
+        return _advance_locked(path, story_key, target, now=now, allow_regression=allow_regression)
 
 
 def _advance_locked(
-    path: Path, story_key: str, target: str, *, now: str | None = None
+    path: Path,
+    story_key: str,
+    target: str,
+    *,
+    now: str | None = None,
+    allow_regression: bool = False,
 ) -> str | None:
     """:func:`advance`'s read-modify-write, run with the board's lock already held.
 
@@ -411,14 +446,20 @@ def _advance_locked(
     already have done, and deliberately: those answers are taken without
     exclusion, so a delete can land between the ``is_file`` check and the
     acquisition, and the advisory probe's row (#736) can be stale by the time the
-    lock is held. Only what this function reads decides the published bytes."""
+    lock is held. Only what this function reads decides the published bytes.
+
+    ``allow_regression`` is :func:`advance`'s opt-in: the authoritative
+    allowlist check for a regressing pair happens here, under the hold, and a
+    refused pair raises before any byte is written."""
     if not path.is_file():
         return None
     current = story_status(path, story_key)
     if current is None:
         return None
     if _row_at_or_past(current, target):
-        return current  # already at or past target — never regress
+        if not allow_regression or current == target:
+            return current  # already at or past target — never regress
+        check_board_regression(story_key, current, target)  # raises unless allowlisted
 
     text = path.read_bytes().decode("utf-8")
     lines = text.splitlines(keepends=True)

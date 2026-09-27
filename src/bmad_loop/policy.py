@@ -36,6 +36,7 @@ SWEEP_AUTO_MODES = {"never", "per-epic", "run-end"}
 REVIEW_TRIGGER_MODES = {"always", "recommended"}
 REVIEW_ON_TIMEOUT_MODES = {"retry", "salvage-if-done", "defer"}
 REVIEW_ON_STATUS_CONTRADICTION_MODES = {"escalate", "retry"}
+OPERATOR_ON_REVIEW_DEMOTION_MODES = {"escalate", "park"}
 # Session stages, in run order. Lives here rather than in the TUI because
 # settings_schema's expand_stages loop fans a template section out over it.
 STAGES = ("dev", "review", "triage")
@@ -326,6 +327,16 @@ class OperatorPolicy:
     # know the status, so a session that writes it anyway is retried with that
     # mismatch as feedback rather than silently committing.
     enabled: bool = True
+    # What a REVIEW pass that finalizes the spec at `awaiting-operator` gets
+    # (DW-383). "escalate" (default) keeps the historical behavior: the review
+    # prompt carries no park clause, the demotion is not accepted, and the loop
+    # cycles on it like any non-terminal status. "park" takes it down the normal
+    # commit path as a park: the board moves `done -> awaiting-operator` through
+    # the one allowlisted regression (statemachine.BOARD_REGRESSIONS), the review
+    # verify gate holds it to the park pair + non-empty actions + verify commands,
+    # and the story commits to AWAITING_OPERATOR. Inert unless parking itself is
+    # live (`enabled` in sprint mode) — stories/sweep runs never park.
+    on_review_demotion: str = "escalate"
 
 
 @dataclass(frozen=True)
@@ -1282,8 +1293,17 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         tasks_height=_tui_dim(tui_d, "tasks_height"),
     )
     operator = OperatorPolicy(
-        enabled=_typed_bool(operator_d, "operator", "enabled", OperatorPolicy.enabled)
+        enabled=_typed_bool(operator_d, "operator", "enabled", OperatorPolicy.enabled),
+        on_review_demotion=_typed_str(
+            operator_d, "operator", "on_review_demotion", OperatorPolicy.on_review_demotion
+        ).strip(),
     )
+    if operator.on_review_demotion not in OPERATOR_ON_REVIEW_DEMOTION_MODES:
+        raise PolicyError(
+            "operator.on_review_demotion must be one of "
+            f"{sorted(OPERATOR_ON_REVIEW_DEMOTION_MODES)}:"
+            f" got {operator.on_review_demotion!r}"
+        )
     mux = MuxPolicy(backend=_typed_str(mux_d, "mux", "backend", MuxPolicy.backend).strip())
     if mux.backend and not _MUX_NAME_RE.match(mux.backend):
         raise PolicyError(
@@ -1538,6 +1558,12 @@ low_frame_rate = false
 # story with `bmad-loop confirm <story-key>` once you have done those actions.
 # Turn this off to hold sessions to the two older outcomes (done / blocked).
 enabled = true
+# What happens when a REVIEW pass concludes a `done` story still owes such
+# actions and finalizes its spec at awaiting-operator. "escalate" (default): the
+# review is not offered the park and the demotion is not accepted. "park": the
+# review prompt offers the park, and a demotion that passes the verify gate
+# moves the board done -> awaiting-operator, commits, and parks the story.
+# on_review_demotion = "escalate"
 
 [mux]
 # Terminal-multiplexer backend for this machine (the transport axis — which

@@ -1,7 +1,14 @@
 import pytest
 
 from bmad_loop.model import TERMINAL_PHASES, Phase, StoryTask
-from bmad_loop.statemachine import TRANSITIONS, IllegalTransition, advance
+from bmad_loop.sprintstatus import STATUS_ORDER
+from bmad_loop.statemachine import (
+    BOARD_REGRESSIONS,
+    TRANSITIONS,
+    IllegalTransition,
+    advance,
+    check_board_regression,
+)
 
 
 def test_table_covers_every_phase():
@@ -100,3 +107,33 @@ def test_migration_triage_commit_path_sequence():
     ):
         advance(task, phase)
     assert task.terminal
+
+
+# ---------------------------------------------------------------------------
+# sprint-board regression allowlist (DW-383)
+
+
+def test_board_regression_allowlist_is_exactly_the_review_demotion():
+    """One pair and no more: widening this set silently licenses the sole board
+    writer to walk a story backward."""
+    assert BOARD_REGRESSIONS == frozenset({("done", "awaiting-operator")})
+
+
+def test_the_allowlisted_board_regression_passes():
+    check_board_regression("1-1-x", "done", "awaiting-operator")  # no raise
+
+
+@pytest.mark.parametrize(
+    ("current", "target"),
+    [
+        (current, target)
+        for i, current in enumerate(STATUS_ORDER)
+        for target in STATUS_ORDER[:i]
+        if (current, target) != ("done", "awaiting-operator")
+    ],
+)
+def test_every_other_board_regression_raises(current, target):
+    """Ablation: make `check_board_regression` a no-op (or widen the set) and every
+    case here reddens."""
+    with pytest.raises(IllegalTransition, match=f"{current} -> {target}"):
+        check_board_regression("1-1-x", current, target)

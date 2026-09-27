@@ -8426,6 +8426,54 @@ def test_awaiting_operator_isolated_unit_carries_its_board_advance(project):
     ]
 
 
+def test_review_demotion_under_isolation_carries_the_park_to_the_main_board(project):
+    """DW-383 under worktree isolation: the dev leg finalizes `done` (the unit's
+    seeded board -> done), then a review pass finalizes the spec at
+    `awaiting-operator` with actions and leaves the board alone. Under
+    `on_review_demotion = "park"` the unit board regresses through the allowlisted
+    pair, `board_advance_intended` follows it, the unit merges, and
+    `_carry_board_advance` carries `awaiting-operator` — not `done` — to the MAIN
+    (gitignored) board."""
+    ignored_sprint(project, {"1-1-a": "ready-for-dev"})
+    actions = ["publish the DNS record"]
+
+    def demote(spec):
+        wt = project.rebased(spec.cwd)
+        sp = wt.implementation_artifacts / "spec-1-1-a.md"
+        baseline = _spec_baseline(sp)
+        write_spec(sp, "awaiting-operator", baseline, operator_actions=actions)
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": "1-1-a",
+                "spec_file": str(sp),
+                "baseline_commit": baseline,
+                "status": "awaiting-operator",
+                "followup_review_recommended": False,
+                "escalations": [],
+            },
+        )
+
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), demote],
+        policy=replace(wt_policy(), operator=OperatorPolicy(on_review_demotion="park")),
+    )
+
+    summary = engine.run()
+
+    task = engine.state.tasks["1-1-a"]
+    assert summary.awaiting_operator == 1 and task.phase == Phase.AWAITING_OPERATOR
+    assert task.operator_actions == actions
+    assert task.board_advance_intended == "awaiting-operator"
+    assert "unit-merged" in [e["kind"] for e in engine.journal.entries()]
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+    assert [(e["target"], e["status"]) for e in _board_carry_events(engine)] == [
+        ("awaiting-operator", "awaiting-operator")
+    ]
+
+
 def test_board_carry_refuses_a_board_replaced_by_a_directory(project, monkeypatch):
     """DW-237 at `_carry_board_advance`, the one guarded site whose family is
     `"store"` rather than `"ledger"`: the family names the validation POLICY, not the

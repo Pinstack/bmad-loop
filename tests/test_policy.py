@@ -847,6 +847,7 @@ def test_boolean_policy_fields_accept_a_real_toml_false(section, key):
         ("scm", "target_branch"),
         ("scm", "merge_strategy"),
         ("scm", "commit_message_template"),
+        ("operator", "on_review_demotion"),
         ("mux", "backend"),
     ],
 )
@@ -1428,6 +1429,24 @@ def test_template_operator_block_parses_to_the_default():
     # unlike [mux]'s commented anchor, this key ships uncommented — the template
     # must therefore agree with the dataclass, not merely parse
     assert policy.loads(policy.POLICY_TEMPLATE).operator.enabled is True
+
+
+def test_operator_on_review_demotion_default_parse_and_template():
+    """Default "escalate" is today's behavior byte-for-byte (DW-383); "park" is the
+    opt-in. The template ships the key commented at its default, so the template
+    must still parse to the dataclass default."""
+    assert policy.loads("").operator.on_review_demotion == "escalate"
+    assert policy.OperatorPolicy().on_review_demotion == "escalate"
+    for mode in sorted(policy.OPERATOR_ON_REVIEW_DEMOTION_MODES):
+        loaded = policy.loads(f'[operator]\non_review_demotion = " {mode} "\n')
+        assert loaded.operator.on_review_demotion == mode
+    assert policy.loads(policy.POLICY_TEMPLATE).operator.on_review_demotion == "escalate"
+    assert '# on_review_demotion = "escalate"' in policy.POLICY_TEMPLATE
+
+
+def test_operator_on_review_demotion_invalid():
+    with pytest.raises(policy.PolicyError, match=r"operator\.on_review_demotion"):
+        policy.loads('[operator]\non_review_demotion = "defer"\n')
 
 
 # ---------------------------------------------------------------------------

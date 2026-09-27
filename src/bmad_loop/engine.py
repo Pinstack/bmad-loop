@@ -3297,7 +3297,12 @@ class Engine:
     def _review_and_commit(
         self, task: StoryTask, resume_result: SessionResult | None = None
     ) -> None:
-        if self._park_awaiting_operator(task):
+        # A replayed REVIEW result finalized at `awaiting-operator` under
+        # on_review_demotion = "park" is a review demotion (DW-383), not a dev park
+        # (a dev park never reaches a review session): the loop below replays it
+        # into `_park_review_demotion`, which owns the board regression and intent.
+        replayed_demotion = resume_result is not None and self._review_demotion_parks()
+        if not replayed_demotion and self._park_awaiting_operator(task):
             return
         if not self.policy.review.enabled and not task.salvage_refile_pending:
             # review.enabled = false: the bmad-build-auto session's own inline
@@ -3527,10 +3532,21 @@ class Engine:
             self._emit("post_review_result", task, role="review", result_json=rj)
             if self._run_workflows("post_review_result", task, task.review_cycle):
                 return
-            if status == "done" and (not followup or damped):
-                outcome = self._review_verify_gate(
-                    task, session_status=result.status, result_json=result.result_json
-                )
+            # A review DEMOTION (DW-383): the pass concluded a `done` story still
+            # owes human-only external actions and finalized the spec at
+            # `awaiting-operator`. Under `[operator] on_review_demotion = "park"`
+            # that is a converging outcome, gated and committed like `done` (the
+            # park is chosen downstream by `_finalize_commit_phase` from the
+            # latched actions). Under the default "escalate" it is not taken: the
+            # status falls through as non-terminal, exactly as before.
+            demoted = status == verify.AWAITING_OPERATOR and self._review_demotion_parks()
+            if demoted or (status == "done" and (not followup or damped)):
+                if demoted:
+                    outcome = self._park_review_demotion(task, result)
+                else:
+                    outcome = self._review_verify_gate(
+                        task, session_status=result.status, result_json=result.result_json
+                    )
                 if outcome.ok:
                     if damped:
                         # Verify-green here is the same authority as the converged /
@@ -3881,6 +3897,119 @@ class Engine:
         task.operator_actions = list(verify.operator_actions_of(fm))
         self._skip_review_and_commit(task, kind="review-skipped-awaiting-operator")
         return True
+
+    def _review_demotion_parks(self) -> bool:
+        """Whether a review pass may demote a ``done`` story to an
+        ``awaiting-operator`` park (DW-383).
+
+        Needs BOTH the opt-in ``[operator] on_review_demotion = "park"`` AND parking
+        itself being live (``_operator_park_enabled``): ``StoriesEngine`` and
+        ``SweepEngine`` override that seam to False, and ``[operator] enabled =
+        false`` turns parking off, so the knob is inert there rather than a
+        ``PolicyError`` — the verify gates in those modes cannot hold a park to its
+        pair anyway."""
+        return self.policy.operator.on_review_demotion == "park" and self._operator_park_enabled()
+
+    def _park_review_demotion(self, task: StoryTask, result: SessionResult) -> VerifyOutcome:
+        """Gate a review pass that demoted the story to ``awaiting-operator``.
+
+        The review loop's counterpart of ``_park_awaiting_operator``: the pass
+        finalized the spec at the park status, so the board must follow before the
+        gate reads it. The dev leg already advanced the board to ``done``, and
+        ``done -> awaiting-operator`` is a regression — the ONE pair
+        ``statemachine.BOARD_REGRESSIONS`` allowlists, performed through the sole
+        writer on explicit ``allow_regression=True``. ``board_advance_intended``
+        follows it so ``_carry_board_advance`` re-applies the park stage, not
+        ``done``, to the main checkout under isolation.
+
+        Then the ordinary review gate: ``verify_review`` accepts the
+        ``(awaiting-operator, awaiting-operator)`` pair under ``operator_park``,
+        demands a non-empty action list, and runs the verify commands. Only once it
+        passes are the actions latched onto the task — immediately before the
+        caller's ``_commit``, so a failed demotion can never leave a latch that
+        turns a later ``done`` commit into a park.
+
+        A failed gate unwinds the board write: the row is re-advanced FORWARD to
+        ``done`` (only when the orchestrator's own sign-off was ``done`` — the row
+        read ``done`` before the demotion, or reads the park stage with the
+        recorded intent still ``done``, which is this write replayed; the
+        orchestrator never promotes a row it did not itself sign off) and the prior
+        ``board_advance_intended`` is restored, so a later pass that finalizes
+        ``done`` does not trip the sign-off-regression escalation on the
+        orchestrator's own write. The caller routes the returned failure exactly
+        like a failed ``done`` gate.
+
+        A RAISE out of the gate or the re-read (a hard stop's ``RunStopped`` from
+        the review command sink, an FS fault) unwinds the same way before it
+        travels on — best effort, never replacing the exception — because the run's
+        trailing save would otherwise persist the park-stage intent over a
+        regressed board, and a later ``done`` pass would escalate a false sign-off
+        regression.
+
+        Crash-replay: a replayed result re-enters here, the board write is a no-op
+        on a row already at the park stage, the gate re-runs, and a failure still
+        unwinds the row to ``done`` when the persisted intent is still ``done`` (a
+        host death between the write and any save). A death after a save that
+        carried the park-stage intent — none happens inside this method, but a
+        raise that escaped the unwind would leave one — is not recognized as this
+        write, and the row stays where it is."""
+        board = self.workspace.paths.sprint_status
+        # A board gone by now is the gate's to refuse (sprint None -> retry), not a
+        # crash here: `advance` answers None over a missing file, `load` raises.
+        prior_board = sprint_story_status(board, task.story_key) if board.is_file() else None
+        prior_intended = task.board_advance_intended
+
+        def unwind() -> None:
+            # A row already at the park stage while the recorded sign-off is still
+            # `done` is this method's own unrestored write, replayed after a host
+            # death between the write and the restore (nothing in this method
+            # saves the park-stage intent), so it unwinds the same way.
+            if prior_board == "done" or (
+                prior_board == verify.AWAITING_OPERATOR and prior_intended == "done"
+            ):
+                sprint_advance(board, task.story_key, "done")
+            task.board_advance_intended = prior_intended
+
+        sprint_advance(board, task.story_key, verify.AWAITING_OPERATOR, allow_regression=True)
+        task.board_advance_intended = verify.AWAITING_OPERATOR
+        try:
+            outcome = self._gate_review_demotion(task, result)
+        except BaseException:
+            with contextlib.suppress(Exception):
+                unwind()
+            raise
+        if not outcome.ok:
+            unwind()
+        return outcome
+
+    def _gate_review_demotion(self, task: StoryTask, result: SessionResult) -> VerifyOutcome:
+        """``_park_review_demotion``'s gate + latch, run with the board already
+        demoted. Latches ``task.operator_actions`` only on a pass; the caller owns
+        every unwind."""
+        outcome = self._review_verify_gate(
+            task, session_status=result.status, result_json=result.result_json
+        )
+        if outcome.ok:
+            # The gate just read these same actions and found them non-empty; a
+            # re-read that now finds none (the spec changed or became unreadable
+            # in between — journaled by `_observed_frontmatter`) must not commit
+            # a park with nothing owed, which `_finalize_commit_phase` would file
+            # as DONE on a board reading `awaiting-operator`. Route it as a failed
+            # gate instead.
+            fm = (
+                self._observed_frontmatter(Path(task.spec_file), task.story_key, "review-demotion")
+                if task.spec_file
+                else None
+            )
+            actions = list(verify.operator_actions_of(fm)) if fm is not None else []
+            if actions:
+                task.operator_actions = actions
+                return outcome
+            return VerifyOutcome.retry(
+                f"spec for {task.story_key} no longer declares usable operator_actions "
+                "after the review-demotion gate passed"
+            )
+        return outcome
 
     def _skip_review_and_commit(self, task: StoryTask, *, kind: str = "review-skipped") -> None:
         """review.enabled = false: no separate review session runs. The
@@ -6687,8 +6816,16 @@ class Engine:
         # caller-owned one at the ledger↔board seam, and the join at the
         # board↔redirect seam. The `if tail else ""` guard is live, not defensive —
         # `StoriesEngine` inherits this method and empties both clauses.
+        #
+        # The park clause rides here only under `[operator] on_review_demotion =
+        # "park"` (DW-383) — the one mode in which a review's `awaiting-operator`
+        # finalization is accepted. It goes LAST, after the board clauses, the same
+        # board-before-park order the dev seam keeps. Default prompt unchanged.
+        park = self._operator_park_instruction() if self._review_demotion_parks() else ""
         clauses = [
-            c for c in (self._sprint_board_instruction(), self._board_handback_redirect()) if c
+            c
+            for c in (self._sprint_board_instruction(), self._board_handback_redirect(), park)
+            if c
         ]
         tail = " ".join(clauses)
         return (
@@ -7591,15 +7728,20 @@ class Engine:
         "Never use the blocked status for this" a sentence later in the same prompt.
 
         The vocabulary overlap with the park clause ("a human decision" vs "actions
-        only a HUMAN can perform outside the repo") was checked and is unreachable,
-        not merely unlikely: the two never co-occur because each rides a different
-        builder, and more strongly a parked story is never dispatched a review
-        session at all — `_review_and_commit` early-returns on `_park_awaiting_operator`.
-        The only residual is a story the dev pass should have parked and finalized
-        `done` instead, and there this opens no new path (`blocked` is the skill's
-        native escape) and displaces nothing better (park is dev-only, so a review
-        session cannot park either way). Pause-and-reach-a-human beats a false-green
-        `done`.
+        only a HUMAN can perform outside the repo") is unreachable under the default
+        policy, not merely unlikely: the two never co-occur because each rides a
+        different builder, and more strongly a parked story is never dispatched a
+        review session at all — `_review_and_commit` early-returns on
+        `_park_awaiting_operator`. The residual is a story the dev pass should have
+        parked and finalized `done` instead. By default this opens no new path there
+        (`blocked` is the skill's native escape) and displaces nothing better: a
+        review session is not offered the park, and its `awaiting-operator`
+        finalization is not accepted. Pause-and-reach-a-human beats a false-green
+        `done`. Under `[operator] on_review_demotion = "park"` (DW-383) the review
+        prompt DOES carry the park clause after this one, deliberately: that is
+        the residual's honest outcome, and the two triggers stay distinct — a human
+        DECISION the story cannot proceed without (blocked, halts) versus human
+        ACTIONS outside the repo on otherwise finished work (park, run continues).
 
         Bare sentence, no leading separator, backtick-free — same contract as the
         clause it follows."""
@@ -7613,7 +7755,9 @@ class Engine:
 
     def _operator_park_instruction(self) -> str:
         """The park contract, injected into every dev prompt while
-        ``[operator] enabled``. "" when the feature is off.
+        ``[operator] enabled`` — and appended last to the review prompt under
+        ``[operator] on_review_demotion = "park"`` (DW-383). "" when the feature is
+        off.
 
         Engine-injected rather than skill-owned because the durable home for it is
         upstream — bmad-build-auto's spec template and step-03/04 finalize rules —

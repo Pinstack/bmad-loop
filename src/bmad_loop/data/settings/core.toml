@@ -473,6 +473,13 @@ kind = "switch"
 default_ref = "OperatorPolicy.enabled"
 label = "allow awaiting-operator parks"
 description = "let a session finish + commit a story whose acceptance criteria need a human action (buy a domain, publish a DNS record) and park it as awaiting-operator instead of forcing done or blocked · what is owed is recorded in the story spec's operator_actions: frontmatter, and `bmad-loop confirm <story-key>` completes the story once you have done it"
+[[section.field]]
+key = "on_review_demotion"
+kind = "select"
+options_ref = "OPERATOR_ON_REVIEW_DEMOTION_MODES"
+default_ref = "OperatorPolicy.on_review_demotion"
+label = "review may park a done story"
+description = "escalate: a review pass is never offered the park, and one that finalizes a done story at awaiting-operator is not accepted (default) · park: the review may demote it — the board moves done -> awaiting-operator, the story commits and parks · sprint mode with parks enabled only"
 
 [[section]]
 name = "mux"

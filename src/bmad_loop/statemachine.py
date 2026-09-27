@@ -1,4 +1,11 @@
-"""Story lifecycle transition table — the single source of truth for legal moves."""
+"""Story lifecycle transition table — the single source of truth for legal moves.
+
+Two tables live here. :data:`TRANSITIONS` is the task-phase graph
+:func:`advance` enforces. :data:`BOARD_REGRESSIONS` is the sprint-board side:
+``sprintstatus.advance`` never moves a row backward through its lifecycle order,
+and the pairs listed here are the only exceptions it may perform — each one only
+when its caller opts in explicitly (:func:`check_board_regression`).
+"""
 
 from __future__ import annotations
 
@@ -57,3 +64,27 @@ def advance(task: StoryTask, to: Phase) -> None:
             f"{task.story_key}: {task.phase} -> {to} (allowed: {sorted(allowed)})"
         )
     task.phase = to
+
+
+# The sprint-board regressions `sprintstatus.advance` may perform on explicit
+# opt-in (`allow_regression=True`); every other backward move stays illegal.
+# ("done", "awaiting-operator"): a review pass that finds a `done` story owes
+# human-only external actions demotes it to a park (`[operator]
+# on_review_demotion = "park"`, DW-383). The board sign-off the dev leg wrote is
+# `done`, and without this exception never-regress would leave no honest move.
+# Kept as (current, target) status-token pairs so this module stays free of any
+# sprintstatus import (sprintstatus imports this one).
+BOARD_REGRESSIONS: frozenset[tuple[str, str]] = frozenset({("done", "awaiting-operator")})
+
+
+def check_board_regression(story_key: str, current: str, target: str) -> None:
+    """Refuse a board regression ``current -> target`` that is not allowlisted.
+
+    Called by the sole board writer only for a move it has already classified as
+    a regression; a no-op for a pair in :data:`BOARD_REGRESSIONS`, and
+    :class:`IllegalTransition` for anything else."""
+    if (current, target) not in BOARD_REGRESSIONS:
+        raise IllegalTransition(
+            f"{story_key}: sprint-status {current} -> {target} is a regression "
+            f"(allowed: {sorted(BOARD_REGRESSIONS)})"
+        )

@@ -9565,7 +9565,9 @@ def verify_review(
     ``sprint_reached_done`` tells the gate that the orchestrator had already
     advanced this story's sprint-status to ``done`` before the review ran (it is
     the sole ``sprint_advance`` caller, ``verify_dev`` asserted the write landed,
-    and ``advance`` never regresses). A board now sitting *earlier* than ``done``
+    and ``advance`` never regresses save the one allowlisted opt-in
+    ``done -> awaiting-operator`` of a review demotion, DW-383 — whose own pair
+    this gate accepts below). A board now sitting *earlier* than ``done``
     is therefore not a stage the story never reached — it is a review session
     deliberately revoking the sign-off. Nothing in the review loop re-advances
     the board, so retrying only replays the same failure until the budget runs
@@ -9575,7 +9577,10 @@ def verify_review(
 
     ``(awaiting-operator, awaiting-operator)`` is the second accepted pair, on
     the same observed-spec-status selection ``verify_dev`` uses: this is the gate
-    the park path runs before committing (``Engine._park_awaiting_operator``), so
+    both park paths run before committing — the dev-declared park
+    (``Engine._park_awaiting_operator``) and the review demotion under
+    ``[operator] on_review_demotion = "park"`` (``Engine._park_review_demotion``,
+    DW-383, which has moved the board to the park stage first) — so
     parked work clears exactly the deterministic checks every other commit path
     clears *at this gate* — the pair, a non-empty action list, and the verify
     commands. The scope is load-bearing: a ``done`` story additionally clears
