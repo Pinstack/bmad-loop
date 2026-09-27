@@ -583,6 +583,15 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # `session-idle` / `session-active` (#680): seconds the live transcript has
         # sat still — a float the adapter measured from two stats, no identifier.
         "idle_s",
+        # `sweep-retro-ingest-unavailable`'s discriminator (DW-388): WHICH input the
+        # retro action-item ingest could not use, as a closed three-value enum
+        # (`sprint-status-unreadable` | `action-items-malformed` |
+        # `ledger-unavailable`) chosen by the except arm, never read from either
+        # file. A closed slug deliberately — `error`, the natural spelling, is in
+        # `diagnostics._JOURNAL_DROP_FIELDS` and ships as a presence marker, which
+        # could not tell the operator whether to repair the board or the ledger.
+        # Item ids and action text are operator free text and are never journaled.
+        "ingest_cause",
         # `verify-command-result` (DW-353): a bare `True`, present only on a pass a
         # hard stop request cut short. No identifier.
         "interrupted",
@@ -1693,6 +1702,15 @@ JOURNAL_KINDS = frozenset(
         # `dw_ids` carries the ids the plan named and is routed by name in
         # `diagnostics._JOURNAL_KEYLIST_FIELDS`; `error` is already a drop field.
         "sweep-resolved-close-unavailable",
+        # DW-388. `_ingest_retro_action_items` filed sprint-status retro action
+        # items into the ledger on a fresh sweep; `dw_ids` names the minted
+        # entries and is routed by name (`diagnostics._JOURNAL_KEYLIST_FIELDS`).
+        "sweep-retro-items-ingested",
+        # ...and its degrade: the board could not be read, its `action_items` is
+        # not a list, or the ledger append faulted before writing. The sweep
+        # carries on without ingesting. `ingest_cause` is the closed slug that
+        # tells the three apart; `error` is already a drop field.
+        "sweep-retro-ingest-unavailable",
         "sweep-return-no-client",
         "sweep-returned-after-decisions",
         "sweep-selection-empty",

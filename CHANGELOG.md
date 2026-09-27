@@ -9,6 +9,11 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Ingest sprint-status retro `action_items` into the deferred-work ledger: a fresh
+  `bmad-loop sweep` files each id-keyed, not-`done` item as a `DW-<n>` entry
+  (`origin: retro action item <id>`, `severity: low`) and commits it before triage.
+  A twin of any status, archived stubs included, keeps an item from being re-filed;
+  a bad board journals `sweep-retro-ingest-unavailable` and the sweep continues (DW-388).
 - Document the `_bmad/custom/bmad-retrospective.toml` override that points
   `bmad-retrospective`'s session-log evidence at run-dir journals and per-session logs
   (setup guide; linked from the FEATURES retrospective bullet). Docs only; not shipped by

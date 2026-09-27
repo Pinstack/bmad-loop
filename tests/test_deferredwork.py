@@ -4043,6 +4043,124 @@ def test_cross_spec_advisory_suppression_is_rechecked_under_the_lock(tmp_path, m
     assert not entries[0].open and entries[1].open
 
 
+# --------------------------------------------- dedupe_any_status (DW-388)
+
+RETRO_ORIGIN = "retro action item epic-1-retro-item-1-add-x"
+
+RETRO_SEED = """\
+# Deferred Work
+
+### DW-1: Add X to the checklist
+origin: retro action item epic-1-retro-item-1-add-x
+location: n/a
+source_spec: `docs/retro-epic-1.md`
+severity: low
+reason: retrospective action item.
+status: {status}
+"""
+
+
+def _retro_spec(source_spec: str = "docs/retro-epic-1.md", **over) -> EntrySpec:
+    return EntrySpec(
+        title="Add X to the checklist",
+        origin=RETRO_ORIGIN,
+        source_spec=source_spec,
+        reason="retrospective action item.",
+        severity="low",
+        **over,
+    )
+
+
+@pytest.mark.parametrize("status", ["open", "done 2026-06-01"], ids=["open", "done"])
+def test_any_status_dedupe_suppresses_open_and_closed_twins(tmp_path, status):
+    """An any-status spec is suppressed by a twin of ANY status — and by origin
+    alone, so a twin filed under another `source_spec` counts too.
+
+    Ablation: drop the `dedupe_any_status` arm in `_apply_append` and the `done`
+    row files DW-2 (the default arm is open-only); the `open` row still dedupes
+    only because the source_spec matches, which the cross-spec row below pins."""
+    path = write_ledger(tmp_path, RETRO_SEED.format(status=status))
+    before = path.read_bytes()
+
+    assert append_entries(path, [_retro_spec(dedupe_any_status=True)]) == [None]
+    assert path.read_bytes() == before
+
+
+def test_any_status_dedupe_matches_origin_across_source_specs(tmp_path):
+    """Ablation: drop the `dedupe_any_status` arm and the differing
+    `source_spec` makes the default exact-pair scan miss the twin, minting DW-2."""
+    path = write_ledger(tmp_path, RETRO_SEED.format(status="done 2026-06-01"))
+
+    spec = _retro_spec(source_spec="sprint-status.yaml", dedupe_any_status=True)
+    assert append_entries(path, [spec]) == [None]
+
+
+def test_any_status_dedupe_suppresses_an_archived_stub_twin(tmp_path):
+    """An `archive_closed` stub keeps `origin:`, and that line alone must keep a
+    finished item from being re-filed after its body moved to the archive.
+
+    Ablation: drop the `dedupe_any_status` arm and this mints DW-2."""
+    path = write_ledger(tmp_path, RETRO_SEED.format(status="done 2026-06-01"))
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1"]
+    (stub,) = parse_ledger(path.read_text(encoding="utf-8"))
+    assert "reason:" not in stub.body  # premise: the body really was archived
+    assert f"origin: {RETRO_ORIGIN}" in stub.body
+
+    assert append_entries(path, [_retro_spec(dedupe_any_status=True)]) == [None]
+    assert [e.id for e in parse_ledger(path.read_text(encoding="utf-8"))] == ["DW-1"]
+
+
+def test_any_status_dedupe_files_an_unseen_origin(tmp_path):
+    """The opt-in only suppresses on a real twin: a different origin files."""
+    path = write_ledger(tmp_path, RETRO_SEED.format(status="done 2026-06-01"))
+    spec = EntrySpec(
+        title="Something else",
+        origin="retro action item epic-1-retro-item-2-other",
+        source_spec="docs/retro-epic-1.md",
+        reason="r",
+        dedupe_any_status=True,
+    )
+    assert append_entries(path, [spec]) == ["DW-2"]
+
+
+def test_default_spec_still_refiles_over_a_closed_twin(tmp_path):
+    """The default (and cross-spec) semantics are unchanged: a closed twin does
+    not suppress, because recurring work comes back.
+
+    Ablation: make the any-status arm unconditional and this returns `[None]`."""
+    (tmp_path / "default").mkdir()
+    (tmp_path / "cross").mkdir()
+    default = write_ledger(tmp_path / "default", RETRO_SEED.format(status="done 2026-06-01"))
+    assert append_entries(default, [_retro_spec()]) == ["DW-2"]
+    cross = write_ledger(tmp_path / "cross", RETRO_SEED.format(status="done 2026-06-01"))
+    assert append_entries(cross, [_retro_spec(source_spec="x.md", cross_spec_dedupe=True)]) == [
+        "DW-2"
+    ]
+
+
+def test_any_status_dedupe_no_op_takes_no_lock(tmp_path, monkeypatch):
+    """The advisory pre-lock no-op stays in force for an any-status batch: its
+    twin cannot vanish before the lock (entries are never deleted, stubs keep
+    `origin:`), so a replay is answered from one read.
+
+    Ablation: widen the early return's exclusion to `dedupe_any_status` specs and
+    the lock is acquired."""
+    path = write_ledger(tmp_path, RETRO_SEED.format(status="done 2026-06-01"))
+    acquisitions = []
+    real_lock = deferredwork.ledger_lock
+
+    @contextlib.contextmanager
+    def counting_lock(p):
+        acquisitions.append(p)
+        with real_lock(p):
+            yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", counting_lock)
+
+    assert append_entries(path, [_retro_spec(dedupe_any_status=True)]) == [None]
+    assert acquisitions == []
+
+
 def test_appended_text_equals_what_append_entries_publishes(tmp_path):
     """`appended_text` is the writer's own fold, so a caller recomputing what a batch
     WROTE (the DW-355 carry proof) lands on exactly the published text — including a

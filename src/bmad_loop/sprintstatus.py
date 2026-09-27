@@ -26,11 +26,20 @@ read-dependent no-op — an absent row, or a row already at or past target —
 without acquiring at all (#736), because such a call publishes nothing and so has
 no bytes for the hold to protect. Readers stay lock-free: the publish is an
 atomic replace, so a reader sees either the old board entire or the new one.
+
+Retro action items (DW-388): ``bmad-retrospective`` appends the items a retro
+commits to a top-level ``action_items:`` list, each with a stable ``id`` and a
+``ref`` back to the retro document. :func:`load_action_items` reads that list on
+its own, independently of :func:`load`, so ``development_status`` parsing — and
+the ``RETRO_ITEM_RE``-keyed rows it recognizes — is untouched by it. The sweep is
+its one consumer: it files each unseen, not-``done`` item into the deferred-work
+ledger. Nothing here writes the list.
 """
 
 from __future__ import annotations
 
 import re
+import stat
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -174,6 +183,131 @@ def load(path: Path) -> SprintStatus:
         retro_items=tuple(retro_items),
         unknown_keys=tuple(unknown),
     )
+
+
+@dataclass(frozen=True)
+class ActionItem:
+    """One id-keyed entry of sprint-status's top-level ``action_items:`` list,
+    as ``bmad-retrospective`` appends it (DW-388).
+
+    ``id`` is stripped and never empty — an entry without one is not an
+    ActionItem at all (see :func:`load_action_items`). ``action`` is None when the
+    YAML value is not a string, and kept verbatim otherwise (it may be blank; the
+    consumer decides what a blank action means). ``owner`` and ``ref`` are None
+    unless they are non-blank strings, and are stripped. ``status`` is the stripped
+    string form of the value, ``""`` when absent; it is NOT validated, because an
+    unknown token must not make an item disappear."""
+
+    id: str
+    epic: int | None
+    action: str | None
+    owner: str | None
+    status: str
+    ref: str | None
+
+
+class ActionItemsMalformed(SprintStatusError):
+    """The board parsed, but its ``action_items`` value is not a list.
+
+    A subclass so a caller can tell the one shape fault that is about the retro
+    list itself from a board that could not be read at all, without matching on
+    message text."""
+
+
+def _opt_str(value: object) -> str | None:
+    """A non-blank string, stripped — or None for anything else."""
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _opt_epic(value: object) -> int | None:
+    """The epic number as an int, from an int or an all-decimal string — None
+    otherwise. ``bool`` is refused explicitly: it is an ``int`` subclass, and
+    ``epic: true`` names no epic. ``isdecimal`` rather than ``isdigit``: the latter
+    accepts ``"²"``/``"①"``, which ``int()`` then refuses with a bare ValueError."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdecimal():
+        return int(value.strip())
+    return None
+
+
+def load_action_items(path: Path) -> tuple[ActionItem, ...] | None:
+    """The board's id-keyed ``action_items``, in file order (DW-388).
+
+    Returns None when the board path does not exist — absence is not a fault,
+    and the caller has nothing to ingest — and ``()`` when the board has no
+    ``action_items`` key, or the key holds no value (``action_items:`` with
+    nothing under it, which the retrospective's own writer treats as an empty
+    list too).
+
+    Raises :class:`SprintStatusError` when the path is not a regular file, or
+    the file cannot be read or decoded,
+    is not valid YAML, or has no top-level mapping, and
+    :class:`ActionItemsMalformed` (a subclass) when ``action_items`` holds
+    something other than a list. Deliberately NOT :func:`load`: that reader also
+    requires a ``development_status`` map, and a retro list must stay readable —
+    and ``load`` byte-for-byte unchanged — whatever the rest of the board holds.
+
+    Entries that are not mappings, or carry no non-empty string ``id``, are
+    skipped: a legacy item without a stable id has no identity a consumer could
+    dedupe on, so it cannot be ingested safely at all.
+
+    Existence is probed with ``stat()`` rather than ``is_file()``, for the reason
+    the sweep's triage-cache read gives (DW-224): ``is_file()`` swallows a
+    metadata fault on 3.14 and re-raises it bare on 3.11-3.13, so a permission
+    fault would read as "no board" on one runtime and escape untyped on another.
+    Here it is a :class:`SprintStatusError` on all of them. A path that exists
+    but is not a regular file (a directory, say) is a fault too, not absence: a
+    degrade that read it as "no board" would be indistinguishable from one."""
+    try:
+        mode = path.stat().st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as e:
+        raise SprintStatusError(f"sprint status could not be read: {path}: {e}") from e
+    if not stat.S_ISREG(mode):
+        raise SprintStatusError(f"sprint status is not a regular file: {path}")
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        raise SprintStatusError(f"sprint status could not be read: {path}: {e}") from e
+    try:
+        doc = yaml.safe_load(raw)
+    except yaml.YAMLError as e:
+        raise SprintStatusError(f"sprint status is not valid YAML: {path}: {e}") from e
+    if not isinstance(doc, dict):
+        raise SprintStatusError(f"sprint status has no top-level mapping: {path}")
+    listed = doc.get("action_items")
+    if listed is None:
+        return ()
+    if not isinstance(listed, list):
+        raise ActionItemsMalformed(
+            f"sprint status action_items is not a list ({type(listed).__name__}): {path}"
+        )
+    items: list[ActionItem] = []
+    for entry in listed:
+        if not isinstance(entry, dict):
+            continue
+        item_id = _opt_str(entry.get("id"))
+        if item_id is None:
+            continue
+        action = entry.get("action")
+        raw_status = entry.get("status")
+        items.append(
+            ActionItem(
+                id=item_id,
+                epic=_opt_epic(entry.get("epic")),
+                action=action if isinstance(action, str) else None,
+                owner=_opt_str(entry.get("owner")),
+                status="" if raw_status is None else str(raw_status).strip(),
+                ref=_opt_str(entry.get("ref")),
+            )
+        )
+    return tuple(items)
 
 
 def next_actionable(

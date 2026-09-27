@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
+import yaml
 from conftest import (
     _OK,
     NUL_PATH_RESOLVE_FAULTS,
@@ -11945,7 +11946,7 @@ def test_every_sweep_ledger_commit_names_its_own_tree():
     """Every `_commit_ledger` call in `sweep.py` names the FILE the caller just
     published — checked by the argument's VALUE, not its presence.
 
-    The behavioral rows above drive six of the nine callers; this one is TOTAL,
+    The behavioral rows above drive seven of the ten callers; this one is TOTAL,
     and it is what holds the post-migration publisher (which cannot be driven at
     that layer) plus any caller added later. Presence alone is
     not enough: `path=self.workspace.root` is an explicit argument that would
@@ -11955,7 +11956,7 @@ def test_every_sweep_ledger_commit_names_its_own_tree():
     one of exactly two sanctioned spellings, and the two families must be the right
     SIZE:
 
-    * seven LEDGER publishers, all spelling `self.workspace.paths.deferred_work`.
+    * eight LEDGER publishers, all spelling `self.workspace.paths.deferred_work`.
       Three of them are DW-193's: `_close_resolved`'s pair of arms — the `closed`
       arm publishes this pass's write, the `pending` arm a previous pass's write
       that a crash stranded before its commit — plus `_publish_stranded_close`,
@@ -11965,7 +11966,8 @@ def test_every_sweep_ledger_commit_names_its_own_tree():
       `implementation_artifacts` is configurable to any absolute path, so only the
       ledger's own file is correct in all three topologies — and only the
       WORKSPACE's copy of it, since `self.paths.deferred_work` is a different file
-      under worktree isolation.
+      under worktree isolation. The eighth is DW-388's retro action-item ingest,
+      which publishes the entries it minted at the top of a fresh sweep.
     * two pre-answer STORE prunes, spelling `decisions_store.store_path(project)`.
       The store is a bare join off the project root that no config knob can move,
       and each site binds `project` from `_project_of_run_dir(self.run_dir)` two
@@ -11981,7 +11983,7 @@ def test_every_sweep_ledger_commit_names_its_own_tree():
     "every call site spells the right argument" is a property no single run can
     observe. That `path` is required at all is
     `test_commit_ledger_requires_the_published_path`'s claim; this guard only holds
-    what the nine in-tree callers put in it.
+    what the ten in-tree callers put in it.
 
     Known limit: the store spelling embeds one bare name — `project` — so a site
     that bound that name to something else would pass, though both prune sites
@@ -11997,7 +11999,7 @@ def test_every_sweep_ledger_commit_names_its_own_tree():
     the wrong one is a silently weaker guard rather than a type error.
 
     Ablation: respell any publisher's `path=` as `decisions_store.store_path(project)`
-    and the family counts red (6 ledger, 3 store); respell it `self.workspace.root`,
+    and the family counts red (7 ledger, 3 store); respell it `self.workspace.root`,
     revert one to `self.workspace.paths.deferred_work.parent`, or drop the argument
     and the per-call check reds naming that line. Flip any one call's `family=` to
     the other token, or compute it, and the declaration checks red naming that
@@ -12015,7 +12017,7 @@ def test_every_sweep_ledger_commit_names_its_own_tree():
     ]
     # premise: the scan actually finds the calls it is grading, so an AST shape
     # change cannot turn this into a guard over an empty set
-    assert len(calls) == 9, f"expected 9 _commit_ledger callers, found {len(calls)}"
+    assert len(calls) == 10, f"expected 10 _commit_ledger callers, found {len(calls)}"
     published = {}
     declared = {}
     for node in calls:
@@ -12044,7 +12046,7 @@ def test_every_sweep_ledger_commit_names_its_own_tree():
     assert unsanctioned == {}, f"unsanctioned _commit_ledger paths: {unsanctioned}"
     ledger_published = sorted(line for line, s in published.items() if s in _LEDGER_PUBLISHED)
     store_published = sorted(line for line, s in published.items() if s in _STORE_PUBLISHED)
-    assert len(ledger_published) == 7, f"expected 7 ledger publishers: {ledger_published}"
+    assert len(ledger_published) == 8, f"expected 8 ledger publishers: {ledger_published}"
     assert len(store_published) == 2, f"expected 2 store prunes: {store_published}"
     # ...and each family's calls declare THAT family (DW-199/203/205). The two
     # validations are not interchangeable: `family="store"` on a ledger publisher
@@ -35533,3 +35535,444 @@ def test_nested_recover_inflight_bundle_reanchors_on_the_mount_project(project, 
         engine._recover_inflight_bundle(task)
 
     assert seen == [str(mount / "app" / rel)]
+
+
+# ------------------------------------------- retro action-item ingest (DW-388)
+
+_RETRO_ITEM = {
+    "id": "epic-1-retro-item-1-add-x",
+    "epic": 1,
+    "action": "Add X",
+    "owner": "Amelia",
+    "status": "open",
+    "ref": "docs/r.md",
+}
+_RETRO_ORIGIN = "origin: retro action item epic-1-retro-item-1-add-x"
+_INGEST_MESSAGE = "chore(sweep): ingest retro action items"
+
+
+def _write_retro_board(project, items, *, commit=True, raw=None):
+    """A sprint-status board carrying `items` as its top-level `action_items:`
+    (or `raw` verbatim). Committed by default — sweeps start from a clean tree."""
+    if raw is None:
+        doc = {
+            "development_status": {"epic-1": "done", "epic-1-retrospective": "done"},
+            "action_items": items,
+        }
+        raw = yaml.safe_dump(doc, sort_keys=False)
+    project.sprint_status.write_text(raw, encoding="utf-8")
+    if commit:
+        git(project.project, "add", "-A")
+        git(project.project, "commit", "-q", "-m", "board")
+
+
+def _ledger_at_head(project) -> str:
+    rel = project.deferred_work.relative_to(project.project).as_posix()
+    return git(project.project, "show", f"HEAD:{rel}")
+
+
+def _subjects(project) -> list[str]:
+    return git(project.project, "log", "--format=%s").splitlines()
+
+
+def _head_subject_when_triaged(project, plan, seen):
+    """A triage effect that records HEAD's subject and the ledger at HEAD at the
+    moment triage runs — the proof the ingest commit landed BEFORE triage."""
+
+    def effect(spec):
+        seen.append((_subjects(project)[0], _ledger_at_head(project)))
+        return SessionResult(status="completed", result_json=plan)
+
+    return effect
+
+
+def test_retro_ingest_files_and_commits_a_new_item_before_triage(project):
+    """The I/O matrix's first row and the first acceptance criterion: one
+    canonical entry, committed to git before triage runs, and triage sees it
+    open (`validate_triage` refuses a plan whose `open_ids` differ from the
+    ledger's open set, so a passing triage IS that proof).
+
+    Ablation: drop the `_ingest_retro_action_items` call from `_loop` and the
+    ledger stays empty — `sweep-nothing-open`, no triage session at all."""
+    _write_retro_board(project, [_RETRO_ITEM])
+    seen = []
+    plan = triage_result(["DW-1"], skip=[{"id": "DW-1", "reason": "later"}])
+    engine, adapter = make_sweep(project, [_head_subject_when_triaged(project, plan, seen)])
+
+    summary = engine.run()
+
+    assert not summary.crashed and len(adapter.sessions) == 1
+    (entry,) = ledger_entries(project).values()
+    assert entry.id == "DW-1" and entry.title == "Add X" and entry.open
+    body = entry.body
+    assert _RETRO_ORIGIN in body.splitlines()
+    assert "source_spec: `docs/r.md`" in body.splitlines()
+    assert "severity: low" in body.splitlines()
+    assert "location: n/a" in body.splitlines()
+    assert (
+        "reason: retrospective action item from sprint-status.yaml (epic 1; owner Amelia; "
+        "sprint-status status open)" in body.splitlines()
+    )
+    # committed BEFORE triage ran, with the entry in HEAD's ledger
+    ((subject, head_ledger),) = seen
+    assert subject == _INGEST_MESSAGE
+    assert "### DW-1: Add X" in head_ledger
+    (row,) = _records(engine, "sweep-retro-items-ingested")
+    assert row["dw_ids"] == ["DW-1"]
+    assert not engine.state.sweep_ledger_commit_owed
+    assert _records(engine, "sweep-retro-ingest-unavailable") == []
+
+
+def _close_first_entry(project, how):
+    if how == "open":
+        return
+    text = project.deferred_work.read_text(encoding="utf-8")
+    project.deferred_work.write_text(
+        text.replace("status: open", "status: done 2026-09-01", 1), encoding="utf-8"
+    )
+    if how == "archived":
+        assert deferredwork.archive_closed(project.deferred_work, archive_date="2026-09-02") == [
+            "DW-1"
+        ]
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "close")
+
+
+@pytest.mark.parametrize("how", ["open", "done", "archived"])
+def test_retro_ingest_second_sweep_files_nothing(project, how, monkeypatch):
+    """The second acceptance criterion: a second sweep over the same board
+    appends nothing whether the first entry is still open, closed, or archived
+    to a stub — ledger bytes unchanged, no ingest commit, no debt latched.
+
+    Ablation: drop `dedupe_any_status=True` from `_retro_item_spec` and the
+    `done`/`archived` rows mint DW-2 (the default scan is open-only). Drop the
+    `appended_text` pre-check and the debt-latch spy below reddens on every row
+    (the append itself still no-ops, so the bytes stay equal)."""
+    _write_retro_board(project, [_RETRO_ITEM])
+    plan = triage_result(["DW-1"], skip=[{"id": "DW-1", "reason": "later"}])
+    first, _ = make_sweep(project, [triage_effect(plan)])
+    assert not first.run().crashed
+    _close_first_entry(project, how)
+    before = project.deferred_work.read_bytes()
+    subjects_before = _subjects(project)
+
+    script = [triage_effect(plan)] if how == "open" else []
+    second, _ = make_sweep(project, script, run_id="sweep-run-2")
+    owed = []
+    real_owe = second._owe_ledger_commit
+    monkeypatch.setattr(second, "_owe_ledger_commit", lambda: owed.append(1) or real_owe())
+
+    assert not second.run().crashed
+    assert project.deferred_work.read_bytes() == before
+    assert _subjects(project) == subjects_before
+    assert _records(second, "sweep-retro-items-ingested") == []
+    assert owed == []
+
+
+def test_retro_ingest_skips_done_and_unkeyed_items(project):
+    """Legacy (no `id`) and `done` items are not ingested; an unknown status
+    token is. `done` matches case-insensitively, so a hand-typed `Done` is not
+    filed either.
+
+    Ablation: drop the done filter and the done item is filed as DW-1, shifting
+    the unknown-status item to DW-2; drop only the `casefold()` and the `Done`
+    item is filed as DW-2."""
+    _write_retro_board(
+        project,
+        [
+            {"epic": 1, "action": "legacy, no id", "status": "open"},
+            {"id": "epic-1-retro-item-2-finished", "action": "Finished", "status": "done"},
+            {"id": "epic-1-retro-item-4-typed", "action": "Hand-typed", "status": "Done"},
+            {"id": "epic-1-retro-item-3-odd", "action": "Odd status", "status": "someday"},
+        ],
+    )
+    plan = triage_result(["DW-1"], skip=[{"id": "DW-1", "reason": "later"}])
+    engine, _ = make_sweep(project, [triage_effect(plan)])
+
+    assert not engine.run().crashed
+    (entry,) = ledger_entries(project).values()
+    assert entry.id == "DW-1" and entry.title == "Odd status"
+    assert "origin: retro action item epic-1-retro-item-3-odd" in entry.body.splitlines()
+
+
+def test_retro_ingest_falls_back_for_a_blank_action_and_a_missing_ref(project):
+    _write_retro_board(project, [{"id": "epic-2-retro-item-1-x", "action": "   "}])
+    plan = triage_result(["DW-1"], skip=[{"id": "DW-1", "reason": "later"}])
+    engine, _ = make_sweep(project, [triage_effect(plan)])
+
+    assert not engine.run().crashed
+    (entry,) = ledger_entries(project).values()
+    assert entry.title == "retro action item epic-2-retro-item-1-x"
+    assert "source_spec: `sprint-status.yaml`" in entry.body.splitlines()
+    assert "reason: retrospective action item from sprint-status.yaml" in entry.body.splitlines()
+
+
+@pytest.mark.parametrize("board", ["absent", "no-key"])
+def test_retro_ingest_absence_is_silent(project, board):
+    """No board, or no `action_items` key: nothing ingested and NO row.
+
+    Ablation: journal the `None`/`()` answers and the row assertion reddens."""
+    write_ledger(project, {"DW-1": "done 2026-06-01"})
+    if board == "no-key":
+        write_sprint(project, {"epic-1": "done"})
+        git(project.project, "add", "-A")
+        git(project.project, "commit", "-q", "-m", "board")
+    before = project.deferred_work.read_bytes()
+    engine, adapter = make_sweep(project, [])
+
+    summary = engine.run()
+
+    assert not summary.crashed and adapter.sessions == []
+    assert project.deferred_work.read_bytes() == before
+    kinds = journal_kinds(engine)
+    assert "sweep-retro-items-ingested" not in kinds
+    assert "sweep-retro-ingest-unavailable" not in kinds
+    assert "sweep-nothing-open" in kinds
+
+
+@pytest.mark.parametrize(
+    ("raw", "cause"),
+    [
+        ("development_status: [unclosed", "sprint-status-unreadable"),
+        ("action_items: {id: x}\n", "action-items-malformed"),
+    ],
+    ids=["bad-yaml", "non-list"],
+)
+def test_retro_ingest_malformed_board_journals_and_the_sweep_proceeds(project, raw, cause):
+    """A board fault is a visible degrade: one row with the closed cause, and
+    the sweep still triages the ledger it has.
+
+    Ablation: swap the two `except` arms' order and the non-list row reports
+    `sprint-status-unreadable`; drop either row and its case reddens."""
+    write_ledger(project, {"DW-1": "open"})
+    _write_retro_board(project, None, raw=raw)
+    before = project.deferred_work.read_bytes()
+    plan = triage_result(["DW-1"], skip=[{"id": "DW-1", "reason": "later"}])
+    engine, adapter = make_sweep(project, [triage_effect(plan)])
+
+    summary = engine.run()
+
+    assert not summary.crashed and len(adapter.sessions) == 1
+    assert project.deferred_work.read_bytes() == before
+    (row,) = _records(engine, "sweep-retro-ingest-unavailable")
+    assert row["ingest_cause"] == cause
+    assert row["error"]
+    assert _records(engine, "sweep-retro-items-ingested") == []
+
+
+def test_retro_ingest_is_not_attempted_on_a_resumed_sweep(project):
+    """A triage task already in state means this is not a fresh sweep: the
+    cached plan must not be perturbed by entries it never planned over.
+
+    Ablation: drop the `TRIAGE_KEY not in self.state.tasks` term and the board's
+    item is filed as DW-2 on the resume."""
+    write_ledger(project, {"DW-1": "done 2026-06-01"})
+    _write_retro_board(project, [_RETRO_ITEM])
+    original, _ = make_sweep(project, [])
+    triage = StoryTask(story_key="sweep-triage", epic=0)
+    triage.phase = Phase.DONE
+    original.state.tasks[triage.story_key] = triage
+    save_state(original.run_dir, original.state)
+    before = project.deferred_work.read_bytes()
+    resumed, adapter = resume_sweep(project, original, [])
+
+    summary = resumed.run()
+
+    assert not summary.crashed and adapter.sessions == []
+    assert project.deferred_work.read_bytes() == before
+    assert "sweep-retro-items-ingested" not in journal_kinds(resumed)
+
+
+def test_retro_ingest_is_not_attempted_under_the_ledger_doubt(project):
+    """The run's inherited doubt refuses the ingest outright: it would publish
+    the whole doubted file.
+
+    Ablation: drop the `not self._ledger_unfit_to_publish()` term in `_loop` and
+    DW-2 is minted (its publish then withheld at the call site)."""
+    write_ledger(project, {"DW-1": "done 2026-06-01"})
+    _write_retro_board(project, [_RETRO_ITEM])
+    engine, adapter = make_sweep(project, [])
+    engine.state.sweep_ledger_in_doubt = True
+    engine._ledger_doubt_inherited = True
+    before = project.deferred_work.read_bytes()
+
+    summary = engine.run()
+
+    assert not summary.crashed and adapter.sessions == []
+    assert project.deferred_work.read_bytes() == before
+    assert "sweep-retro-items-ingested" not in journal_kinds(engine)
+
+
+def test_retro_ingest_publish_is_withheld_on_a_doubt_armed_in_between(project):
+    """The call-site gate: `_loop` checked the doubt, but a doubt armed after
+    that check still withholds the publish — the entry is written, the debt stays
+    latched for the bytes on disk, and HEAD is untouched.
+
+    Ablation: drop the `_ledger_unfit_to_publish()` check around the ingest's
+    `_commit_ledger` and HEAD gains the ingest commit."""
+    _write_retro_board(project, [_RETRO_ITEM])
+    engine, _ = make_sweep(project, [])
+    engine._close_ledger_in_doubt = True
+    head_before = _subjects(project)
+
+    assert engine._ingest_retro_action_items("") is True
+
+    assert _subjects(project) == head_before
+    (withheld,) = _records(engine, "sweep-ledger-commit-withheld")
+    assert withheld["message"] == _INGEST_MESSAGE
+    assert engine.state.sweep_ledger_commit_owed
+    assert "### DW-1: Add X" in project.deferred_work.read_text(encoding="utf-8")
+
+
+def test_retro_ingest_ledger_fault_degrades_and_retracts_the_debt(project, monkeypatch):
+    """A pre-write ledger fault (here the lock) journals `ledger-unavailable`,
+    retracts the debt it latched, and the sweep carries on.
+
+    Ablation: drop the `_retract_ledger_commit` in the degrade arm and
+    `sweep_ledger_commit_owed` stays True."""
+    write_ledger(project, {"DW-1": "open"})
+    _write_retro_board(project, [_RETRO_ITEM])
+    before = project.deferred_work.read_bytes()
+
+    @contextlib.contextmanager
+    def refused(path):
+        raise PermissionError(13, "Permission denied", str(path))
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", refused)
+    plan = triage_result(["DW-1"], skip=[{"id": "DW-1", "reason": "later"}])
+    engine, adapter = make_sweep(project, [triage_effect(plan)])
+
+    summary = engine.run()
+
+    assert not summary.crashed and len(adapter.sessions) == 1
+    assert project.deferred_work.read_bytes() == before
+    (row,) = _records(engine, "sweep-retro-ingest-unavailable")
+    assert row["ingest_cause"] == "ledger-unavailable"
+    assert not engine.state.sweep_ledger_commit_owed
+
+
+def test_retro_ingest_write_fault_propagates_and_retracts_the_debt(project, monkeypatch):
+    """A failed atomic write is a repair write that must raise, not degrade;
+    the original is untouched, so the debt is retracted on the way out.
+
+    Ablation: fold `LedgerWriteError` into the degrade tuple and the run
+    finishes instead of crashing."""
+    write_ledger(project, {"DW-1": "open"})
+    _write_retro_board(project, [_RETRO_ITEM])
+
+    def fail(path, text):
+        raise deferredwork.LedgerWriteError(28, "No space left on device")
+
+    monkeypatch.setattr(deferredwork, "_publish", fail)
+    engine, adapter = make_sweep(project, [])
+
+    summary = engine.run()
+
+    assert summary.crashed and adapter.sessions == []
+    assert not load_state(engine.run_dir).sweep_ledger_commit_owed
+
+
+def test_retro_ingest_debt_is_settled_by_the_resume_after_a_lost_commit(project, monkeypatch):
+    """A crash between the ingest's write and its commit leaves the debt
+    latched on disk; the resume settles it at the top of `_loop`, and the
+    re-attempted ingest dedupes rather than filing the item twice.
+
+    Ablation: drop the `_owe_ledger_commit()` latch ahead of the append and the
+    resume never commits the ledger — HEAD's ledger lacks DW-1."""
+    _write_retro_board(project, [_RETRO_ITEM])
+    engine, _ = make_sweep(project, [])
+
+    def die(*_a, **_k):
+        raise RuntimeError("host died before the commit")
+
+    monkeypatch.setattr(engine, "_commit_ledger", die)
+    assert engine.run().crashed
+    assert load_state(engine.run_dir).sweep_ledger_commit_owed
+    written = project.deferred_work.read_bytes()
+
+    plan = triage_result(["DW-1"], skip=[{"id": "DW-1", "reason": "later"}])
+    resumed, _ = resume_sweep(project, engine, [triage_effect(plan)])
+    assert not resumed.run().crashed
+
+    assert project.deferred_work.read_bytes() == written
+    assert "### DW-1: Add X" in _ledger_at_head(project)
+    assert not resumed.state.sweep_ledger_commit_owed
+    # the journal is the run's, shared across the resume: only the first
+    # invocation's row — the resume's ingest deduped and wrote nothing
+    assert len(_records(resumed, "sweep-retro-items-ingested")) == 1
+    (settle,) = [
+        r
+        for r in _records(resumed, "sweep-ledger-commit")
+        if r["message"].startswith("chore(sweep): commit a ledger write")
+    ]
+    # the settle published the ingest's bytes: its commit IS the one at which
+    # HEAD's ledger first carries DW-1, and it named the ledger file
+    assert settle["file"] == project.deferred_work.name
+    rel = project.deferred_work.relative_to(project.project).as_posix()
+    assert "### DW-1: Add X" in git(project.project, "show", f"{settle['commit']}:{rel}")
+    # ...and the ledger did not exist at all in its parent (fresh board, no ledger)
+    assert git(project.project, "ls-tree", "--name-only", f"{settle['commit']}~1", "--", rel) == ""
+
+
+def test_retro_ingest_lock_release_fault_after_a_landed_append_ends_the_sweep_loudly(
+    project, monkeypatch
+):
+    """The far side of the publish, as in `_close_resolved`: `append_entries`
+    wrote the entry and the ledger lock's RELEASE then faulted. That is a landed
+    write, so it must not be reported as `ledger-unavailable`, and the debt it
+    latched must stay for the bytes on disk.
+
+    Ablation: delete the `except deferredwork.LedgerLockReleaseError: raise` arm
+    and the OSError degrade arm catches it — a `sweep-retro-ingest-unavailable`
+    row for an entry the ledger holds, and the debt retracted."""
+    _write_retro_board(project, [_RETRO_ITEM])
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    real_file_lock = deferredwork.file_lock
+
+    @contextlib.contextmanager
+    def releasing_faults(path, **kwargs):
+        with real_file_lock(path, **kwargs):
+            yield
+        raise OSError(9, "Bad file descriptor")
+
+    monkeypatch.setattr(deferredwork, "file_lock", releasing_faults)
+
+    with pytest.raises(deferredwork.LedgerLockReleaseError, match="Bad file descriptor"):
+        engine._ingest_retro_action_items("")
+
+    assert "### DW-1: Add X" in project.deferred_work.read_text(encoding="utf-8")  # it landed
+    assert not (engine.run_dir / "journal.jsonl").exists()  # no degrade row, no false claim
+    assert engine.state.sweep_ledger_commit_owed
+
+
+@pytest.mark.parametrize("how", ["done", "archived"])
+def test_retro_ingest_partially_seen_board_files_only_the_new_item(project, how):
+    """Item 1 was filed by an earlier sweep and has since closed (or been
+    archived to a stub); item 2 is new. The second sweep mints only item 2, names
+    only it in `dw_ids`, and commits it.
+
+    Ablation: drop `dedupe_any_status=True` from `_retro_item_spec` and item 1 is
+    re-filed beside item 2."""
+    _write_retro_board(project, [_RETRO_ITEM])
+    plan = triage_result(["DW-1"], skip=[{"id": "DW-1", "reason": "later"}])
+    first, _ = make_sweep(project, [triage_effect(plan)])
+    assert not first.run().crashed
+    _close_first_entry(project, how)
+    second_item = dict(_RETRO_ITEM, id="epic-1-retro-item-2-add-y", action="Add Y")
+    _write_retro_board(project, [_RETRO_ITEM, second_item])
+
+    plan2 = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "later"}])
+    second, adapter = make_sweep(project, [triage_effect(plan2)], run_id="sweep-run-2")
+    assert not second.run().crashed
+
+    assert len(adapter.sessions) == 1
+    entries = ledger_entries(project)
+    assert sorted(entries) == ["DW-1", "DW-2"]
+    assert entries["DW-2"].title == "Add Y" and entries["DW-2"].open
+    assert "origin: retro action item epic-1-retro-item-2-add-y" in entries["DW-2"].body
+    (row,) = _records(second, "sweep-retro-items-ingested")
+    assert row["dw_ids"] == ["DW-2"]
+    assert _INGEST_MESSAGE in _subjects(project)
+    assert "### DW-2: Add Y" in _ledger_at_head(project)

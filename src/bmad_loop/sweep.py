@@ -23,7 +23,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, NoReturn, TypeVar, assert_never
 
-from . import deferredwork, gates, verify
+from . import deferredwork, gates, sprintstatus, verify
 from .adapters.generic import load_result_document
 from .engine import (
     Engine,
@@ -1529,7 +1529,8 @@ class SweepEngine(Engine):
         two commit arms, `_loop`'s in-flight recovery pass and the publish that
         follows it (the debt settle included), `_loop`'s legacy-migration arm,
         `_publish_stranded_close` (DW-250: the whole publisher, above both of its
-        probes) — and `_loop`'s no-open repair notice (DW-251) all read the doubt
+        probes), and the retro action-item ingest (DW-388: `_loop`'s call gate
+        and its own publish) — and `_loop`'s no-open repair notice (DW-251) all read the doubt
         through here, so a future arming site cannot be wired into one reader and
         missed by the others — which is precisely how the close phase's fault
         reached `_write_intent`'s bare `read_for_write` while the gate above it saw
@@ -1688,9 +1689,10 @@ class SweepEngine(Engine):
         """Latch `state.sweep_ledger_commit_owed` and persist it, BEFORE a ledger
         publish whose commit is gated on that publish's own result.
 
-        The two write-result-gated publishers (`_close_resolved` on `closed`,
-        `_decisions_phase` on `any_effect_landed`) grade the write THIS invocation
-        made, and a resume is a different invocation: a process that dies after
+        The write-result-gated publishers (`_close_resolved` on `closed`,
+        `_decisions_phase` on `any_effect_landed`, and since DW-388
+        `_ingest_retro_action_items` on a minted id) grade the write THIS
+        invocation made, and a resume is a different invocation: a process that dies after
         `mark_done_many` or `record_decision` published but before `_commit_ledger`
         ran replays as a phase that closed nothing — the ids are already `done`,
         the answer already saved — so the guard that was unconditional before
@@ -1955,7 +1957,7 @@ class SweepEngine(Engine):
             # whoever owns it, so this no longer ends on a clean TREE and nothing
             # downstream may assume one. Guarded on a non-empty recovery pass, so
             # a fresh sweep spawns no git at all (see `_close_resolved` for the
-            # guard inventory across all nine sites) — OR on a persisted debt: a
+            # guard inventory across all ten sites) — OR on a persisted debt: a
             # publish the already-resolved close or the decision phase landed and
             # then died before committing (`_owe_ledger_commit`). Both sites gate
             # their own commit on this invocation's write, which a replay of an
@@ -1966,7 +1968,7 @@ class SweepEngine(Engine):
             # The LEDGER FILE (`_commit_ledger`): this publisher wrote the ledger,
             # so it names the file it published and the commit is narrowed to it.
             # Spelled off `self.workspace.paths` rather than a `ledger` local, at
-            # every one of the seven publishers: `self.paths.deferred_work` is a
+            # every one of the eight publishers: `self.paths.deferred_work` is a
             # DIFFERENT file under worktree isolation, and only the workspace's
             # copy is the one a publisher just wrote.
             # ...and WITHHELD when the run already knows the ledger is unfit
@@ -2133,6 +2135,22 @@ class SweepEngine(Engine):
                 # Same cycle, re-read after migration — and degraded on the same
                 # terms as the read above, since the migration's own write is a way
                 # for this read to start failing where the first one did not.
+                text, ledger_fault = self._read_cycle_ledger(ledger)
+                if ledger_fault is not None:
+                    self._stop_on_ledger_fault(ledger_fault, cycles=cycle - 1, ledger=ledger)
+                    return
+            if (
+                cycle == 1
+                and TRIAGE_KEY not in self.state.tasks
+                and not self._ledger_unfit_to_publish()
+                and self._ingest_retro_action_items(text)
+            ):
+                # DW-388: FRESH sweeps only — cycle 1 with no triage task yet — so
+                # a resumed run's cached `triage.json`, which does not re-check the
+                # open set, is never perturbed by entries it did not plan over. And
+                # never under the run's ledger doubt: the ingest publishes the
+                # whole file. Re-read on the same terms as the migration arm above,
+                # so the minted entries join THIS cycle's open set.
                 text, ledger_fault = self._read_cycle_ledger(ledger)
                 if ledger_fault is not None:
                     self._stop_on_ledger_fault(ledger_fault, cycles=cycle - 1, ledger=ledger)
@@ -2306,7 +2324,7 @@ class SweepEngine(Engine):
             # including out-of-band edits without a recovered close beside them.
             # Unrelated files stay with their owner. The whole-file trade is the
             # same as `_publish_stranded_close`; `_close_resolved` inventories the
-            # nine publication sites. A ledger in no repository stays a
+            # ten publication sites. A ledger in no repository stays a
             # best-effort miss here too; a timeout, spawn failure or unreadable
             # index, and an attempted commit git refuses, raise, as at every
             # ledger publisher (DW-336).
@@ -4798,6 +4816,136 @@ class SweepEngine(Engine):
 
     # ------------------------------------------------------ ledger phases
 
+    @staticmethod
+    def _retro_item_spec(item: sprintstatus.ActionItem) -> deferredwork.EntrySpec:
+        """The canonical DW entry one retro action item files as (DW-388).
+
+        The ORIGIN is the identity: exactly ``retro action item <id>``, deduped
+        against entries of any status (``dedupe_any_status``), so the item is
+        filed once and a closed or archived twin keeps it from being filed again.
+        Everything else is presentation: the action as the title (one-lined by
+        the writer; the origin text when the action is blank or not a string), the
+        retro document as ``source_spec`` when the item names one, and a reason
+        naming the epic, owner and board status when the item carries them."""
+        origin = f"retro action item {item.id}"
+        title = item.action if item.action is not None and item.action.strip() else origin
+        facts = []
+        if item.epic is not None:
+            facts.append(f"epic {item.epic}")
+        if item.owner is not None:
+            facts.append(f"owner {item.owner}")
+        if item.status:
+            facts.append(f"sprint-status status {item.status}")
+        reason = "retrospective action item from sprint-status.yaml"
+        if facts:
+            reason += f" ({'; '.join(facts)})"
+        return deferredwork.EntrySpec(
+            title=title,
+            origin=origin,
+            source_spec=item.ref if item.ref is not None else "sprint-status.yaml",
+            reason=reason,
+            severity="low",
+            dedupe_any_status=True,
+        )
+
+    def _ingest_retro_action_items(self, text: str) -> bool:
+        """File every unseen, not-``done``, id-keyed retro action item from
+        sprint-status's ``action_items:`` as a canonical DW entry, and publish the
+        ledger when anything was minted (DW-388). Returns whether anything was.
+
+        `_loop` calls it only on a FRESH sweep (cycle 1, no triage task yet) and
+        never under the run's ledger doubt; `text` is the ledger `_loop` just read
+        at the top of that cycle.
+
+        The BOARD read degrades visibly: an unreadable board and a non-list
+        ``action_items`` each journal `sweep-retro-ingest-unavailable` with a
+        closed `ingest_cause` and the sweep carries on without ingesting. Absence —
+        no board file, no ``action_items`` key — is silent: nothing to ingest is
+        not a fault.
+
+        `text` answers the "nothing new" case without touching state or the lock:
+        the fold is the writer's own (`deferredwork.appended_text`), and with
+        ``dedupe_any_status`` a twin seen in it cannot vanish before the locked
+        pass (entries are never deleted, archive stubs keep ``origin:``). So a
+        second sweep over the same board latches no debt, takes no lock, writes
+        nothing and spawns no git.
+
+        The WRITE is modelled on `_close_resolved`: the debt is latched ahead of
+        the batched append (`_owe_ledger_commit`) and retracted on every outcome
+        that definitively published nothing; a pre-write ledger fault (read,
+        lock, `StateRootError`) journals the same row with
+        `ingest_cause="ledger-unavailable"` and degrades — the items stay unfiled
+        and the next fresh sweep tries again; `LedgerWriteError` and
+        `LedgerLockReleaseError` propagate, because a repair write that failed or
+        landed-then-faulted is not an ingest that found nothing. Unlike the close
+        phase it arms no doubt on that degrade: every arm there is pre-write, so
+        the bytes on disk are the ones `_loop` read and found fit, and nothing
+        this method did makes them less so.
+
+        The publish reads the run's doubt AT the call site, like the close
+        phase's arms: `_loop` has already refused to call this under a doubt, but
+        a doubt armed between the two — `_commit_ledger`'s own refusal arm on an
+        earlier publisher — must still withhold rather than walk the file into
+        HEAD."""
+        try:
+            items = sprintstatus.load_action_items(self.workspace.paths.sprint_status)
+        except sprintstatus.ActionItemsMalformed as e:
+            self.journal.append(
+                "sweep-retro-ingest-unavailable",
+                ingest_cause="action-items-malformed",
+                error=str(e),
+            )
+            return False
+        except sprintstatus.SprintStatusError as e:
+            self.journal.append(
+                "sweep-retro-ingest-unavailable",
+                ingest_cause="sprint-status-unreadable",
+                error=str(e),
+            )
+            return False
+        if not items:
+            return False
+        # casefolded: a hand-typed `Done` is the same finished item, not a new one
+        specs = [self._retro_item_spec(item) for item in items if item.status.casefold() != "done"]
+        if not specs or deferredwork.appended_text(text, specs) == text:
+            return False
+        owed_here = self._owe_ledger_commit()
+        try:
+            minted = deferredwork.append_entries(self.workspace.paths.deferred_work, specs)
+        except deferredwork.LedgerWriteError:
+            # the atomic write failed and the original is untouched
+            self._retract_ledger_commit(owed_here)
+            raise
+        except deferredwork.LedgerLockReleaseError:
+            # the publish LANDED; the debt stays for the bytes on disk
+            raise
+        except (deferredwork.LedgerReadError, OSError, ValueError, StateRootError) as e:
+            self._retract_ledger_commit(owed_here)  # every arm here is pre-write
+            self.journal.append(
+                "sweep-retro-ingest-unavailable",
+                ingest_cause="ledger-unavailable",
+                error=str(e),
+            )
+            return False
+        new_ids = [dw_id for dw_id in minted if dw_id is not None]
+        if not new_ids:
+            # a rival filed every twin between `text` and the locked pass: zero
+            # bytes written, nothing to settle
+            self._retract_ledger_commit(owed_here)
+            return False
+        self.journal.append("sweep-retro-items-ingested", dw_ids=new_ids)
+        # the ledger file: `append_entries` above wrote it. Gated on the run's
+        # doubt at the call site (see `_close_resolved`'s guard inventory).
+        if self._ledger_unfit_to_publish():
+            self._withhold_ledger_publish("chore(sweep): ingest retro action items")
+        else:
+            self._commit_ledger(
+                "chore(sweep): ingest retro action items",
+                path=self.workspace.paths.deferred_work,
+                family="ledger",
+            )
+        return True
+
     def _close_resolved(self, plan: TriagePlan) -> int:
         self._emit("pre_close_resolved")
         ledger = self.workspace.paths.deferred_work
@@ -4920,10 +5068,12 @@ class SweepEngine(Engine):
             # keeps a phase that resolved nothing away from git ENTIRELY: with no
             # ids named there is no write to publish under either arm.
             #
-            # The guard inventory across all nine `_commit_ledger` sites, since
+            # The guard inventory across all ten `_commit_ledger` sites, since
             # it is not uniform and reading it as uniform is the trap:
-            #   * SIX gate on a write result or a normally returned effect:
+            #   * SEVEN gate on a write result or a normally returned effect:
             #     both prunes (`dropped`, and `drop_pre_answer` answering True),
+            #     `_ingest_retro_action_items` (DW-388: `append_entries` minting
+            #     at least one id),
             #     this site's TWO arms (`closed`, and `pending` — the same landed
             #     write, read back off disk after a crash lost only its commit),
             #     `_decisions_phase` (`any_effect_landed`), and
@@ -4956,10 +5106,13 @@ class SweepEngine(Engine):
             #     publishing.
             # The RUN'S DOUBT (`_ledger_unfit_to_publish()`, the one reader of the
             # two cycle latches and the persisted DW-218/219 mirror) is a SECOND,
-            # non-uniform gate laid over the nine, and which sites read it is the
+            # non-uniform gate laid over the ten, and which sites read it is the
             # other trap to read as uniform:
-            #   * FOUR read it at the call site and journal
-            #     `sweep-ledger-commit-withheld` instead of publishing: this site's
+            #   * FIVE read it at the call site and journal
+            #     `sweep-ledger-commit-withheld` instead of publishing:
+            #     `_ingest_retro_action_items` (DW-388 — `_loop` also refuses to
+            #     call it under the doubt, so the call-site gate covers only a
+            #     doubt armed in between), this site's
             #     TWO arms and `_loop`'s post-recovery publisher, the debt settle
             #     included (DW-246 — all three
             #     run on a resume AHEAD of `_cycle`'s dispatch gate, so a run that
@@ -4976,12 +5129,14 @@ class SweepEngine(Engine):
             #     so it writes no row of its own.
             #   * `_loop`'s boundary publisher needs no gate of its own: it sits
             #     BELOW the unfit-to-publish stop, which returns first.
-            #   * `_loop` reads it TWICE more, ahead of publishers rather than at
-            #     them: the in-flight recovery pass is withheld whole (a re-armed
-            #     bundle's own `commit_story` is a whole-tree `git add -A`;
-            #     `sweep-bundles-withheld`), and `_ensure_migration` is refused on
-            #     the doubt's own `ledger-unreadable` stop before any rewrite
-            #     session is spent — so its publisher never reads it itself.
+            #   * `_loop` reads it THREE times more, ahead of publishers rather
+            #     than at them: the in-flight recovery pass is withheld whole (a
+            #     re-armed bundle's own `commit_story` is a whole-tree `git add -A`;
+            #     `sweep-bundles-withheld`), `_ensure_migration` is refused on the
+            #     doubt's own `ledger-unreadable` stop before any rewrite session
+            #     is spent — so its publisher never reads it itself — and the
+            #     retro action-item ingest's call gate (DW-388) skips the ingest
+            #     outright, silently, ahead of its own call-site read above.
             #   * Both store prunes are about a different file and never read it.
             # Reading is one direction; ARMING is the other, and since DW-244 it
             # IS uniform across the ledger family: every LEDGER-family site — the
@@ -4996,7 +5151,7 @@ class SweepEngine(Engine):
             # was spawned, so it carries `reason="ledger-in-doubt"` (DW-217's token
             # for a ledger that READS but is unfit) rather than a fifth
             # `refuse_cause`.
-            # Beneath all nine are TWO uniform floors, in this order:
+            # Beneath all ten are TWO uniform floors, in this order:
             #   * the TARGET VALIDATION (DW-199/203/205), which asks whether the
             #     declared `family`'s file is still there and still readable before
             #     any git runs. It is what the per-site guards above cannot cover:
@@ -5007,9 +5162,10 @@ class SweepEngine(Engine):
             #   * `_commit_ledger`'s `path_clean`, which makes any of them a no-op
             #     when the published file already matches HEAD.
             # The per-site guards are the early-outs that keep a phase which wrote
-            # nothing from reaching git at all. What the two write-result guards
+            # nothing from reaching git at all. What the write-result guards
             # cannot see is a publish a PREVIOUS invocation landed and never
-            # committed — a replay closes nothing — so those two sites persist
+            # committed — a replay closes nothing — so this site, the decision
+            # phase and the retro-item ingest (DW-388) persist
             # the debt ahead of the write (`_owe_ledger_commit`) and `_loop`
             # settles it at the top of a resume.
             #
@@ -6017,9 +6173,9 @@ class SweepEngine(Engine):
             # `_apply_decision_effect` is this walk's only ledger write, so a walk
             # that answered nothing (every decision pre-answered, skipped
             # unattended, or dropped) wrote nothing, and no git is spawned
-            # (DW-183/DW-185). This is one of the SIX sites gating on a write
+            # (DW-183/DW-185). This is one of the SEVEN sites gating on a write
             # result or returned effect; three gate on something weaker, and `path_clean`
-            # is the uniform floor beneath all nine — the inventory is spelled out
+            # is the uniform floor beneath all ten — the inventory is spelled out
             # at `_close_resolved`.
             #
             # The LEDGER FILE, not the project and not `self.workspace.root`: this
@@ -6263,7 +6419,7 @@ class SweepEngine(Engine):
         bookkeeping") — the two families name different files because they write
         different files:
 
-        * the seven ledger PUBLISHERS pass `self.workspace.paths.deferred_work`.
+        * the eight ledger PUBLISHERS pass `self.workspace.paths.deferred_work`.
           The ledger hangs off `implementation_artifacts`, which
           `bmadconfig._resolve` accepts as any absolute path and
           `ProjectPaths.rebased` leaves unmoved when it sits outside the project
@@ -6428,7 +6584,7 @@ class SweepEngine(Engine):
         is asked about the RESOLVED target (DW-188) and those are the bytes that
         would be published; before, because a refused publish must spawn no git at
         all — the same property the per-site guards buy. The two families need
-        different validation (the seven ledger publishers read through
+        different validation (the eight ledger publishers read through
         `deferredwork.read_for_write`, the two prunes probe the type directly —
         though BOTH families require a REGULAR FILE and both name
         `target-not-a-file` when they do not get one, since DW-238), and

@@ -2058,7 +2058,17 @@ class EntrySpec:
     ``origin`` alone. It is opt-in because only producers whose origin is already
     a complete, spec-independent work identity may safely collapse rows from
     different source specs. The scan remains open-only so resolved work can be
-    filed again when it recurs."""
+    filed again when it recurs.
+
+    ``dedupe_any_status`` (DW-388) is the opposite trade: an entry of ANY status —
+    open, done, legacy, or an :func:`archive_closed` stub, which keeps its
+    ``origin:`` line — carrying the same ``origin`` suppresses the append, whatever
+    its ``source_spec``. It is for producers whose origin names ONE immutable
+    commitment (a retro action item's stable id), where recurrence is meaningless
+    and a finished item must never be re-filed. With it set, the advisory pre-lock
+    no-op in :func:`append_entries_published` stays safe: entries are never deleted
+    and stubs keep ``origin:``, so a twin observed before the lock is still there
+    under it — unlike the open-only arms, whose twin can close in between."""
 
     title: str
     origin: str
@@ -2068,6 +2078,7 @@ class EntrySpec:
     status: str = "open"
     severity: str | None = None
     cross_spec_dedupe: bool = False
+    dedupe_any_status: bool = False
 
 
 def _apply_append(text: str, spec: EntrySpec) -> tuple[str, str | None]:
@@ -2093,7 +2104,9 @@ def _apply_append(text: str, spec: EntrySpec) -> tuple[str, str | None]:
     The scan is deliberately open-only for both match arms: a closed entry with
     the same marker does not suppress the append, because the work has come
     back. The origin-only arm is opt-in so non-harvest producers keep the
-    released exact-pair semantics."""
+    released exact-pair semantics. ``dedupe_any_status`` is the one exception,
+    and it is opt-in too: its origin-only match counts entries of every status
+    (see :class:`EntrySpec`)."""
     given_title = bool(spec.title)
     title = _one_line(spec.title)
     origin = _one_line(spec.origin)
@@ -2101,6 +2114,10 @@ def _apply_append(text: str, spec: EntrySpec) -> tuple[str, str | None]:
     reason = _one_line(spec.reason)
     location = _one_line(spec.location)
     for entry in parse_ledger(text):
+        if spec.dedupe_any_status:
+            if field_line_present(entry, "origin", origin):
+                return text, None
+            continue
         if not entry.open or not field_line_present(entry, "origin", origin):
             continue
         if spec.cross_spec_dedupe or field_line_present(entry, "source_spec", source_spec):
@@ -2246,7 +2263,10 @@ def append_entries_published(
     An opted-in cross-spec batch always reaches the lock, even when the advisory
     fold suppresses every spec, because an observed open twin may close before
     the authoritative decision; the locked re-read must then file the recurrence
-    fresh. Deliberately NO missing-ledger guard, unlike its sibling mutators: an
+    fresh. An any-status batch (``dedupe_any_status``, DW-388) keeps the
+    lock-free no-op: its twin cannot vanish between the probe and the lock,
+    because entries are never deleted and archive stubs keep ``origin:``.
+    Deliberately NO missing-ledger guard, unlike its sibling mutators: an
     absent ledger here means CREATE, which is a write, and a write must take the
     lock.
 
