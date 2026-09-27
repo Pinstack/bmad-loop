@@ -154,6 +154,11 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Refuse a managed relay under a native event the profile does not map when it
+  reports `Stop` or a canonical event the profile maps elsewhere (e.g. claude
+  `SubagentStop` running `relay Stop`): `validate`/`probe-adapter` flag
+  `hooks.registered`, and `init` and worktree provisioning strip it; relays reporting
+  a canonical the profile never maps are kept for aliases sharing the config (DW-409).
 - Resolve a relative stories-mode spec folder against the workspace's project, not
   its code root (`_stories_folder` joins `workspace.paths.project`), so a nested
   `repo_root:` override finds `stories.yaml` in place and in a mount (DW-379).

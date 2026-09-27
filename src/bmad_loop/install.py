@@ -1605,15 +1605,30 @@ def strip_relay_hooks(config: dict, dialect: str) -> bool:
     Empty event lists are dropped; an empty container is left in place for
     `merge_hooks` to refill.
     """
-    container = hook_event_container(config, dialect)
+    return _strip_commands(hook_event_container(config, dialect), _relay_command)
+
+
+def _strip_commands(
+    container: dict,
+    predicate: Callable[[object], bool],
+    native_events: Iterable[str] | None = None,
+) -> bool:
+    """Drop every command `predicate` selects from a `native event -> handlers` map.
+
+    `native_events` limits the visit (default: every event in `container`). A
+    non-list event value is not ours and is skipped. Removal is at command
+    granularity for nested entries and whole-entry for flat ones; empty event lists
+    are dropped. True if anything went. The predicate alone decides what is
+    stripped, in both shapes.
+    """
     removed = False
-    for native_event in list(container):
+    for native_event in list(container if native_events is None else native_events):
         handlers = container.get(native_event)
         if not isinstance(handlers, list):
             continue
         kept = []
         for handler in handlers:
-            if not any(_relay_command(c) for c in _commands_in_handler(handler)):
+            if not any(predicate(c) for c in _commands_in_handler(handler)):
                 kept.append(handler)
                 continue
             # claude/codex/gemini wrap commands in a nested "hooks" list, and a
@@ -1624,9 +1639,7 @@ def strip_relay_hooks(config: dict, dialect: str) -> bool:
             nested = handler.get("hooks") if isinstance(handler, dict) else None
             if isinstance(nested, list):
                 surviving = [
-                    c
-                    for c in nested
-                    if not (isinstance(c, dict) and _relay_command(c.get("command")))
+                    c for c in nested if not (isinstance(c, dict) and predicate(c.get("command")))
                 ]
                 if surviving:
                     if len(surviving) != len(nested):
@@ -1643,6 +1656,35 @@ def strip_relay_hooks(config: dict, dialect: str) -> bool:
     return removed
 
 
+def _strip_hazardous_unmapped_relays(container: dict, registrations: Mapping[str, str]) -> bool:
+    """Strip managed relays under natives outside `registrations` that would lie.
+
+    A relay under an unregistered native event is hazardous when the canonical
+    event it reports is `Stop` (it would complete sessions early) or one the
+    registrations report from a different native event (the two disagree). For
+    every profile that maps Stop (all that can complete) this is the same set
+    `relay_registered` refuses. Any other relay there is left alone: it
+    may belong to an alias profile sharing this config file (DW-409).
+
+    `Stop` joins the set only through a registration reporting it, which every
+    profile that can complete has. A Stop-less registration set (an alias mapping
+    only `Notification`, or probe-capture commands, which parse to None) must not
+    strip another alias's `Stop` relay from the native it legitimately sits under.
+    `relay_registered` needs no such guard: it refuses a Stop-less map outright.
+    """
+    hazardous = {
+        canonical
+        for command in registrations.values()
+        if (canonical := _relay_canonical_event(command)) is not None
+    }
+
+    def hazardous_relay(command: object) -> bool:
+        return isinstance(command, str) and _relay_canonical_event(command) in hazardous
+
+    unmapped = [native for native in container if native not in registrations]
+    return _strip_commands(container, hazardous_relay, unmapped)
+
+
 def relay_registered(config: dict, dialect: str, events: Mapping[str, str]) -> bool:
     """True if the relay is truthfully registered for a profile's `events`.
 
@@ -1653,6 +1695,13 @@ def relay_registered(config: dict, dialect: str, events: Mapping[str, str]) -> b
     SessionStart firing `relay Stop` would complete every session at launch, and a
     Stop firing `relay SessionEnd` never completes one. Other events need not be
     present.
+
+    The same hazard reaches native events OUTSIDE `events` (DW-409): a claude
+    `SubagentStop` firing `relay Stop` completes a session when a subagent ends. So
+    a relay under an unmapped native that reports `Stop`, or a canonical event the
+    map reports from a different native, is refused too. A relay there reporting a
+    canonical event the map never names is accepted: profiles can share a config
+    file, and it may be an alias profile's registration.
     """
     container = hook_event_container(config, dialect)
     stop_natives = [native for native, canonical in events.items() if canonical == "Stop"]
@@ -1671,6 +1720,14 @@ def relay_registered(config: dict, dialect: str, events: Mapping[str, str]) -> b
                 if reported != canonical:
                     return False
                 satisfied.add(native)
+    hazardous = {"Stop", *events.values()}
+    for native, handlers in container.items():
+        if native in events or not isinstance(handlers, list):
+            continue
+        for handler in handlers:
+            for command in _executed_commands_in_handler(handler):
+                if _relay_canonical_event(command) in hazardous:
+                    return False
     return all(native in satisfied for native in stop_natives)
 
 
@@ -1759,6 +1816,7 @@ def merge_hooks(config: dict, registrations: dict[str, str], dialect: str) -> tu
             if not _managed_hook_in_handlers(handlers):
                 handlers.append(_hook_entry(dialect, command))
                 changed = True
+        changed |= _strip_hazardous_unmapped_relays(group, registrations)
         return config, changed
     if dialect == "copilot-settings-json":
         config.setdefault("version", 1)  # Copilot hook configs are versioned
@@ -1771,7 +1829,13 @@ def merge_hooks(config: dict, registrations: dict[str, str], dialect: str) -> tu
             for existing in _commands_in_handler(h)
         ):
             # Scope the strip to this event. Profiles may share a config file;
-            # their disjoint events must survive later registrations.
+            # their disjoint events must survive later registrations. (The
+            # unmapped-event strip below is scoped the same way: it removes only
+            # relays reporting Stop or a canonical event registered here from
+            # another native. A Stop relay under an unmapped native completes
+            # this profile's sessions early. Aliases whose maps put one canonical
+            # event on different natives are contradictory for one CLI, so the
+            # last merge wins: an accepted tradeoff — DW-409.)
             scoped = {"hooks": {native_event: matchers}}
             changed |= strip_relay_hooks(scoped, dialect)
             if native_event in scoped["hooks"]:
@@ -1785,6 +1849,7 @@ def merge_hooks(config: dict, registrations: dict[str, str], dialect: str) -> tu
         if not _managed_hook_in_handlers(matchers):
             matchers.append(_hook_entry(dialect, command))
             changed = True
+    changed |= _strip_hazardous_unmapped_relays(hooks, registrations)
     return config, changed
 
 

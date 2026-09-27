@@ -11376,6 +11376,37 @@ def test_validate_refuses_relay_registered_only_on_session_start(project, capsys
     )
 
 
+def test_validate_refuses_stop_relay_under_unmapped_native_and_init_repairs(project, capsys):
+    """DW-409: a managed `relay Stop` under a native event claude's profile does
+    not map (`SubagentStop`) completes sessions early — validate flags it, and a
+    re-run init strips it so the same check reads ok."""
+    from bmad_loop.install import install_into
+
+    install_bmad_config(project)
+    _write_policy(project.project)
+    assert install_into(project.project, clis=("claude",), skills=False) == 0
+    config = project.project / ".claude/settings.json"
+    data = json.loads(config.read_text())
+    data["hooks"]["SubagentStop"] = data["hooks"]["Stop"]
+    config.write_text(json.dumps(data))
+    capsys.readouterr()
+
+    def registered_severities():
+        _rc, doc = _validate_json(project.project, capsys)
+        return [
+            f["severity"]
+            for f in doc["findings"]
+            if f["check"] == "hooks.registered" and f["detail"]["profile"] == "claude"
+        ]
+
+    assert registered_severities() == ["problem"]
+
+    assert install_into(project.project, clis=("claude",), skills=False) == 0
+    assert "SubagentStop" not in json.loads(config.read_text())["hooks"]
+    capsys.readouterr()
+    assert registered_severities() == ["ok"]
+
+
 def test_validate_passes_hooks_registered_without_the_notification_relay(project, capsys):
     """DW-348 acceptance: an existing project whose `.claude/settings.json` lacks
     the `Notification` relay (initialized before it existed) still passes

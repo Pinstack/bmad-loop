@@ -495,6 +495,150 @@ def test_non_command_stop_relay_is_unregistered_and_merge_adds_command(name):
     assert not changed
 
 
+def _correct_config(profile):
+    """Every mapped native running its own correct relay, in the profile's shape."""
+    return _hook_config(
+        profile,
+        {
+            native: [_relay_handler(profile, command)]
+            for native, command in _registrations(profile, f"{_RELAY_EXE} relay {{event}}").items()
+        },
+    )
+
+
+_LEGACY_STOP = "python3 /p/.bmad-loop/bmad_loop_hook.py Stop"
+
+
+@pytest.mark.parametrize(
+    "name,native,command",
+    [
+        ("claude", "SubagentStop", f"{_RELAY_EXE} relay Stop"),
+        ("claude", "UserPromptSubmit", f"{_RELAY_EXE} relay Stop"),
+        ("copilot", "userPromptSubmitted", f"{_RELAY_EXE} relay Stop"),
+        ("antigravity", "PreToolUse", f"{_RELAY_EXE} relay Stop"),
+        ("claude", "UserPromptSubmit", f"{_RELAY_EXE} relay SessionStart"),
+        ("claude", "SubagentStop", _LEGACY_STOP),
+    ],
+    ids=["subagent-stop", "user-prompt", "copilot-flat", "agy-flat", "disagrees", "legacy"],
+)
+def test_hazardous_relay_under_unmapped_native_is_refused_and_merge_strips_it(
+    name, native, command
+):
+    """DW-409: a managed relay under a native the profile does not map, reporting
+    Stop or a canonical event the profile maps from another native, fires on the
+    wrong event. `relay_registered` refuses it and `merge_hooks` repairs it."""
+    profile = get_profile(name)
+    assert native not in profile.hooks.events
+    config = _correct_config(profile)
+    container = install_mod.hook_event_container(config, profile.hooks.dialect)
+    assert _registered(profile, config)
+    container[native] = [_relay_handler(profile, command)]
+    assert not _registered(profile, config)
+
+    registrations = _registrations(profile, f"{_RELAY_EXE} relay {{event}}")
+    config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
+    assert changed
+    container = install_mod.hook_event_container(config, profile.hooks.dialect)
+    assert native not in container
+    assert container == install_mod.hook_event_container(
+        _correct_config(profile), profile.hooks.dialect
+    )
+    assert _registered(profile, config)
+    _, changed = merge_hooks(config, registrations, profile.hooks.dialect)
+    assert not changed
+
+
+def test_relay_reporting_an_unmapped_canonical_under_an_unmapped_native_is_kept():
+    """It may be an alias profile's registration in a shared config file."""
+    profile = get_profile("codex")
+    assert "PreCompact" not in profile.hooks.events
+    assert "PreCompact" not in profile.hooks.events.values()
+    config = _correct_config(profile)
+    config["hooks"]["PreCompact"] = [_relay_handler(profile, f"{_RELAY_EXE} relay PreCompact")]
+    before = json.loads(json.dumps(config))
+    assert _registered(profile, config)
+
+    config, changed = merge_hooks(
+        config, _registrations(profile, f"{_RELAY_EXE} relay {{event}}"), profile.hooks.dialect
+    )
+    assert not changed
+    assert config == before
+
+
+def test_unmapped_strip_keeps_a_user_command_beside_the_relay():
+    profile = get_profile("claude")
+    user = {"type": "command", "command": "make lint"}
+    relay = {"type": "command", "command": f"{_RELAY_EXE} relay Stop"}
+    config = _correct_config(profile)
+    config["hooks"]["SubagentStop"] = [{"hooks": [user, relay]}]
+    assert not _registered(profile, config)
+
+    registrations = _registrations(profile, f"{_RELAY_EXE} relay {{event}}")
+    config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
+    assert changed
+    assert config["hooks"]["SubagentStop"] == [{"hooks": [user]}]
+    assert _registered(profile, config)
+    _, changed = merge_hooks(config, registrations, profile.hooks.dialect)
+    assert not changed
+
+
+@pytest.mark.parametrize("grouped", [True, False], ids=["one-matcher", "two-matchers"])
+def test_unmapped_strip_removes_only_the_hazardous_relay(grouped):
+    """codex maps no Notification, so that relay may be an alias's; Stop never is."""
+    profile = get_profile("codex")
+    stop = {"type": "command", "command": f"{_RELAY_EXE} relay Stop"}
+    notification = {"type": "command", "command": f"{_RELAY_EXE} relay Notification"}
+    config = _correct_config(profile)
+    config["hooks"]["SubagentStop"] = (
+        [{"hooks": [stop, notification]}]
+        if grouped
+        else [{"hooks": [stop]}, {"hooks": [notification]}]
+    )
+    assert not _registered(profile, config)
+
+    registrations = _registrations(profile, f"{_RELAY_EXE} relay {{event}}")
+    config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
+    assert changed
+    assert config["hooks"]["SubagentStop"] == [{"hooks": [notification]}]
+    assert _registered(profile, config)
+    _, changed = merge_hooks(config, registrations, profile.hooks.dialect)
+    assert not changed
+
+
+def test_non_command_relay_under_unmapped_native_never_runs():
+    profile = get_profile("claude")
+    config = _correct_config(profile)
+    config["hooks"]["SubagentStop"] = [
+        _relay_handler(profile, f"{_RELAY_EXE} relay Stop", handler_type="prompt")
+    ]
+    assert _registered(profile, config)
+
+    # The strip is any-shape, like `strip_relay_hooks`: a managed command goes
+    # wherever it sits, executed or not.
+    registrations = _registrations(profile, f"{_RELAY_EXE} relay {{event}}")
+    config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
+    assert changed
+    assert "SubagentStop" not in config["hooks"]
+    _, changed = merge_hooks(config, registrations, profile.hooks.dialect)
+    assert not changed
+
+
+@pytest.mark.parametrize("name", ["claude", "antigravity"])
+def test_non_list_value_under_unmapped_native_is_skipped(name):
+    profile = get_profile(name)
+    config = _correct_config(profile)
+    container = install_mod.hook_event_container(config, profile.hooks.dialect)
+    container["SubagentStop"] = {"not": "ours"}
+    assert _registered(profile, config)
+    config, changed = merge_hooks(
+        config, _registrations(profile, f"{_RELAY_EXE} relay {{event}}"), profile.hooks.dialect
+    )
+    assert not changed
+    assert install_mod.hook_event_container(config, profile.hooks.dialect)["SubagentStop"] == {
+        "not": "ours"
+    }
+
+
 @pytest.mark.parametrize(
     "command,expected",
     [
