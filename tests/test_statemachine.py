@@ -109,6 +109,19 @@ def test_migration_triage_commit_path_sequence():
     assert task.terminal
 
 
+def test_pending_migration_with_an_empty_manifest_completes_as_done():
+    """DW-440: a sweep migrate task whose input holds no legacy entries has nothing
+    to convert, so `_ensure_migration` retires it straight from PENDING to DONE
+    through `advance()` rather than dispatching a session. DONE is terminal, so
+    `migration_resume` never re-enters it."""
+    task = StoryTask(story_key="sweep-migrate", epic=0)
+    advance(task, Phase.DONE)
+    assert task.phase == Phase.DONE
+    assert task.terminal
+    with pytest.raises(IllegalTransition):
+        advance(task, Phase.TRIAGE_RUNNING)
+
+
 # ---------------------------------------------------------------------------
 # sprint-board regression allowlist (DW-383)
 

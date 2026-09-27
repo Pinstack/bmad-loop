@@ -154,6 +154,14 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Pause a sweep migration before dispatch when its input is a tracked ledger that
+  differs from its committed version (or the check faults), instead of spending a
+  session whose accepted rewrite then fails with
+  `migration ledger publication unavailable`. Journals `migrate-ledger-dirty`; commit
+  the ledger, then resume (DW-437).
+- Complete a sweep migration with no legacy entries to convert (for example, a re-armed
+  task over a non-legacy ledger) as DONE with no session, remove its recovery records,
+  and go on to triage. Journals `migrate-empty-manifest` (DW-440).
 - Warn in `validate` (`policy.extra-args-unservable`) when a role's resolved
   `extra_args` under an `opencode-http` profile repeat an adapter-owned serve flag
   (`--port`/`--hostname`/`--print-logs`, or a `--flag=` spelling): they land after the

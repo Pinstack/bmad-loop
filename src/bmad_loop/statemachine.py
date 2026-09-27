@@ -19,8 +19,10 @@ class IllegalTransition(Exception):
 TRANSITIONS: dict[Phase, frozenset[Phase]] = {
     # TRIAGE_RUNNING: a sweep run's triage task — also reused by the sweep's
     # legacy-ledger migration task (same lifecycle, its own task key);
-    # story tasks go to DEV_RUNNING
-    Phase.PENDING: frozenset({Phase.DEV_RUNNING, Phase.TRIAGE_RUNNING}),
+    # story tasks go to DEV_RUNNING.
+    # DONE: the sweep migrate task's empty manifest (DW-440) — its input holds no
+    # legacy entries, so the migration is a completed no-op and dispatches nothing
+    Phase.PENDING: frozenset({Phase.DEV_RUNNING, Phase.TRIAGE_RUNNING, Phase.DONE}),
     Phase.DEV_RUNNING: frozenset({Phase.DEV_VERIFY}),
     # COMMITTING: review.enabled = false skips the review loop entirely, so a
     # verified dev pass commits straight from DEV_VERIFY

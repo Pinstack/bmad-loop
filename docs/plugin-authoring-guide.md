@@ -648,7 +648,8 @@ retried, and a veto on `post_migrate` is ignored. Every delivery of one completi
 carries the same `ctx.delivery_id` (`BMAD_LOOP_DELIVERY_ID` for a declarative hook),
 and a later re-migration gets a new one. A handler with non-idempotent side effects
 should deduplicate on that id. Stages without an id leave `ctx.delivery_id` as `None`
-and do not set the variable.
+and do not set the variable. A migration whose ledger holds no legacy entries completes
+without a session and fires neither `pre_migrate_session` nor `post_migrate`.
 
 ---
 

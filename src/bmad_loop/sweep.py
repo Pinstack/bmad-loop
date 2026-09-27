@@ -4024,19 +4024,129 @@ class SweepEngine(Engine):
         if refund_attempt and task.attempt > 0:
             task.attempt -= 1
         self._save()
-        # DW-315: fallback hosts never unlink a record by an unbound name, so
-        # they skip retirement. The leftovers are inert there — fallback
-        # recovery escalates before it reads any record — and the durable
-        # PENDING state above already denies them authority.
-        if DIR_FD_ANCHORED_WRITES:
-            for name in (
-                _MIGRATE_BASELINE_RECORD,
-                _MIGRATE_MANIFEST_RECORD,
-                _MIGRATE_REWRITE_RECORD,
-                _MIGRATE_RESULT_RECORD,
-            ):
-                self._remove_migration_record(self.run_dir / name)
+        self._retire_migration_records()
         raise RuntimeError("migration ledger changed before adapter launch")
+
+    def _retire_migration_records(self) -> None:
+        """Remove the four migrate-* recovery records, on dir-fd hosts only.
+
+        Callers persist the state that denies the records authority FIRST — a
+        PENDING task with no baseline or current-format marker, or a DONE one —
+        and unlink after, so a cleanup fault that propagates from here leaves
+        inert evidence, never recovery authority.
+
+        DW-315: fallback hosts never unlink a record by an unbound name, so they
+        skip retirement. The leftovers are inert there — fallback recovery
+        escalates before it reads any record — and the durable state the caller
+        wrote already denies them authority.
+        """
+        if not DIR_FD_ANCHORED_WRITES:
+            return
+        for name in (
+            _MIGRATE_BASELINE_RECORD,
+            _MIGRATE_MANIFEST_RECORD,
+            _MIGRATE_REWRITE_RECORD,
+            _MIGRATE_RESULT_RECORD,
+        ):
+            self._remove_migration_record(self.run_dir / name)
+
+    def _refuse_dirty_migration_input(self, task: StoryTask) -> None:
+        """DW-437: pause before dispatch when the migration input is a TRACKED
+        ledger that differs from its committed blob.
+
+        `verify.commit_path_bound` binds the migration's publication to that
+        committed blob, so an accepted rewrite of a dirty input fails with
+        `migration ledger publication unavailable` only after a session has been
+        spent on it. Reached by a DW-429 kept rival or an operator's uncommitted
+        edit. An untracked ledger, or one proven outside the repo (`_ledger_rel`
+        → `(None, None)`), has no committed blob to bind and is never refused.
+
+        A probe fault — `_ledger_rel` failing, or `verify.GitError`/`OSError`
+        from either probe — refuses too, naming the fault: an unknown state is
+        never assumed clean.
+
+        The refusal mirrors the duplicate-id one in :meth:`_ensure_migration`
+        exactly (its invariant comment is the doctrine): PAUSE_STORY_GATE, the
+        task stays PENDING and owns no baseline, and no session is dispatched.
+        The remedy is to commit the ledger and resume, never done on the
+        operator's behalf.
+        """
+        ledger = self.workspace.paths.deferred_work
+        root = self.workspace.root
+        rel, fault = self._ledger_rel()
+        if rel is None and fault is None:
+            return  # proven external: no revision of this repo can name it
+        dirty = False
+        if rel is not None:
+            try:
+                dirty = verify.path_tracked(root, rel) and not verify.path_clean(root, rel)
+            except (verify.GitError, OSError) as e:
+                fault = e
+        if fault is None and not dirty:
+            return
+        if fault is not None:
+            error = f"{type(fault).__name__}: {fault}"
+            reason = (
+                f"could not tell whether {ledger.name} differs from its committed "
+                f"version ({error}), and a dirty tracked ledger's accepted migration "
+                "could not be published; fix the fault, make sure the ledger is "
+                "COMMITTED, then resume"
+            )
+            # `refuse_cause` is a closed slug (`dirty` | `probe-fault`), because
+            # `error` is scrubbed from dumps and would otherwise be the only
+            # thing telling a probe fault from a dirty ledger (DW-201 convention).
+            self.journal.append(
+                "migrate-ledger-dirty",
+                story_key=MIGRATE_KEY,
+                ledger=str(ledger),
+                refuse_cause="probe-fault",
+                error=error,
+            )
+        else:
+            reason = (
+                f"{ledger.name} differs from its committed version, so an accepted "
+                "migration of it could not be published (publication is bound to the "
+                "committed ledger); COMMIT the ledger, then resume"
+            )
+            self.journal.append(
+                "migrate-ledger-dirty",
+                story_key=MIGRATE_KEY,
+                ledger=str(ledger),
+                refuse_cause="dirty",
+            )
+        gates.notify(
+            self.policy,
+            self.run_dir,
+            f"migration refused: {ledger.name}",
+            f"{reason} — then `bmad-loop resume {self.state.run_id}`",
+        )
+        task.baseline_commit = None
+        task.baseline_untracked = None
+        self._save()
+        raise RunPaused(reason, PAUSE_STORY_GATE, MIGRATE_KEY)
+
+    def _complete_empty_migration(self, task: StoryTask) -> None:
+        """DW-440: the migration input holds no legacy entries, so there is
+        nothing to convert — a completed no-op, not a session.
+
+        Reached by a re-armed (`runs.rearm_escalation` → PENDING, marker kept)
+        format-1 task over a non-legacy ledger, and by other restart paths. The
+        task retires its recovery marker and baseline, clears both escalation
+        latches, and goes PENDING → DONE through `advance()`; DONE sits outside
+        `migration_resume`, so later resumes never re-enter the migration.
+        Persisted first, then the migrate-* records are unlinked, as
+        :meth:`_retire_migration_dispatch_authority` does. No `sweep-migrated`
+        row, no `post_migrate`, and no delivery latch: nothing was converted.
+        """
+        task.migration_recovery_format = 0
+        task.baseline_commit = None
+        task.baseline_untracked = None
+        task.migration_ledger_rival = False
+        task.migration_commit_escalated = False
+        advance(task, Phase.DONE)
+        self.journal.append("migrate-empty-manifest", story_key=MIGRATE_KEY)
+        self._save()
+        self._retire_migration_records()
 
     def _ensure_migration(self, text: str) -> None:
         """Pre-DW-format ledger content (older BMAD-method projects) blocks a
@@ -4162,6 +4272,22 @@ class SweepEngine(Engine):
                 task.baseline_untracked = None
             task.migration_ledger_rival = False  # leaving ESCALATED consumes the latch
             task.phase = Phase.PENDING  # deliberate reset, not a normal transition
+        # DW-437/DW-440: two pre-dispatch guards, AFTER the whole entry chain so
+        # they cover every path that reaches dispatch (fresh, PENDING-with-marker,
+        # the ESCALATED/format-0 restart including a `keep_ledger` rival, and the
+        # TRIAGE_RUNNING/TRIAGE_VERIFY restores), and ABOVE the duplicate-id guard
+        # and the baseline stamp for the invariant spelled out below. Dirty first:
+        # an empty manifest over a dirty ledger must pause re-askably, never go
+        # DONE and let a plain resume triage into the same publication failure.
+        self._refuse_dirty_migration_input(task)
+        manifest = self._migration_manifest(text)
+        # A no-op migration skips the duplicate-id refusal below: no rewrite
+        # happens, so the ledger reaches the cycle exactly as an ordinary
+        # non-legacy sweep's does. Nothing downstream refuses it there; a close
+        # on a duplicated id is journaled `deferred-close-duplicate-id` (#286).
+        if not manifest:
+            self._complete_empty_migration(task)
+            return
         # **The invariant: a refusal that dispatches nothing leaves this task
         # owning NO baseline.** It takes both halves below. Sitting above the
         # stamp keeps a fresh entry from taking one; clearing handles the entry
@@ -4235,7 +4361,6 @@ class SweepEngine(Engine):
             task.baseline_untracked = sorted(verify.untracked_files(self.workspace.root))
 
         pre_canonical = snapshot_canonical(text)
-        manifest = self._migration_manifest(text)
         manifest_path = self.run_dir / _MIGRATE_MANIFEST_RECORD
         confine_root = _project_of_run_dir(self.run_dir)
         # Bind the recovery records to the same authoritative input `_loop`

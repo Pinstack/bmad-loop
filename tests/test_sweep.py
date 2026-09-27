@@ -22116,20 +22116,29 @@ def test_committing_resume_refuses_live_ledger_drift_before_publication(project,
 
 
 def test_pending_migration_can_validate_an_already_canonical_operator_repair(project):
+    """A PENDING migrate task whose ledger the operator already repaired to
+    canonical form has nothing to convert, so it completes DONE and triage runs.
+
+    Since DW-440 the empty manifest dispatches no migration session: the only
+    session is triage. The ledger is committed, so the dirty-input guard lets it
+    through.
+
+    Ablation, performed: delete the empty-manifest short-circuit in
+    `_ensure_migration` and this reddens — a `--migrate` session is dispatched
+    first, so the first session's prompt names `--migrate`."""
     canonical = migrated_ledger()
     write_legacy_ledger(project, canonical)
     plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
-    engine, adapter = make_sweep(
-        project,
-        [migrate_effect(project, canonical, []), triage_effect(plan)],
-    )
+    engine, adapter = make_sweep(project, [triage_effect(plan)])
     engine.state.tasks["sweep-migrate"] = StoryTask(story_key="sweep-migrate", epic=0)
 
     summary = engine.run()
 
     assert not summary.crashed and not summary.paused
     assert engine.state.tasks["sweep-migrate"].phase == Phase.DONE
-    assert len(adapter.sessions) == 2
+    assert len(adapter.sessions) == 1 and "--migrate" not in adapter.sessions[0].prompt
+    assert len(_records(engine, "migrate-empty-manifest")) == 1
+    assert _records(engine, "sweep-migrated") == []
 
 
 @needs_dir_fd_recovery
@@ -33239,7 +33248,46 @@ def test_migration_reread_fault_retires_predispatch_authority(
 
 
 def test_migration_refuses_rival_between_cycle_read_and_setup_reread(project, monkeypatch):
+    """The setup reread refuses a rival that lands after the cycle read.
+
+    Over a TRACKED ledger the rival lands just AFTER the DW-437 dirty-input guard,
+    because a tracked rival landing before the guard is refused by the guard
+    instead, as a story-gate pause
+    (`test_migration_refuses_a_dirty_tracked_legacy_ledger_before_dispatch`). The
+    guard lets an untracked ledger through, so there the whole cycle-read →
+    reread window still depends on the reread: the sibling
+    `test_migration_refuses_untracked_rival_between_cycle_read_and_setup_reread`
+    pins that."""
     write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, adapter = make_sweep(
+        project, [migrate_effect(project, migrated_ledger(), _valid_migration_mapping())]
+    )
+    rival = LEGACY_LEDGER + "\n<!-- rival after cycle read -->\n"
+    real_guard = engine._refuse_dirty_migration_input
+
+    def guard_then_rival(task):
+        real_guard(task)
+        project.deferred_work.write_text(rival, encoding="utf-8")
+
+    monkeypatch.setattr(engine, "_refuse_dirty_migration_input", guard_then_rival)
+    summary = engine.run()
+
+    assert summary.crashed and adapter.sessions == []
+    persisted = load_state(engine.run_dir).tasks["sweep-migrate"]
+    assert persisted.phase == Phase.PENDING and persisted.attempt == 0
+    assert persisted.baseline_commit is None and persisted.baseline_untracked is None
+    assert project.deferred_work.read_text(encoding="utf-8") == rival
+
+
+def test_migration_refuses_untracked_rival_between_cycle_read_and_setup_reread(
+    project, monkeypatch
+):
+    """The DW-437 guard never refuses an untracked ledger, so a rival that lands
+    right after the cycle read passes the guard, and the setup reread is still
+    what refuses it: no session, the task PENDING with no baseline, the rival
+    intact."""
+    write_legacy_ledger(project, LEGACY_LEDGER, commit=False)
+    assert git(project.project, "ls-files", "--", ledger_rel(project)) == ""
     engine, adapter = make_sweep(
         project, [migrate_effect(project, migrated_ledger(), _valid_migration_mapping())]
     )
@@ -33255,6 +33303,7 @@ def test_migration_refuses_rival_between_cycle_read_and_setup_reread(project, mo
     summary = engine.run()
 
     assert summary.crashed and adapter.sessions == []
+    assert _records(engine, "migrate-ledger-dirty") == []  # the guard let it through
     persisted = load_state(engine.run_dir).tasks["sweep-migrate"]
     assert persisted.phase == Phase.PENDING and persisted.attempt == 0
     assert persisted.baseline_commit is None and persisted.baseline_untracked is None
@@ -34112,23 +34161,45 @@ def _escalate_on_a_tracked_rival(project, monkeypatch):
 def test_escalated_restart_keeps_a_refused_rival_as_the_migration_input(project, monkeypatch):
     """DW-429: a refused readable rival latches `migration_ledger_rival`, and the
     next resume's generic ESCALATED restart puts the rival back after its reset
-    instead of hard-resetting it away. The replacement session grades the rival
-    text (on disk before dispatch, and pinned as the attempt's baseline record),
-    the validation-retry restore republishes it for the second attempt, and
-    leaving ESCALATED consumes the latch — the cap escalation that follows is not
-    a rival refusal and stamps it False.
+    instead of hard-resetting it away. Leaving ESCALATED consumes the latch.
 
-    The sessions reject rather than convert: a dirty tracked ledger's accepted
-    migration is refused by the publisher's committed-blob binding
-    (`commit_path_bound`), which is outside this fix.
+    DW-437: the kept rival is a TRACKED ledger that differs from its committed
+    blob. `commit_path_bound` binds publication to that blob, so an accepted
+    migration of it could not be published. The first resume therefore keeps the
+    rival and then refuses it before dispatch: a story-gate pause, no session, the
+    task PENDING with no baseline, and the consumed latch persisted False. After
+    the operator commits the rival, the next resume dispatches. The replacement
+    session grades the rival text (on disk before dispatch, and pinned as the
+    attempt's baseline record), and the validation-retry restore republishes it
+    for the second attempt. The sessions reject rather than convert, so the cap
+    escalation that follows is not a rival refusal and stamps the latch False.
 
     Ablation, performed: force `keep_ledger = False` in the generic restart and
-    this reddens — the reset republishes the committed legacy ledger and the
-    session observes that instead of the rival. Delete the restart's
-    `task.migration_ledger_rival = False` consumption and the dispatch-time
-    `latches` row reddens."""
+    this reddens — the reset republishes the committed legacy ledger, which is
+    clean, so the first resume dispatches over that instead of refusing the rival.
+    Delete the restart's `task.migration_ledger_rival = False` consumption and the
+    persisted-latch assertion after the refusal reddens. Delete the dirty-input
+    guard and the first resume dispatches the rival (`adapter.sessions == []`
+    reddens)."""
     escalated = _escalate_on_a_tracked_rival(project, monkeypatch)
     assert load_state(escalated.run_dir).tasks["sweep-migrate"].migration_ledger_rival is True
+
+    refusing, adapter = resume_sweep(project, escalated, [])
+
+    summary = refusing.run()
+
+    assert summary.paused and not summary.crashed and adapter.sessions == []
+    persisted = load_state(refusing.run_dir)
+    assert persisted.paused_stage == PAUSE_STORY_GATE
+    task = persisted.tasks["sweep-migrate"]
+    assert task.phase == Phase.PENDING and task.baseline_commit is None
+    assert task.migration_ledger_rival is False  # leaving ESCALATED consumed the latch
+    assert project.deferred_work.read_text(encoding="utf-8") == _RIVAL_LEGACY_LEDGER
+    assert len(_records(refusing, "migrate-ledger-dirty")) == 1
+    assert "COMMIT the ledger" in persisted.paused_reason
+
+    git(project.project, "add", "--", ledger_rel(project))
+    git(project.project, "commit", "-q", "-m", "commit the kept rival")
     observed: list[str] = []
     baselines: list[str] = []
     latches: list[bool] = []
@@ -34142,7 +34213,7 @@ def test_escalated_restart_keeps_a_refused_rival_as_the_migration_input(project,
         return reject(spec)
 
     resumed, adapter = resume_sweep(
-        project, escalated, [reject_after_observing, reject_after_observing]
+        project, refusing, [reject_after_observing, reject_after_observing]
     )
 
     summary = resumed.run()
@@ -34150,7 +34221,7 @@ def test_escalated_restart_keeps_a_refused_rival_as_the_migration_input(project,
     assert summary.paused and not summary.crashed and len(adapter.sessions) == 2
     assert observed == [_RIVAL_LEGACY_LEDGER, _RIVAL_LEGACY_LEDGER]
     assert baselines == [_RIVAL_LEGACY_LEDGER, _RIVAL_LEGACY_LEDGER]
-    assert latches == [False, False]  # leaving ESCALATED consumed the latch
+    assert latches == [False, False]
     task = load_state(resumed.run_dir).tasks["sweep-migrate"]
     assert task.phase == Phase.ESCALATED and task.migration_ledger_rival is False
     assert "failed deterministic validation" in resumed.state.paused_reason
@@ -35048,12 +35119,21 @@ def test_marked_triage_running_restores_over_the_reset_committed_blob(project):
     work, so the snapshot replaces it and the replacement session sees the
     snapshot, with no divergence row.
 
+    Since DW-437 a dirty tracked input is refused before dispatch, so the
+    crashed first run stands in for one that started before that guard existed
+    (the guard is stubbed out for it alone). On resume the restored snapshot is
+    once again a dirty tracked input, so the run pauses at the story gate with
+    the snapshot on disk and no session. After the operator commits it, the
+    replacement session sees the snapshot.
+
     Ablation: drop the `anchor is BASELINE and current == committed` operand and
     this reddens: the reset's blob reads as a rival and the task escalates."""
     committed = "# Deferred Work\n\n"
     write_legacy_ledger(project, committed)
     write_legacy_ledger(project, LEGACY_LEDGER, commit=False)
-    engine = _crash_in_triage_running(project)
+    with pytest.MonkeyPatch.context() as pre_dw437:
+        pre_dw437.setattr(SweepEngine, "_refuse_dirty_migration_input", lambda _self, _task: None)
+        engine = _crash_in_triage_running(project)
     assert (engine.run_dir / "migrate-baseline.md").read_text(encoding="utf-8") == LEGACY_LEDGER
     mapping = _valid_migration_mapping()
     observed: list[str] = []
@@ -35062,9 +35142,21 @@ def test_marked_triage_running_restores_over_the_reset_committed_blob(project):
         observed.append(project.deferred_work.read_text(encoding="utf-8"))
         return migrate_effect(project, migrated_ledger(), mapping)(spec)
 
+    restoring, adapter = resume_sweep(project, engine, [])
+
+    summary = restoring.run()
+
+    assert summary.paused and adapter.sessions == []
+    assert load_state(restoring.run_dir).paused_stage == PAUSE_STORY_GATE
+    assert project.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
+    assert len(_records(restoring, "migrate-ledger-dirty")) == 1
+    assert _records(restoring, "sweep-migration-restore-diverged") == []
+
+    git(project.project, "add", "--", ledger_rel(project))
+    git(project.project, "commit", "-q", "-m", "commit the restored legacy ledger")
     plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
     resumed, adapter = resume_sweep(
-        project, engine, [migrate_after_observing_baseline, triage_effect(plan)]
+        project, restoring, [migrate_after_observing_baseline, triage_effect(plan)]
     )
 
     resumed.run()
@@ -36007,3 +36099,284 @@ def test_bundle_close_repair_notice_folds_a_multiline_fault(project):
     [refused] = _records(engine, "sweep-bundle-close-refused")
     assert refused["error"].endswith("fatal: x\x1b[31m\nhint: y)")
     assert "fatal: x\x1b[31m\nhint: y" in raised.value.reason  # persisted reason unfolded
+
+
+# ---------- DW-437/DW-440: pre-dispatch refusals in `_ensure_migration`
+#
+# Two cases where the outcome of a migration session is already known before
+# dispatch. A tracked ledger that differs from its committed blob cannot publish
+# an accepted rewrite (`commit_path_bound` binds the committed blob), so the run
+# pauses at the story gate until the operator commits it (DW-437). A migration
+# input with no legacy entries has nothing to convert, so the task goes straight
+# to DONE (DW-440).
+
+_LEGACY_COMMITTED_HALF = (
+    "# Deferred Work\n\n"
+    "## Deferred from: epic 1 review (2026-04-06)\n\n"
+    "- ~~**Old fixed thing** — was broken, then repaired~~ → fixed in 1.3\n"
+)
+
+
+def _assert_refused_dirty(engine, adapter, summary, cause: str = "dirty") -> dict:
+    """The DW-437 refusal: a story-gate pause, PENDING, no baseline, no session.
+    `cause` is the closed `refuse_cause` slug that survives a scrubbed dump."""
+    assert summary.paused and not summary.crashed and adapter.sessions == []
+    persisted = load_state(engine.run_dir)
+    assert persisted.paused_stage == PAUSE_STORY_GATE
+    assert persisted.paused_story_key == "sweep-migrate"
+    task = persisted.tasks["sweep-migrate"]
+    assert task.phase == Phase.PENDING
+    assert task.baseline_commit is None and task.baseline_untracked is None
+    [row] = _records(engine, "migrate-ledger-dirty")
+    assert row["story_key"] == "sweep-migrate"
+    assert row["ledger"] == str(engine.workspace.paths.deferred_work)
+    assert row["refuse_cause"] == cause
+    attention = _attention_text(engine)
+    assert "migration refused: deferred-work.md" in attention
+    assert f"bmad-loop resume {engine.state.run_id}" in attention
+    return row
+
+
+def test_migration_refuses_a_dirty_tracked_legacy_ledger_before_dispatch(project):
+    """DW-437: the migration input is a tracked legacy ledger with an uncommitted
+    legacy edit. An accepted rewrite of it could not be published, so the run
+    pauses at the story gate BEFORE any session, with a commit-the-ledger remedy.
+    The task stays PENDING with no baseline, like the duplicate-id refusal, and
+    the ledger is untouched. Committing the edit and resuming then migrates
+    normally.
+
+    The engine is driven directly, which bypasses the CLI's own dirty-tree check.
+
+    Ablation, performed: delete the `_refuse_dirty_migration_input(task)` call in
+    `_ensure_migration` and this reddens — the scripted session runs over the
+    dirty ledger (`adapter.sessions == []` fails). Green-ablation record: moving
+    the call below the baseline stamp leaves this test green, because the
+    refusal clears the baseline itself (the duplicate-id invariant's second
+    half); the placement is pinned by the empty-manifest ordering test
+    `test_rearmed_migration_over_a_dirty_non_legacy_ledger_pauses_instead`."""
+    write_legacy_ledger(project, _LEGACY_COMMITTED_HALF)
+    write_legacy_ledger(project, LEGACY_LEDGER, commit=False)
+    engine, adapter = make_sweep(
+        project, [migrate_effect(project, migrated_ledger(), _valid_migration_mapping())]
+    )
+
+    summary = engine.run()
+
+    row = _assert_refused_dirty(engine, adapter, summary)
+    assert "error" not in row
+    reason = load_state(engine.run_dir).paused_reason or ""
+    assert "differs from its committed version" in reason and "COMMIT the ledger" in reason
+    assert project.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
+
+    git(project.project, "add", "--", ledger_rel(project))
+    git(project.project, "commit", "-q", "-m", "commit the legacy edit")
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    resumed, adapter = resume_sweep(
+        project,
+        engine,
+        [
+            migrate_effect(project, migrated_ledger(), _valid_migration_mapping()),
+            triage_effect(plan),
+        ],
+    )
+
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert len(adapter.sessions) == 2 and "--migrate" in adapter.sessions[0].prompt
+    assert resumed.state.tasks["sweep-migrate"].phase == Phase.DONE
+    assert len(_records(resumed, "migrate-ledger-dirty")) == 1  # only the first run's
+
+
+def test_migration_dispatches_over_an_untracked_legacy_ledger(project):
+    """DW-437 is scoped to TRACKED ledgers: an untracked one has no committed blob
+    for publication to bind, so it is never refused and migrates as before.
+
+    Ablation, performed: drop the `verify.path_tracked(root, rel) and` operand in
+    `_refuse_dirty_migration_input` and this reddens — `git status` reports the
+    untracked ledger as `??`, so it reads dirty and the run pauses."""
+    write_legacy_ledger(project, LEGACY_LEDGER, commit=False)
+    assert git(project.project, "ls-files", "--", ledger_rel(project)) == ""
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    engine, adapter = make_sweep(
+        project,
+        [
+            migrate_effect(project, migrated_ledger(), _valid_migration_mapping()),
+            triage_effect(plan),
+        ],
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert len(adapter.sessions) == 2 and "--migrate" in adapter.sessions[0].prompt
+    assert engine.state.tasks["sweep-migrate"].phase == Phase.DONE
+    assert _records(engine, "migrate-ledger-dirty") == []
+
+
+@pytest.mark.parametrize("probe", ["ledger_rel", "path_tracked", "path_clean"])
+def test_migration_dirty_probe_fault_refuses_and_names_the_fault(project, monkeypatch, probe):
+    """DW-437: a fault in any probe behind the dirty-input guard refuses too, as a
+    story-gate pause naming the fault. An unknown state is never assumed clean.
+    The ledger here is committed and clean, so only the fault can refuse.
+
+    Ablation, performed: return early on a probe fault in
+    `_refuse_dirty_migration_input` (treat it as clean) and every case reddens —
+    the migration session dispatches."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, adapter = make_sweep(
+        project, [migrate_effect(project, migrated_ledger(), _valid_migration_mapping())]
+    )
+    if probe == "ledger_rel":
+        monkeypatch.setattr(engine, "_ledger_rel", lambda: (None, OSError("scope probe boom")))
+    else:
+
+        def boom(*_args, **_kwargs):
+            raise verify.GitError(f"{probe} boom")
+
+        monkeypatch.setattr(verify, probe, boom)
+
+    summary = engine.run()
+
+    row = _assert_refused_dirty(engine, adapter, summary, cause="probe-fault")
+    expected = "OSError: scope probe boom" if probe == "ledger_rel" else f"GitError: {probe} boom"
+    assert row["error"] == expected
+    reason = load_state(engine.run_dir).paused_reason or ""
+    assert expected in reason and "COMMITTED" in reason
+    assert project.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
+
+
+def _rearm_escalated_non_legacy_migration(project, monkeypatch, *, commit: bool):
+    """DW-440 setup: a format-1 migration ESCALATED from TRIAGE_VERIFY whose live
+    ledger is the migrated (non-legacy) rewrite, then re-armed to PENDING with the
+    marker kept. `commit` decides whether that ledger is committed first.
+
+    Returns the engine and whether this host has dir-fd record writes. The
+    escalation helper forces the fallback arm, so the host's own setting is put
+    back for the resume."""
+    dir_fd = sweep_mod.DIR_FD_ANCHORED_WRITES
+    engine = _escalate_from_fallback_triage_verify(project, monkeypatch)
+    monkeypatch.setattr(sweep_mod, "DIR_FD_ANCHORED_WRITES", dir_fd)
+    if commit:
+        git(project.project, "add", "--", ledger_rel(project))
+        git(project.project, "commit", "-q", "-m", "commit the migrated ledger by hand")
+    runs.rearm_escalation(
+        engine.run_dir, "sweep-migrate", isolated_redrive=False, resolution_recorded=True
+    )
+    task = load_state(engine.run_dir).tasks["sweep-migrate"]
+    assert task.phase == Phase.PENDING and task.migration_recovery_format == 1
+    assert list(engine.run_dir.glob("migrate-*"))  # the records outlived the escalation
+    return engine, dir_fd
+
+
+def test_rearmed_migration_over_a_non_legacy_ledger_completes_without_a_session(
+    project, monkeypatch
+):
+    """DW-440: a re-armed format-1 migrate task whose committed ledger holds no
+    legacy entries has an empty manifest. No migration session runs. The task goes
+    PENDING -> DONE with the recovery marker, baseline and latches retired, the
+    migrate-* records are removed (dir-fd hosts only, DW-315), and the sweep goes
+    on to triage over the ledger. Nothing was converted, so there is no
+    `sweep-migrated` row and no delivery latch.
+
+    Ablation, performed: delete the empty-manifest short-circuit in
+    `_ensure_migration` and this reddens — a `--migrate` session is dispatched
+    first, so `adapter.sessions` holds two sessions."""
+    engine, dir_fd = _rearm_escalated_non_legacy_migration(project, monkeypatch, commit=True)
+    head = git(project.project, "rev-parse", "HEAD")
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    resumed, adapter = resume_sweep(project, engine, [triage_effect(plan)])
+
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert len(adapter.sessions) == 1 and "--migrate" not in adapter.sessions[0].prompt
+    task = load_state(resumed.run_dir).tasks["sweep-migrate"]
+    assert task.phase == Phase.DONE
+    assert task.migration_recovery_format == 0
+    assert task.baseline_commit is None and task.baseline_untracked is None
+    assert task.migration_ledger_rival is False and task.migration_commit_escalated is False
+    assert task.migration_delivery_pending is False
+    assert len(_records(resumed, "migrate-empty-manifest")) == 1
+    assert _records(resumed, "sweep-migrated") == []
+    assert _records(resumed, "migrate-ledger-dirty") == []
+    records = list(resumed.run_dir.glob("migrate-*"))
+    if dir_fd:
+        assert records == []
+    else:
+        assert records  # DW-315: the fallback keeps them as inert evidence
+    assert project.deferred_work.read_text(encoding="utf-8") == migrated_ledger()
+    assert git(project.project, "rev-parse", "HEAD") == head  # nothing committed for it
+
+
+def test_rearmed_migration_over_a_dirty_non_legacy_ledger_pauses_instead(project, monkeypatch):
+    """DW-437 before DW-440: the same re-armed empty manifest over a ledger left
+    UNCOMMITTED is refused as dirty, and the task stays PENDING. Going DONE would
+    let a plain resume triage straight into the same publication failure, while
+    the pause stays re-askable once the ledger is committed.
+
+    Ablation, performed: swap the two guards in `_ensure_migration` (the
+    empty-manifest short-circuit first) and this reddens — the task goes DONE and
+    triage runs over the uncommitted ledger."""
+    engine, _ = _rearm_escalated_non_legacy_migration(project, monkeypatch, commit=False)
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    resumed, adapter = resume_sweep(project, engine, [triage_effect(plan)])
+
+    summary = resumed.run()
+
+    _assert_refused_dirty(resumed, adapter, summary)
+    assert load_state(resumed.run_dir).tasks["sweep-migrate"].migration_recovery_format == 1
+    assert _records(resumed, "migrate-empty-manifest") == []
+    assert project.deferred_work.read_text(encoding="utf-8") == migrated_ledger()
+
+
+def test_empty_manifest_over_duplicate_ids_completes_before_the_duplicate_refusal(project):
+    """DW-440 ordering: a PENDING migrate task over a clean NON-legacy ledger that
+    carries duplicate DW ids goes DONE through the empty-manifest short-circuit.
+    Before DW-440 it paused on the duplicate-id refusal. A no-op migration
+    rewrites nothing, so the ledger reaches the cycle exactly as an ordinary
+    non-legacy sweep's does, and the downstream duplicate-id refusals (#286) own
+    it from there.
+
+    Ablation, performed: move the empty-manifest short-circuit below the
+    duplicate-id guard in `_ensure_migration` and this reddens — the run pauses
+    on `migrate-duplicate-ids` with the task still PENDING."""
+    twins = "# Deferred Work\n\n" + _gated_dw1("gate: 3-2") + "\n" + _gated_dw1("gate: 3-3")
+    write_legacy_ledger(project, twins)
+    assert legacy_manifest(twins) == []  # the premise: nothing legacy to convert
+    assert duplicate_ids(deferredwork.parse_ledger(twins)) == ["DW-1"]
+    plan = triage_result(["DW-1"], skip=[{"id": "DW-1", "reason": "not this cycle"}])
+    engine, adapter = make_sweep(project, [triage_effect(plan)])
+    engine.state.tasks["sweep-migrate"] = StoryTask(story_key="sweep-migrate", epic=0)
+
+    engine.run()
+
+    assert load_state(engine.run_dir).tasks["sweep-migrate"].phase == Phase.DONE
+    assert len(_records(engine, "migrate-empty-manifest")) == 1
+    assert _records(engine, "migrate-duplicate-ids") == []
+    assert not any("--migrate" in s.prompt for s in adapter.sessions)
+
+
+def test_migration_dirty_probe_uses_the_repo_root_relative_path(project):
+    """DW-437 under the monorepo shape (`repo_root` an ancestor of `project`):
+    the dirty probe must name the ledger relative to the repo root, with the
+    project offset (`app/`) included, as `Engine._ledger_rel` does. A dirty
+    tracked legacy ledger in the nested project is refused before any session.
+
+    Ablation, performed: build `rel` as
+    `ledger.relative_to(self.workspace.paths.project).as_posix()` in
+    `_refuse_dirty_migration_input` and this reddens — the project-relative path
+    names nothing tracked in the repo root, so the guard lets the dirty ledger
+    through and the migration session is dispatched."""
+    paths = nested_repo_root_paths(project)
+    assert paths.project != paths.repo_root and paths.project.parent == paths.repo_root
+    write_legacy_ledger(paths, _LEGACY_COMMITTED_HALF)
+    write_legacy_ledger(paths, LEGACY_LEDGER, commit=False)
+    engine, adapter = make_sweep(
+        paths, [migrate_effect(paths, migrated_ledger(), _valid_migration_mapping())]
+    )
+
+    summary = engine.run()
+
+    _assert_refused_dirty(engine, adapter, summary)
+    assert paths.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER

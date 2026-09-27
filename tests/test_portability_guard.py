@@ -300,6 +300,7 @@ REFUSAL_HELPER_DEFS = {
     ("runs.py", "_refuse_live_session"),
     ("runs.py", "_refuse_uncontained_run_dir"),
     ("sweep.py", "_refuse_advanced_migration_head"),  # DW-427/428, test_sweep.py
+    ("sweep.py", "_refuse_dirty_migration_input"),  # DW-437, test_sweep.py
     ("win32_at.py", "_refuse_link"),  # ELOOP for a symlink/junction under O_NOFOLLOW
     ("workspace.py", "_refuse_foreign_checkout"),
     ("worktree_flow.py", "_refuse_integrated_artifacts"),
@@ -1386,6 +1387,15 @@ JOURNAL_KINDS = frozenset(
         "decision-skipped-unattended",
         "migrate-decision",
         "migrate-duplicate-ids",
+        # DW-440: `_ensure_migration`'s input held no legacy entries, so the
+        # migrate task went PENDING -> DONE with no session. `story_key` routed.
+        "migrate-empty-manifest",
+        # DW-437: the migration input is a tracked ledger that differs from its
+        # committed blob (or the probe faulted), so the run paused at the story
+        # gate before dispatch. `story_key` routed, `ledger` and `refuse_cause`
+        # (`dirty` | `probe-fault`) benign, `error` (the probe fault, when there
+        # is one) dropped.
+        "migrate-ledger-dirty",
         "sweep-bundle-close-carried",
         # DW-237. The REFUSAL arm of the bundle-close carry — the sweep's own copy of
         # `story-deferred-close-carry-refused`, on `SweepEngine`'s override. Last of
