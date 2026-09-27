@@ -154,6 +154,11 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Create the missing GitHub release on a verified existing tag in
+  `scripts/release.py publish` instead of reporting "nothing to publish"; a
+  `gh release view` error other than "release not found" fails the publish (DW-411).
+- Re-read the tag on `origin` after a fresh `scripts/release.py publish` create and
+  fail unless it points at the targeted commit (DW-412).
 - Refuse a managed relay under a native event the profile does not map when it
   reports `Stop` or a canonical event the profile maps elsewhere (e.g. claude
   `SubagentStop` running `relay Stop`): `validate`/`probe-adapter` flag

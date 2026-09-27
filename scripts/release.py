@@ -18,9 +18,13 @@ The flow is two-phase:
   ``.github/workflows/release.yml``). It is idempotent: if the ``vX.Y.Z`` tag
   already exists it is verified rather than trusted — the commit the tag points to
   on ``origin`` must carry ``X.Y.Z`` (or, when ``gh release create`` loses a race,
-  must be exactly the commit this run targeted) — and a match is a no-op while a
-  mismatch, a local-only tag or an unreadable remote fails the publish. Otherwise
-  it creates the tag + GitHub release with notes extracted from the CHANGELOG.
+  must be exactly the commit this run targeted) — and a mismatch, a local-only tag
+  or an unreadable remote fails the publish. A verified tag whose GitHub release
+  exists is a no-op; one with no release (hand-pushed, or a ``gh release create``
+  that cut the tag and then failed) gets its release created on that tag.
+  Otherwise it creates the tag + GitHub release with notes extracted from the
+  CHANGELOG, then re-reads the tag on ``origin`` and fails unless it landed on
+  the commit this run targeted (``gh`` ignores ``--target`` for a pre-existing tag).
 
 Usage::
 
@@ -290,7 +294,9 @@ def tag_exists(tag: str) -> bool:
 
     A hit is never trusted on its own: ``cmd_publish`` follows it with
     :func:`remote_tag_target` and requires the commit the tag points to on
-    ``origin`` to carry the version being published.
+    ``origin`` to carry the version being published. A verified tag is then
+    probed with :func:`release_exists`: its release is created on the existing
+    tag when missing, and the publish is a no-op only when it is present.
     """
     return (
         _run(["git", "rev-parse", "-q", "--verify", f"refs/tags/{tag}"], check=False).returncode
@@ -358,6 +364,22 @@ def _already_exists(stderr: str) -> bool:
     target, bad notes) on the loud path where it belongs.
     """
     return "already exists" in (stderr or "").lower()
+
+
+def release_exists(tag: str) -> bool:
+    """Whether a GitHub release exists for ``tag``, via ``gh release view``.
+
+    Only gh's ``release not found`` answer reads as missing — matched by phrase,
+    like :func:`_already_exists`. Any other failure (auth, network, rate limit)
+    dies with its rc and stderr rather than being mistaken for a missing release.
+    """
+    proc = _run(["gh", "release", "view", tag], capture=True, check=False)
+    if proc.returncode == 0:
+        return True
+    stderr = (proc.stderr or "").strip()
+    if "release not found" in stderr.lower():
+        return False
+    _die(f"`gh release view {tag}` failed with rc {proc.returncode}: {stderr}")
 
 
 def last_release_tag() -> str | None:
@@ -620,6 +642,25 @@ def _commit_summary(version: str) -> str:
     return "version bump + changelog"
 
 
+def _release_notes(version: str) -> str:
+    """The CHANGELOG section for ``version``, bounded to GitHub's release-body limit.
+
+    Shared by both create paths (fresh tag, existing tag with no release). Dies
+    when the section is absent; says so when the body had to be truncated.
+    """
+    notes = extract_section(CHANGELOG.read_text(), version)
+    if not notes:
+        _die(f"no CHANGELOG `## [{version}]` section — cannot publish release notes")
+
+    bounded = bound_release_notes(notes, version, repo_url())
+    if bounded is not notes:
+        print(
+            f"release notes: CHANGELOG section is {len(notes):,} chars, over GitHub's "
+            f"{GITHUB_NOTES_LIMIT:,} limit — publishing a truncated body that links the full section"
+        )
+    return bounded
+
+
 def cmd_publish(args: argparse.Namespace) -> int:
     version = sync_version.read_canonical()
     tag = f"v{version}"
@@ -647,20 +688,41 @@ def cmd_publish(args: argparse.Namespace) -> int:
                 f"not {version} — the tag was cut from the wrong commit; delete or "
                 "re-point the origin tag and re-run the publish"
             )
-        print(f"{tag} already exists — nothing to publish")
+        # A verified tag is not proof of a release: a hand-pushed tag, or a
+        # `gh release create` that cut the tag and then failed, leaves a bare
+        # tag that every later run would otherwise skip forever (DW-411).
+        if not shutil.which("gh"):
+            _die("`gh` CLI not found — required to check for the GitHub release")
+        if release_exists(tag):
+            print(f"{tag} already exists — nothing to publish")
+            return 0
+        notes = _release_notes(version)
+        if args.dry_run:
+            print(
+                f"[dry-run] would create release {tag} on the existing tag at "
+                f"{target[:12]} with notes:\n"
+            )
+            print(notes)
+            return 0
+        print(f"creating release {tag} on the existing tag at {target[:12]} ...")
+        # No `--target`: gh ignores it for an existing tag. `--verify-tag` makes gh
+        # abort if the tag vanished from origin since the ls-remote above, instead
+        # of silently cutting a fresh tag from the default branch.
+        proc = subprocess.run(
+            ["gh", "release", "create", tag, "--verify-tag", "--title", tag, "--notes-file", "-"],
+            cwd=REPO,
+            check=False,
+            text=True,
+            input=notes,
+            capture_output=True,
+        )
+        if proc.returncode != 0:
+            sys.stderr.write(proc.stderr)
+            _die(f"`gh release create {tag}` failed with rc {proc.returncode}")
+        print(f"published {tag} for the existing tag at {target[:12]}")
         return 0
 
-    notes = extract_section(CHANGELOG.read_text(), version)
-    if not notes:
-        _die(f"no CHANGELOG `## [{version}]` section — cannot publish release notes")
-
-    bounded = bound_release_notes(notes, version, repo_url())
-    if bounded is not notes:
-        print(
-            f"release notes: CHANGELOG section is {len(notes):,} chars, over GitHub's "
-            f"{GITHUB_NOTES_LIMIT:,} limit — publishing a truncated body that links the full section"
-        )
-    notes = bounded
+    notes = _release_notes(version)
 
     sha = _git_out("rev-parse", "HEAD")
     if args.dry_run:
@@ -709,6 +771,22 @@ def cmd_publish(args: argparse.Namespace) -> int:
             return 0
         sys.stderr.write(proc.stderr)
         _die(f"`gh release create {tag}` failed with rc {proc.returncode}")
+    # `gh` ignores `--target` when the tag already exists on origin, so a success
+    # says nothing about which commit the release is attached to. Re-read the tag
+    # and require exactly `sha`, as the lost-race arm does (DW-412). A mismatch is
+    # left for the operator — never delete a release or tag automatically.
+    target = remote_tag_target(tag)
+    if target is None:
+        _die(
+            f"`gh release create {tag}` succeeded, but origin has no {tag} tag — "
+            "cannot verify where the release landed"
+        )
+    if target != sha:
+        _die(
+            f"{tag} on origin points to {target}, not {sha} this run targeted — the "
+            "release was created on a pre-existing tag; the operator must delete the "
+            "release and tag (or re-point them) and re-run the publish"
+        )
     print(f"published {tag}")
     return 0
 

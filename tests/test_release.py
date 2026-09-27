@@ -321,14 +321,21 @@ def _publish_with_gh(
     remote_target=HEAD_SHA,
     version_at_target="0.5.0",
     gh_calls=None,
+    release_view_rc=0,
+    release_view_stderr="",
+    gh_available=True,
+    dry_run=False,
+    changelog=SAMPLE,
 ):
     cl = tmp_path / "CHANGELOG.md"
-    cl.write_text(SAMPLE)
+    cl.write_text(changelog)
     monkeypatch.setattr(release, "CHANGELOG", cl)
     monkeypatch.setattr(release.sync_version, "read_canonical", lambda: "0.5.0")
     monkeypatch.setattr(release, "tag_exists", lambda tag: tag_exists_locally)
     monkeypatch.setattr(release, "_git_out", lambda *a: HEAD_SHA)
-    monkeypatch.setattr(release.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        release.shutil, "which", lambda name: f"/usr/bin/{name}" if gh_available else None
+    )
     # Argument-dependent, so probing the wrong tag or reading the version at the
     # wrong commit (HEAD, the local tag) falls through to None and goes red.
     monkeypatch.setattr(
@@ -341,14 +348,19 @@ def _publish_with_gh(
     )
 
     def fake_run(*a, **kw):
+        cmd = a[0] if a else kw.get("args")
         if gh_calls is not None:
-            gh_calls.append(a[0] if a else kw.get("args"))
+            gh_calls.append(cmd)
         if seen is not None:
             seen.update(kw)
+        if cmd[:3] == ["gh", "release", "view"]:
+            return SimpleNamespace(
+                returncode=release_view_rc, stdout="", stderr=release_view_stderr
+            )
         return SimpleNamespace(returncode=returncode, stdout="", stderr=stderr)
 
     monkeypatch.setattr(release.subprocess, "run", fake_run)
-    return release.cmd_publish(SimpleNamespace(dry_run=False))
+    return release.cmd_publish(SimpleNamespace(dry_run=dry_run))
 
 
 def test_publish_treats_a_lost_race_as_success(monkeypatch, capsys, tmp_path):
@@ -417,7 +429,7 @@ def test_publish_noop_when_existing_tag_target_carries_the_version(monkeypatch, 
     )
     assert rc == 0
     assert "v0.5.0 already exists — nothing to publish" in capsys.readouterr().out
-    assert gh_calls == []
+    assert gh_calls == [["gh", "release", "view", "v0.5.0"]]
 
 
 def test_publish_dies_when_existing_tag_target_carries_another_version(monkeypatch, tmp_path):
@@ -459,6 +471,171 @@ def test_publish_dies_when_the_tag_exists_only_locally(monkeypatch, tmp_path):
         )
     assert "not on origin" in str(exc.value)
     assert gh_calls == []
+
+
+# --- publish creates the missing release on a verified tag (DW-411) -------- #
+# A verified tag is not a release: a hand-pushed tag, or a `gh release create` that
+# cut the tag then failed, must get its release rather than being skipped forever.
+RELEASE_NOT_FOUND = "release not found"
+EXISTING_TARGET = "cafe" * 10
+
+
+def test_publish_creates_the_missing_release_on_a_verified_tag(monkeypatch, capsys, tmp_path):
+    gh_calls: list = []
+    seen: dict[str, object] = {}
+    rc = _publish_with_gh(
+        monkeypatch,
+        tmp_path,
+        tag_exists_locally=True,
+        remote_target=EXISTING_TARGET,
+        release_view_rc=1,
+        release_view_stderr=RELEASE_NOT_FOUND,
+        gh_calls=gh_calls,
+        seen=seen,
+    )
+    assert rc == 0
+    assert gh_calls[0] == ["gh", "release", "view", "v0.5.0"]
+    assert gh_calls[1] == [
+        "gh",
+        "release",
+        "create",
+        "v0.5.0",
+        "--verify-tag",
+        "--title",
+        "v0.5.0",
+        "--notes-file",
+        "-",
+    ]
+    assert len(gh_calls) == 2
+    assert seen["cwd"] == release.REPO
+    assert "**A thing.**" in str(seen["input"])
+    out = capsys.readouterr().out
+    assert f"published v0.5.0 for the existing tag at {EXISTING_TARGET[:12]}" in out
+    assert "nothing to publish" not in out
+
+
+def test_publish_bounds_the_body_on_the_existing_tag_path(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(release, "repo_url", lambda: REPO_URL)
+    seen: dict[str, object] = {}
+    rc = _publish_with_gh(
+        monkeypatch,
+        tmp_path,
+        tag_exists_locally=True,
+        remote_target=EXISTING_TARGET,
+        release_view_rc=1,
+        release_view_stderr=RELEASE_NOT_FOUND,
+        seen=seen,
+        changelog=SAMPLE.replace("- **A thing.** It no longer breaks.", _long_section(1_000)),
+    )
+    assert rc == 0
+    sent = seen["input"]
+    assert isinstance(sent, str) and len(sent) <= release.GITHUB_NOTES_LIMIT
+    assert f"{REPO_URL}/blob/v0.5.0/CHANGELOG.md" in sent
+    assert "over GitHub's 125,000 limit" in capsys.readouterr().out
+
+
+def test_publish_dry_run_reports_the_missing_release_without_creating(
+    monkeypatch, capsys, tmp_path
+):
+    gh_calls: list = []
+    rc = _publish_with_gh(
+        monkeypatch,
+        tmp_path,
+        tag_exists_locally=True,
+        remote_target=EXISTING_TARGET,
+        release_view_rc=1,
+        release_view_stderr=RELEASE_NOT_FOUND,
+        gh_calls=gh_calls,
+        dry_run=True,
+    )
+    assert rc == 0
+    assert gh_calls == [["gh", "release", "view", "v0.5.0"]]
+    out = capsys.readouterr().out
+    assert (
+        f"[dry-run] would create release v0.5.0 on the existing tag at {EXISTING_TARGET[:12]}"
+        in out
+    )
+    assert "**A thing.**" in out
+
+
+def test_publish_dies_when_the_release_view_errors(monkeypatch, capsys, tmp_path):
+    gh_calls: list = []
+    with pytest.raises(SystemExit) as exc:
+        _publish_with_gh(
+            monkeypatch,
+            tmp_path,
+            tag_exists_locally=True,
+            remote_target=EXISTING_TARGET,
+            release_view_rc=1,
+            release_view_stderr="HTTP 401: Bad credentials",
+            gh_calls=gh_calls,
+        )
+    msg = str(exc.value)
+    assert msg.startswith("release: ")
+    assert "gh release view v0.5.0" in msg and "rc 1" in msg and "Bad credentials" in msg
+    assert gh_calls == [["gh", "release", "view", "v0.5.0"]]  # no create
+    assert "nothing to publish" not in capsys.readouterr().out
+
+
+def test_publish_dies_when_the_existing_tag_create_fails(monkeypatch, capsys, tmp_path):
+    with pytest.raises(SystemExit) as exc:
+        _publish_with_gh(
+            monkeypatch,
+            tmp_path,
+            tag_exists_locally=True,
+            remote_target=EXISTING_TARGET,
+            release_view_rc=1,
+            release_view_stderr=RELEASE_NOT_FOUND,
+            returncode=1,
+            stderr="tag v0.5.0 doesn't exist in the repo",
+        )
+    msg = str(exc.value)
+    assert msg.startswith("release: ") and "gh release create v0.5.0" in msg and "rc 1" in msg
+    captured = capsys.readouterr()
+    assert "doesn't exist in the repo" in captured.err
+    assert "published" not in captured.out
+
+
+def test_publish_dies_without_gh_on_the_existing_tag_path(monkeypatch, tmp_path):
+    gh_calls: list = []
+    with pytest.raises(SystemExit) as exc:
+        _publish_with_gh(
+            monkeypatch,
+            tmp_path,
+            tag_exists_locally=True,
+            remote_target=EXISTING_TARGET,
+            gh_available=False,
+            gh_calls=gh_calls,
+        )
+    assert "`gh` CLI not found" in str(exc.value)
+    assert gh_calls == []
+
+
+# --- a fresh create re-verifies where the tag landed (DW-412) --------------- #
+# `gh` ignores `--target` when the tag already exists on origin, so rc 0 alone does
+# not say the release is attached to the commit this run targeted.
+def test_publish_dies_when_a_fresh_create_lands_on_another_commit(monkeypatch, capsys, tmp_path):
+    with pytest.raises(SystemExit) as exc:
+        _publish_with_gh(monkeypatch, tmp_path, returncode=0, remote_target="f00d" * 10)
+    msg = str(exc.value)
+    assert msg.startswith("release: ")
+    assert "v0.5.0" in msg and "f00d" * 10 in msg and HEAD_SHA in msg
+    assert "pre-existing tag" in msg
+    assert "published" not in capsys.readouterr().out
+
+
+def test_publish_dies_when_a_fresh_create_leaves_no_remote_tag(monkeypatch, capsys, tmp_path):
+    with pytest.raises(SystemExit) as exc:
+        _publish_with_gh(monkeypatch, tmp_path, returncode=0, remote_target=None)
+    msg = str(exc.value)
+    assert msg.startswith("release: ") and "origin has no v0.5.0 tag" in msg
+    assert "published" not in capsys.readouterr().out
+
+
+def test_publish_reports_published_when_the_fresh_tag_lands_on_head(monkeypatch, capsys, tmp_path):
+    rc = _publish_with_gh(monkeypatch, tmp_path, returncode=0)
+    assert rc == 0
+    assert "published v0.5.0" in capsys.readouterr().out
 
 
 ANNOTATED_LS_REMOTE = (
@@ -616,6 +793,7 @@ def test_publish_sends_a_bounded_body_and_says_so(monkeypatch, capsys, tmp_path)
     monkeypatch.setattr(release, "tag_exists", lambda tag: False)
     monkeypatch.setattr(release, "repo_url", lambda: REPO_URL)
     monkeypatch.setattr(release, "_git_out", lambda *a: "deadbeef" * 5)
+    monkeypatch.setattr(release, "remote_tag_target", lambda tag: "deadbeef" * 5)
     monkeypatch.setattr(release.shutil, "which", lambda name: f"/usr/bin/{name}")
     seen: dict[str, object] = {}
 
