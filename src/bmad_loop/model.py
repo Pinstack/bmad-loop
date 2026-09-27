@@ -240,6 +240,25 @@ def _baseline_artifacts_from(raw: object) -> dict[str, list[int] | None] | None:
     return out
 
 
+def _identity_record_from(raw: object) -> tuple[int, int] | None:
+    """Rehydrate a mint-time root identity record (DW-446) from state.json: a
+    two-int ``[st_dev, st_ino]`` list. A pre-upgrade absent key, ``null``, or any
+    other shape reads as "no record" — on which every pin refuses rather than
+    degrading to an unpinned open — and never raises out of ``from_dict``."""
+    if not isinstance(raw, list):
+        return None
+    items: list[object] = list(raw)
+    # `bool` is an `int`; a `[true, 42]` is a mangled record, not an identity
+    ints = [v for v in items if isinstance(v, int) and not isinstance(v, bool)]
+    if len(items) == 2 and len(ints) == 2:
+        return (ints[0], ints[1])
+    return None
+
+
+def _identity_record_to(record: tuple[int, int] | None) -> list[int] | None:
+    return None if record is None else [record[0], record[1]]
+
+
 @dataclass
 class StoryTask:
     story_key: str
@@ -562,6 +581,19 @@ class StoryTask:
     # mounted worktree dir and branch, recorded so a paused/crashed run can
     # reconstruct or discard the in-flight worktree on resume.
     worktree_path: str = ""
+    # The mount's mint-time identity, ``(st_dev, st_ino)`` (DW-446): recorded by
+    # `worktree_flow.run_isolated` beside `worktree_path` before any session runs,
+    # and cleared wherever `worktree_path` is. The mount writers'
+    # `runs.mount_root_identity` compares the mount they open against it, so a
+    # mount — or an ancestor (`worktrees/`, `runs/<id>/`) — swapped for a link to
+    # a tree holding a real `<unit>` refuses. None — a pre-upgrade state.json, an
+    # unpinnable mount — refuses every pinned mount write until
+    # `runs.reconcile_root_identities` backfills it on resume/re-arm. That locked
+    # load never overwrites a non-None record, save one exception: a mount that
+    # still lstats as a real directory with the same `st_ino` and a renumbered
+    # `st_dev` (a reboot/remount) has its `st_dev` re-bound. Deliberately absent
+    # from `documents.py`'s `--json` projection (schema 1).
+    worktree_identity: tuple[int, int] | None = None
     branch: str = ""
     sessions: list[SessionRecord] = field(default_factory=list)
     tokens: TokenUsage = field(default_factory=TokenUsage)
@@ -675,6 +707,7 @@ class StoryTask:
             "dw_ids": self.dw_ids,
             "bundle_file": self.bundle_file,
             "worktree_path": self.worktree_path,
+            "worktree_identity": _identity_record_to(self.worktree_identity),
             "branch": self.branch,
             "sessions": [s.to_dict() for s in self.sessions],
             "tokens": self.tokens.to_dict(),
@@ -953,6 +986,7 @@ class StoryTask:
             dw_ids=[str(i) for i in d.get("dw_ids", [])],
             bundle_file=d.get("bundle_file"),
             worktree_path=str(d.get("worktree_path", "")),
+            worktree_identity=_identity_record_from(d.get("worktree_identity")),
             branch=str(d.get("branch", "")),
             sessions=[SessionRecord.from_dict(s) for s in d.get("sessions", [])],
             tokens=TokenUsage.from_dict(d.get("tokens", {})),
@@ -998,6 +1032,18 @@ class RunState:
     # baseline instead of being parked and reset over. Deliberately absent from
     # `documents.py`'s `--json` projection (schema 1).
     accept_baseline: bool = False
+    # The run dir's mint-time identity, ``(st_dev, st_ino)`` (DW-446): recorded by
+    # `runsetup.compose_run`/`compose_sweep` from the claim that minted the dir.
+    # `Journal.write_verify_stream` compares the run dir it opens against it, so
+    # `runs/` or `runs/<id>/` swapped for a link to a tree holding a real `<id>/`
+    # refuses. None — a pre-upgrade state.json, an unpinnable or zero-inode claim
+    # — refuses the verify stream (on the win32 arm too, which before DW-446 wrote
+    # through a zero-inode run dir) until `runs.reconcile_root_identities`
+    # backfills it on resume/re-arm; a zero-inode run dir never backfills. A
+    # non-None record is never overwritten except the locked `st_dev` re-bind
+    # (same `st_ino`, still a real directory). Deliberately absent from
+    # `documents.py`'s `--json` projection (schema 1).
+    run_dir_identity: tuple[int, int] | None = None
     policy_snapshot: dict[str, Any] = field(default_factory=dict)
     # SECONDARY copy of the host-exec baseline (#498) — runsetup.config_digest over
     # the agent-writable config that reaches HOST code execution: verify commands,
@@ -1221,6 +1267,7 @@ class RunState:
             "repo_root": self.repo_root,
             "code_root_restamp_pending": self.code_root_restamp_pending,
             "accept_baseline": self.accept_baseline,
+            "run_dir_identity": _identity_record_to(self.run_dir_identity),
             "started_at": self.started_at,
             "policy_snapshot": self.policy_snapshot,
             "trusted_config_digest": self.trusted_config_digest,
@@ -1261,6 +1308,7 @@ class RunState:
             repo_root=str(d.get("repo_root", "")),
             code_root_restamp_pending=bool(d.get("code_root_restamp_pending", False)),
             accept_baseline=bool(d.get("accept_baseline", False)),
+            run_dir_identity=_identity_record_from(d.get("run_dir_identity")),
             started_at=d["started_at"],
             policy_snapshot=d.get("policy_snapshot", {}),
             trusted_config_digest=str(d.get("trusted_config_digest", "")),

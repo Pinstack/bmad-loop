@@ -29,7 +29,7 @@ from bmad_loop import envvars, platform_util, runs, verify
 from bmad_loop.adapters import tmux_base
 from bmad_loop.adapters.multiplexer import MultiplexerError
 from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
-from bmad_loop.journal import load_state, save_state
+from bmad_loop.journal import Journal, load_state, save_state
 from bmad_loop.model import RunState, StoryTask
 from bmad_loop.process_host import ProcessHost
 
@@ -7677,6 +7677,12 @@ def _never_matches(identity) -> bool:
     return identity is not None and not stat.S_ISDIR(identity.st_mode) and identity.st_ino == 0
 
 
+def _rec(path: Path):
+    """``path``'s mint-time identity record, as `worktree_flow` persists a mount's
+    (DW-446)."""
+    return platform_util.root_identity_record(path)
+
+
 def test_live_spec_root_identity_is_none_for_the_project(tmp_path):
     """No mount, and a spec the mount cannot confine: both roots are the project,
     which the operator chose and may keep behind a link — unpinned.
@@ -7769,7 +7775,7 @@ def test_mount_root_identity_pins_an_intact_mount(tmp_path):
     mount = _mount(tmp_path)
     mount.mkdir(parents=True)
 
-    assert _same_dir(runs.mount_root_identity(mount, mount=mount), mount)
+    assert _same_dir(runs.mount_root_identity(mount, mount=mount, recorded=_rec(mount)), mount)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
@@ -7780,9 +7786,10 @@ def test_mount_root_identity_never_matches_a_linked_mount(tmp_path):
     Ablation: return `pinned_root_identity(root)` raw and this reddens."""
     mount = _mount(tmp_path)
     mount.mkdir(parents=True)
+    record = _rec(mount)
     _swap_mount_for_link(mount, tmp_path / "outside")
 
-    assert _never_matches(runs.mount_root_identity(mount, mount=mount))
+    assert _never_matches(runs.mount_root_identity(mount, mount=mount, recorded=record))
 
 
 def test_mount_root_identity_never_matches_a_gone_or_non_directory_mount(tmp_path):
@@ -7790,12 +7797,18 @@ def test_mount_root_identity_never_matches_a_gone_or_non_directory_mount(tmp_pat
     never-matching identity without raising — the refusal belongs to the write.
 
     Ablation: return `pinned_root_identity(root)` raw (None) and both rows redden."""
-    gone = _mount(tmp_path)  # never created
-    assert _never_matches(runs.mount_root_identity(gone, mount=gone))
+    gone = _mount(tmp_path)
+    gone.mkdir(parents=True)
+    record = _rec(gone)
+    gone.rmdir()  # recorded at the mint, gone since
+    assert _never_matches(runs.mount_root_identity(gone, mount=gone, recorded=record))
 
     a_file = tmp_path / "not-a-dir"
+    a_file.mkdir()
+    record = _rec(a_file)
+    a_file.rmdir()
     a_file.write_text("x", encoding="utf-8")
-    assert _never_matches(runs.mount_root_identity(a_file, mount=a_file))
+    assert _never_matches(runs.mount_root_identity(a_file, mount=a_file, recorded=record))
 
 
 def test_mount_root_identity_pins_an_intact_nested_project(tmp_path):
@@ -7808,7 +7821,7 @@ def test_mount_root_identity_pins_an_intact_nested_project(tmp_path):
     nested = mount / "apps" / "web"
     nested.mkdir(parents=True)
 
-    assert _same_dir(runs.mount_root_identity(nested, mount=mount), nested)
+    assert _same_dir(runs.mount_root_identity(nested, mount=mount, recorded=_rec(mount)), nested)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
@@ -7824,11 +7837,12 @@ def test_mount_root_identity_never_matches_a_nested_chain_through_a_link(tmp_pat
     mount = _mount(tmp_path)
     nested = mount / "apps" / "web"
     nested.mkdir(parents=True)
+    record = _rec(mount)
     link_at = mount if swapped == "worktree" else mount / "apps"
     _swap_mount_for_link(link_at, tmp_path / "outside")
     assert nested.is_dir()  # the premise: the spelling still reaches a directory
 
-    assert _never_matches(runs.mount_root_identity(nested, mount=mount))
+    assert _never_matches(runs.mount_root_identity(nested, mount=mount, recorded=record))
 
 
 def test_mount_root_identity_never_matches_a_root_outside_the_mount(tmp_path):
@@ -7842,8 +7856,11 @@ def test_mount_root_identity_never_matches_a_root_outside_the_mount(tmp_path):
     sibling = tmp_path / "elsewhere"
     sibling.mkdir()
 
-    assert _never_matches(runs.mount_root_identity(sibling, mount=mount))
-    assert _never_matches(runs.mount_root_identity(mount / ".." / "1", mount=mount))
+    record = _rec(mount)
+    assert _never_matches(runs.mount_root_identity(sibling, mount=mount, recorded=record))
+    assert _never_matches(
+        runs.mount_root_identity(mount / ".." / "1", mount=mount, recorded=record)
+    )
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
@@ -7863,7 +7880,377 @@ def test_mount_root_identity_accepts_a_root_spelled_through_a_resolved_ancestor(
     mount = _mount(project)  # spelled through the linked `.bmad-loop`
     root = mount.resolve()
 
-    assert _same_dir(runs.mount_root_identity(root, mount=mount), root)
+    assert _same_dir(runs.mount_root_identity(root, mount=mount, recorded=_rec(mount)), root)
+
+
+# ------------------------------------ mint-time mount identity (DW-446, DW-486)
+
+
+@pytest.fixture(params=["handle", "no-handle"])
+def mount_pin_arm(request, monkeypatch):
+    """Both arms of `mount_root_identity`: the handle-anchored ``O_NOFOLLOW`` walk
+    from the recorded mount, and the no-handle ``lstat`` fallback."""
+    if request.param == "handle" and not platform_util.HANDLE_ANCHORED_WRITES:
+        pytest.skip("no handle-anchored writes on this host")
+    if request.param == "no-handle":
+        monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
+    return request.param
+
+
+def test_mount_root_identity_refuses_a_missing_record(tmp_path, mount_pin_arm):
+    """DW-446: a mount with no mint-time record (a pre-upgrade state not yet
+    backfilled) answers the never-matching identity — never a fresh `lstat` and
+    never None (the unpinned write), even for an intact mount.
+
+    Ablation: map ``recorded=None`` to the pre-DW-446 per-component `lstat` walk and
+    both arms redden with the mount's real identity."""
+    mount = _mount(tmp_path)
+    mount.mkdir(parents=True)
+
+    assert _never_matches(runs.mount_root_identity(mount, mount=mount, recorded=None))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_mount_root_identity_refuses_a_worktrees_dir_swapped_for_a_link_holding_a_real_unit(
+    tmp_path, mount_pin_arm
+):
+    """DW-446: ``worktrees/`` swapped, after the mint, for a link to a tree holding
+    a REAL ``<unit>/``. The mount path now reaches a real, non-link directory — a
+    fresh `lstat` of it, and of every component below it, accepts the outside tree —
+    but it is not the minted mount, so both arms answer never-matching.
+
+    Ablation: take the identity from `pinned_root_identity(mount)` instead of
+    comparing against ``recorded`` (the pre-DW-446 pin) and both arms redden with
+    the outside unit's identity."""
+    mount = _mount(tmp_path)
+    mount.mkdir(parents=True)
+    record = _rec(mount)
+    worktrees = mount.parent
+    outside = tmp_path / "outside"
+    (outside / mount.name).mkdir(parents=True)
+    worktrees.rename(worktrees.with_name("worktrees-aside"))
+    worktrees.symlink_to(outside, target_is_directory=True)
+    assert mount.is_dir() and not mount.is_symlink()  # the premise
+
+    assert _never_matches(runs.mount_root_identity(mount, mount=mount, recorded=record))
+
+
+def test_mount_root_identity_refuses_a_mount_replaced_by_another_directory(tmp_path, mount_pin_arm):
+    """The record is compared, not re-taken: a mount renamed aside and replaced by
+    a fresh real directory of the same name is not the minted mount.
+
+    Ablation: re-record on a mismatch (answer the current identity) and both arms
+    redden."""
+    mount = _mount(tmp_path)
+    mount.mkdir(parents=True)
+    record = _rec(mount)
+    mount.rename(mount.with_name("1-aside"))
+    mount.mkdir()
+
+    assert _never_matches(runs.mount_root_identity(mount, mount=mount, recorded=record))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("swapped", ["mount", "worktrees"])
+def test_mount_root_identity_refuses_a_nested_mount_swapped_for_a_link_holding_a_real_offset(
+    tmp_path, mount_pin_arm, swapped
+):
+    """DW-486: under a nested project the pinned root is ``<mount>/<offset>``. A
+    ``<mount>`` swapped for a link to a tree holding a real ``app/`` — or its
+    ``worktrees/`` parent swapped for one holding a real ``<unit>/app/`` — makes
+    ``<mount>/app`` a real directory reached through the link; the recorded mount
+    no longer matches, so the pin refuses.
+
+    Ablation: skip the record compare (open ``mount`` unpinned, the handle arm) and
+    both rows redden with the outside ``app/``'s identity; the pre-DW-446
+    per-component `lstat` walk reddens the ``worktrees`` row."""
+    mount = _mount(tmp_path)
+    (mount / "app").mkdir(parents=True)
+    record = _rec(mount)
+    outside = tmp_path / "outside"
+    link_at = mount if swapped == "mount" else mount.parent
+    real_offset = outside / "app" if swapped == "mount" else outside / mount.name / "app"
+    real_offset.mkdir(parents=True)
+    link_at.rename(link_at.with_name(link_at.name + "-aside"))
+    link_at.symlink_to(outside, target_is_directory=True)
+    assert (mount / "app").is_dir()  # the premise
+
+    assert _never_matches(runs.mount_root_identity(mount / "app", mount=mount, recorded=record))
+
+
+def test_mount_root_identity_of_an_intact_nested_project_is_its_own_fstat(tmp_path):
+    """DW-486 positive control: a recorded mount and a real ``<mount>/<offset>``
+    answer ``<mount>/<offset>``'s own identity — what the writers compare the root
+    they open against — so the intact writes land."""
+    mount = _mount(tmp_path)
+    nested = mount / "app"
+    nested.mkdir(parents=True)
+
+    identity = runs.mount_root_identity(nested, mount=mount, recorded=_rec(mount))
+
+    fd = os.open(nested, os.O_RDONLY)
+    try:
+        own = os.fstat(fd)
+    finally:
+        os.close(fd)
+    assert (identity.st_dev, identity.st_ino) == (own.st_dev, own.st_ino)
+
+
+@requires_symlinked_mount_swap
+def test_rearm_flip_refuses_a_worktrees_dir_swapped_for_a_link_holding_a_real_unit(tmp_path):
+    """DW-446 on a re-arm writer: the status flip through a mount whose
+    ``worktrees/`` was swapped for a link to a tree holding a real ``<unit>`` (with
+    the same spec subpath) refuses, and the outside copy keeps its bytes; the
+    unpinned control shows the same swap really lands outside.
+
+    Ablation: answer `pinned_root_identity` per component in `mount_root_identity`
+    (the pre-DW-446 pin) and the pinned flip lands in the outside copy."""
+    mount = _mount(tmp_path)
+    (mount / "specs").mkdir(parents=True)
+    (mount / "specs" / "6-4.md").write_text(_PINNED_SPEC, encoding="utf-8")
+    run = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(mount))
+    assert run.task.worktree_identity == _rec(mount)  # the premise: recorded at the mint
+    worktrees = mount.parent
+    outside = tmp_path / "outside"
+    import shutil
+
+    shutil.copytree(worktrees, outside)
+    worktrees.rename(worktrees.with_name("worktrees-aside"))
+    worktrees.symlink_to(outside, target_is_directory=True)
+    spec = runs.live_spec_path(run.task, run.state, tmp_path)
+    confine_root = runs.live_spec_root(run.task, run.state, tmp_path)
+    identity = runs.live_spec_root_identity(run.task, run.state, tmp_path)
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        verify.set_frontmatter_status(
+            spec, "ready-for-dev", confine_root=confine_root, root_identity=identity
+        )
+    outside_spec = outside / mount.name / "specs" / "6-4.md"
+    assert outside_spec.read_text(encoding="utf-8") == _PINNED_SPEC
+
+    assert verify.set_frontmatter_status(spec, "ready-for-dev", confine_root=confine_root)
+    assert "status: ready-for-dev" in outside_spec.read_text(encoding="utf-8")
+
+
+# ------------------------------------ legacy backfill (DW-446)
+
+
+def _legacy_rows(run_dir: Path) -> list[dict]:
+    return [e for e in Journal(run_dir).entries() if e.get("kind") == "root-identity-recorded"]
+
+
+def test_reconcile_root_identities_backfills_journals_and_never_overwrites(tmp_path):
+    """A pre-DW-446 state records the run dir and each mounted task's identity, one
+    `root-identity-recorded` row per record; a second pass records nothing; an
+    existing record — even a stale one — is never overwritten; an unpinnable
+    (gone) mount records nothing.
+
+    Ablation: re-take a fresh `root_identity_record` for every root regardless of
+    its record (``if record is None:`` → ``if True:`` in `_reconcile_one_root`) and
+    the second pass reports a change and journals two more rows."""
+    mount = _mount(tmp_path)
+    mount.mkdir(parents=True)
+    run = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(mount))
+    state = load_state(run.run_dir)
+    state.run_dir_identity = None
+    state.tasks["s1"].worktree_identity = None
+    gone = StoryTask(story_key="s2", epic=1, worktree_path=str(tmp_path / "gone"))
+    state.tasks["s2"] = gone
+    journal = Journal(run.run_dir)
+
+    assert runs.reconcile_root_identities(state, run.run_dir, journal, tmp_path)
+
+    assert state.run_dir_identity == _rec(run.run_dir)
+    assert state.tasks["s1"].worktree_identity == _rec(mount)
+    assert gone.worktree_identity is None
+    rows = _legacy_rows(run.run_dir)
+    assert [(r["root"], r.get("story_key")) for r in rows] == [
+        ("run-dir", None),
+        ("worktree", "s1"),
+    ]
+    assert (rows[1]["dev"], rows[1]["ino"]) == _rec(mount)
+    assert rows[1]["path"] == str(mount)
+
+    assert not runs.reconcile_root_identities(state, run.run_dir, journal, tmp_path)
+    assert len(_legacy_rows(run.run_dir)) == 2
+
+    # a stale record (another inode) is never re-recorded, whatever its `st_dev`
+    run_stale = (1, _rec(run.run_dir)[1] + 1)
+    mount_stale = (1, _rec(mount)[1] + 1)
+    state.run_dir_identity = run_stale
+    state.tasks["s1"].worktree_identity = mount_stale
+    assert not runs.reconcile_root_identities(state, run.run_dir, journal, tmp_path)
+    assert state.run_dir_identity == run_stale
+    assert state.tasks["s1"].worktree_identity == mount_stale
+
+
+def test_rearm_backfills_a_legacy_state_before_its_pinned_writes(tmp_path):
+    """A re-arm on a state.json written before DW-446 records the mount's identity
+    before its first pinned write — so the flip lands — journals it, and persists
+    it with the re-arm's own `save_state`.
+
+    Ablation: drop the `reconcile_root_identities` call from
+    `_rearm_escalation_locked` and the flip refuses (the record is missing)."""
+    mount = _mount(tmp_path)
+    (mount / "specs").mkdir(parents=True)
+    (mount / "specs" / "6-4.md").write_text(_PINNED_SPEC, encoding="utf-8")
+    run = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(mount))
+    raw = json.loads((run.run_dir / "state.json").read_text(encoding="utf-8"))
+    raw.pop("run_dir_identity")
+    for task in raw["tasks"].values():
+        task.pop("worktree_identity")
+    (run.run_dir / "state.json").write_text(json.dumps(raw), encoding="utf-8")
+
+    runs.rearm_escalation(run.run_dir, isolated_redrive=True, resolution_recorded=False)
+
+    assert "status: ready-for-dev" in (mount / "specs" / "6-4.md").read_text(encoding="utf-8")
+    saved = load_state(run.run_dir)
+    assert saved.run_dir_identity == _rec(run.run_dir)
+    assert saved.tasks["s1"].worktree_identity == _rec(mount)
+    assert {r["root"] for r in _legacy_rows(run.run_dir)} == {"run-dir", "worktree"}
+
+
+# ------------------------------------ `st_dev` re-bind at a locked load (DW-446)
+
+
+def _rebound_rows(run_dir: Path) -> list[dict]:
+    return [e for e in Journal(run_dir).entries() if e.get("kind") == "root-identity-rebound"]
+
+
+def _renumbered(path: Path) -> tuple[int, int]:
+    """``path``'s record as a reboot would leave it: the real inode, another `st_dev`."""
+    dev, ino = _rec(path)
+    return (dev + 1, ino)
+
+
+def test_reconcile_rebinds_a_renumbered_st_dev_once(tmp_path):
+    """A record whose root still `lstat`s as a real directory with the SAME inode
+    but another `st_dev` (a reboot on btrfs, an NFS/overlay remount) is re-bound to
+    today's `st_dev`, journaling one `root-identity-rebound` per root with its
+    fields; the pinned mount identity then matches; a second pass journals nothing.
+
+    Ablation: drop the re-bind (return the record untouched) and the rows, the
+    re-bound records and the pinned identity all redden."""
+    mount = _mount(tmp_path)
+    mount.mkdir(parents=True)
+    run = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(mount))
+    state = load_state(run.run_dir)
+    run_old, mount_old = _renumbered(run.run_dir), _renumbered(mount)
+    state.run_dir_identity = run_old
+    state.tasks["s1"].worktree_identity = mount_old
+    assert _never_matches(runs.mount_root_identity(mount, mount=mount, recorded=mount_old))
+    journal = Journal(run.run_dir)
+
+    assert runs.reconcile_root_identities(state, run.run_dir, journal, tmp_path)
+
+    assert state.run_dir_identity == _rec(run.run_dir)
+    assert state.tasks["s1"].worktree_identity == _rec(mount)
+    rows = _rebound_rows(run.run_dir)
+    assert [
+        (r["root"], r.get("story_key"), r["path"], r["old_dev"], r["dev"], r["ino"]) for r in rows
+    ] == [
+        ("run-dir", None, str(run.run_dir), run_old[0], *_rec(run.run_dir)),
+        ("worktree", "s1", str(mount), mount_old[0], *_rec(mount)),
+    ]
+    assert _legacy_rows(run.run_dir) == []  # a re-bind is not a backfill
+    assert _same_dir(
+        runs.mount_root_identity(mount, mount=mount, recorded=state.tasks["s1"].worktree_identity),
+        mount,
+    )
+
+    assert not runs.reconcile_root_identities(state, run.run_dir, journal, tmp_path)
+    assert len(_rebound_rows(run.run_dir)) == 2
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("change", ["inode", "link"])
+def test_reconcile_never_rebinds_an_inode_mismatch_or_a_link(tmp_path, change):
+    """The re-bind is inode-matched and real-directory-only. A root whose inode
+    differs (renamed aside, replaced by a fresh directory) or that is now a link to
+    the ORIGINAL directory (same inode through the link) is left alone: no row, the
+    record unchanged, and the pinned mount identity keeps refusing.
+
+    Ablation: accept an inode mismatch in `_reconcile_one_root` (drop the
+    ``st_ino != ino`` check) and the ``inode`` row reddens; re-bind from a
+    following ``os.stat`` instead of `pinned_root_identity` and the ``link`` row
+    reddens."""
+    mount = _mount(tmp_path)
+    mount.mkdir(parents=True)
+    run = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(mount))
+    state = load_state(run.run_dir)
+    record = _renumbered(mount)
+    state.tasks["s1"].worktree_identity = record
+    if change == "inode":
+        mount.rename(mount.with_name("1-aside"))
+        mount.mkdir()
+    else:
+        aside = mount.with_name("1-aside")
+        mount.rename(aside)
+        mount.symlink_to(aside, target_is_directory=True)
+        assert os.stat(mount).st_ino == record[1]  # the premise: same inode via the link
+    journal = Journal(run.run_dir)
+
+    assert not runs.reconcile_root_identities(state, run.run_dir, journal, tmp_path)
+
+    assert state.tasks["s1"].worktree_identity == record
+    assert _rebound_rows(run.run_dir) == []
+    assert _legacy_rows(run.run_dir) == []
+    assert _never_matches(runs.mount_root_identity(mount, mount=mount, recorded=record))
+
+
+def test_rearm_rebinds_a_renumbered_st_dev_before_its_pinned_writes(tmp_path):
+    """A re-arm over records whose `st_dev` a reboot renumbered re-binds them before
+    its first pinned write — so the status flip lands — journals
+    `root-identity-rebound` per root, and persists the re-bound records.
+
+    Ablation: drop the `reconcile_root_identities` call from
+    `_rearm_escalation_locked` and the flip refuses (the record no longer matches)."""
+    mount = _mount(tmp_path)
+    (mount / "specs").mkdir(parents=True)
+    (mount / "specs" / "6-4.md").write_text(_PINNED_SPEC, encoding="utf-8")
+    run = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(mount))
+    state = load_state(run.run_dir)
+    state.run_dir_identity = _renumbered(run.run_dir)
+    state.tasks["s1"].worktree_identity = _renumbered(mount)
+    save_state(run.run_dir, state)
+
+    runs.rearm_escalation(run.run_dir, isolated_redrive=True, resolution_recorded=False)
+
+    assert "status: ready-for-dev" in (mount / "specs" / "6-4.md").read_text(encoding="utf-8")
+    saved = load_state(run.run_dir)
+    assert saved.run_dir_identity == _rec(run.run_dir)
+    assert saved.tasks["s1"].worktree_identity == _rec(mount)
+    assert [r["root"] for r in _rebound_rows(run.run_dir)] == ["run-dir", "worktree"]
+
+
+def test_rearm_keeps_refusing_an_inode_mismatch(tmp_path):
+    """A re-arm over a mount record whose inode no longer matches (the mount was
+    replaced while paused) does not re-bind it: the pinned status flip refuses and
+    the record persists unchanged, with no `root-identity-rebound` row.
+
+    Ablation: accept an inode mismatch in `_reconcile_one_root` (drop the
+    ``info.st_ino != ino`` check) and the persisted-record and no-rebound-row
+    assertions redden. The flip still refuses: that re-bind keeps the record's old
+    inode, so the pin never matches either way."""
+    mount = _mount(tmp_path)
+    (mount / "specs").mkdir(parents=True)
+    (mount / "specs" / "6-4.md").write_text(_PINNED_SPEC, encoding="utf-8")
+    run = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(mount))
+    record = run.task.worktree_identity
+    assert record is not None
+    stale = (record[0] + 1, record[1] + 1)
+    state = load_state(run.run_dir)
+    state.tasks["s1"].worktree_identity = stale
+    save_state(run.run_dir, state)
+
+    with pytest.raises(
+        runs.RearmError, match=r"UnconfinedWriteError: cannot reach .* without a redirect"
+    ):
+        runs.rearm_escalation(run.run_dir, isolated_redrive=True, resolution_recorded=False)
+
+    assert (mount / "specs" / "6-4.md").read_text(encoding="utf-8") == _PINNED_SPEC
+    assert load_state(run.run_dir).tasks["s1"].worktree_identity == stale
+    assert _rebound_rows(run.run_dir) == []
 
 
 def _nested_escalated_run(tmp_path: Path):

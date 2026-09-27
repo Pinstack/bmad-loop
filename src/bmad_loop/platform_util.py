@@ -1047,17 +1047,27 @@ def pinned_root_identity(root: Path) -> os.stat_result | None:
     exact-path candidate worktree, the integration snapshot directory's
     no-dir-fd arms, the ``live_spec_root`` spec writers — re-arm and TUI
     replan (DW-423, through ``runs.live_spec_root_identity``) — and the engine's
-    and ``recovery_flow``'s worktree-mount writers (DW-445). Both mount-writer
-    families go through ``runs.mount_root_identity``, which applies this to the
-    unit worktree and every directory down to the pinned root and turns a None
-    into a never-matching identity so the refusal lands at the write. Their
-    contract refuses a linked root, so a root that is a symlink, a win32 link
-    reparse point (:data:`_LINK_REPARSE_TAGS`), not a directory, or cannot be probed answers
-    None, and a pinned caller treats None as a refusal — never as "open it
-    unpinned". Pass the result to :func:`open_dir_confined`'s ``root_identity``
-    (or a confined writer's), which refuses unless the root it actually opened
-    is this same directory. Operator-chosen roots (the project checkout, the
-    state root) are not pinned; see :func:`open_dir_confined`."""
+    and ``recovery_flow``'s worktree-mount writers (DW-445). Their contract
+    refuses a linked root, so a root that is a symlink, a win32 link reparse
+    point (:data:`_LINK_REPARSE_TAGS`), not a directory, or cannot be probed
+    answers None, and a pinned caller treats None as a refusal — never as "open
+    it unpinned". Pass the result to :func:`open_dir_confined`'s
+    ``root_identity`` (or a confined writer's), which refuses unless the root it
+    actually opened is this same directory. Operator-chosen roots (the project
+    checkout, the state root) are not pinned; see :func:`open_dir_confined`.
+
+    A fresh ``lstat`` refuses a link only at the FINAL component: an ancestor
+    swapped for a link to a tree holding a real leaf of the same name answers
+    the outside directory. So the two roots a session outlives — the run dir and
+    each unit worktree mount — are not pinned by a per-write call of this but by
+    a MINT-TIME record (DW-446): :func:`root_identity_record` takes this identity
+    when the orchestrator mints the root, run state persists it, and the pin
+    compares the opened root against :func:`recorded_root_identity`. The mount
+    writers reach a nested project (DW-379) from the recorded mount by an
+    ``O_NOFOLLOW`` walk (``runs.mount_root_identity``). The candidate worktree is
+    pinned by this call right after ``git worktree add`` and held for its
+    one-call lifetime; the artifacts root is held by artifact publication's
+    whole-chain walk, which refuses a link at every ancestor."""
     try:
         info = os.lstat(root)
     except OSError:
@@ -1069,6 +1079,57 @@ def pinned_root_identity(root: Path) -> os.stat_result | None:
     if not stat.S_ISDIR(info.st_mode):
         return None
     return info
+
+
+# A root's mint-time identity as persisted in run state (DW-446): ``(st_dev,
+# st_ino)``. Serialized as a two-int JSON list; ``None`` means "no record".
+RootIdentityRecord = tuple[int, int]
+
+# An identity no directory can match: mode 0 is not ``S_ISDIR`` and inode 0 carries
+# no identity, so :func:`_same_dir_identity` refuses it and every pinned write
+# handed it refuses. What a missing mint-time record pins to (DW-446): a missing
+# record REFUSES, it never degrades to an unpinned open or to a fresh ``lstat``.
+NEVER_MATCHING_IDENTITY = os.stat_result((0,) * 10)
+
+
+def root_identity_record(root: Path) -> RootIdentityRecord | None:
+    """The mint-time identity record for an orchestrator-minted ``root`` (the run
+    dir, a unit worktree mount): :func:`pinned_root_identity`'s ``(st_dev,
+    st_ino)``, or None when ``root`` is unpinnable or reports a zero inode (a host
+    or synthetic stat that carries no identity — it would never match anyway).
+
+    Take it at the MINT, before any session can reach the root, and persist it;
+    the pins then compare the root they open against this record through
+    :func:`recorded_root_identity` rather than a per-write ``lstat`` that follows a
+    link at every ancestor. Trust-on-first-use: whatever sits at ``root`` when this
+    is taken is what every later write is held to.
+
+    A zero-inode root (some win32 filesystems) records None, so every write
+    pinned to it refuses. For the mount writers and the dir-fd verify-stream arm
+    that is unchanged — a zero inode never matched — but the win32 verify-stream
+    arm, which used to write through such a run dir, now refuses it: a refusal,
+    not a degrade, journaled per stream as ``capture_error`` (DW-446, accepted
+    2026-09-27). ``st_dev`` is not stable across a reboot or remount, so
+    ``runs.reconcile_root_identities`` re-binds a record's ``st_dev`` at a locked
+    resume/re-arm when the root still ``lstat``s as a real directory with the
+    same ``st_ino``; within a live engine the compare stays full ``(st_dev,
+    st_ino)``."""
+    info = pinned_root_identity(root)
+    if info is None or info.st_ino == 0:
+        return None
+    return (info.st_dev, info.st_ino)
+
+
+def recorded_root_identity(record: RootIdentityRecord | None) -> os.stat_result:
+    """A ``root_identity`` for :func:`open_dir_confined` (or any pinned writer)
+    built from a persisted mint-time record: a synthetic directory stat carrying the
+    record's ``st_dev``/``st_ino``. A ``None`` record answers
+    :data:`NEVER_MATCHING_IDENTITY`, so a missing record refuses at the write."""
+    if record is None:
+        return NEVER_MATCHING_IDENTITY
+    dev, ino = record
+    # os.stat_result field order: mode, ino, dev, nlink, uid, gid, size, atime, mtime, ctime
+    return os.stat_result((stat.S_IFDIR, ino, dev, 0, 0, 0, 0, 0, 0, 0))
 
 
 def _same_dir_identity(a: os.stat_result, b: os.stat_result) -> bool:
@@ -1294,12 +1355,27 @@ def open_dir_confined(
     directory is held by its own ``O_NOFOLLOW`` root open on the dir-fd arm (a
     leaf check, not this identity compare) and by :func:`pinned_root_identity`
     pre-checks on the others. A pin taken by a fresh ``lstat`` covers the root
-    ITSELF — and, for the mount pins, every directory from the unit worktree
-    down to it — while a link at a parent directory above that (for a mount,
-    ``worktrees/`` or ``runs/<id>/``) is followed, a residual every pin above
-    shares. The confined writers' no-handle fallback re-``lstat``s the root
-    instead — check-then-write, the residual :func:`path_is_confined` documents
-    (DW-295)."""
+    ITSELF but follows a link at any ancestor, so the run-dir and mount pins
+    compare against the identity recorded when the orchestrator MINTED the root
+    (DW-446, :func:`root_identity_record` / :func:`recorded_root_identity`): an
+    ancestor (``runs/``, ``runs/<id>/``, ``worktrees/``) swapped for a link to a
+    tree holding a real leaf opens a directory with another identity and
+    refuses, and a missing record refuses outright. A nested mount project is
+    reached from the recorded mount by an ``O_NOFOLLOW`` walk (DW-486). The
+    candidate worktree is held per call — pinned right after ``git worktree
+    add`` for its whole one-call lifetime — and artifact publication by a
+    whole-chain walk that refuses a link at every ancestor. Accepted residuals:
+    the record is trust-on-first-use; the locked resume/re-arm ``st_dev`` re-bind
+    (``runs.reconcile_root_identities``) trusts an inode-only match, so a swap
+    made during a pause to a real directory with the same inode number on
+    another filesystem would be re-bound; a win32 zero-inode run dir records
+    nothing, so its verify-stream log tails are lost (each journaled as
+    ``capture_error``); a ``state.json`` edited in a crash window can forge a
+    record; a cross-filesystem project copy changes inodes, so its pinned writes
+    refuse; and a legacy run paused at a plan checkpoint cannot replan from the
+    TUI until a resume or re-arm records its mount. The confined writers' no-handle fallback
+    re-``lstat``s the root instead — check-then-write, the residual
+    :func:`path_is_confined` documents (DW-295)."""
     if not HANDLE_ANCHORED_WRITES:
         return None
     try:

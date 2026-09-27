@@ -11301,7 +11301,12 @@ def commit_path_bound(
     calls elsewhere. A replaced root refuses with a typed `GitError`, and
     cleanup skips the remove and leaves the registration to the prune below.
     Each re-check is an `lstat` compare, check-then-act: a swap landing between
-    the check and git's own open of the path is the accepted residual.
+    the check and git's own open of the path is the accepted residual. The pin is
+    the candidate's MINT-TIME identity, held for the checkout's whole one-call
+    lifetime (a per-call `TemporaryDirectory`), so it needs no persisted record
+    (DW-446): a PARENT directory swapped after the pin for a link to a tree
+    holding a real `candidate/` resolves every re-check to that other directory,
+    whose identity does not match, and refuses.
 
     The candidate `.git` gitfile is pinned right after the root (DW-442): git
     picks the repository for those calls from its `gitdir:` line, so a rewrite

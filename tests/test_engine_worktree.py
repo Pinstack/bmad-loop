@@ -9,6 +9,7 @@ adapter (no tmux, no LLM).
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 from dataclasses import replace
@@ -1436,6 +1437,13 @@ def test_missing_upstream_skill_seed_escalates_before_dispatch_and_records_mount
     opened = next(entry for entry in entries if entry["kind"] == "worktree-opened")
     assert opened["path"] == task.worktree_path
     assert Path(task.worktree_path).is_dir(), "an escalated worktree stays mounted"
+    # DW-446: the mount's mint-time identity is recorded with its path and persisted
+    minted = os.lstat(task.worktree_path)
+    assert task.worktree_identity == (minted.st_dev, minted.st_ino)
+    assert load_state(engine.run_dir).tasks["1-1-a"].worktree_identity == (
+        minted.st_dev,
+        minted.st_ino,
+    )
 
 
 def _install_short_renderer_case(project, tmp_path, *, renderer_stub):
@@ -5084,6 +5092,7 @@ def test_restart_arm_clears_the_baseline_it_measured_in_the_discarded_mount(proj
     )
     task = StoryTask("1-1-a", 1, phase=Phase.DEV_RUNNING)
     task.worktree_path = str(unit.path)
+    task.worktree_identity = (1, 2)  # recorded at the mint (DW-446)
     task.branch = unit.branch
     task.baseline_commit = rev_parse_head(unit.path)
     task.baseline_untracked = []  # a fresh mount is a tracked-only checkout
@@ -5102,6 +5111,7 @@ def test_restart_arm_clears_the_baseline_it_measured_in_the_discarded_mount(proj
 
     saved = load_state(engine.run_dir).tasks["1-1-a"]
     assert saved.worktree_path == ""
+    assert saved.worktree_identity is None  # cleared with the path (DW-446)
     assert saved.branch == ""
     assert saved.baseline_commit is None
     assert saved.baseline_untracked is None
@@ -5289,6 +5299,7 @@ def test_isolation_flip_releases_the_units_baseline_before_the_in_place_rollback
 
     task = StoryTask("1-1-a", 1, phase=Phase.DEV_RUNNING)
     task.worktree_path = str(mount)  # the persisted mount the live policy ignores
+    task.worktree_identity = (1, 2)  # recorded at the mint (DW-446)
     task.spec_file = "_bmad-output/accepted.md"
     task.dispatched_spec_file = "_bmad-output/accepted.md"
     task.dispatched_spec_snapshot = b"pre-launch bytes"
@@ -5323,6 +5334,7 @@ def test_isolation_flip_releases_the_units_baseline_before_the_in_place_rollback
 
     # the CLAIM is dropped: the retrospective readers must now answer the main checkout
     assert saved.worktree_path == ""
+    assert saved.worktree_identity is None  # cleared with the path (DW-446)
     assert saved.branch == ""
     assert runs.task_stories_root(saved, engine.state) == project.project
     assert runs.task_spec_root(saved, engine.state) == project.project
@@ -10501,11 +10513,16 @@ def test_nested_mount_writers_pin_the_mount_project_and_still_write(project):
     guards the pinned root."""
     import os
 
+    from bmad_loop import platform_util
+
     _paths, engine, unit = _nested_unit(project)
     engine.workspace = unit.workspace
     mount_project = unit.workspace.paths.project
     assert mount_project == unit.path.resolve() / "app"  # the premise (DW-379)
-    identity = engine._mount_root_identity(mount_project)
+    task = StoryTask("1-1-a", 1, phase=Phase.DEV_VERIFY)
+    task.worktree_path = str(unit.path)
+    task.worktree_identity = platform_util.root_identity_record(unit.path)  # the mint
+    identity = engine._mount_root_identity(task, mount_project)
     assert identity is not None
     assert (identity.st_dev, identity.st_ino) == (
         os.lstat(mount_project).st_dev,
@@ -10518,8 +10535,6 @@ def test_nested_mount_writers_pin_the_mount_project_and_still_write(project):
         "---\nstatus: done\n---\n\nbody\n\n## Auto Run Result\n\nStatus: done\n",
         encoding="utf-8",
     )
-    task = StoryTask("1-1-a", 1, phase=Phase.DEV_VERIFY)
-    task.worktree_path = str(unit.path)
     task.spec_file = str(spec)
 
     engine._reset_spec_for_repair(task)
@@ -10554,13 +10569,16 @@ def test_nested_mount_writers_refuse_a_worktree_swapped_for_a_link(project, tmp_
     original = "---\nstatus: done\n---\n\n## Intent\n\nbody\n"
     spec.write_text(original, encoding="utf-8")
     worktree = unit.workspace.root
+    record = platform_util.root_identity_record(worktree)  # the mint, before the swap
     outside = tmp_path / "outside"
     shutil.copytree(worktree, outside, symlinks=True)
     worktree.rename(worktree.with_name(worktree.name + "-aside"))
     worktree.symlink_to(outside, target_is_directory=True)
     outside_spec = outside / spec.relative_to(worktree)
     assert os.path.isdir(mount_project)  # the premise: the spelling still reaches a dir
-    task = StoryTask("1-1-a", 1, spec_file=str(spec))
+    task = StoryTask(
+        "1-1-a", 1, spec_file=str(spec), worktree_path=str(worktree), worktree_identity=record
+    )
 
     engine._repair_spec_marker(task, {"spec_file": str(spec), "status": "done"})
 
@@ -10574,7 +10592,7 @@ def test_nested_mount_writers_refuse_a_worktree_swapped_for_a_link(project, tmp_
     assert "without a redirect" in failed["error"]
     assert outside_spec.read_text(encoding="utf-8") == original
 
-    monkeypatch.setattr(Engine, "_mount_root_identity", lambda self, root: None)  # control
+    monkeypatch.setattr(Engine, "_mount_root_identity", lambda self, task, root: None)  # control
     engine._repair_spec_marker(task, {"spec_file": str(spec), "status": "done"})
     assert "## Auto Run Result" in outside_spec.read_text(encoding="utf-8")
 

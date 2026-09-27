@@ -2683,7 +2683,10 @@ def test_pinned_writers_keep_the_missing_spec_no_op_for_a_gone_mount(tmp_path, w
     from bmad_loop import runs
 
     mount = tmp_path / "project" / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
-    identity = runs.mount_root_identity(mount, mount=mount)
+    mount.mkdir(parents=True)
+    record = (os.lstat(mount).st_dev, os.lstat(mount).st_ino)  # recorded at the mint
+    mount.rmdir()  # gone since
+    identity = runs.mount_root_identity(mount, mount=mount, recorded=record)
     spec = mount / "specs" / "6-4.md"
 
     if writer == "reset_spec_status":

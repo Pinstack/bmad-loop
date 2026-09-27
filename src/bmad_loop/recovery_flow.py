@@ -342,8 +342,9 @@ class RecoveryFlow:
         mount swapped for a link, before or after the spec path was bound,
         refuses with `platform_util.UnconfinedWriteError` (an ``OSError``, raised
         as any unreachable parent is) and nothing lands outside the repository.
-        The pin covers the unit worktree and every directory down to
-        ``confine_root``; parent directories above the worktree stay followed.
+        The pin compares the unit worktree against its mint-time record
+        (``task.worktree_identity``, DW-446) and walks ``O_NOFOLLOW`` down to
+        ``confine_root``, so an ancestor swapped for a link refuses too.
 
         The write is `frontmatter.set_frontmatter_status_anchored` (DW-323), the
         fifth spec writer: the confinement rule stated in
@@ -806,23 +807,26 @@ class RecoveryFlow:
                 ),
             )
 
-    def _mount_root_identity(self, workspace: Workspace) -> os.stat_result | None:
+    def _mount_root_identity(self, task: StoryTask, workspace: Workspace) -> os.stat_result | None:
         """The ``root_identity`` pinning ``workspace.paths.project`` — the
         ``confine_root`` every attempt-owned normalization passes — for one write
         (DW-445). Take it at the call, beside that ``confine_root``.
 
         ``None`` when ``workspace`` is not a unit mount (``workspace.root ==
         self.paths.repo_root``, the ``in_unit_worktree`` idiom): the operator's
-        project stays unpinned. Otherwise `runs.mount_root_identity`, which answers
-        a never-matching identity for a mount that cannot be pinned so the refusal
-        lands at the write. The live ``workspace`` decides, not the task: it is the
-        tree the write opens. ``workspace.root`` is the unit worktree, so the pin
-        covers it and every directory down to ``paths.project``
-        (``<worktree>/<offset>`` under a nested project); parent directories above
-        the worktree stay followed, the residual every DW-338 pin shares."""
+        project stays unpinned. Otherwise `runs.mount_root_identity` against
+        ``task.worktree_identity``, the mount's MINT-TIME record (DW-446), which
+        answers a never-matching identity for a mount that cannot be pinned — a
+        missing record, a mount or ancestor (``worktrees/``, ``runs/<id>/``)
+        swapped for a link — so the refusal lands at the write. The live
+        ``workspace`` decides mountedness: it is the tree the write opens.
+        ``paths.project`` is reached from the recorded mount by an ``O_NOFOLLOW``
+        walk (``<worktree>/<offset>`` under a nested project, DW-486)."""
         if workspace.root == self.paths.repo_root:
             return None
-        return mount_root_identity(workspace.paths.project, mount=workspace.root)
+        return mount_root_identity(
+            workspace.paths.project, mount=workspace.root, recorded=task.worktree_identity
+        )
 
     def _normalize_attempt_owned_spec_or_pause(
         self,
@@ -1329,7 +1333,7 @@ class RecoveryFlow:
                                 task.dispatched_spec_snapshot,
                                 target_status,
                                 confine_root=workspace.paths.project,
-                                root_identity=self._mount_root_identity(workspace),
+                                root_identity=self._mount_root_identity(task, workspace),
                                 unsafe_context="while restoring the pre-attempt retry input",
                             )
                             owned_snapshot_restored = True
@@ -1339,7 +1343,7 @@ class RecoveryFlow:
                                 spec_path,
                                 target_status,
                                 confine_root=workspace.paths.project,
-                                root_identity=self._mount_root_identity(workspace),
+                                root_identity=self._mount_root_identity(task, workspace),
                                 unsafe_context=(
                                     "while restoring the attempt-owned lifecycle status"
                                 ),
@@ -1408,7 +1412,7 @@ class RecoveryFlow:
                                         "while restoring the pre-launch operator input"
                                     ),
                                     confine_root=workspace.paths.project,
-                                    root_identity=self._mount_root_identity(workspace),
+                                    root_identity=self._mount_root_identity(task, workspace),
                                 )
                                 owned_snapshot_restored = True
                                 normalized_status = None
@@ -1443,7 +1447,7 @@ class RecoveryFlow:
                         original_spec,
                         unsafe_context="while undoing a tentative lifecycle repair",
                         confine_root=workspace.paths.project,
-                        root_identity=self._mount_root_identity(workspace),
+                        root_identity=self._mount_root_identity(task, workspace),
                     )
                     normalized_status = None
         if (
@@ -1592,7 +1596,7 @@ class RecoveryFlow:
                             task.dispatched_spec_snapshot,
                             target_status,
                             confine_root=workspace.paths.project,
-                            root_identity=self._mount_root_identity(workspace),
+                            root_identity=self._mount_root_identity(task, workspace),
                             unsafe_context="before the baseline reset",
                         )
                     else:
@@ -1602,7 +1606,7 @@ class RecoveryFlow:
                             task.dispatched_spec_snapshot,
                             unsafe_context="before the baseline reset",
                             confine_root=workspace.paths.project,
-                            root_identity=self._mount_root_identity(workspace),
+                            root_identity=self._mount_root_identity(task, workspace),
                         )
                     owned_snapshot_restored = True
                 self.safe_reset(task, preserve=protected)
@@ -1618,7 +1622,7 @@ class RecoveryFlow:
                         task.dispatched_spec_snapshot,
                         unsafe_context="after the baseline reset",
                         confine_root=workspace.paths.project,
-                        root_identity=self._mount_root_identity(workspace),
+                        root_identity=self._mount_root_identity(task, workspace),
                     )
                     owned_snapshot_restored = True
                 if redrive and task.baseline_commit and owned_spec:
@@ -1645,7 +1649,7 @@ class RecoveryFlow:
                             task.dispatched_spec_snapshot,
                             target_status,
                             confine_root=workspace.paths.project,
-                            root_identity=self._mount_root_identity(workspace),
+                            root_identity=self._mount_root_identity(task, workspace),
                             unsafe_context="after the baseline reset",
                         )
                     else:
@@ -1654,7 +1658,7 @@ class RecoveryFlow:
                             owned_spec[0],
                             target_status,
                             confine_root=workspace.paths.project,
-                            root_identity=self._mount_root_identity(workspace),
+                            root_identity=self._mount_root_identity(task, workspace),
                             unsafe_context="after the baseline reset",
                         )
                     try:
@@ -1737,7 +1741,7 @@ class RecoveryFlow:
                 task.dispatched_spec_snapshot,
                 unsafe_context="before the ordinary manual-recovery pause",
                 confine_root=workspace.paths.project,
-                root_identity=self._mount_root_identity(workspace),
+                root_identity=self._mount_root_identity(task, workspace),
             )
             restored_before_pause = str(owned_spec[0])
             self.journal.append(

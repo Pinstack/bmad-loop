@@ -1351,7 +1351,7 @@ class Engine:
     def _isolated(self) -> bool:
         return self._worktree_flow.isolated
 
-    def _mount_root_identity(self, root: Path) -> os.stat_result | None:
+    def _mount_root_identity(self, task: StoryTask, root: Path) -> os.stat_result | None:
         """The ``root_identity`` a mount writer pins ``root`` with (DW-445) — take it
         fresh at each write, beside the ``confine_root`` it pins, and pass the SAME
         root: an identity for another directory would refuse every legitimate write.
@@ -1360,17 +1360,19 @@ class Engine:
         (``workspace.root == paths.repo_root``): ``root`` is then the operator's
         project, which the pin rule leaves unpinned. Otherwise ``root`` is inside
         the orchestrator-minted unit mount ``workspace.root``, whose parent is
-        session-writable, so `runs.mount_root_identity` pins it — the worktree and
-        every directory from it down to ``root`` (``<worktree>/<offset>`` under a
-        nested project) — answering never-matching when it cannot, so the refusal
-        lands AT THE WRITE, through the site's existing handling. Mountedness is
-        read off the live workspace, not ``task.worktree_path``: the writes go
-        wherever ``self.workspace`` points, including a mount ``_finish_inflight``
-        reopened. Parent directories ABOVE the unit worktree stay followed — the
-        residual every DW-338 pin shares."""
+        session-writable, so `runs.mount_root_identity` pins it against
+        ``task.worktree_identity`` — the mount's MINT-TIME identity (DW-446) — and
+        reaches ``root`` from it by an ``O_NOFOLLOW`` walk (``<worktree>/<offset>``
+        under a nested project, DW-486). A mount or any ancestor (``worktrees/``,
+        ``runs/<id>/``) swapped for a link, or a missing record, answers
+        never-matching, so the refusal lands AT THE WRITE, through the site's
+        existing handling. Mountedness is read off the live workspace, not
+        ``task.worktree_path``: the writes go wherever ``self.workspace`` points,
+        including a mount ``_finish_inflight`` reopened (the same directory, so the
+        same record)."""
         if self.workspace.root == self.paths.repo_root:
             return None
-        return mount_root_identity(root, mount=self.workspace.root)
+        return mount_root_identity(root, mount=self.workspace.root, recorded=task.worktree_identity)
 
     def _ensure_target_branch(self) -> None:
         self._worktree_flow.ensure_target_branch()
@@ -1801,6 +1803,7 @@ class Engine:
         # mount project (DW-379)
         task.release_mount_owned_state(self._mount_project(task))
         task.worktree_path = ""
+        task.worktree_identity = None
         task.branch = ""
 
     def _mount_project(self, task: StoryTask) -> Path:
@@ -1828,6 +1831,7 @@ class Engine:
         # mount project (DW-379)
         task.release_mount_owned_state(self._mount_project(task))
         task.worktree_path = ""
+        task.worktree_identity = None
         task.branch = ""
         self.journal.append(
             "isolation-flip-orphaned-worktree",
@@ -3784,12 +3788,12 @@ class Engine:
                 spec_path,
                 "done",
                 confine_root=confine_root,
-                root_identity=self._mount_root_identity(confine_root),
+                root_identity=self._mount_root_identity(task, confine_root),
             )
             devcontract.strip_auto_run_result(
                 spec_path,
                 confine_root=confine_root,
-                root_identity=self._mount_root_identity(confine_root),
+                root_identity=self._mount_root_identity(task, confine_root),
             )
         # A timed-out review can still have recorded new frontmatter findings.
         # Normalize first so the success-status gate sees `done`, then mirror the
@@ -4333,7 +4337,7 @@ class Engine:
                 spec_file=self._park_spec_relpath(task),
                 run_id=self.state.run_id,
                 parked_at=self._today(),
-                root_identity=self._mount_root_identity(self.workspace.paths.project),
+                root_identity=self._mount_root_identity(task, self.workspace.paths.project),
             )
         except (OSError, RuntimeError) as e:
             self.journal.append("operator-index-failed", story_key=task.story_key, error=str(e))
@@ -4396,7 +4400,7 @@ class Engine:
         path, prior = record
         root = self.workspace.paths.project
         try:
-            root_identity = self._mount_root_identity(root)
+            root_identity = self._mount_root_identity(task, root)
             if prior is None:
                 require_root_pinned(root, root_identity)
                 path.unlink(missing_ok=True)
@@ -4693,7 +4697,7 @@ class Engine:
             spec_path,
             success_status,
             confine_root=self.workspace.paths.project,
-            root_identity=self._mount_root_identity(self.workspace.paths.project),
+            root_identity=self._mount_root_identity(task, self.workspace.paths.project),
         ):
             return fm_status
         # Keep the in-place result_json the rest of _dev_phase reads consistent with
@@ -4793,7 +4797,7 @@ class Engine:
                 fm_status,
                 confine_root=self.workspace.paths.project,
                 detail=detail,
-                root_identity=self._mount_root_identity(self.workspace.paths.project),
+                root_identity=self._mount_root_identity(task, self.workspace.paths.project),
             )
         except (OSError, UnicodeDecodeError) as e:
             # UnicodeDecodeError as well as OSError: the writer reads the spec's raw
@@ -4857,7 +4861,7 @@ class Engine:
                 spec,
                 target,
                 confine_root=self.workspace.root,
-                root_identity=self._mount_root_identity(self.workspace.root),
+                root_identity=self._mount_root_identity(task, self.workspace.root),
             )
             status = verify.status_of(verify.read_frontmatter(spec))
         except (OSError, FrontmatterWriteError) as e:
@@ -6088,7 +6092,11 @@ class Engine:
                 path: str | None = None
                 if max_bytes > 0:
                     try:
-                        path = self.journal.write_verify_stream(f"{stem}.{kind}.log", tail)
+                        path = self.journal.write_verify_stream(
+                            f"{stem}.{kind}.log",
+                            tail,
+                            run_dir_identity=self.state.run_dir_identity,
+                        )
                     except OSError as exc:
                         # Nothing published: atomic_write_text removes its temp and
                         # leaves the target absent, so 0 retained is the literal truth.
@@ -7928,12 +7936,12 @@ class Engine:
             resolved,
             "in-progress",
             confine_root=confine_root,
-            root_identity=self._mount_root_identity(confine_root),
+            root_identity=self._mount_root_identity(task, confine_root),
         )
         devcontract.strip_auto_run_result(
             resolved,
             confine_root=confine_root,
-            root_identity=self._mount_root_identity(confine_root),
+            root_identity=self._mount_root_identity(task, confine_root),
         )
 
     def _reset_spec_for_review(self, task: StoryTask) -> SpecSnapshot | None:
@@ -8012,7 +8020,7 @@ class Engine:
         devcontract.strip_auto_run_result(
             resolved,
             confine_root=self.workspace.paths.project,
-            root_identity=self._mount_root_identity(self.workspace.paths.project),
+            root_identity=self._mount_root_identity(task, self.workspace.paths.project),
         )
         try:
             raw = resolved.read_bytes()

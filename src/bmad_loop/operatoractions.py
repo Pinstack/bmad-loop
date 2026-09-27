@@ -192,9 +192,9 @@ def record_park(
     `UnconfinedWriteError` BEFORE the ``mkdir``, so a mount swapped for a link
     gets no directories created at the link's target either. That pre-check is
     ``lstat``-then-``mkdir`` (`platform_util.require_root_pinned`; the write
-    itself re-pins through its handle). The identity covers the unit worktree and
-    every directory down to ``project``; parent directories ABOVE the worktree are
-    still followed, the residual every DW-338 pin shares."""
+    itself re-pins through its handle). The identity is that of ``project`` reached
+    by an ``O_NOFOLLOW`` walk from the mount's MINT-TIME record (DW-446), so a
+    parent directory ABOVE the worktree swapped for a link refuses too."""
     path = record_path(project, story_key)
     require_root_pinned(project, root_identity)
     path.parent.mkdir(parents=True, exist_ok=True)

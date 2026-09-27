@@ -3915,6 +3915,9 @@ def _stories_paused_run(
         spec.parent.mkdir(parents=True, exist_ok=True)
         spec.write_text(body.replace("# plan for", "# worktree plan for"), encoding="utf-8")
         task.spec_file = str(spec)  # to_dict re-persists this RELATIVE to the mount
+    if worktree_path:
+        # the mount's mint-time identity (DW-446), as `run_isolated` records it
+        task.worktree_identity = platform_util.root_identity_record(Path(worktree_path))
     task.review_cycle = review_cycle
     if commit_sha:
         task.commit_sha = commit_sha
@@ -4234,6 +4237,47 @@ async def test_plan_checkpoint_replan_refuses_a_worktree_mount_swapped_for_a_lin
         await until(pilot, lambda: any("replan failed" in m for m in notifications(app)))
     assert calls == []
     assert outside_spec.read_bytes() == untouched
+
+
+async def test_plan_checkpoint_replan_refuses_a_legacy_mount_with_no_identity_record(
+    project, monkeypatch
+):
+    """DW-446: a paused isolated run whose state.json predates the mint-time record
+    (``worktree_identity`` absent) cannot replan from the TUI — the observer never
+    writes the record, so the pin has nothing to compare against and refuses:
+    error notice, no resume, the spec untouched. A resume or re-arm records it.
+
+    Ablation: map a missing record to a fresh `lstat` in `runs.mount_root_identity`
+    and the replan resets the spec to draft and resumes."""
+    calls: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    wt = _unit_worktree(project.project)
+    run_dir, spec = _stories_paused_run(
+        project.project,
+        stage="plan-checkpoint",
+        worktree_path=str(wt),
+        blocked_result="stale terminal result",
+    )
+    raw = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    for task in raw["tasks"].values():
+        task.pop("worktree_identity")  # the pre-DW-446 shape
+    (run_dir / "state.json").write_text(json.dumps(raw), encoding="utf-8")
+    untouched = spec.read_bytes()
+    monkeypatch.chdir(project.project)
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        await pilot.click(await ready(pilot, "#act-replan"))
+        await until(pilot, lambda: any("replan failed" in m for m in notifications(app)))
+    assert calls == []
+    assert spec.read_bytes() == untouched
+    assert (
+        "worktree_identity"
+        not in json.loads((run_dir / "state.json").read_text(encoding="utf-8"))["tasks"]["1"]
+    )  # the observer wrote no record
 
 
 async def test_plan_checkpoint_replan_confines_on_the_project_for_an_out_of_mount_spec(

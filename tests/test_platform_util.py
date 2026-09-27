@@ -2173,6 +2173,58 @@ def test_pinned_root_identity_refuses_links_files_and_missing_roots(tmp_path):
     assert identity.st_ino == os.lstat(real).st_ino
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_root_identity_record_is_the_pinned_dev_and_ino_or_none(tmp_path, monkeypatch):
+    """DW-446: the mint-time record is `pinned_root_identity`'s ``(st_dev, st_ino)``
+    for a real directory, and None for anything a pin could not vouch for — a link,
+    a file, a missing path, or a zero inode (no identity to hold a root to).
+
+    Ablation: drop the ``st_ino == 0`` check and the zero-inode row answers
+    ``(dev, 0)``."""
+    real = tmp_path / "real"
+    real.mkdir()
+    linked = tmp_path / "linked"
+    linked.symlink_to(real, target_is_directory=True)
+    a_file = tmp_path / "file"
+    a_file.write_text("x", encoding="utf-8")
+
+    own = os.lstat(real)
+    assert platform_util.root_identity_record(real) == (own.st_dev, own.st_ino)
+    for unpinnable in (linked, a_file, tmp_path / "absent"):
+        assert platform_util.root_identity_record(unpinnable) is None
+
+    zero = tmp_path / "zero"
+    zero.mkdir()
+    real_lstat = os.lstat
+    zero_stat = os.stat_result((stat.S_IFDIR, 0, own.st_dev, 1, 0, 0, 0, 0, 0, 0))
+    monkeypatch.setattr(
+        os, "lstat", lambda p, *a, **k: zero_stat if str(p) == str(zero) else real_lstat(p, *a, **k)
+    )
+    assert platform_util.root_identity_record(zero) is None
+
+
+def test_recorded_root_identity_carries_the_record_in_stat_field_order(tmp_path):
+    """DW-446: the synthetic identity built from a record is a DIRECTORY stat whose
+    ``st_dev``/``st_ino`` are the record's (`os.stat_result` takes mode, ino, dev in
+    that order), so it matches the recorded directory's own stat; a None record is
+    the never-matching identity.
+
+    Ablation: swap ``ino``/``dev`` in the tuple `recorded_root_identity` builds and
+    the field and match rows redden."""
+    real = tmp_path / "real"
+    real.mkdir()
+    own = os.lstat(real)
+    identity = platform_util.recorded_root_identity((own.st_dev, own.st_ino))
+
+    assert (identity.st_dev, identity.st_ino) == (own.st_dev, own.st_ino)
+    assert stat.S_ISDIR(identity.st_mode)
+    assert platform_util._same_dir_identity(identity, own)
+    never = platform_util.recorded_root_identity(None)
+    assert never is platform_util.NEVER_MATCHING_IDENTITY
+    assert not platform_util._same_dir_identity(never, own)
+    assert not platform_util._same_dir_identity(never, never)
+
+
 def test_pinned_root_identity_refuses_a_reparse_tagged_dir(tmp_path, monkeypatch):
     """A win32 junction `lstat`s as a DIRECTORY with a nonzero inode, so only the
     reparse-tag check stands between it and a pinned identity; drive that

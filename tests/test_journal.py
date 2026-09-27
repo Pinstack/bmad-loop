@@ -260,6 +260,11 @@ def test_two_concurrent_saves_never_share_the_fixed_temp_file(tmp_path, monkeypa
     assert load_state(tmp_path).run_id in {"first", "second"}
 
 
+def _minted(run_dir):
+    """The run dir's mint-time identity record, as the composers persist it (DW-446)."""
+    return platform_util.root_identity_record(run_dir)
+
+
 def _planted_verify_symlink(tmp_path):
     """A run dir whose `verify/` a session has already replaced with a link out."""
     run_dir, elsewhere = tmp_path / "run", tmp_path / "elsewhere"
@@ -296,7 +301,9 @@ def test_write_verify_stream_refuses_a_symlinked_verify_directory(tmp_path):
     journal, elsewhere = _planted_verify_symlink(tmp_path)
 
     with pytest.raises(OSError, match=r"unconfined verify directory"):
-        journal.write_verify_stream("v.stdout.log", "verifier output")
+        journal.write_verify_stream(
+            "v.stdout.log", "verifier output", run_dir_identity=_minted(journal.run_dir)
+        )
 
     # the assertion that actually pins the fix: nothing escaped the run dir
     assert list(elsewhere.iterdir()) == []
@@ -306,8 +313,8 @@ def test_write_verify_stream_refuses_a_symlinked_verify_directory(tmp_path):
 def test_write_verify_stream_refuses_a_run_dir_swapped_after_the_pin(tmp_path, monkeypatch):
     """DW-338: the run dir itself is engine-minted, so the anchored write pins it.
     A run dir replaced by a link (to a tree that also carries `verify/`) after
-    `pinned_root_identity` accepted it, but before the root open, is refused —
-    the confinement walk below the run dir alone would pass that swap.
+    its identity was recorded, but before the root open, is refused — the
+    confinement walk below the run dir alone would pass that swap.
 
     Ablation: drop `root_identity=` from the `open_dir_confined` call in
     `write_verify_stream` and this fails `DID NOT RAISE`, with `v.stdout.log`
@@ -316,6 +323,7 @@ def test_write_verify_stream_refuses_a_run_dir_swapped_after_the_pin(tmp_path, m
     (run_dir / "verify").mkdir(parents=True)
     (elsewhere / "verify").mkdir(parents=True)
     journal = Journal(run_dir)
+    record = _minted(run_dir)
     opener = journal_mod.open_dir_confined
 
     def swap_then_open(root, target, **kwargs):
@@ -325,7 +333,7 @@ def test_write_verify_stream_refuses_a_run_dir_swapped_after_the_pin(tmp_path, m
 
     monkeypatch.setattr(journal_mod, "open_dir_confined", swap_then_open)
     with pytest.raises(OSError, match=r"unconfined verify directory"):
-        journal.write_verify_stream("v.stdout.log", "verifier output")
+        journal.write_verify_stream("v.stdout.log", "verifier output", run_dir_identity=record)
 
     assert list((elsewhere / "verify").iterdir()) == []
     assert list((tmp_path / "run-aside" / "verify").iterdir()) == []
@@ -334,18 +342,21 @@ def test_write_verify_stream_refuses_a_run_dir_swapped_after_the_pin(tmp_path, m
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 @pytest.mark.skipif(not journal_mod.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only")
 def test_write_verify_stream_refuses_a_linked_run_dir(tmp_path):
-    """A run dir that is already a link has no identity to pin: the engine mints
+    """A run dir that is already a link has no identity to record: the engine mints
     run dirs, so a linked one is refused by contract rather than walked.
 
-    Ablation: fall back to an unpinned open when `pinned_root_identity` answers
-    None and this fails `DID NOT RAISE`, the stream landing in `real/verify/`."""
+    Ablation: fall back to an unpinned open when the record is None and this fails
+    `DID NOT RAISE`, the stream landing in `real/verify/`."""
     real = tmp_path / "real"
     real.mkdir()
     run_dir = tmp_path / "run"
     run_dir.symlink_to(real, target_is_directory=True)
 
+    assert _minted(run_dir) is None  # a link records nothing
     with pytest.raises(OSError, match=r"unconfined verify directory"):
-        Journal(run_dir).write_verify_stream("v.stdout.log", "verifier output")
+        Journal(run_dir).write_verify_stream(
+            "v.stdout.log", "verifier output", run_dir_identity=_minted(run_dir)
+        )
 
     assert not (real / "verify").exists()  # not even the directory
 
@@ -365,27 +376,80 @@ def test_write_verify_stream_refuses_a_symlinked_verify_directory_on_the_win32_p
     journal, elsewhere = _planted_verify_symlink(tmp_path)
 
     with pytest.raises(OSError, match=r"redirected verify directory"):
-        journal.write_verify_stream("v.stdout.log", "verifier output")
+        journal.write_verify_stream(
+            "v.stdout.log", "verifier output", run_dir_identity=_minted(journal.run_dir)
+        )
 
     assert list(elsewhere.iterdir()) == []
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
-def test_write_verify_stream_refuses_a_linked_run_dir_on_the_win32_path(tmp_path, monkeypatch):
-    """DW-338 on the check-then-write arm: a linked run dir is refused there too.
+@pytest.mark.parametrize("guard", ["record-pin", "link-check"])
+def test_write_verify_stream_refuses_a_linked_run_dir_on_the_win32_path(
+    tmp_path, monkeypatch, guard
+):
+    """DW-338 on the check-then-write arm: a linked run dir is refused there too,
+    even when handed the identity of the directory the link leads to. Each guard
+    is exercised on its own: ``record-pin`` is the DW-446 `require_root_pinned`
+    compare (a link's `lstat` is not the recorded directory); ``link-check``
+    neutralizes it so the `is_link_like(self.run_dir)` check alone must refuse.
 
-    Ablation: drop the `is_link_like(self.run_dir)` check and this fails
-    `DID NOT RAISE`, the stream landing in `real/verify/`."""
+    Ablation: drop the `require_root_pinned` calls and the ``record-pin`` row
+    reddens (the refusal it gets is the link check's, not the pin's); drop the
+    `is_link_like(self.run_dir)` checks and the ``link-check`` row fails `DID NOT
+    RAISE`, the stream landing in `real/verify/`."""
     monkeypatch.setattr(journal_mod, "DIR_FD_ANCHORED_WRITES", False)
     real = tmp_path / "real"
     real.mkdir()
     run_dir = tmp_path / "run"
     run_dir.symlink_to(real, target_is_directory=True)
+    if guard == "link-check":
+        monkeypatch.setattr(journal_mod, "require_root_pinned", lambda root, identity: None)
+    expected = r"no longer the directory" if guard == "record-pin" else r"redirected verify"
 
-    with pytest.raises(OSError, match=r"redirected verify directory"):
-        Journal(run_dir).write_verify_stream("v.stdout.log", "verifier output")
+    with pytest.raises(OSError, match=expected):
+        Journal(run_dir).write_verify_stream(
+            "v.stdout.log", "verifier output", run_dir_identity=_minted(real)
+        )
 
     assert not (real / "verify").exists()  # not even the directory
+
+
+def test_write_verify_stream_refuses_a_zero_inode_run_dir_on_the_win32_path(tmp_path, monkeypatch):
+    """DW-446, accepted 2026-09-27: a run dir whose `lstat` reports `st_ino` 0 (a
+    win32 filesystem with no inode identity, DW-444's pattern) records no mint-time
+    identity, and the win32 check-then-write arm now REFUSES it — before DW-446 it
+    wrote there. A refusal, not a degrade: nothing is created, and the engine
+    journals it as the verify record's `capture_error`.
+
+    Ablation: revert the win32 arm's pin (drop its `require_root_pinned` calls, the
+    pre-DW-446 fresh-`lstat`-only arm) and this fails `DID NOT RAISE`, the stream
+    landing in `run/verify/`."""
+    monkeypatch.setattr(journal_mod, "DIR_FD_ANCHORED_WRITES", False)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    real_lstat = os.lstat
+
+    class _ZeroInode:
+        def __init__(self, real):
+            self._real = real
+            self.st_ino = 0
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    def lstat(path, *args, **kwargs):
+        real = real_lstat(path, *args, **kwargs)
+        return _ZeroInode(real) if str(path) == str(run_dir) else real
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    record = platform_util.root_identity_record(run_dir)
+    assert record is None  # the mint records nothing for a zero inode
+
+    with pytest.raises(OSError, match=r"no longer the directory"):
+        Journal(run_dir).write_verify_stream("v.stdout.log", "out", run_dir_identity=record)
+
+    assert not (run_dir / "verify").exists()
 
 
 def test_write_verify_stream_writes_an_ordinary_verify_directory(tmp_path):
@@ -399,10 +463,127 @@ def test_write_verify_stream_writes_an_ordinary_verify_directory(tmp_path):
     run_dir.mkdir()
     journal = Journal(run_dir)
 
-    pointer = journal.write_verify_stream("v.stdout.log", "verifier output")
+    pointer = journal.write_verify_stream(
+        "v.stdout.log", "verifier output", run_dir_identity=_minted(run_dir)
+    )
 
     assert pointer == "verify/v.stdout.log"
     assert (run_dir / pointer).read_text(encoding="utf-8") == "verifier output"
+    # and again over the now-existing `verify/` (the mkdir's FileExistsError arm)
+    journal.write_verify_stream("v.stderr.log", "more", run_dir_identity=_minted(run_dir))
+    assert (run_dir / "verify" / "v.stderr.log").read_text(encoding="utf-8") == "more"
+
+
+def test_write_verify_stream_writes_an_ordinary_verify_directory_on_the_win32_path(
+    tmp_path, monkeypatch
+):
+    """The positive control for the check-then-write arm: an intact run dir whose
+    record matches still retains its streams."""
+    monkeypatch.setattr(journal_mod, "DIR_FD_ANCHORED_WRITES", False)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    pointer = Journal(run_dir).write_verify_stream(
+        "v.stdout.log", "verifier output", run_dir_identity=_minted(run_dir)
+    )
+
+    assert (run_dir / pointer).read_text(encoding="utf-8") == "verifier output"
+
+
+@pytest.mark.parametrize("arm", ["dir-fd", "win32-path"])
+def test_write_verify_stream_refuses_a_missing_run_dir_record(tmp_path, monkeypatch, arm):
+    """DW-446: a run dir with no mint-time record (a pre-upgrade state not yet
+    backfilled) refuses — it never degrades to an unpinned open or a fresh `lstat`.
+
+    Ablation: map a None record to `pinned_root_identity(self.run_dir)` (the
+    pre-DW-446 per-write pin) and both arms fail `DID NOT RAISE`."""
+    if arm == "dir-fd" and not journal_mod.DIR_FD_ANCHORED_WRITES:
+        pytest.skip("dir-fd anchoring is POSIX-only")
+    if arm == "win32-path":
+        monkeypatch.setattr(journal_mod, "DIR_FD_ANCHORED_WRITES", False)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    with pytest.raises(OSError):
+        Journal(run_dir).write_verify_stream("v.stdout.log", "out", run_dir_identity=None)
+
+    assert not (run_dir / "verify").exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("arm", ["dir-fd", "win32-path"])
+def test_write_verify_stream_refuses_a_runs_dir_swapped_for_a_link_holding_a_real_run(
+    tmp_path, monkeypatch, arm
+):
+    """DW-446: `runs/` swapped, after the mint, for a link to a tree holding a REAL
+    `<id>/` refuses on both arms, and nothing is created or written outside.
+
+    A fresh `lstat` refuses a link only at the final component: here the run dir
+    itself is a real directory reached THROUGH the link, so the pre-DW-446 per-write
+    pin accepted it and the stream landed in `outside/<id>/verify/`. The pin is now
+    the identity recorded when the run dir was minted.
+
+    Ablation: pin with `pinned_root_identity(self.run_dir)` instead of the record
+    (the pre-DW-446 behaviour) and both arms fail `DID NOT RAISE`, with
+    `outside/r1/verify/v.stdout.log` written."""
+    if arm == "dir-fd" and not journal_mod.DIR_FD_ANCHORED_WRITES:
+        pytest.skip("dir-fd anchoring is POSIX-only")
+    if arm == "win32-path":
+        monkeypatch.setattr(journal_mod, "DIR_FD_ANCHORED_WRITES", False)
+    runs_dir = tmp_path / "project" / ".bmad-loop" / "runs"
+    run_dir = runs_dir / "r1"
+    run_dir.mkdir(parents=True)
+    record = _minted(run_dir)
+    journal = Journal(run_dir)
+    outside = tmp_path / "outside"
+    (outside / "r1").mkdir(parents=True)
+    runs_dir.rename(runs_dir.with_name("runs-aside"))
+    runs_dir.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(OSError):
+        journal.write_verify_stream("v.stdout.log", "verifier output", run_dir_identity=record)
+
+    assert list((outside / "r1").iterdir()) == []  # not even `verify/`
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_write_verify_stream_win32_path_repins_the_run_dir_before_the_write(tmp_path, monkeypatch):
+    """DW-446 on the check-then-write arm: `runs/` swapped for a link to a tree
+    holding a real `<id>/verify/` AFTER the first pin (on the first `is_link_like`
+    call, before the `mkdir`) is caught by the SECOND `require_root_pinned`, just
+    before the write; nothing lands in the outside `verify/`. The run dir and
+    `verify/` are real directories reached through the link, so the `is_link_like`
+    checks alone pass the swap.
+
+    Ablation: drop the second `require_root_pinned(self.run_dir, root_identity)`
+    (between `verify_dir.mkdir` and the write) and this fails `DID NOT RAISE`, with
+    `outside/r1/verify/v.stdout.log` written."""
+    monkeypatch.setattr(journal_mod, "DIR_FD_ANCHORED_WRITES", False)
+    runs_dir = tmp_path / "project" / ".bmad-loop" / "runs"
+    run_dir = runs_dir / "r1"
+    run_dir.mkdir(parents=True)
+    record = _minted(run_dir)
+    journal = Journal(run_dir)
+    outside = tmp_path / "outside"
+    (outside / "r1" / "verify").mkdir(parents=True)
+    real_is_link_like = journal_mod.is_link_like
+    swapped = False
+
+    def swap_then_check(path):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            runs_dir.rename(runs_dir.with_name("runs-aside"))
+            runs_dir.symlink_to(outside, target_is_directory=True)
+        return real_is_link_like(path)
+
+    monkeypatch.setattr(journal_mod, "is_link_like", swap_then_check)
+
+    with pytest.raises(OSError, match=r"no longer the directory"):
+        journal.write_verify_stream("v.stdout.log", "verifier output", run_dir_identity=record)
+
+    assert swapped  # the premise: the swap happened after the first pin
+    assert list((outside / "r1" / "verify").iterdir()) == []
 
 
 class _ReparseStat:
@@ -445,7 +626,9 @@ def test_write_verify_stream_refuses_a_junctioned_verify_directory(tmp_path, mon
     )
 
     with pytest.raises(OSError, match=r"redirected verify directory"):
-        Journal(run_dir).write_verify_stream("v.stdout.log", "verifier output")
+        Journal(run_dir).write_verify_stream(
+            "v.stdout.log", "verifier output", run_dir_identity=_minted(run_dir)
+        )
 
 
 # ------------------------------------------------- append tail heal (DW-97)

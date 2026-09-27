@@ -69,6 +69,47 @@ def test_run_state_code_root_restamp_pending_round_trips_and_defaults_false():
     assert RunState.from_dict(d).code_root_restamp_pending is False
 
 
+def test_mint_time_root_identities_round_trip_as_two_int_lists():
+    """DW-446: `RunState.run_dir_identity` and `StoryTask.worktree_identity` persist
+    as a two-int JSON list (or null) and read back as the same tuple.
+
+    Ablation: drop either key from `to_dict` and its round trip reads None."""
+    task = StoryTask(story_key="1-1-a", epic=1, worktree_path="/p/wt", worktree_identity=(7, 42))
+    state = _state(run_dir_identity=(3, 9), tasks={"1-1-a": task})
+
+    d = json.loads(json.dumps(state.to_dict()))
+    assert d["run_dir_identity"] == [3, 9]
+    assert d["tasks"]["1-1-a"]["worktree_identity"] == [7, 42]
+    back = RunState.from_dict(d)
+    assert back.run_dir_identity == (3, 9)
+    assert back.tasks["1-1-a"].worktree_identity == (7, 42)
+
+    unset = json.loads(json.dumps(_state(tasks={"x": StoryTask("x", 1)}).to_dict()))
+    assert unset["run_dir_identity"] is None
+    assert unset["tasks"]["x"]["worktree_identity"] is None
+
+
+def test_mint_time_root_identities_default_none_for_legacy_or_malformed_state():
+    """A state.json from before the fields existed reads back None (no record, which
+    every pin refuses), and so does anything that is not a list of exactly two ints —
+    never a raise out of `from_dict`, which would keep the run from loading."""
+    task = StoryTask(story_key="1-1-a", epic=1, worktree_identity=(7, 42))
+    legacy = _state(run_dir_identity=(3, 9), tasks={"1-1-a": task}).to_dict()
+    del legacy["run_dir_identity"]
+    del legacy["tasks"]["1-1-a"]["worktree_identity"]
+    back = RunState.from_dict(legacy)
+    assert back.run_dir_identity is None
+    assert back.tasks["1-1-a"].worktree_identity is None
+
+    for bad in ([1], [1, 2, 3], ["1", 2], [True, 2], [1.0, 2], {"dev": 1}, "1,2", 12, [None, 2]):
+        d = _state(run_dir_identity=(3, 9), tasks={"1-1-a": task}).to_dict()
+        d["run_dir_identity"] = bad
+        d["tasks"]["1-1-a"]["worktree_identity"] = bad
+        back = RunState.from_dict(d)
+        assert back.run_dir_identity is None, bad
+        assert back.tasks["1-1-a"].worktree_identity is None, bad
+
+
 def test_run_state_repo_root_round_trips_and_backs_code_root():
     """The git root a run's code work happens in, persisted because
     `runs.rearm_escalation` runs OUT OF PROCESS from the engine and had only

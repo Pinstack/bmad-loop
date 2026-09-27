@@ -2515,6 +2515,48 @@ def test_missing_root_with_a_swapped_ancestor_creates_nothing_outside(
     assert not task.artifact_publication_complete
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink swap")
+@pytest.mark.parametrize("fallback", [False, True], ids=["descriptor", "fallback"])
+def test_existing_root_parent_swapped_for_a_link_holding_a_real_root_is_refused(
+    publication_case, monkeypatch, fallback
+):
+    """DW-446: the artifacts root gets no persisted mint-time record — it is
+    operator-configured and shared across runs — because `_confined` `lstat`s EVERY
+    ancestor and refuses a symlink anywhere in the chain. An EXISTING root's parent
+    swapped for a link to a tree holding a REAL artifacts directory (so the root
+    path reaches a real, non-link directory a fresh `lstat` of the root would
+    accept) refuses both capture and publish with `PublicationError`, and nothing
+    is written outside.
+
+    Ablation: have `_confined` skip the components ABOVE `root` (both its `S_ISLNK`
+    and its parent-is-a-directory refusal — either alone refuses this swap) and
+    publish writes into the outside artifacts directory."""
+    task, paths, source = publication_case
+    if not fallback and not publication.DIR_FD_ANCHORED_WRITES:
+        pytest.skip("descriptor-relative writes are unavailable")
+    bind_and_prepare(task, paths, source)
+    root = paths.implementation_artifacts
+    assert root.is_dir()  # an EXISTING root
+    parent = root.parent
+    assert parent != paths.repo_root
+    outside = paths.project.parent / "outside-output"
+    (outside / root.name).mkdir(parents=True)
+    parent.rename(parent.with_name(parent.name + "-aside"))
+    parent.symlink_to(outside, target_is_directory=True)
+    assert root.is_dir() and not root.is_symlink()  # the premise
+    if fallback:
+        _force_path_fallback(monkeypatch)
+
+    with pytest.raises(publication.PublicationError):
+        publication.publish(task, paths)
+    fresh = StoryTask(story_key="dw-fix-2", epic=0, dw_ids=["DW-2"])
+    with pytest.raises(publication.PublicationError):
+        publication.capture(fresh, paths)
+
+    assert list((outside / root.name).iterdir()) == []
+    assert not task.artifact_publication_complete
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="real win32 directory junction")
 def test_a_real_junction_below_the_artifacts_root_is_refused(publication_case, tmp_path):
     """DW-422 on a real win32 junction under the artifacts root: `_confined`

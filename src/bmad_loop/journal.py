@@ -13,14 +13,19 @@ from typing import Any
 
 from .model import RunState
 from .platform_util import (
+    AT_DIRECTORY,
+    AT_NOFOLLOW,
     DIR_FD_ANCHORED_WRITES,
+    RootIdentityRecord,
     atomic_replace,
     atomic_write_text,
     atomic_write_text_at,
     file_lock,
     is_link_like,
+    open_at,
     open_dir_confined,
-    pinned_root_identity,
+    recorded_root_identity,
+    require_root_pinned,
 )
 
 STATE_FILE = "state.json"
@@ -229,7 +234,9 @@ class Journal:
         with self.path.open("a", encoding="utf-8") as f:
             f.write(text)
 
-    def write_verify_stream(self, name: str, content: str) -> str:
+    def write_verify_stream(
+        self, name: str, content: str, *, run_dir_identity: RootIdentityRecord | None
+    ) -> str:
         """Atomically retain one verifier subprocess stream under ``verify/`` and
         return its run-relative pointer.  The journal records the pointer and byte
         counts, never unbounded subprocess output inline.
@@ -286,9 +293,9 @@ class Journal:
         never names a path again.  A path check would be answered *about a path*
         and stale the moment it returned — the session can re-plant the link
         between check and write — so this closes the window rather than narrowing
-        it.  The ``mkdir`` above may still be fooled; that is harmless, because the
-        confinement walk that follows is not, and refusal is what the fooled case
-        produces.
+        it.  ``verify/`` is created relative to the pinned run-dir descriptor, so a
+        planted link there makes the ``mkdir`` answer ``FileExistsError`` and the
+        ``O_NOFOLLOW`` open that follows refuses it.
 
         win32 has no ``*at()`` family to anchor against, so it keeps a
         check-then-write, and the check is :func:`is_link_like` rather than
@@ -302,13 +309,27 @@ class Journal:
         as this writer and the names here are engine-minted, so the exposure is a
         redirected diagnostic rather than a foothold.
 
-        The run dir itself is PINNED on the anchored arm (DW-338): it is
-        engine-minted, so a linked run dir is refused by contract, and the walk
-        refuses unless the root it opens is the directory
-        :func:`pinned_root_identity` accepted just before — a run dir replaced by a
-        link in between is not written through. A run dir that is already a link
-        (or missing) has no identity to pin and refuses outright. The win32 arm
-        extends its check-then-write refusal to a linked run dir the same way.
+        The run dir itself is PINNED to its MINT-TIME identity (DW-338, DW-446):
+        ``run_dir_identity`` is ``RunState.run_dir_identity``, the ``(st_dev,
+        st_ino)`` the composer recorded when it claimed the directory. A fresh
+        ``lstat`` would refuse a link only at the run dir itself; ``runs/`` (or
+        the run dir) swapped for a link to a tree holding a real ``<id>/`` would
+        answer the outside directory, and every record would land there. On the
+        dir-fd arm the run dir is OPENED first and its ``fstat`` compared against
+        the record, before ``verify/`` is created — relative to that descriptor —
+        so a swapped run dir gets no ``verify/`` in its target, and ``verify/``
+        is then walked ``O_NOFOLLOW`` from the same descriptor. The win32 arm
+        re-``lstat``s the run dir against the record before its ``mkdir`` and
+        again before the write (check-then-write, beside its
+        :func:`is_link_like` checks). A missing record (``None``: a pre-upgrade
+        state not yet backfilled, a zero-inode claim) refuses outright — it never
+        degrades to an unpinned open. That is no change on the dir-fd arm (a zero
+        inode never matched), but the win32 arm, which before DW-446 wrote through
+        a zero-inode run dir, now REFUSES it (accepted 2026-09-27): a refusal, not a
+        degrade, surfaced by the caller as the verify record's ``capture_error``.
+        Trust-on-first-use: the record is what sat at the run dir when it was
+        minted; only a locked resume/re-arm (``runs.reconcile_root_identities``)
+        backfills a missing one or re-binds an ``st_dev`` a reboot renumbered.
 
         Raises ``OSError`` — including when confinement cannot be established, so
         an unconfined ``verify/`` REFUSES rather than writing through the link.
@@ -316,28 +337,38 @@ class Journal:
         the record still lands, with a null pointer and ``capture_error``.
         """
         verify_dir = self.run_dir / VERIFY_DIR
-        # Pin (or refuse) the run dir BEFORE the mkdir: a linked run dir must not
+        root_identity = recorded_root_identity(run_dir_identity)
+        # Pin (or refuse) the run dir BEFORE the mkdir: a swapped run dir must not
         # get a `verify/` created in its target ahead of the refusal.
         if DIR_FD_ANCHORED_WRITES:
-            root_identity = pinned_root_identity(self.run_dir)
-            if root_identity is None:
+            run_fd = open_dir_confined(self.run_dir, self.run_dir, root_identity=root_identity)
+            if run_fd is None:
                 raise OSError(
                     f"refusing to write into an unconfined verify directory: {verify_dir}"
                 )
-            verify_dir.mkdir(parents=True, exist_ok=True)
-            dir_fd = open_dir_confined(self.run_dir, verify_dir, root_identity=root_identity)
-            if dir_fd is None:
-                raise OSError(
-                    f"refusing to write into an unconfined verify directory: {verify_dir}"
-                )
+            try:
+                try:
+                    os.mkdir(VERIFY_DIR, 0o777, dir_fd=run_fd)
+                except FileExistsError:
+                    pass  # an existing entry — the O_NOFOLLOW open below vets it
+                try:
+                    dir_fd = open_at(run_fd, VERIFY_DIR, os.O_RDONLY | AT_DIRECTORY | AT_NOFOLLOW)
+                except OSError as e:
+                    raise OSError(
+                        f"refusing to write into an unconfined verify directory: {verify_dir}"
+                    ) from e
+            finally:
+                os.close(run_fd)
             try:
                 atomic_write_text_at(dir_fd, name, content)
             finally:
                 os.close(dir_fd)
         else:
+            require_root_pinned(self.run_dir, root_identity)
             if is_link_like(self.run_dir):
                 raise OSError(f"refusing to write into a redirected verify directory: {verify_dir}")
             verify_dir.mkdir(parents=True, exist_ok=True)
+            require_root_pinned(self.run_dir, root_identity)
             if is_link_like(self.run_dir) or is_link_like(verify_dir):
                 raise OSError(f"refusing to write into a redirected verify directory: {verify_dir}")
             atomic_write_text(verify_dir / name, content, follow_symlinks=False)

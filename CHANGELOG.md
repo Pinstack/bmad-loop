@@ -154,6 +154,21 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Pin the run dir and each worktree mount to the identity recorded when the orchestrator
+  minted it (DW-446, DW-486). `state.json` now persists `run_dir_identity` and each task's
+  `worktree_identity`. The verify stream and every mount writer compare the root they open
+  against that record, and reach a nested mount project by a no-follow walk from the
+  recorded mount. With `runs/`, `runs/<id>/` or `worktrees/` swapped for a link to a tree
+  holding a real run or unit dir, the verify stream and the mount writers now refuse
+  instead of writing outside the repository.
+  A missing or mismatched record also refuses: the verify stream loses its log tail
+  (journaled as `capture_error`), and a mount write refuses through its site's handling.
+  State written before this change records its roots at the first `resume` or re-arm,
+  journaling `root-identity-recorded`. Until then, TUI replan of such a run refuses.
+  A `resume` or re-arm re-binds a record whose `st_dev` a reboot or remount renumbered
+  (same inode, still a real directory), journaling `root-identity-rebound`. An inode
+  mismatch is never re-bound. On Windows, the verify stream now refuses a run dir that
+  reports a zero inode, where it used to write.
 - On Windows, stop a DW bundle from pausing at baseline capture when the artifacts root
   reports no inode (DW-444). Each degraded read is journaled as
   `artifact-observation-unpinned` with the filesystem. A bundle with artifact

@@ -10519,6 +10519,64 @@ def test_commit_path_bound_refuses_a_candidate_root_swapped_for_a_link(
         assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_commit_path_bound_refuses_a_candidate_parent_swapped_for_a_link_holding_a_real_root(
+    project, tmp_path, monkeypatch
+):
+    """DW-446: the candidate is pinned at its mint (right after `worktree add`) and
+    that pin is HELD for its one-call lifetime, so it needs no persisted record. Its
+    `TemporaryDirectory` parent swapped after the pin for a link to a tree holding a
+    REAL `candidate/` (a full copy, `.git` gitfile included) makes the candidate path
+    reach a real, non-link directory — a fresh `lstat` of it accepts that tree — but
+    the re-check compares against the held pin and refuses. Nothing is written into
+    the outside copy, HEAD stays.
+
+    Ablation: make `platform_util._root_still_pinned` accept any fresh non-link
+    `lstat` (re-take the pin at each re-check) and this reddens — the root
+    re-checks pass the outside candidate and the call goes on to fail elsewhere."""
+    import tempfile
+
+    temp_base = tmp_path / "tmp"
+    temp_base.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(temp_base))
+    repo, path, baseline, accepted, original = _nested_bound_publish_inputs(
+        project, "outer/inner/ledger.md"
+    )
+    outside = tmp_path / "outside"
+    real_pin = verify.pinned_root_identity
+    swapped: list[Path] = []
+    snapshot: list[str] = []
+
+    def pin_then_swap_parent(root):
+        identity = real_pin(root)
+        if root.name == "candidate" and not swapped:
+            parent = root.parent
+            shutil.copytree(parent, outside, symlinks=True)
+            parent.rename(parent.with_name(parent.name + "-aside"))
+            parent.symlink_to(outside, target_is_directory=True)
+            assert root.is_dir() and not root.is_symlink()  # the premise
+            swapped.append(parent)
+            snapshot.extend(sorted(p.relative_to(outside).as_posix() for p in outside.rglob("*")))
+        return identity
+
+    monkeypatch.setattr(verify, "pinned_root_identity", pin_then_swap_parent)
+
+    with pytest.raises(verify.GitError, match="replaced"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+            baseline_commit=original,
+        )
+
+    assert swapped
+    written = sorted(p.relative_to(outside).as_posix() for p in outside.rglob("*"))
+    assert written == snapshot  # nothing created in the outside candidate
+    assert verify.rev_parse_head(repo) == original
+
+
 # DW-401/420/425: filter-free candidate checkout, root re-checks, handle-anchored
 # win32 parent creation.
 

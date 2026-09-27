@@ -17712,6 +17712,192 @@ def test_sweep_archive_routes_a_locked_ledger_os_read_fault(
         assert not archive.exists()
 
 
+def test_resume_backfills_legacy_root_identities_once(project, monkeypatch):
+    """DW-446: a paused run whose state.json predates the mint-time root identities
+    resumes, and the resume records the run dir's identity and each mounted task's
+    (persisted before the engine runs), journaling one `root-identity-recorded` per
+    record. A second resume journals none — the records are on disk, and an existing
+    record is never re-taken.
+
+    Ablation: drop the `runs.reconcile_root_identities` call from
+    `_prepare_resume_locked` and the persisted identities stay None (first block);
+    re-take a fresh `root_identity_record` for every root regardless of its record
+    (``if record is None:`` → ``if True:`` in `runs._reconcile_one_root`) and the
+    second resume journals two more rows."""
+    from bmad_loop import platform_util
+    from bmad_loop.journal import Journal, load_state, save_state
+    from bmad_loop.model import Phase, StoryTask
+
+    run_dir = _paused_run_for_resume(
+        project,
+        monkeypatch,
+        tasks={
+            "1-1-a": StoryTask(
+                "1-1-a",
+                1,
+                phase=Phase.DEV_VERIFY,
+                worktree_path=str(
+                    project.project / ".bmad-loop/runs/20990101-000000-beef/worktrees/1-1-a"
+                ),
+                branch="bmad-loop/1-1-a",
+            )
+        },
+    )
+    mount = run_dir / "worktrees" / "1-1-a"
+    mount.mkdir(parents=True)
+    raw = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    raw.pop("run_dir_identity")
+    raw["tasks"]["1-1-a"].pop("worktree_identity")  # the pre-DW-446 shape
+    (run_dir / "state.json").write_text(json.dumps(raw), encoding="utf-8")
+    seen: list[tuple] = []
+
+    class _IdentityEngine(_StubEngine):
+        def __init__(self, **kwargs):
+            state = kwargs["state"]
+            seen.append((state.run_dir_identity, state.tasks["1-1-a"].worktree_identity))
+
+    monkeypatch.setattr(cli, "Engine", _IdentityEngine)
+    argv = ["resume", "--project", str(project.project), run_dir.name]
+
+    def recorded_rows():
+        return [e for e in Journal(run_dir).entries() if e["kind"] == "root-identity-recorded"]
+
+    assert cli.main(argv) == 0
+    expected = (
+        platform_util.root_identity_record(run_dir),
+        platform_util.root_identity_record(mount),
+    )
+    assert expected[0] is not None and expected[1] is not None
+    assert seen == [expected]
+    saved = load_state(run_dir)
+    assert (saved.run_dir_identity, saved.tasks["1-1-a"].worktree_identity) == expected
+    rows = recorded_rows()
+    assert [(r["root"], r.get("story_key")) for r in rows] == [
+        ("run-dir", None),
+        ("worktree", "1-1-a"),
+    ]
+
+    state = load_state(run_dir)
+    state.paused_reason, state.paused_stage = "escalation", "escalation"
+    save_state(run_dir, state)
+    assert cli.main(argv) == 0
+    assert len(recorded_rows()) == 2  # a second resume journals none
+
+
+def _resume_with_records(project, monkeypatch, record_of):
+    """A paused mounted run whose persisted records are ``record_of(path)`` for the
+    run dir and the mount; returns ``(run_dir, mount, argv)`` with a stub engine."""
+    from bmad_loop.journal import load_state, save_state
+    from bmad_loop.model import Phase, StoryTask
+
+    run_dir = _paused_run_for_resume(
+        project,
+        monkeypatch,
+        tasks={
+            "1-1-a": StoryTask(
+                "1-1-a",
+                1,
+                phase=Phase.DEV_VERIFY,
+                worktree_path=str(
+                    project.project / ".bmad-loop/runs/20990101-000000-beef/worktrees/1-1-a"
+                ),
+                branch="bmad-loop/1-1-a",
+            )
+        },
+    )
+    mount = run_dir / "worktrees" / "1-1-a"
+    mount.mkdir(parents=True)
+    state = load_state(run_dir)
+    state.run_dir_identity = record_of(run_dir)
+    state.tasks["1-1-a"].worktree_identity = record_of(mount)
+    save_state(run_dir, state)
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+    return run_dir, mount, ["resume", "--project", str(project.project), run_dir.name]
+
+
+def test_resume_rebinds_a_renumbered_st_dev_once(project, monkeypatch):
+    """DW-446, human decision 2026-09-27 (b): `st_dev` is not stable across a reboot
+    (btrfs, NFS, overlay remounts). A paused run whose records carry the roots' real
+    inodes under another `st_dev` resumes, re-binds both records to today's
+    `st_dev`, persists them, journals one `root-identity-rebound` per root, and the
+    pinned writes then succeed (the verify stream lands, the mount identity is the
+    mount's own). A second resume journals nothing.
+
+    Ablation: drop the `runs.reconcile_root_identities` call from
+    `_prepare_resume_locked` and the persisted records stay renumbered and the
+    verify stream refuses."""
+    from bmad_loop import platform_util, runs
+    from bmad_loop.journal import Journal, load_state, save_state
+
+    def renumbered(path):
+        dev, ino = platform_util.root_identity_record(path)
+        return (dev + 7, ino)
+
+    run_dir, mount, argv = _resume_with_records(project, monkeypatch, renumbered)
+    old_run, old_mount = renumbered(run_dir), renumbered(mount)
+
+    def rebound_rows():
+        return [e for e in Journal(run_dir).entries() if e["kind"] == "root-identity-rebound"]
+
+    assert cli.main(argv) == 0
+
+    saved = load_state(run_dir)
+    assert saved.run_dir_identity == platform_util.root_identity_record(run_dir)
+    assert saved.tasks["1-1-a"].worktree_identity == platform_util.root_identity_record(mount)
+    assert [(r["root"], r.get("story_key"), r["old_dev"]) for r in rebound_rows()] == [
+        ("run-dir", None, old_run[0]),
+        ("worktree", "1-1-a", old_mount[0]),
+    ]
+    assert Journal(run_dir).write_verify_stream(
+        "v.stdout.log", "out", run_dir_identity=saved.run_dir_identity
+    )
+    identity = runs.mount_root_identity(
+        mount, mount=mount, recorded=saved.tasks["1-1-a"].worktree_identity
+    )
+    assert (identity.st_dev, identity.st_ino) == platform_util.root_identity_record(mount)
+
+    state = load_state(run_dir)
+    state.paused_reason, state.paused_stage = "escalation", "escalation"
+    save_state(run_dir, state)
+    assert cli.main(argv) == 0
+    assert len(rebound_rows()) == 2  # a second resume journals none
+
+
+def test_resume_never_rebinds_an_inode_mismatch(project, monkeypatch):
+    """The re-bind is inode-matched: a record whose inode differs from the root's
+    (the root was replaced while paused) is left as it is — the resume still
+    succeeds, nothing is journaled, and the pinned writes keep refusing.
+
+    Ablation: accept an inode mismatch in `runs._reconcile_one_root` (drop the
+    ``info.st_ino != ino`` check) and the persisted-record and no-journal-row
+    assertions redden. The pinned writes still refuse: that re-bind keeps the
+    record's old inode, so the pin never matches either way."""
+    from bmad_loop import platform_util, runs
+    from bmad_loop.journal import Journal, load_state
+
+    def stale(path):
+        dev, ino = platform_util.root_identity_record(path)
+        return (dev + 7, ino + 1)
+
+    run_dir, mount, argv = _resume_with_records(project, monkeypatch, stale)
+
+    assert cli.main(argv) == 0
+
+    saved = load_state(run_dir)
+    assert saved.run_dir_identity == stale(run_dir)
+    assert saved.tasks["1-1-a"].worktree_identity == stale(mount)
+    kinds = {e["kind"] for e in Journal(run_dir).entries()}
+    assert not kinds & {"root-identity-rebound", "root-identity-recorded"}
+    with pytest.raises(OSError):
+        Journal(run_dir).write_verify_stream(
+            "v.stdout.log", "out", run_dir_identity=saved.run_dir_identity
+        )
+    identity = runs.mount_root_identity(
+        mount, mount=mount, recorded=saved.tasks["1-1-a"].worktree_identity
+    )
+    assert identity.st_ino == 0  # never-matching
+
+
 def test_resume_accept_baseline_latches_for_one_resume_only(project, monkeypatch):
     """DW-371: `resume --accept-baseline` persists `state.accept_baseline=True` before
     the engine starts; a later plain resume (the path `resolve` and the TUI also take)

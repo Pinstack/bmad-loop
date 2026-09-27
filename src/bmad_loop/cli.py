@@ -3561,6 +3561,14 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     # and only here — past every refusal above — on the write that persists this
     # resume, so a refused resume cannot arm it and a plain one always clears it.
     state.accept_baseline = accept_baseline
+    # DW-446: reconcile the mint-time root identities — past every refusal above,
+    # before the engine's first pinned write, and persisted by the `save_state`
+    # below. A state.json written before they existed records them (one
+    # `root-identity-recorded` per record); a record whose root still lstats as a
+    # real directory with the same inode but a renumbered `st_dev` (a reboot or
+    # remount) is re-bound (one `root-identity-rebound`). An inode mismatch is never
+    # re-recorded — its pinned writes keep refusing.
+    runs.reconcile_root_identities(state, run_dir, journal, project)
     state.clear_pause()
     runs.write_pid(run_dir)
     # Persist before the engine starts: status, the TUI and diagnose only ever

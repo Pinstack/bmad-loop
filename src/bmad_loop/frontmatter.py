@@ -542,10 +542,10 @@ def set_frontmatter_status(
     `runs.live_spec_root_identity` for the re-arm/replan writers (DW-423), and
     directly for the engine's and `recovery_flow`'s writers when their workspace
     is a unit mount (DW-445; under isolation ``workspace.paths.project`` IS the
-    mount project) — and it covers the unit worktree and every directory down to
-    the pinned root. A swapped parent directory ABOVE the worktree
-    (``worktrees/``, ``runs/<id>/``) is not caught — the per-write ``lstat``
-    follows it, the residual every DW-338 pin shares.
+    mount project) — pinned to the mount's MINT-TIME identity
+    (``StoryTask.worktree_identity``, DW-446) with an ``O_NOFOLLOW`` walk down to
+    the pinned root, so a swapped parent directory ABOVE the worktree
+    (``worktrees/``, ``runs/<id>/``) refuses too.
     `verify.set_frontmatter_field`, `devcontract._atomic_write_spec` and
     `set_frontmatter_status_anchored` take the keyword on the same terms.
 

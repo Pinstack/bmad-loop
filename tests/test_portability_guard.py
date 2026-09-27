@@ -439,6 +439,13 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     # `ReFS`, `unknown`), the volume path already stripped; `_scrub_entry` keeps
     # it only while identifier-shaped. Kind-scoped because `fs_type` is generic.
     "artifact-observation-unpinned": frozenset({"fs_type"}),
+    # DW-446: the recorded root's `(st_dev, st_ino)` — two integers naming no story,
+    # branch, commit or path; left as-is so a maintainer can compare the record with
+    # a later refusal. Kind-scoped because `dev` is generic.
+    "root-identity-recorded": frozenset({"dev", "ino"}),
+    # DW-446: the `st_dev` a locked resume/re-arm re-bound (`old_dev` -> `dev`) under
+    # a still-matching `ino` — integers only, kept for the same comparison.
+    "root-identity-rebound": frozenset({"old_dev", "dev", "ino"}),
 }
 
 # Every OTHER field name journalled today: a declared inventory, not a per-name
@@ -1132,6 +1139,18 @@ JOURNAL_KINDS = frozenset(
         "run-resume",
         # cli.py + runs.py
         "rearm-code-root-restamped",
+        # cli.py + runs.py (resume and re-arm, `runs.reconcile_root_identities`).
+        # DW-446: a state.json written before the mint-time root identities records
+        # one at the first locked load; one row per record. `root` (`run-dir` |
+        # `worktree`) and `path` are presence-only in `diagnostics._JOURNAL_DROP_FIELDS`,
+        # `story_key` is aliased, `dev`/`ino` are kind-scoped benign.
+        "root-identity-recorded",
+        # cli.py + runs.py (same helper). DW-446: a recorded root whose `st_dev` a
+        # reboot/remount renumbered (same `st_ino`, still a real directory) is
+        # re-bound at the locked resume/re-arm; one row per re-bound root. Fields
+        # routed as on `root-identity-recorded`; `old_dev`/`dev`/`ino` kind-scoped
+        # benign.
+        "root-identity-rebound",
         # engine.py
         "board-advance-carried",
         "board-advance-carry-failed",

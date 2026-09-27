@@ -1370,7 +1370,13 @@ class BmadLoopApp(App[None]):
         identity stay one claim. `runs.live_spec_root_identity` answers it: the mount's
         identity when the root is the worktree mount, `None` for the project (and for
         the no-task arm, which is the project). Taken at the replan gesture, just
-        before the writes it pins."""
+        before the writes it pins. The mount identity is compared against the
+        mount's persisted mint-time record (`StoryTask.worktree_identity`, DW-446).
+        This replan pin is the observer path: it never writes or re-binds a record,
+        so a legacy paused run whose state predates it refuses the replan until a
+        `resume` or a re-arm has recorded it. A TUI-launched re-arm (`_do_rearm`)
+        goes through the locked `runs.rearm_escalation` and reconciles — backfill
+        and `st_dev` re-bind, `runs.reconcile_root_identities` — like any re-arm."""
         task = self._paused_task(state)
         if task:
             return runs.live_spec_root_identity(task, state, self.project)

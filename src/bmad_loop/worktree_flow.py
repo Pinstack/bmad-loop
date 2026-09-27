@@ -68,7 +68,7 @@ from .install import (
 )
 from .model import Phase
 from .mountpaths import rebased_project
-from .platform_util import atomic_write_text, filesystem_type
+from .platform_util import atomic_write_text, filesystem_type, root_identity_record
 from .workspace import (
     UnitWorkspace,
     Workspace,
@@ -2351,6 +2351,10 @@ class WorktreeFlow:
             self._save()
             return
         task.worktree_path = str(unit.path)
+        # The mount's mint-time identity (DW-446), taken before any session runs
+        # and persisted with `worktree_path`: every mount writer's pin compares the
+        # mount it opens against this record, never a per-write `lstat`.
+        task.worktree_identity = root_identity_record(unit.path)
         self.journal.append(
             "worktree-opened", story_key=task.story_key, branch=unit.branch, path=str(unit.path)
         )

@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from . import bmadconfig, deferredwork, devcontract, envvars, verify
+from . import bmadconfig, deferredwork, devcontract, envvars, platform_util, verify
 from .adapters.multiplexer import (
     MultiplexerError,
     TerminalMultiplexer,
@@ -45,6 +45,8 @@ from .model import PAUSE_ESCALATION, Phase, RunState, StoryTask
 from .mountpaths import project_offset
 from .platform_util import (
     MAX_SEGMENT,
+    NEVER_MATCHING_IDENTITY,
+    RootIdentityRecord,
     UnconfinedWriteError,
     _mkstemp_beside,
     atomic_replace,
@@ -57,8 +59,10 @@ from .platform_util import (
     is_link_like,
     names_tree_root,
     pinned_root_identity,
+    recorded_root_identity,
     require_root_pinned,
     retrying_unlink,
+    root_identity_record,
     safe_segment,
 )
 from .process_host import ProcessHostError, get_process_host
@@ -3617,9 +3621,10 @@ def live_spec_root(task: StoryTask, state: RunState, project_root: Path) -> Path
     return rebase_recorded_project_path(task_spec_root(task, state), state, project_root)
 
 
-# An identity no directory can match: mode 0 is not S_ISDIR and inode 0 carries no
-# identity, so `platform_util._same_dir_identity` refuses it — the write refuses.
-_UNPINNABLE_MOUNT = os.stat_result((0,) * 10)
+# An identity no directory can match (`platform_util.NEVER_MATCHING_IDENTITY`): mode 0
+# is not S_ISDIR and inode 0 carries no identity, so the write refuses. Kept as an
+# alias for the mount-writer callers and tests that name it here.
+_UNPINNABLE_MOUNT = NEVER_MATCHING_IDENTITY
 
 
 def live_spec_root_identity(
@@ -3634,21 +3639,27 @@ def live_spec_root_identity(
     `platform_util.open_dir_confined` leaves it unpinned.
 
     Otherwise `mount_root_identity` of that root, with the rebased
-    ``task.worktree_path`` — the unit worktree the root sits in — as ``mount``:
-    ``<project>/.bmad-loop/runs/<id>/worktrees/<unit>``, or ``<worktree>/<offset>``
-    under a nested project (DW-379). Its parent is session-writable, so a worktree
-    (or a directory between it and the root) swapped for a link would otherwise
-    carry the flip, strip, re-stamp, undo and the TUI replan outside the
-    repository, since the confined writers open their root following links
-    (DW-338 class). An unpinnable mount answers the never-matching identity, so
-    the refusal happens AT THE WRITE: every re-arm writer answers a missing spec
-    with ``False`` before any open, and a gone mount keeps that no-op rather than
-    becoming an abort here. The residual — parent directories ABOVE the unit
-    worktree — is `mount_root_identity`'s."""
+    ``task.worktree_path`` — the unit worktree the root sits in — as ``mount`` and
+    ``task.worktree_identity`` — the mount's MINT-TIME record (DW-446) — as
+    ``recorded``. The root is the mount's PROJECT: the mount itself, or
+    ``<mount>/<offset>`` under a nested project (DW-379). The pin is the recorded
+    mount plus an ``O_NOFOLLOW`` walk down to that project (DW-486), so a mount —
+    or any ancestor above it (``worktrees/``, ``runs/<id>/``) — swapped for a link
+    to a tree holding a real ``<unit>``, or a ``<mount>`` swapped for one holding a
+    real ``<offset>``, would otherwise carry the flip, strip, re-stamp, undo and
+    the TUI replan outside the repository, since the confined writers open their
+    root following links (DW-338 class). An unpinnable mount or a missing record
+    answers the never-matching identity, so the refusal happens AT THE WRITE:
+    every re-arm writer answers a missing spec with ``False`` before any open, and
+    a gone mount keeps that no-op rather than becoming an abort here. A legacy
+    paused run whose state predates the record refuses these writes until a
+    resume or re-arm backfills it (`reconcile_root_identities`)."""
     if not task.worktree_path or task_spec_root(task, state) != state.mount_project(task):
         return None
     mount = rebase_recorded_project_path(Path(task.worktree_path), state, project_root)
-    return mount_root_identity(live_spec_root(task, state, project_root), mount=mount)
+    return mount_root_identity(
+        live_spec_root(task, state, project_root), mount=mount, recorded=task.worktree_identity
+    )
 
 
 def _below_mount(root: Path, mount: Path) -> tuple[str, ...] | None:
@@ -3661,13 +3672,15 @@ def _below_mount(root: Path, mount: Path) -> tuple[str, ...] | None:
     return None if ".." in parts else parts
 
 
-def mount_root_identity(root: Path, *, mount: Path) -> os.stat_result:
+def mount_root_identity(
+    root: Path, *, mount: Path, recorded: RootIdentityRecord | None
+) -> os.stat_result:
     """The ``root_identity`` pinning ``root``, the ``confine_root`` a writer is about
-    to open inside the unit worktree ``mount`` — ``root``'s own ``lstat`` identity
-    when it can be pinned, else `_UNPINNABLE_MOUNT`, never ``None`` and never a
-    raise. Take it fresh at each write, beside the ``confine_root`` it pins, and
-    pass the SAME root that write opens: an identity for another directory would
-    refuse every legitimate write.
+    to open inside the unit worktree ``mount`` — the TRUE identity of ``root`` as
+    reached from the mount recorded at its mint, else `_UNPINNABLE_MOUNT`, never
+    ``None`` and never a raise. Take it fresh at each write, beside the
+    ``confine_root`` it pins, and pass the SAME root that write opens: an identity
+    for another directory would refuse every legitimate write.
 
     The one pin primitive for worktree-mount writers: `live_spec_root_identity`
     answers it for the re-arm/replan writers (DW-423), and the engine's
@@ -3677,31 +3690,50 @@ def mount_root_identity(root: Path, *, mount: Path) -> os.stat_result:
     workspace is a unit mount (DW-445). The caller decides mountedness; this only
     pins — an operator-chosen project root is never handed here.
 
-    Pinnable means ``root`` is ``mount`` or lexically under it with no ``..``, and
-    EVERY component from ``mount`` down to ``root`` ``lstat``s as a non-link
-    directory (`platform_util.pinned_root_identity` per component). A nested project
-    (DW-379) pins ``<worktree>/<offset>``, and a ``<worktree>`` — or any directory
-    between it and ``<offset>`` — swapped for a link answers the never-matching
-    identity, not the ``lstat`` of the directory the link leads to. A swap after the
-    identity is taken changes the identity of the root the writer then opens, so the
-    write refuses (``fstat`` of the opened root on the handle arm, a re-``lstat`` on
-    the no-handle fallback and on every writer's external-arm pre-check).
+    ``recorded`` is ``StoryTask.worktree_identity``, the mount's ``(st_dev,
+    st_ino)`` taken by `worktree_flow` when it minted the mount (DW-446). A
+    ``None`` record REFUSES — never a fallback to a fresh ``lstat``, which refuses
+    a link only at the final component and would accept ``worktrees/`` (or
+    ``runs/<id>/``) swapped for a link to a tree holding a real ``<unit>``.
+
+    With handle-anchored writes, ``mount`` is opened (following links) and its
+    ``fstat`` must equal the record, so a swapped mount or ancestor refuses; the
+    components down to ``root`` are then walked ``O_NOFOLLOW`` from that handle
+    (`platform_util.open_dir_confined`), and the ``fstat`` of the directory reached
+    is the answer. A nested project (DW-379, DW-486) therefore pins the real
+    ``<mount>/<offset>`` of the minted mount, not whatever the path resolves to: a
+    ``<mount>`` — or any directory between it and ``<offset>`` — swapped for a link
+    to a tree holding a real ``<offset>`` answers the never-matching identity.
+    Every writer re-opens ``root`` by path and compares against this (``fstat`` of
+    the opened root on the handle arm, a re-``lstat`` on the no-handle fallback and
+    on every writer's external-arm pre-check), so a path that resolves anywhere
+    else refuses. Hosts with no handle arm check ``os.lstat(mount)`` against the
+    record, then ``lstat`` each component down to ``root`` as a non-link directory
+    (check-then-write, `platform_util.path_is_confined`'s residual).
 
     A ``root`` spelled through a resolved parent (``ProjectPaths.rebased`` resolves
     the mount it rebases onto) is compared against ``mount``'s own name under its
     resolved parent: resolving the parent follows only the ancestors above the
-    unit worktree, never the worktree itself.
+    unit worktree, never the worktree itself — and the record then holds the mount
+    reached that way to its mint.
 
-    A mount that is a link, a reparse point, not a directory, or gone answers the
-    never-matching identity so the refusal lands AT THE WRITE: a writer's own
-    missing-file no-op still runs first, and a root reached through a link cannot be
-    written through.
+    A mount that is a link, a reparse point, not a directory, gone, or no longer the
+    recorded directory answers the never-matching identity so the refusal lands AT
+    THE WRITE: a writer's own missing-file no-op still runs first, and a root
+    reached through a link cannot be written through.
 
-    Residual: the parent directories ABOVE the unit worktree (``worktrees/``,
-    ``runs/<id>/``, …). A fresh ``lstat`` follows a link there, so an ancestor
-    swapped for a link to a tree holding a real ``<unit>`` matches the outside
-    directory, and one gesture's writes may land in different directories. That
-    residual is shared by every DW-338 pin and deferred for all of them at once."""
+    Within a live engine the compare is full ``(st_dev, st_ino)``: a record is
+    never re-taken here. Only a locked resume/re-arm (`reconcile_root_identities`)
+    backfills a missing record or re-binds an ``st_dev`` a reboot/remount
+    renumbered under a still-matching inode.
+
+    Accepted residuals: the record is trust-on-first-use (whatever sat at the mount
+    path when it was minted); the locked ``st_dev`` re-bind trusts an inode-only
+    match; a ``state.json`` edited during a crash window can forge a record; and a
+    cross-filesystem project copy changes inodes, so its pinned writes refuse — the
+    "refuse on mismatch" the decision asks for."""
+    if recorded is None:
+        return _UNPINNABLE_MOUNT
     parts = _below_mount(root, mount)
     if parts is None:
         try:
@@ -3711,6 +3743,21 @@ def mount_root_identity(root: Path, *, mount: Path) -> os.stat_result:
         parts = _below_mount(root, mount)
         if parts is None:
             return _UNPINNABLE_MOUNT
+    expected = recorded_root_identity(recorded)
+    if platform_util.HANDLE_ANCHORED_WRITES:
+        fd = platform_util.open_dir_confined(mount, mount.joinpath(*parts), root_identity=expected)
+        if fd is None:
+            return _UNPINNABLE_MOUNT
+        try:
+            return os.fstat(fd)
+        except OSError:
+            return _UNPINNABLE_MOUNT
+        finally:
+            os.close(fd)
+    try:
+        require_root_pinned(mount, expected)
+    except UnconfinedWriteError:
+        return _UNPINNABLE_MOUNT
     cursor = mount
     identity = pinned_root_identity(cursor)
     for part in parts:
@@ -3719,6 +3766,115 @@ def mount_root_identity(root: Path, *, mount: Path) -> os.stat_result:
         cursor = cursor / part
         identity = pinned_root_identity(cursor)
     return _UNPINNABLE_MOUNT if identity is None else identity
+
+
+def _reconcile_one_root(
+    record: RootIdentityRecord | None, path: Path
+) -> tuple[RootIdentityRecord | None, Literal["recorded", "rebound"] | None]:
+    """One root's `reconcile_root_identities` step: ``(the record it should now hold,
+    what changed)``.
+
+    ``None`` → today's identity when ``path`` is pinnable (``"recorded"``), else
+    ``None`` unchanged. A non-``None`` record → re-bound to today's ``st_dev`` ONLY
+    when ``path`` is pinnable (`pinned_root_identity`: a real directory, not a link
+    or a win32 link reparse point), reports a nonzero ``st_ino`` equal to the
+    record's, and a different ``st_dev`` (``"rebound"``). Anything else — an inode
+    mismatch, a link, a non-directory, a gone root, an unchanged record — returns
+    the record untouched."""
+    if record is None:
+        fresh = root_identity_record(path)
+        return fresh, (None if fresh is None else "recorded")
+    info = pinned_root_identity(path)
+    old_dev, ino = record
+    if info is None or info.st_ino == 0 or info.st_ino != ino or info.st_dev == old_dev:
+        return record, None
+    return (info.st_dev, ino), "rebound"
+
+
+def reconcile_root_identities(
+    state: RunState, run_dir: Path, journal: Journal, project_root: Path
+) -> bool:
+    """Reconcile the persisted mint-time root identities (DW-446) at a LOCKED load —
+    `cli._prepare_resume_locked` and `_rearm_escalation_locked`, before any pinned
+    write. Returns whether anything changed; the CALLER persists the state under
+    the run lock it already holds.
+
+    The roots are ``state.run_dir_identity`` (``run_dir``) and the
+    ``worktree_identity`` of each task with a recorded mount (``worktree_path``,
+    rebased onto ``project_root``). Two repairs, nothing else:
+
+    * **Backfill** — a ``None`` record (a ``state.json`` written before DW-446) is
+      taken from today's root and journals ``root-identity-recorded`` (``root``
+      = ``"run-dir"`` | ``"worktree"``, ``path``, ``story_key`` for a worktree,
+      ``dev``, ``ino``). Trust-on-first-use for a legacy run: a swap made while
+      it was paused under an older version is not seen.
+    * **``st_dev`` re-bind** — ``st_dev`` is not stable across a reboot or
+      remount (btrfs subvolume device numbers, NFS, overlay/container remounts),
+      and a run paused across one would otherwise refuse every pinned write
+      forever. A record whose root still ``lstat``s as a real directory (not a
+      link or reparse point) with the SAME ``st_ino`` and a different ``st_dev``
+      has its ``st_dev`` rewritten and journals ``root-identity-rebound``
+      (``root``, ``path``, ``story_key`` for a worktree, ``old_dev``, ``dev``,
+      ``ino``). Accepted residual: at this locked boundary the match is
+      inode-only, so a swap made during the pause to a real directory with the
+      same inode number on another filesystem would be re-bound. The live
+      engine never re-binds — its compare stays full ``(st_dev, st_ino)``, and
+      the swap threat (a coding session) exists only while an engine is live.
+
+    Any other mismatch — a different ``st_ino``, a link, a non-directory, a gone
+    root — is NEVER re-recorded: the record stays and its pinned writes keep
+    refusing. An unpinnable or zero-inode root with no record records nothing and
+    journals nothing. Only the locked resume and re-arm call this — including a
+    TUI-launched re-arm (`_do_rearm` → `rearm_escalation`), which reconciles like
+    any re-arm; the TUI's replan pin (the observer path) never does."""
+    changed = False
+    old = state.run_dir_identity
+    new, what = _reconcile_one_root(old, run_dir)
+    if what == "recorded" and new is not None:
+        journal.append(
+            "root-identity-recorded", root="run-dir", path=str(run_dir), dev=new[0], ino=new[1]
+        )
+    elif what == "rebound" and new is not None and old is not None:
+        journal.append(
+            "root-identity-rebound",
+            root="run-dir",
+            path=str(run_dir),
+            old_dev=old[0],
+            dev=new[0],
+            ino=new[1],
+        )
+    if what is not None:
+        state.run_dir_identity = new
+        changed = True
+    for task in state.tasks.values():
+        if not task.worktree_path:
+            continue
+        mount = rebase_recorded_project_path(Path(task.worktree_path), state, project_root)
+        old = task.worktree_identity
+        new, what = _reconcile_one_root(old, mount)
+        if what == "recorded" and new is not None:
+            journal.append(
+                "root-identity-recorded",
+                root="worktree",
+                path=str(mount),
+                story_key=task.story_key,
+                dev=new[0],
+                ino=new[1],
+            )
+        elif what == "rebound" and new is not None and old is not None:
+            journal.append(
+                "root-identity-rebound",
+                root="worktree",
+                path=str(mount),
+                story_key=task.story_key,
+                old_dev=old[0],
+                dev=new[0],
+                ino=new[1],
+            )
+        if what is not None:
+            task.worktree_identity = new
+            changed = True
+    return changed
 
 
 def live_stories_root(task: StoryTask | None, state: RunState, project_root: Path) -> Path:
@@ -4937,6 +5093,12 @@ def _rearm_escalation_locked(
     live_project = project_root if project_root is not None else Path(state.project)
 
     journal = _RearmJournal(run_dir)
+    # DW-446: reconcile the mint-time root identities before the first pinned write
+    # below — backfill a state.json written before they existed, and re-bind an
+    # `st_dev` a reboot/remount renumbered under a still-matching inode — so the
+    # mount writers have a current record to compare against (persisted by the
+    # `save_state` that commits this re-arm). Never re-records an inode mismatch.
+    reconcile_root_identities(state, run_dir, journal, live_project)
     # Read before the unconditional overwrite below: they describe the restore
     # attempt this re-arm is abandoning, and the residue block needs both.
     old_latch = task.restore_patch

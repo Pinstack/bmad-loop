@@ -130,7 +130,17 @@ def _confined(root: Path, path: Path) -> os.stat_result | None:
     ``_root_still_pinned`` (:func:`_still_pinned`), so a root replaced by a link
     between this predicate and the open is refused rather than walked (DW-338).
     A None identity is itself a refusal for an opening caller — there is no
-    accepted root to pin to."""
+    accepted root to pin to.
+
+    Why this root carries no persisted mint-time record, unlike the run dir and
+    the unit mounts (DW-446): the root is operator-configured and shared across
+    runs, not minted, so a record would refuse an operator's legitimate
+    re-creation of the directory; and the ancestor residual a fresh ``lstat``
+    leaves at those roots does not arise here, because this walk ``lstat``s
+    EVERY ancestor on each call and refuses a symlink anywhere in the chain — a
+    parent swapped for a symlink to a tree holding a real artifacts directory
+    refuses before any open. The one accepted exemption is DW-422's: a win32
+    junction ABOVE ``root`` is the operator's layout and passes."""
     if has_parent_ref(path):
         raise PublicationError(f"artifact path contains parent traversal: {path}")
     if not path.is_relative_to(root):

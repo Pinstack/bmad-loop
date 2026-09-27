@@ -906,8 +906,9 @@ def test_active_task_id_ignores_verifier_streams(tmp_path):
     os.utime(logs / "1-1-a-dev-1.log", ns=(1, 1))  # older than anything written below
 
     journal = Journal(tmp_path)
-    journal.write_verify_stream("verify-1-1-a-dev-1-1-0.stdout.log", "out")
-    journal.write_verify_stream("verify-1-1-a-dev-1-1-0.stderr.log", "err")
+    record = platform_util.root_identity_record(tmp_path)
+    journal.write_verify_stream("verify-1-1-a-dev-1-1-0.stdout.log", "out", run_dir_identity=record)
+    journal.write_verify_stream("verify-1-1-a-dev-1-1-0.stderr.log", "err", run_dir_identity=record)
 
     # a dev session that has ended -> no open session -> the fallback fires
     ended = [

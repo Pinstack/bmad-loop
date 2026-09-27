@@ -1042,6 +1042,65 @@ def test_composition_persists_the_code_root(tmp_path, run_type):
     assert persisted.code_root != Path(persisted.project)
 
 
+@pytest.mark.parametrize("run_type", ["run", "sweep"])
+def test_composition_records_the_run_dir_mint_identity(tmp_path, monkeypatch, run_type):
+    """DW-446: both composers persist the run dir's mint-time identity — the
+    `(st_dev, st_ino)` of the claim `_claim_run_dir` took when it created the
+    directory — as `RunState.run_dir_identity`, which the verify-stream pin compares
+    against. Both, because `compose_run` goes through `build_run_state` and
+    `compose_sweep` constructs `RunState` inline.
+
+    Graded against the CLAIM, which is spied. Asserted on the persisted state.
+
+    Ablation: drop `run_dir_identity=` at either composer and that parametrization
+    reddens alone (None)."""
+    claims: list[os.stat_result] = []
+    real_claim = runsetup._claim_run_dir
+
+    def spy_claim(run_dir):
+        claim = real_claim(run_dir)
+        claims.append(claim)
+        return claim
+
+    monkeypatch.setattr(runsetup, "_claim_run_dir", spy_claim)
+    if run_type == "run":
+        composed = runsetup.compose_run(
+            project=tmp_path,
+            paths=_fake_paths(tmp_path),
+            policy=policy_mod.loads(""),
+            run_id=RUN_ID,
+            epic_filter=None,
+            story_filter=None,
+            max_stories=None,
+            stories_on=False,
+            spec_folder="",
+            sweep_factory=lambda _trigger, *, started: None,
+            make_adapters=_accepting_adapters,
+            engine_cls=_AcceptingEngine,
+            stories_engine_cls=_AcceptingEngine,
+            trusted_config_digest="deadbeef",
+        )
+    else:
+        composed = _run_compose_sweep(tmp_path, _accepting_adapters, engine_cls=_AcceptingEngine)
+
+    (claim,) = claims
+    persisted = load_state(composed.run_dir)
+    assert persisted.run_dir_identity == (claim.st_dev, claim.st_ino)
+    current = os.lstat(composed.run_dir)
+    assert persisted.run_dir_identity == (current.st_dev, current.st_ino)
+
+
+def test_claim_identity_is_none_for_a_zero_inode():
+    """A zero inode carries no identity (it never matches), so it records None and
+    the verify stream refuses. On the dir-fd arm that is unchanged; the win32 arm,
+    which used to write through a zero-inode run dir, now refuses it (accepted
+    2026-09-27)."""
+    zero = os.stat_result((0o040755, 0, 5, 0, 0, 0, 0, 0, 0, 0))
+    assert runsetup._claim_identity(zero) is None
+    real = os.stat_result((0o040755, 9, 5, 0, 0, 0, 0, 0, 0, 0))
+    assert runsetup._claim_identity(real) == (5, 9)
+
+
 @pytest.mark.parametrize("composer", ["run", "resume"])
 def test_story_compositions_wire_the_retro_adapter(tmp_path, monkeypatch, composer):
     """DW-389: `compose_run` and the story branch of `compose_resume` hand the

@@ -5200,7 +5200,7 @@ def test_accept_current_baseline_git_fault_folds_a_multiline_error(project, tmp_
 # Under worktree isolation the live workspace is a REAL unit mount
 # (`workspace.open_unit_workspace`), and every attempt-owned normalization and
 # restore confines to its `paths.project`. The call sites pass
-# `_mount_root_identity(workspace)`. The swap: the mount copied to an outside tree,
+# `_mount_root_identity(task, workspace)`. The swap: the mount copied to an outside tree,
 # renamed aside, and a link planted at its name. Each row has an unpinned control
 # (`_mount_root_identity` answering None) showing the same swap really lands outside.
 
@@ -5232,6 +5232,16 @@ def _swap_unit_mount(workspace, outside: Path) -> None:
     workspace.root.symlink_to(outside, target_is_directory=True)
 
 
+def _unit_task(workspace, story_key: str = "1-1-a") -> StoryTask:
+    """`_task` on the unit mount ``workspace``, carrying the mount's mint-time
+    identity record (DW-446) — taken now, before any swap, as `run_isolated` takes
+    it before any session runs."""
+    task = _task(workspace.root, story_key)
+    task.worktree_path = str(workspace.root)
+    task.worktree_identity = platform_util.root_identity_record(workspace.root)
+    return task
+
+
 def _unit_flow(project, workspace, run_dir, monkeypatch, *, pinned: bool, rollback: bool):
     flow = _make_flow(
         workspace=workspace,
@@ -5240,7 +5250,7 @@ def _unit_flow(project, workspace, run_dir, monkeypatch, *, pinned: bool, rollba
         run_dir=run_dir,
     )
     if not pinned:
-        monkeypatch.setattr(flow, "_mount_root_identity", lambda workspace: None)
+        monkeypatch.setattr(flow, "_mount_root_identity", lambda task, workspace: None)
     return flow
 
 
@@ -5263,14 +5273,17 @@ def test_recovery_mount_root_identity_follows_the_live_workspace(project):
     Ablation: drop the `workspace.root == self.paths.repo_root` arm and the first
     row reddens; answer None unconditionally and the second does."""
     ws = Workspace.default(project)
-    assert _make_flow(workspace=ws, paths=project)._mount_root_identity(ws) is None
+    task = StoryTask(story_key="1-1-a", epic=1)
+    assert _make_flow(workspace=ws, paths=project)._mount_root_identity(task, ws) is None
 
     unit_ws, run_dir = _real_unit(project)
     flow = _make_flow(workspace=unit_ws, paths=project, run_dir=run_dir)
-    identity = flow._mount_root_identity(unit_ws)
+    identity = flow._mount_root_identity(_unit_task(unit_ws), unit_ws)
     assert identity is not None
     expected = os.lstat(unit_ws.paths.project)
     assert (identity.st_dev, identity.st_ino) == (expected.st_dev, expected.st_ino)
+    # DW-446: a task with no mint-time record refuses, never a fresh `lstat`
+    assert flow._mount_root_identity(task, unit_ws).st_ino == 0
 
 
 @requires_descriptor_restoration
@@ -5291,7 +5304,7 @@ def test_normalization_refuses_a_relative_binding_made_through_a_swapped_mount(
     spec_main = _tracked_spec(project)
     ws, run_dir = _real_unit(project)
     spec = ws.paths.implementation_artifacts / spec_main.name
-    task = _task(ws.root)
+    task = _unit_task(ws)
     task.dispatched_spec_file = spec.relative_to(ws.paths.project).as_posix()
     spec.write_text(spec.read_text().replace("ready-for-dev", "in-progress"))  # child flip
     flow = _unit_flow(project, ws, run_dir, monkeypatch, pinned=pinned, rollback=False)
@@ -5333,7 +5346,7 @@ def test_snapshot_restore_refuses_a_binding_made_through_a_swapped_mount(
     spec.parent.mkdir(parents=True, exist_ok=True)
     corrected = b"---\nstatus: ready-for-dev\n---\n\nhuman corrected untracked intent\n"
     spec.write_bytes(corrected)
-    task = _task(ws.root)
+    task = _unit_task(ws)
     task.baseline_untracked = [spec.relative_to(ws.root).as_posix()]
     task.dispatched_spec_file = spec.relative_to(ws.paths.project).as_posix()
     task.dispatched_spec_snapshot = corrected
@@ -5370,14 +5383,14 @@ def test_snapshot_restore_on_an_intact_mount_lands_under_the_pin(project, monkey
     spec = ws.paths.implementation_artifacts / "untracked-redrive.md"
     spec.parent.mkdir(parents=True, exist_ok=True)
     corrected = b"---\nstatus: ready-for-dev\n---\n\nhuman corrected untracked intent\n"
-    task = _task(ws.root)
+    task = _unit_task(ws)
     task.baseline_untracked = [spec.relative_to(ws.root).as_posix()]
     task.dispatched_spec_file = spec.relative_to(ws.paths.project).as_posix()
     task.dispatched_spec_snapshot = corrected
     task.resolved_redrive = redrive
     spec.write_bytes(b"---\nstatus: done\n---\n\nfailed child untracked body\n")
     flow = _unit_flow(project, ws, run_dir, monkeypatch, pinned=True, rollback=False)
-    assert flow._mount_root_identity(ws) is not None
+    assert flow._mount_root_identity(task, ws) is not None
 
     with contextlib.suppress(_Pause):
         flow.rollback_or_pause(task)
@@ -5405,7 +5418,7 @@ def test_redrive_post_reset_normalization_refuses_a_mount_swapped_during_the_res
     ws, run_dir = _real_unit(project)
     spec = ws.paths.implementation_artifacts / spec_main.name
     spec.write_bytes(b"---\nstatus: done\n---\n\nescalated attempt\n")
-    task = _task(ws.root)
+    task = _unit_task(ws)
     task.dispatched_spec_file = str(spec)
     (ws.root / "src.txt").write_text("failed attempt residue\n")  # real dirt to undo
     flow = _unit_flow(project, ws, run_dir, monkeypatch, pinned=pinned, rollback=False)
@@ -5440,7 +5453,7 @@ def _site_retry_input(project, ws, flow, monkeypatch, outside):
     input". Swapped before binding."""
     spec = ws.paths.implementation_artifacts / "spec-1-1-a.md"
     spec.write_bytes(_EDITED_SPEC)
-    task = _task(ws.root)
+    task = _unit_task(ws)
     task.dispatched_spec_file = spec.relative_to(ws.paths.project).as_posix()
     task.dispatched_spec_snapshot = _EDITED_SPEC
     task.resolved_redrive = True
@@ -5468,7 +5481,7 @@ def _site_operator_input(project, ws, flow, monkeypatch, outside):
     journaled problem ("could not be revalidated", not "became unsafe") tells the
     pin's refusal apart."""
     spec = ws.paths.implementation_artifacts / "spec-1-1-a.md"
-    task = _task(ws.root)
+    task = _unit_task(ws)
     task.dispatched_spec_file = str(spec)
     task.dispatched_spec_snapshot = _EDITED_SPEC  # the operator's pre-launch input
     spec.write_bytes(_BASE_SPEC)  # the child reverted it to baseline
@@ -5483,7 +5496,7 @@ def _site_tentative_repair(project, ws, flow, monkeypatch, outside):
     bytes back. Swapped right after normalization, for `_site_operator_input`'s
     reason (the pin refuses the normalization itself on an earlier swap)."""
     spec = ws.paths.implementation_artifacts / "spec-1-1-a.md"
-    task = _task(ws.root)
+    task = _unit_task(ws)
     task.dispatched_spec_file = str(spec)
     spec.write_bytes(_CHILD_SPEC)
     _swap_after_normalization(flow, ws, monkeypatch, outside)
@@ -5497,7 +5510,7 @@ def _after_reset_site(redrive: bool):
         (plain) or restore-and-route (re-drive). Swapped before binding."""
         spec = ws.paths.implementation_artifacts / "untracked.md"
         spec.write_bytes(_EDITED_SPEC)
-        task = _task(ws.root)
+        task = _unit_task(ws)
         task.baseline_untracked = [spec.relative_to(ws.root).as_posix()]
         task.dispatched_spec_file = spec.relative_to(ws.paths.project).as_posix()
         task.dispatched_spec_snapshot = _EDITED_SPEC

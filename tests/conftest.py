@@ -2358,6 +2358,11 @@ def escalated_run(
         restore_patch=restore_patch,
         sentinel_kind=sentinel_kind,
         worktree_path=worktree_path,
+        # the mount's mint-time identity (DW-446) when the caller built the mount
+        # first; None otherwise, which re-arm/resume backfill
+        worktree_identity=(
+            platform_util.root_identity_record(Path(worktree_path)) if worktree_path else None
+        ),
     )
     if with_session:
         task.sessions.append(
@@ -2375,5 +2380,8 @@ def escalated_run(
         source=source,
     )
     run_dir = project / ".bmad-loop" / "runs" / run_id
+    save_state(run_dir, state)
+    # the run dir's mint-time identity (DW-446), as the composers record it
+    state.run_dir_identity = platform_util.root_identity_record(run_dir)
     save_state(run_dir, state)
     return EscalatedRun(run_dir=run_dir, state=state, task=task)

@@ -791,6 +791,7 @@ def build_run_state(
     stories_on: bool,
     spec_folder: str,
     trusted_config_digest: str,
+    run_dir_identity: tuple[int, int] | None,
 ) -> RunState:
     """Assemble the launch-time :class:`RunState` for a fresh run.
 
@@ -807,11 +808,16 @@ def build_run_state(
     ``repo_root`` records the git root code work happens in (``paths.repo_root``),
     which equals ``project`` unless the BMAD config sets a `repo_root:` override.
     ``runs.rearm_escalation`` runs out of process and reads it back to advance the
-    attempt baseline in the tree the proof-of-work gate actually measures."""
+    attempt baseline in the tree the proof-of-work gate actually measures.
+
+    ``run_dir_identity`` is the run dir's mint-time identity
+    (:func:`_claim_identity` of the composer's claim, DW-446) — what the verify
+    stream's pin compares the run dir it opens against."""
     return RunState(
         run_id=run_id,
         project=str(project),
         repo_root=str(repo_root),
+        run_dir_identity=run_dir_identity,
         started_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
         policy_snapshot=policy.to_dict(),
         epic_filter=epic_filter,
@@ -987,6 +993,20 @@ def validate_sweep_options_binding(
     """Bind current sweep options to the exact bytes published at launch."""
     if version == SWEEP_OPTIONS_VERSION and options.digest != expected_digest:
         raise SweepOptionsError("sweep.json no longer matches the options bound at launch")
+
+
+def _claim_identity(claim: os.stat_result) -> tuple[int, int] | None:
+    """The run dir's mint-time identity record (DW-446) from the composer's claim —
+    the ``lstat`` of the directory this process just created, before any session
+    can reach it — or None for a zero inode, which carries no identity, so every
+    pin compared against it refuses. On the dir-fd verify-stream arm and for the
+    mount writers that is no change (a zero inode never matched), but the win32
+    verify-stream arm, which before DW-446 wrote through a zero-inode run dir, now
+    REFUSES it (accepted 2026-09-27): each lost log tail is journaled as the
+    verify record's ``capture_error`` and verification proceeds without it."""
+    if claim.st_ino == 0:
+        return None
+    return (claim.st_dev, claim.st_ino)
 
 
 def _claim_run_dir(run_dir: Path) -> os.stat_result:
@@ -1202,6 +1222,7 @@ def compose_run(
             stories_on=stories_on,
             spec_folder=spec_folder,
             trusted_config_digest=trusted_config_digest,
+            run_dir_identity=_claim_identity(composer_claim),
         )
         # State becoming resumable and the pid making this process live are one
         # publication.  An explicit-id resume waits for the pid rather than entering
@@ -1361,6 +1382,7 @@ def compose_sweep(
             run_id=run_id,
             project=str(project),
             repo_root=str(paths.repo_root),
+            run_dir_identity=_claim_identity(composer_claim),
             started_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
             policy_snapshot=policy.to_dict(),
             run_type="sweep",

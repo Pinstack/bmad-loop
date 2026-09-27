@@ -129,6 +129,9 @@ def make_engine(project, script, policy=None, **kwargs) -> tuple[Engine, MockAda
     run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
     adapter = MockAdapter(script, usage_per_session=TokenUsage(input_tokens=10, output_tokens=5))
     state = RunState(run_id="test-run", project=str(project.project), started_at="now")
+    journal = Journal(run_dir)
+    # the run dir's mint-time identity, as `runsetup.compose_run` records it (DW-446)
+    state.run_dir_identity = platform_util.root_identity_record(run_dir)
     engine = Engine(
         paths=project,
         policy=policy
@@ -142,7 +145,7 @@ def make_engine(project, script, policy=None, **kwargs) -> tuple[Engine, MockAda
         ),
         adapter=adapter,
         run_dir=run_dir,
-        journal=Journal(run_dir),
+        journal=journal,
         state=state,
         **kwargs,
     )
@@ -480,6 +483,44 @@ def test_verify_stream_capture_retains_a_bounded_tail(project):
     assert entry["stderr_captured_bytes"] == 0
     assert entry["stderr_truncated"] is False
     assert entry["capture_error"] is None
+
+
+@pytest.mark.parametrize("case", ["no-record", "runs-swapped"])
+def test_verify_stream_capture_refuses_an_unrecorded_or_swapped_run_dir(project, tmp_path, case):
+    """DW-446 through the engine: the verify stream is pinned to
+    `state.run_dir_identity`, the run dir's MINT-TIME record. With no record (a
+    legacy state not yet resumed), or with `runs/` swapped after the mint for a link
+    to a tree holding a real `<id>/`, the stream refuses and the engine degrades it
+    to `capture_error` — no pointer, nothing written in the outside tree.
+
+    Ablation: pass ``run_dir_identity=root_identity_record(self.run_dir)`` (a fresh
+    per-write `lstat`) from the engine and both rows redden — the no-record row
+    retains the stream, the swapped row writes `outside/test-run/verify/`."""
+    if case == "runs-swapped" and sys.platform == "win32":
+        pytest.skip("POSIX symlink swap")
+    engine = _capture_engine(project, 1)
+    assert engine.state.run_dir_identity is not None  # the premise: minted
+    outside = tmp_path / "outside"
+    if case == "no-record":
+        engine.state.run_dir_identity = None
+    else:
+        runs_dir = engine.run_dir.parent
+        (outside / engine.run_dir.name).mkdir(parents=True)
+        runs_dir.rename(runs_dir.with_name("runs-aside"))
+        runs_dir.symlink_to(outside, target_is_directory=True)
+
+    engine._journal_verify_command_results(
+        StoryTask(story_key="1-1-a", epic=1),
+        "dev",
+        (verify.CommandResult("pytest -q", 1, "tail", "out\n", "err\n"),),
+    )
+
+    entry = _sole_verify_record(engine)
+    assert entry["capture_error"] is not None
+    assert entry["stdout_path"] is None and entry["stderr_path"] is None
+    assert not (outside / engine.run_dir.name / "verify").exists()
+    if case == "no-record":
+        assert not (engine.run_dir / "verify").exists()
 
 
 def test_a_ceilinged_stream_still_reports_what_the_command_emitted(project):
@@ -22170,7 +22211,12 @@ _PIN_REFUSAL = "no longer the directory it was pinned to"
 
 
 def _unpin(monkeypatch) -> None:
-    monkeypatch.setattr(Engine, "_mount_root_identity", lambda self, root: None)
+    monkeypatch.setattr(Engine, "_mount_root_identity", lambda self, task, root: None)
+
+
+# Each mount's mint-time identity record (DW-446), taken by `_mount_engine_on` before
+# any swap, as `worktree_flow.run_isolated` records it before any session runs.
+_MINT_RECORDS: dict[Path, tuple[int, int] | None] = {}
 
 
 def _mount_engine_on(project, mount: Path) -> Engine:
@@ -22180,8 +22226,15 @@ def _mount_engine_on(project, mount: Path) -> Engine:
 
     engine, _ = make_engine(project, [])
     mount.mkdir(parents=True)
+    _MINT_RECORDS[mount] = platform_util.root_identity_record(mount)
     engine.workspace = Workspace(root=mount, paths=project.rebased(mount))
     return engine
+
+
+def _mount_task(engine: Engine, **fields) -> StoryTask:
+    """A task mounted at the engine's unit mount, carrying its mint-time record."""
+    mount = engine.workspace.root
+    return StoryTask(worktree_path=str(mount), worktree_identity=_MINT_RECORDS[mount], **fields)
 
 
 def _swap_engine_mount(engine: Engine, outside: Path) -> Path:
@@ -22213,7 +22266,8 @@ def test_engine_mount_root_identity_is_none_for_the_default_workspace(project):
     the project's identity."""
     engine, _ = make_engine(project, [])
     assert engine.workspace.root == engine.paths.repo_root  # the premise
-    assert engine._mount_root_identity(project.project) is None
+    task = StoryTask(story_key="1-1-a", epic=1)
+    assert engine._mount_root_identity(task, project.project) is None
 
 
 def test_engine_mount_root_identity_pins_a_unit_mount(project):
@@ -22223,11 +22277,27 @@ def test_engine_mount_root_identity_pins_a_unit_mount(project):
     Ablation: answer None unconditionally and this reddens."""
     engine = _mount_engine_on(project, _mount_dir(project))
 
-    identity = engine._mount_root_identity(engine.workspace.paths.project)
+    identity = engine._mount_root_identity(
+        _mount_task(engine, story_key="1-1-a", epic=1), engine.workspace.paths.project
+    )
 
     assert identity is not None
     expected = os.lstat(engine.workspace.paths.project)
     assert (identity.st_dev, identity.st_ino) == (expected.st_dev, expected.st_ino)
+
+
+def test_engine_mount_root_identity_refuses_a_unit_mount_with_no_record(project):
+    """DW-446: a unit workspace whose task carries no mint-time record answers the
+    never-matching identity — never a fresh `lstat` and never None (unpinned).
+
+    Ablation: pass ``recorded=`` a fresh `root_identity_record(workspace.root)` and
+    this reddens."""
+    engine = _mount_engine_on(project, _mount_dir(project))
+    task = StoryTask(story_key="1-1-a", epic=1)
+
+    identity = engine._mount_root_identity(task, engine.workspace.paths.project)
+
+    assert identity is not None and identity.st_ino == 0
 
 
 _MARKERLESS_DONE_SPEC = "---\nstatus: done\n---\n\n## Intent\n\nbody\n"
@@ -22245,7 +22315,7 @@ def _mounted_spec(project, tmp_path, text: str):
     sp.parent.mkdir(parents=True, exist_ok=True)
     sp.write_text(text, encoding="utf-8")
     outside_spec = tmp_path / "outside" / sp.relative_to(mount)
-    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(sp))
+    task = _mount_task(engine, story_key="1-1-a", epic=1, spec_file=str(sp))
     return engine, sp, outside_spec, task
 
 
@@ -22421,7 +22491,7 @@ def test_write_park_record_refuses_a_mount_swapped_for_a_link(project, tmp_path,
     engine = _mount_engine_on(project, _mount_dir(project))
     outside = tmp_path / "outside"
     _swap_engine_mount(engine, outside)
-    task = StoryTask(story_key="1-1-a", epic=1, operator_actions=["buy the domain"])
+    task = _mount_task(engine, story_key="1-1-a", epic=1, operator_actions=["buy the domain"])
 
     assert engine._write_park_record(task) is None
     (failed,) = [e for e in engine.journal.entries() if e["kind"] == "operator-index-failed"]
@@ -22431,6 +22501,38 @@ def test_write_park_record_refuses_a_mount_swapped_for_a_link(project, tmp_path,
     _unpin(monkeypatch)  # control
     assert engine._write_park_record(task) is not None
     assert operatoractions.record_path(outside, "1-1-a").is_file()
+
+
+@requires_symlinked_mount_swap
+def test_write_park_record_refuses_a_worktrees_dir_swapped_for_a_link_holding_a_real_unit(
+    project, tmp_path, monkeypatch
+):
+    """DW-446 on an engine mount writer: ``worktrees/`` swapped for a link to a tree
+    holding a REAL ``<unit>/`` — the mount path reaches a real, non-link directory,
+    which a fresh `lstat` accepted — refuses at the write because it is not the
+    mount recorded at the mint; nothing lands outside. The unpinned control shows
+    the same swap really lands outside.
+
+    Ablation: answer `pinned_root_identity` per component in
+    `runs.mount_root_identity` (the pre-DW-446 pin) and the record lands outside."""
+    from bmad_loop import operatoractions
+
+    engine = _mount_engine_on(project, _mount_dir(project))
+    task = _mount_task(engine, story_key="1-1-a", epic=1, operator_actions=["buy the domain"])
+    worktrees = engine.workspace.root.parent
+    outside = tmp_path / "outside"
+    (outside / engine.workspace.root.name).mkdir(parents=True)
+    worktrees.rename(worktrees.with_name("worktrees-aside"))
+    worktrees.symlink_to(outside, target_is_directory=True)
+
+    assert engine._write_park_record(task) is None
+    (failed,) = [e for e in engine.journal.entries() if e["kind"] == "operator-index-failed"]
+    assert _PIN_REFUSAL in failed["error"]
+    assert list((outside / engine.workspace.root.name).iterdir()) == []
+
+    _unpin(monkeypatch)  # control
+    assert engine._write_park_record(task) is not None
+    assert operatoractions.record_path(outside / engine.workspace.root.name, "1-1-a").is_file()
 
 
 def _park_record_in_mount(project, tmp_path, *, prior: str | None):
@@ -22443,7 +22545,7 @@ def _park_record_in_mount(project, tmp_path, *, prior: str | None):
     record.parent.mkdir(parents=True)
     record.write_text('{"written": "by this park"}', encoding="utf-8")
     outside_record = tmp_path / "outside" / record.relative_to(engine.workspace.root)
-    task = StoryTask(story_key="1-1-a", epic=1)
+    task = _mount_task(engine, story_key="1-1-a", epic=1)
     return engine, record, outside_record, (record, prior), task
 
 
@@ -22493,10 +22595,10 @@ def test_restore_park_record_on_an_intact_mount_rolls_back_under_the_pin(project
     holds the earlier bytes — and nothing journals `park-record-rollback-failed`.
 
     Ablation: pin the wrong directory (e.g. `require_root_pinned(path.parent, …)` in
-    the unlink arm, or `self._mount_root_identity(path.parent)` for the put-back) and
+    the unlink arm, or `self._mount_root_identity(task, path.parent)` for the put-back) and
     the rollback refuses here while every swapped-mount row stays green."""
     engine, record, _outside, restore, task = _park_record_in_mount(project, tmp_path, prior=prior)
-    assert engine._mount_root_identity(engine.workspace.paths.project) is not None
+    assert engine._mount_root_identity(task, engine.workspace.paths.project) is not None
 
     engine._restore_park_record(task, restore)
 
