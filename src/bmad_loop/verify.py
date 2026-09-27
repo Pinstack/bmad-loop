@@ -11063,15 +11063,171 @@ def _make_candidate_parents(
         os.close(fd)
 
 
-def _require_pinned_candidate(root: Path, identity: os.stat_result) -> None:
+# A worktree gitfile is one `gitdir: <path>` line; anything past this is not one.
+_CANDIDATE_GITFILE_MAX_BYTES = 64 * 1024
+
+
+@dataclass(frozen=True)
+class _CandidateGitfilePin:
+    """The candidate worktree's `.git` gitfile as pinned right after `worktree
+    add` (DW-442): its `(st_dev, st_ino)` and its exact bytes."""
+
+    dev: int
+    ino: int
+    data: bytes
+
+
+def _read_pinned_file(path: Path, what: str) -> _CandidateGitfilePin:
+    """`path` as a pin, read without following a final-component link and
+    without blocking on a FIFO: `O_NOFOLLOW | O_NONBLOCK` and `S_ISREG` on the
+    DESCRIPTOR (the `diagnostics._count_lines` idiom), bounded to
+    `_CANDIDATE_GITFILE_MAX_BYTES`. The POSIX-only flags degrade to 0 on win32,
+    where opening a directory already fails and the fd check carries alone.
+    Anything else — a link, FIFO, directory, oversized or unreadable file —
+    raises `GitError` naming `what` (chained from the `OSError` or `ValueError`
+    where there is one)."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_BINARY", 0)  # win32: no CRLF translation on the raw fd
+    try:
+        fd = os.open(path, flags)
+    except (OSError, ValueError) as exc:
+        raise GitError(f"{what} {path} could not be opened") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise GitError(f"{what} {path} is not a regular file")
+        chunks: list[bytes] = []
+        size = 0
+        while size <= _CANDIDATE_GITFILE_MAX_BYTES:
+            chunk = os.read(fd, _CANDIDATE_GITFILE_MAX_BYTES + 1 - size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+    except OSError as exc:
+        raise GitError(f"{what} {path} could not be read") from exc
+    finally:
+        os.close(fd)
+    if size > _CANDIDATE_GITFILE_MAX_BYTES:
+        raise GitError(f"{what} {path} is too large")
+    return _CandidateGitfilePin(info.st_dev, info.st_ino, b"".join(chunks))
+
+
+def _read_candidate_gitfile(root: Path) -> _CandidateGitfilePin:
+    """`root/.git` as a pin, through `_read_pinned_file`."""
+    return _read_pinned_file(root / ".git", "candidate checkout gitfile")
+
+
+def _pin_candidate_gitfile(
+    repo_root: Path, candidate_root: Path, root_identity: os.stat_result
+) -> _CandidateGitfilePin:
+    """Pin the candidate's `.git` gitfile right after the root pin (DW-442).
+
+    Git picks the repository for `git -C <candidate_root>` from this file's
+    `gitdir:` line, so a same-uid writer that rewrites it steers every later
+    candidate git call — and its index and object writes — into whatever
+    repository it names. The root pin cannot see that: the root is untouched.
+
+    The root pin is re-checked first, so a root swapped since `root_identity`
+    was taken refuses as a replaced root rather than as a foreign gitfile read
+    through it. The pin is then taken only when the file is a regular file with
+    a nonzero inode whose `gitdir:` (parsed as git does: the `gitdir: ` prefix,
+    trailing CR/LF dropped, a relative path resolved against the candidate
+    root, as `worktree.useRelativePaths` writes it) names a real directory — not
+    a link, not a reparse link, not `..` — directly under this repository's
+    `<git-common-dir>/worktrees/`, and whose `gitdir` back-pointer (read the
+    same no-follow, non-blocking, bounded way; a relative value resolved against
+    the admin dir) names this candidate's `.git`, and whose `commondir` (read
+    and resolved the same way) names this repository's common dir. The
+    back-pointer is what keeps a sibling linked worktree's admin dir from
+    passing: its index and HEAD would otherwise take the candidate's writes;
+    the `commondir` is what keeps a forged admin dir planted under `worktrees/`
+    from routing the object and ref writes into another repository's common
+    dir. That location check covers the
+    window between `worktree add` and the pin, which no later compare can.
+    `_require_pinned_candidate` then holds the file to these exact bytes and
+    identity; the admin dir and its `commondir` are validated here only, and git
+    re-resolves them by path on every later call. Anything else — a NUL byte or
+    an undecodable value included — raises `GitError`."""
+    if not platform_util._root_still_pinned(candidate_root, root_identity):
+        raise GitError("detached candidate checkout root was replaced")
+    pin = _read_candidate_gitfile(candidate_root)
+    if pin.ino == 0:
+        raise GitError("candidate checkout gitfile carries no file identity")
+    rc, raw, detail = _git_raw_out(
+        repo_root, "rev-parse", "--path-format=absolute", "--git-common-dir"
+    )
+    if rc != 0:
+        raise GitError(f"git common directory probe failed in {repo_root}: {detail}")
+    common_dir = Path(raw.removesuffix("\n"))
+    refused = GitError(
+        f"candidate checkout gitfile {candidate_root / '.git'} does not name a "
+        f"worktree of {repo_root}"
+    )
+    prefix = b"gitdir: "
+    if not pin.data.startswith(prefix):
+        raise refused
+    value = pin.data[len(prefix) :].rstrip(b"\r\n")
+    if not value:
+        raise refused
+    try:
+        gitdir = candidate_root / os.fsdecode(value)
+        if gitdir.name in ("", ".."):
+            raise refused
+        if pinned_root_identity(gitdir) is None:
+            raise refused
+        if not os.path.samefile(gitdir.parent, common_dir / "worktrees"):
+            raise refused
+        back_value = _read_pinned_file(gitdir / "gitdir", "candidate worktree back-pointer")
+        back_raw = back_value.data.rstrip(b"\r\n")
+        if not back_raw:
+            raise refused
+        back = gitdir / os.fsdecode(back_raw)
+        if not os.path.samefile(back, candidate_root / ".git"):
+            raise refused
+        commondir_value = _read_pinned_file(gitdir / "commondir", "candidate worktree commondir")
+        commondir_raw = commondir_value.data.rstrip(b"\r\n")
+        if not commondir_raw:
+            raise refused
+        if not os.path.samefile(gitdir / os.fsdecode(commondir_raw), common_dir):
+            raise refused
+    except (GitError, OSError, ValueError) as exc:
+        if exc is refused:
+            raise
+        raise refused from exc
+    return pin
+
+
+def _require_pinned_candidate(
+    root: Path, identity: os.stat_result, gitfile: _CandidateGitfilePin
+) -> None:
     """Refuse a git call on the candidate worktree unless `root` is still the
-    directory pinned right after `worktree add` (DW-425). Git takes the root by
-    path, so a root swapped for a link would steer the call into whatever the
-    link names. An `lstat` compare — check-then-act, the residual
-    `_root_still_pinned` documents: a swap landing between this check and git's
-    own open of the path still wins."""
+    directory pinned right after `worktree add` (DW-425) and its `.git` gitfile
+    still has the pinned `(st_dev, st_ino)` and bytes (DW-442).
+
+    Git takes the root by path, so a root swapped for a link would steer the
+    call into whatever the link names; and it takes the repository from the
+    gitfile's `gitdir:` line, so a rewritten gitfile would steer it into another
+    repository's index and object store. The root is checked first, then the
+    gitfile, re-read no-follow and non-blocking; a zero inode never matches.
+    Both are check-then-act — the residual `_root_still_pinned` documents: a
+    swap or rewrite landing between this check and git's own read of the path
+    still wins. Only the gitfile is held here: the admin dir it names and that
+    dir's `commondir` were validated at the pin and are re-resolved by git by
+    path on every call, so a change to them after the pin is not seen."""
     if not platform_util._root_still_pinned(root, identity):
         raise GitError("detached candidate checkout root was replaced")
+    try:
+        current = _read_candidate_gitfile(root)
+    except GitError as exc:
+        raise GitError("candidate checkout gitfile was rewritten or replaced") from exc
+    if (
+        current.ino == 0
+        or gitfile.ino == 0
+        or (current.dev, current.ino) != (gitfile.dev, gitfile.ino)
+        or current.data != gitfile.data
+    ):
+        raise GitError("candidate checkout gitfile was rewritten or replaced")
 
 
 def commit_path_bound(
@@ -11144,6 +11300,25 @@ def commit_path_bound(
     cleanup skips the remove and leaves the registration to the prune below.
     Each re-check is an `lstat` compare, check-then-act: a swap landing between
     the check and git's own open of the path is the accepted residual.
+
+    The candidate `.git` gitfile is pinned right after the root (DW-442): git
+    picks the repository for those calls from its `gitdir:` line, so a rewrite
+    would steer their index and object writes into another repository. At the
+    pin (taken after a root re-check) it must be a regular file whose `gitdir:`
+    names a real directory directly under this repository's
+    `<git-common-dir>/worktrees/` whose `gitdir` back-pointer names this
+    candidate's `.git` and whose `commondir` names this repository's common dir
+    (covering the add-to-pin window, a sibling linked worktree's admin dir and
+    a forged one included); each of the five re-checks above then
+    re-reads it no-follow and non-blocking and refuses with a typed `GitError`
+    unless its `(st_dev, st_ino)` and bytes still match the pin. Two residuals:
+    the same check-then-act one — a rewrite between the re-check and git's own
+    read of the gitfile still wins — and the admin dir the gitfile names, with
+    its `commondir`, is validated at the pin only; git re-resolves both by path
+    on each later call, so a change to them after the pin is not seen. The
+    cleanup `worktree remove` is left as it is — git refuses to remove a
+    worktree whose gitfile does not point back, which lands as a noted cleanup
+    fault and the prune.
 
     The object-content reads run under `GIT_NO_REPLACE_OBJECTS=1`
     (`_bound_git_env`), so those decisions are made on the raw objects the
@@ -11335,13 +11510,19 @@ def commit_path_bound(
                 candidate_identity = pinned_root_identity(candidate_root)
                 if candidate_identity is None:
                     raise GitError("detached candidate checkout root is missing or redirected")
+                # Pin the gitfile beside it: git picks the repository from its
+                # `gitdir:` line, so a rewrite would steer every later candidate
+                # git call into another repository (DW-442).
+                candidate_gitfile = _pin_candidate_gitfile(
+                    repo_root, candidate_root, candidate_identity
+                )
                 # `--no-checkout` leaves the candidate index empty; fill it from
                 # the captured commit without `-u`, so the worktree stays
                 # untouched and no smudge runs (DW-401). It stands in for the
                 # checkout's index half, so it reads raw objects (DW-331), and
                 # runs hook-free like the add: its index write would otherwise
                 # fire `post-index-change` before the accepted bytes land (DW-326).
-                _require_pinned_candidate(candidate_root, candidate_identity)
+                _require_pinned_candidate(candidate_root, candidate_identity, candidate_gitfile)
                 rc, _out = _git_env(
                     candidate_root,
                     "-c",
@@ -11369,7 +11550,7 @@ def commit_path_bound(
                     )
                 except (OSError, RuntimeError, ValueError) as exc:
                     raise GitError("exact-path candidate content could not be written") from exc
-                _require_pinned_candidate(candidate_root, candidate_identity)
+                _require_pinned_candidate(candidate_root, candidate_identity, candidate_gitfile)
                 rc, _out = _git(
                     candidate_root,
                     "add",
@@ -11379,18 +11560,18 @@ def commit_path_bound(
                 )
                 if rc != 0:
                     raise GitError(f"git exact-path candidate staging failed in {repo_root}")
-                _require_pinned_candidate(candidate_root, candidate_identity)
+                _require_pinned_candidate(candidate_root, candidate_identity, candidate_gitfile)
                 staged_entry = _bound_index_entry(candidate_root, rel)
                 if staged_entry != _BoundGitEntry(expected_mode, "blob", accepted_oid):
                     raise GitError("exact-path candidate staging changed accepted content")
                 _bound_live_ledger_identity(lexical, target, accepted_text, observed=observed)
                 if _bound_checkout_identity(repo_root) != captured:
                     raise GitError("checkout changed before exact-path candidate hooks")
-                _require_pinned_candidate(candidate_root, candidate_identity)
+                _require_pinned_candidate(candidate_root, candidate_identity, candidate_gitfile)
                 rc, _out = _git_env(candidate_root, "commit", "-m", message, env=_bound_git_env())
                 if rc != 0:
                     raise GitError(f"git exact-path candidate commit failed in {repo_root}")
-                _require_pinned_candidate(candidate_root, candidate_identity)
+                _require_pinned_candidate(candidate_root, candidate_identity, candidate_gitfile)
                 try:
                     candidate = rev_parse_head(candidate_root)
                 except GitError as exc:

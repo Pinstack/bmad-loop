@@ -512,6 +512,11 @@ breaking changes may land in a minor release.
   pinned root before every later git call on it and skip `worktree remove` on a replaced
   root, pruning instead (DW-425); create missing candidate parents on Windows through
   handle-relative opens that refuse a junction (DW-420).
+- Pin the exact-path candidate worktree's `.git` gitfile beside its root: it must name
+  this candidate's own worktree admin dir in this repository, and a gitfile rewritten or
+  replaced before a later candidate git call is refused instead of steering that call into
+  another repository or worktree. The admin dir and its `commondir` are checked only at the
+  pin, and a rewrite racing git's own read of the gitfile still wins (DW-442).
 - Create missing artifact destination parents, and a missing artifacts directory, through
   anchored no-follow opens pinned to the accepted root instead of `mkdir(parents=True)`, so
   a root swapped for a link gets nothing created outside the repository (DW-421). On

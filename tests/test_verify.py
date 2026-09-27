@@ -5,6 +5,7 @@ import inspect
 import io
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -10650,10 +10651,94 @@ def _record_worktree_removes(monkeypatch):
     return removes
 
 
+_CANDIDATE_POINTS = [
+    "before-pin",
+    "before-read-tree",
+    "before-add",
+    "before-index-read",
+    "before-commit",
+    "before-rev-parse",
+]
+
+
+def _at_candidate_point(monkeypatch, point, act):
+    """Run `act(candidate_root)` at one point of the candidate flow: right after
+    `worktree add` (`before-pin`), right after the root pin (`after-root-pin`,
+    between it and the gitfile pin), right after the gitfile pin
+    (`before-read-tree`), or at the DW-425 re-check hooks before `git add`, the
+    staged-entry read, `git commit` and the candidate `rev-parse`."""
+    if point == "before-pin":
+        _intercept_candidate_checkout(monkeypatch, act)
+    elif point == "after-root-pin":
+        real_root_pin = verify.pinned_root_identity
+
+        def root_pin_then_act(root):
+            identity = real_root_pin(root)
+            act(root)
+            return identity
+
+        monkeypatch.setattr(verify, "pinned_root_identity", root_pin_then_act)
+    elif point == "before-read-tree":
+        real_pin = verify._pin_candidate_gitfile
+
+        def pin_then_act(repo_root, root, *rest):
+            pin = real_pin(repo_root, root, *rest)
+            act(root)
+            return pin
+
+        monkeypatch.setattr(verify, "_pin_candidate_gitfile", pin_then_act)
+    elif point == "before-add":
+        real_write = verify.atomic_write_bytes_confined
+
+        def write_then_act(target, data, **kwargs):
+            real_write(target, data, **kwargs)
+            act(kwargs["confine_root"])
+
+        monkeypatch.setattr(verify, "atomic_write_bytes_confined", write_then_act)
+    elif point == "before-index-read":
+        real_git = verify._git
+
+        def add_then_act(git_repo, *args, **kwargs):
+            result = real_git(git_repo, *args, **kwargs)
+            if args[:1] == ("add",):
+                act(Path(git_repo))
+            return result
+
+        monkeypatch.setattr(verify, "_git", add_then_act)
+    elif point == "before-commit":
+        real_entry = verify._bound_index_entry
+
+        def entry_then_act(git_repo, rel):
+            result = real_entry(git_repo, rel)
+            if Path(git_repo).name == "candidate":
+                act(Path(git_repo))
+            return result
+
+        monkeypatch.setattr(verify, "_bound_index_entry", entry_then_act)
+    else:
+        assert point == "before-rev-parse"
+        real_git_env = verify._git_env
+
+        def commit_then_act(git_repo, *args, **kwargs):
+            result = real_git_env(git_repo, *args, **kwargs)
+            if args[:1] == ("commit",):
+                act(Path(git_repo))
+            return result
+
+        monkeypatch.setattr(verify, "_git_env", commit_then_act)
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 @pytest.mark.parametrize(
     "swap_point",
-    ["before-read-tree", "before-add", "before-index-read", "before-commit", "before-rev-parse"],
+    [
+        "after-root-pin",
+        "before-read-tree",
+        "before-add",
+        "before-index-read",
+        "before-commit",
+        "before-rev-parse",
+    ],
 )
 def test_commit_path_bound_rechecks_the_candidate_root_before_each_git_call(
     project, tmp_path_factory, monkeypatch, swap_point
@@ -10663,7 +10748,10 @@ def test_commit_path_bound_rechecks_the_candidate_root_before_each_git_call(
     the index population, `git add`, the staged-entry read, `git commit` or the
     candidate `rev-parse` refuses with a typed `GitError`; nothing runs in the
     other repository, HEAD stays, cleanup skips `worktree remove` and the
-    registration is pruned.
+    registration is pruned. A root swapped between the root pin and the gitfile
+    pin (`after-root-pin`, DW-442) refuses as a replaced root too, not as a
+    foreign gitfile read through the link — ablate the root re-check in
+    `_pin_candidate_gitfile` and that row's message changes.
 
     Ablation: drop the matching `_require_pinned_candidate` call and its row
     fails — the refusal message changes (the git call runs in `outside`, e.g.
@@ -10681,53 +10769,7 @@ def test_commit_path_bound_rechecks_the_candidate_root_before_each_git_call(
         swapped.append(True)
 
     removes = _record_worktree_removes(monkeypatch)
-    if swap_point == "before-read-tree":
-        real_pin = verify.pinned_root_identity
-
-        def pin_then_swap(root):
-            identity = real_pin(root)
-            swap(root)
-            return identity
-
-        monkeypatch.setattr(verify, "pinned_root_identity", pin_then_swap)
-    elif swap_point == "before-add":
-        real_write = verify.atomic_write_bytes_confined
-
-        def write_then_swap(target, data, **kwargs):
-            real_write(target, data, **kwargs)
-            swap(kwargs["confine_root"])
-
-        monkeypatch.setattr(verify, "atomic_write_bytes_confined", write_then_swap)
-    elif swap_point == "before-index-read":
-        recording_git = verify._git
-
-        def add_then_swap(git_repo, *args, **kwargs):
-            result = recording_git(git_repo, *args, **kwargs)
-            if args[:1] == ("add",):
-                swap(Path(git_repo))
-            return result
-
-        monkeypatch.setattr(verify, "_git", add_then_swap)
-    elif swap_point == "before-commit":
-        real_entry = verify._bound_index_entry
-
-        def entry_then_swap(git_repo, rel):
-            result = real_entry(git_repo, rel)
-            if Path(git_repo).name == "candidate":
-                swap(Path(git_repo))
-            return result
-
-        monkeypatch.setattr(verify, "_bound_index_entry", entry_then_swap)
-    else:
-        real_git_env = verify._git_env
-
-        def commit_then_swap(git_repo, *args, **kwargs):
-            result = real_git_env(git_repo, *args, **kwargs)
-            if args[:1] == ("commit",):
-                swap(Path(git_repo))
-            return result
-
-        monkeypatch.setattr(verify, "_git_env", commit_then_swap)
+    _at_candidate_point(monkeypatch, swap_point, swap)
 
     with pytest.raises(verify.GitError, match="candidate checkout root was replaced") as raised:
         verify.commit_path_bound(
@@ -10746,6 +10788,346 @@ def test_commit_path_bound_rechecks_the_candidate_root_before_each_git_call(
     assert verify.rev_parse_head(outside) == outside_head
     assert git(outside, "status", "--porcelain") == ""
     assert sorted(p.name for p in outside.iterdir()) == [".git", "keep.txt"]
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+@pytest.mark.parametrize("rewrite_point", _CANDIDATE_POINTS)
+def test_commit_path_bound_refuses_a_rewritten_candidate_gitfile(
+    project, tmp_path_factory, monkeypatch, rewrite_point
+):
+    """DW-442: git picks the candidate's repository from its `.git` gitfile, so
+    the gitfile is pinned beside the root. One rewritten to name another
+    repository's gitdir right after `worktree add` is refused at the pin (it
+    names no directory under this repo's `<git-common-dir>/worktrees/`); one
+    rewritten after the pin is refused by the re-check before the index
+    population, `git add`, the staged-entry read, `git commit` or the candidate
+    `rev-parse`. Nothing lands in the other repository (HEAD, index bytes,
+    status), this repo's HEAD stays, and the registration is pruned (git refuses
+    `worktree remove` on a gitfile that does not point back). No links, so it
+    runs on win32 too.
+
+    Ablations, each failing its row on the refusal message: the `before-pin`
+    row is refused twice over (no `worktrees/` location, no back-pointer in
+    `outside`), so only dropping both of those pin checks fails it — `read-tree`
+    runs against `outside` and fails there (each alone is isolated by a
+    `..._naming_no_candidate_admin_dir` row); drop the gitfile half of
+    `_require_pinned_candidate` (every other row — the next candidate git call
+    runs against `outside`, e.g. `before-add` stages into its index and fails
+    later as "candidate commit failed")."""
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    outside = _outside_repo(tmp_path_factory)
+    outside_head = verify.rev_parse_head(outside)
+    outside_index = (outside / ".git" / "index").read_bytes()
+    rewritten = []
+
+    def rewrite(candidate_root):
+        (candidate_root / ".git").write_bytes(f"gitdir: {(outside / '.git').as_posix()}\n".encode())
+        rewritten.append(True)
+
+    _at_candidate_point(monkeypatch, rewrite_point, rewrite)
+    expected = (
+        "gitfile .* does not name a worktree of"
+        if rewrite_point == "before-pin"
+        else "candidate checkout gitfile was rewritten"
+    )
+
+    with pytest.raises(verify.GitError, match=expected):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert rewritten
+    assert verify.rev_parse_head(repo) == original
+    assert verify.rev_parse_head(outside) == outside_head
+    assert (outside / ".git" / "index").read_bytes() == outside_index
+    assert git(outside, "status", "--porcelain") == ""
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+def _gitfile_target(gitfile):
+    """The admin dir a worktree gitfile's `gitdir:` line names, as a Path."""
+    value = gitfile.read_bytes()[len(b"gitdir: ") :].rstrip(b"\r\n")
+    return gitfile.parent / os.fsdecode(value)
+
+
+@pytest.mark.parametrize(
+    "forgery",
+    ["dotdot", "linked-admin", "sibling", "foreign", "foreign-commondir", "nul-byte", "no-prefix"],
+)
+def test_commit_path_bound_pin_refuses_a_gitfile_naming_no_candidate_admin_dir(
+    project, tmp_path_factory, monkeypatch, forgery
+):
+    """DW-442: right after `worktree add`, the pin accepts only a gitfile whose
+    `gitdir:` names a real directory directly under this repo's `worktrees/`
+    whose `gitdir` back-pointer names this candidate's `.git` and whose
+    `commondir` names this repo's common dir. Each row plants
+    whatever else it needs so that only one guard stands between the forgery
+    and the candidate git calls:
+
+    - `dotdot` names `worktrees/..` (this repo's own gitdir, back-pointer
+      planted) — ablate the `..` name guard and the candidate calls run against
+      this repo's own gitdir (the refusal becomes a later ref-transaction
+      failure);
+    - `linked-admin` names `worktrees/evil`, a symlink to another repository's
+      gitdir (back-pointer planted there; POSIX symlinks) — ablate the
+      `pinned_root_identity` link guard and git runs against `outside`;
+    - `sibling` names a real sibling linked worktree's admin dir — ablate the
+      back-pointer check and the candidate calls run in the sibling's admin dir
+      and publication goes through (only cleanup fails);
+    - `foreign` names another repository's gitdir directly, with a back-pointer
+      and a `commondir` naming this repo's common dir planted there — ablate
+      the `worktrees/` location check and `read-tree` writes `outside`'s
+      index;
+    - `foreign-commondir` names a real admin dir planted under `worktrees/`
+      whose back-pointer names the candidate but whose `commondir` names
+      another repository's gitdir — ablate the `commondir` check and git takes
+      its objects and refs from `outside` (`read-tree` fails there);
+    - `nul-byte` holds a NUL in the value — ablate the `ValueError` conversion
+      and an untyped `ValueError` escapes;
+    - `no-prefix` spells the prefix `GITDIR: ` before the real admin dir —
+      ablate the prefix check and the pin passes, leaving git's own parse to
+      fail `read-tree`.
+
+    Every row refuses with the typed "does not name a worktree of" `GitError`,
+    and nothing moves: this repo's HEAD and index, the other repository's HEAD,
+    index and status, the sibling's HEAD and index."""
+    if forgery == "linked-admin" and sys.platform == "win32":
+        pytest.skip("POSIX symlinks")
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    outside = _outside_repo(tmp_path_factory)
+    outside_head = verify.rev_parse_head(outside)
+    outside_index = (outside / ".git" / "index").read_bytes()
+    sibling = None
+    if forgery == "sibling":
+        sibling = tmp_path_factory.mktemp("sibling-parent") / "sibling"
+        git(repo, "worktree", "add", "-q", "--detach", str(sibling), "HEAD")
+    sibling_head = verify.rev_parse_head(sibling) if sibling else None
+    sibling_admin = _gitfile_target(sibling / ".git") if sibling else None
+    sibling_index = (sibling_admin / "index").read_bytes() if sibling_admin else None
+    seen = {}
+
+    def forge(candidate_root):
+        gitfile = candidate_root / ".git"
+        admin = _gitfile_target(gitfile)
+        worktrees = admin.parent
+        seen["repo-index"] = (repo / ".git" / "index").read_bytes()
+        back = f"{gitfile.as_posix()}\n"
+        if forgery == "dotdot":
+            (worktrees.parent / "gitdir").write_text(back, encoding="utf-8")
+            value = f"{worktrees.as_posix()}/.."
+        elif forgery == "linked-admin":
+            (outside / ".git" / "gitdir").write_text(back, encoding="utf-8")
+            (worktrees / "evil").symlink_to(outside / ".git", target_is_directory=True)
+            value = f"{worktrees.as_posix()}/evil"
+        elif forgery == "sibling":
+            value = sibling_admin.as_posix()
+        elif forgery == "foreign":
+            (outside / ".git" / "gitdir").write_text(back, encoding="utf-8")
+            (outside / ".git" / "commondir").write_text(
+                f"{worktrees.parent.as_posix()}\n", encoding="utf-8"
+            )
+            value = (outside / ".git").as_posix()
+        elif forgery == "foreign-commondir":
+            evil = worktrees / "evil"
+            evil.mkdir()
+            (evil / "gitdir").write_text(back, encoding="utf-8")
+            (evil / "commondir").write_text(f"{(outside / '.git').as_posix()}\n", encoding="utf-8")
+            (evil / "HEAD").write_bytes((admin / "HEAD").read_bytes())
+            value = evil.as_posix()
+        elif forgery == "nul-byte":
+            value = f"{worktrees.as_posix()}/cand\x00idate"
+        else:
+            gitfile.write_bytes(f"GITDIR: {admin.as_posix()}\n".encode())
+            return
+        gitfile.write_bytes(f"gitdir: {value}\n".encode())
+
+    _intercept_candidate_checkout(monkeypatch, forge)
+    if forgery in ("linked-admin", "foreign-commondir"):
+        # With the back-pointer planted, the cleanup's `worktree remove --force`
+        # resolves the candidate path to the `evil` entry, validates it, and
+        # deletes that admin dir — through the link for `linked-admin`,
+        # emptying `outside/.git` — leaving the real entry unpruned. That is
+        # the unchanged cleanup flow, not the pin, so undo the plant before it
+        # runs and observe only the candidate calls.
+        real_git = verify._git
+
+        def unplant_then_git(git_repo, *args, **kwargs):
+            if args[:2] == ("worktree", "remove"):
+                for evil in Path(git_repo).glob(".git/worktrees/evil"):
+                    if evil.is_symlink():
+                        evil.unlink()
+                    else:
+                        shutil.rmtree(evil)
+                (outside / ".git" / "gitdir").unlink(missing_ok=True)
+            return real_git(git_repo, *args, **kwargs)
+
+        monkeypatch.setattr(verify, "_git", unplant_then_git)
+
+    try:
+        with pytest.raises(verify.GitError, match="gitfile .* does not name a worktree of"):
+            verify.commit_path_bound(
+                repo,
+                "chore: bound ledger",
+                path,
+                accepted_text=accepted,
+                baseline_text=baseline,
+            )
+    finally:
+        (outside / ".git" / "gitdir").unlink(missing_ok=True)
+        (outside / ".git" / "commondir").unlink(missing_ok=True)
+
+    assert seen
+    assert verify.rev_parse_head(repo) == original
+    assert (repo / ".git" / "index").read_bytes() == seen["repo-index"]
+    assert verify.rev_parse_head(outside) == outside_head
+    assert (outside / ".git" / "index").read_bytes() == outside_index
+    assert git(outside, "status", "--porcelain") == ""
+    if sibling is not None:
+        assert verify.rev_parse_head(sibling) == sibling_head
+        assert (sibling_admin / "index").read_bytes() == sibling_index
+    expected_worktrees = 2 if sibling is not None else 1
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == expected_worktrees
+
+
+@pytest.mark.parametrize("kind", ["directory", "fifo", "link"])
+@pytest.mark.parametrize("replace_point", ["before-pin", "before-add"])
+def test_commit_path_bound_refuses_a_non_regular_candidate_gitfile(
+    project, monkeypatch, kind, replace_point
+):
+    """DW-442: a candidate `.git` replaced by a directory, a FIFO or a link to a
+    copy of itself — at the pin or at a later re-check — is refused with a
+    typed `GitError` (win32: the open of a directory already fails), and the
+    FIFO never blocks the read. Ablations: drop `O_NONBLOCK` from
+    `_read_pinned_file` and the `fifo` rows hang; drop its `S_ISREG` check and
+    every POSIX `directory`/`fifo` row fails on the reason (a directory read
+    raises `IsADirectoryError`, a writerless FIFO reads as empty); drop its
+    `O_NOFOLLOW` and both `link` rows fail — `before-pin` publishes through the
+    link, `before-add` is still refused, but by the identity compare rather
+    than at the open."""
+    if kind == "fifo" and not hasattr(os, "mkfifo"):
+        pytest.skip("no FIFOs on this platform")
+    if kind == "link" and sys.platform == "win32":
+        pytest.skip("POSIX symlinks; O_NOFOLLOW degrades to 0 on win32")
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    replaced = []
+
+    def replace(candidate_root):
+        gitfile = candidate_root / ".git"
+        data = gitfile.read_bytes()
+        gitfile.unlink()
+        if kind == "directory":
+            gitfile.mkdir()
+        elif kind == "fifo":
+            os.mkfifo(gitfile)
+        else:
+            copy = candidate_root.parent / "gitfile-copy"
+            copy.write_bytes(data)
+            gitfile.symlink_to(copy)
+        replaced.append(True)
+
+    _at_candidate_point(monkeypatch, replace_point, replace)
+
+    with pytest.raises(verify.GitError, match="candidate checkout gitfile") as raised:
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    # The re-check chains the reader's refusal; the pin raises it directly.
+    reason = raised.value if replace_point == "before-pin" else raised.value.__cause__
+    expected = (
+        "could not be opened" if kind == "link" else "is not a regular file|could not be opened"
+    )
+    assert re.search(expected, str(reason))
+    assert replaced
+    assert verify.rev_parse_head(repo) == original
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+def test_require_pinned_candidate_holds_the_gitfile_identity_and_bytes(tmp_path, monkeypatch):
+    """DW-442: the re-check refuses a gitfile whose bytes changed in place, one
+    replaced by an identical copy (a new inode), and any pin with a zero inode —
+    an identity that proves nothing never matches, even against a current read
+    that is also zero. Ablation: drop the `(st_dev, st_ino)` compare and the
+    identical-copy case passes (as does a zero pin against a real read, which
+    only that compare refuses); drop BOTH zero-inode guards and the
+    zero-against-zero case passes. Either guard alone refuses that case, since
+    it only arises when both sides are zero, so dropping just one stays green."""
+    root = tmp_path / "candidate"
+    root.mkdir()
+    gitfile = root / ".git"
+    gitfile.write_bytes(b"gitdir: /nowhere/.git/worktrees/candidate\n")
+    identity = platform_util.pinned_root_identity(root)
+    assert identity is not None
+    pin = verify._read_candidate_gitfile(root)
+    verify._require_pinned_candidate(root, identity, pin)
+
+    zero = dataclasses.replace(pin, ino=0)
+    with pytest.raises(verify.GitError, match="gitfile was rewritten"):
+        verify._require_pinned_candidate(root, identity, zero)
+    with monkeypatch.context() as patched:
+        patched.setattr(verify, "_read_candidate_gitfile", lambda _root: zero)
+        with pytest.raises(verify.GitError, match="gitfile was rewritten"):
+            verify._require_pinned_candidate(root, identity, zero)
+
+    copy = root / "gitfile-copy"
+    copy.write_bytes(pin.data)
+    os.replace(copy, gitfile)
+    with pytest.raises(verify.GitError, match="gitfile was rewritten"):
+        verify._require_pinned_candidate(root, identity, pin)
+
+    repinned = verify._read_candidate_gitfile(root)
+    gitfile.write_bytes(b"gitdir: /elsewhere/.git\n")
+    with pytest.raises(verify.GitError, match="gitfile was rewritten"):
+        verify._require_pinned_candidate(root, identity, repinned)
+
+
+def test_commit_path_bound_publishes_through_a_relative_candidate_gitfile(project, monkeypatch):
+    """DW-442: with `worktree.useRelativePaths` (git >= 2.48) the candidate
+    gitfile names its gitdir relative to the candidate root; the pin resolves it
+    there, finds it under this repo's `worktrees/`, resolves the admin dir's
+    relative back-pointer and `commondir` against that dir, and publication
+    proceeds. Ablation: resolve the `gitdir:` value, the back-pointer or the
+    `commondir` against the process cwd instead and the pin refuses."""
+    reported = subprocess.run(["git", "--version"], capture_output=True, text=True).stdout
+    if not verify.git_version_at_least(reported, (2, 48)):
+        pytest.skip("worktree.useRelativePaths needs git >= 2.48")
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    git(repo, "config", "worktree.useRelativePaths", "true")
+    gitfiles = []
+
+    def record(root):
+        gitfiles.append((root / ".git").read_bytes())
+        admin = _gitfile_target(root / ".git")
+        gitfiles.append((admin / "gitdir").read_bytes())
+        gitfiles.append((admin / "commondir").read_bytes())
+
+    _intercept_candidate_checkout(monkeypatch, record)
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    gitfile, back, commondir = gitfiles
+    assert not Path(os.fsdecode(gitfile[len(b"gitdir: ") :].rstrip(b"\r\n"))).is_absolute()
+    assert not Path(os.fsdecode(back.rstrip(b"\r\n"))).is_absolute()
+    assert not Path(os.fsdecode(commondir.rstrip(b"\r\n"))).is_absolute()
+    assert published == verify.rev_parse_head(repo)
+    assert git(repo, "show", f"{published}:src.txt") == accepted.rstrip("\n")
     assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
 
 
