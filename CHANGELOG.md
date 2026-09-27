@@ -9,6 +9,10 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Document the `_bmad/custom/bmad-retrospective.toml` override that points
+  `bmad-retrospective`'s session-log evidence at run-dir journals and per-session logs
+  (setup guide; linked from the FEATURES retrospective bullet). Docs only; not shipped by
+  `init` (DW-387).
 - Add opt-in `bmad-loop validate --render-probe`: runs each renderer stub's own
   render command in a throwaway temp copy and reports `skills.dev-render-probe`
   (a render `HALT:` fails validate). Needs network for `uv run --no-cache` (DW-381).

@@ -702,7 +702,7 @@ persisted artifacts.
 - `[gates].on_escalation` is reserved: `pause` is its only documented value and the default. It is parsed but has no effect — CRITICAL escalations always pause, whatever it is set to — and the settings screen does not show it (DW-376).
 - Per-story checkpoints (stories mode): independent `spec_checkpoint` (pause before code to review the plan; approve → implement, or request a replan) and `done_checkpoint` (pause after the story commits; skipped when it is the last story). Additive to `gates.mode` — a story can pause twice.
 - Every mid-run pause is surfaced in the TUI: a per-run pause-kind badge, a global attention count, and a `p` viewer per stage (plan-checkpoint spec review, story-checkpoint summary card, escalation with story context, gate spec review) — all calling the same CLI code paths.
-- Retrospective handling (`retrospective = never | notify | auto`) and notification on epic boundaries.
+- Retrospective handling (`retrospective = never | notify | auto`) and notification on epic boundaries. To give `bmad-retrospective` the run journals and per-session logs as its session-log evidence, add the `_bmad/custom/bmad-retrospective.toml` override described in the [setup guide](setup-guide.md#pointing-retrospectives-at-run-journals). bmad-loop doesn't ship it (DW-387).
 
 ### Multi-CLI / multi-agent support
 
