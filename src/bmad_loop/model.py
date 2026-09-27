@@ -310,6 +310,15 @@ class StoryTask:
     # of hard-resetting it away. Re-stamped on every migrate escalation, cleared
     # when that restart leaves ESCALATED; pre-upgrade tasks default to no keep.
     migration_ledger_rival: bool = False
+    # DW-436: whether the migrate task's validation-retry leg rejected a
+    # rewrite in the current attempt. That leg leaves TRIAGE_VERIFY with the
+    # marker but no rewrite record, the same shape as a corrupt record set, so
+    # this durable fact tells a marked TRIAGE_VERIFY resume to restore the
+    # baseline snapshot and redispatch instead of escalating. Set before the
+    # retry leg's reset, cleared on each redispatch and when a restart leaves
+    # for PENDING, re-stamped False on every migrate escalation; pre-upgrade
+    # tasks default to no latch (today's fail-closed escalation).
+    migration_rewrite_rejected: bool = False
     # DW-317: stable identity of one migration completion, minted fresh in the
     # same save that records DONE (a re-migration mints a new one). Hooks see it
     # as ``ctx.delivery_id`` / ``BMAD_LOOP_DELIVERY_ID`` to deduplicate the
@@ -607,6 +616,7 @@ class StoryTask:
             "migration_ledger_doubt_owned": self.migration_ledger_doubt_owned,
             "migration_commit_escalated": self.migration_commit_escalated,
             "migration_ledger_rival": self.migration_ledger_rival,
+            "migration_rewrite_rejected": self.migration_rewrite_rejected,
             "migration_delivery_id": self.migration_delivery_id,
             "migration_delivery_pending": self.migration_delivery_pending,
             "migration_delivery_counts": (
@@ -853,6 +863,7 @@ class StoryTask:
             migration_ledger_doubt_owned=bool(d.get("migration_ledger_doubt_owned", False)),
             migration_commit_escalated=bool(d.get("migration_commit_escalated", False)),
             migration_ledger_rival=bool(d.get("migration_ledger_rival", False)),
+            migration_rewrite_rejected=bool(d.get("migration_rewrite_rejected", False)),
             migration_delivery_id=(
                 str(d["migration_delivery_id"])
                 if d.get("migration_delivery_id") is not None

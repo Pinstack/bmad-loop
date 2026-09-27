@@ -53,7 +53,7 @@ from bmad_loop import verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.bmadconfig import ProjectPaths
-from bmad_loop.engine import RunPaused, _session_task_id
+from bmad_loop.engine import RunPaused, _LedgerAnchor, _session_task_id
 from bmad_loop.journal import Journal, load_state, save_state
 from bmad_loop.model import (
     PAUSE_ESCALATION,
@@ -21660,6 +21660,13 @@ def test_result_fault_resume_refuses_a_rival_that_lands_after_reset(project, mon
 
 @needs_dir_fd_recovery
 def test_rewrite_snapshot_publication_fault_escalates_on_resume_without_reset(project, monkeypatch):
+    """An ACCEPTED rewrite whose record publication faulted reaches the same
+    record-less marked TRIAGE_VERIFY as an interrupted validation-retry leg, but
+    carries no DW-436 latch, so it keeps the fail-closed escalation.
+
+    Ablation, performed: drop the `migration_rewrite_rejected` check from the
+    DW-436 arm (restore every record-less marked TRIAGE_VERIFY) and this
+    reddens — the resume restores the baseline and dispatches a session."""
     write_legacy_ledger(project, LEGACY_LEDGER)
     mapping = _valid_migration_mapping()
     engine, adapter = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
@@ -21682,6 +21689,9 @@ def test_rewrite_snapshot_publication_fault_escalates_on_resume_without_reset(pr
     assert second.paused and resumed_adapter.sessions == []
     assert git(project.project, "rev-parse", "HEAD") == head
     assert project.deferred_work.read_text(encoding="utf-8") == accepted_live
+    assert _records(resumed, "sweep-migration-recovery-invalid")[-1]["detail"] == (
+        "missing accepted rewrite record"
+    )
 
 
 @needs_dir_fd_recovery
@@ -36380,3 +36390,721 @@ def test_migration_dirty_probe_uses_the_repo_root_relative_path(project):
 
     _assert_refused_dirty(engine, adapter, summary)
     assert paths.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
+
+
+# ----------------- DW-436/439: restart a migration from the right input
+#
+# DW-436: the validation-retry leg latches `migration_rewrite_rejected` before
+# its reset, so an interrupted leg resumes by restoring the snapshot instead of
+# escalating on a missing rewrite record. DW-439: a format-1 ESCALATED restart
+# over a ledger git does not republish grades `migrate-baseline.md`, never the
+# rejected rewrite left on disk.
+
+# A rejected rewrite that still carries legacy content: it converted nothing and
+# dropped the fixed item, so grading it would lose that item.
+_LEGACY_BEARING_REWRITE = (
+    "# Deferred Work\n\n"
+    "## Deferred from: epic 1 review (2026-04-06)\n\n"
+    "- **Open legacy thing here** — `src.txt` mishandles em-dashes\n"
+)
+
+
+def _write_ledger_in_mode(project, ledger_mode: str) -> None:
+    if ledger_mode == "ignored":
+        ignore_before_commit(project, "_bmad-output/")
+        write_legacy_ledger(project, LEGACY_LEDGER)
+    elif ledger_mode == "baseline-untracked":
+        write_legacy_ledger(project, LEGACY_LEDGER, commit=False)
+    else:
+        write_legacy_ledger(project, LEGACY_LEDGER)
+    tracked = git(project.project, "ls-files", "--", ledger_rel(project)) != ""
+    assert tracked == (ledger_mode == "tracked")
+
+
+def _observing_migration(project, observed: list[str], run_dir=None, baselines=None):
+    """A valid migration session that first records the input it was handed."""
+    mapping = _valid_migration_mapping()
+
+    def effect(spec):
+        observed.append(project.deferred_work.read_text(encoding="utf-8"))
+        if run_dir is not None:
+            task = load_state(run_dir).tasks[MIGRATE_KEY]
+            assert task.migration_rewrite_rejected is False  # cleared at dispatch
+            if baselines is not None:
+                baselines.append(task.baseline_commit)
+        return migrate_effect(project, migrated_ledger(), mapping)(spec)
+
+    return effect
+
+
+_SKIP_DW2 = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+
+
+def _crash_in_validation_retry(project, monkeypatch):
+    """The first session's rewrite is rejected; the host dies in the retry leg
+    before its reset. Returns the engine, paused in TRIAGE_VERIFY latched."""
+    engine, adapter = make_sweep(
+        project, [migrate_effect(project, _PARTIAL_MIGRATION, _valid_migration_mapping())]
+    )
+
+    def die(task):
+        raise OSError("host died in the validation-retry leg")
+
+    monkeypatch.setattr(engine, "_refuse_advanced_migration_head", die)
+    assert engine.run().crashed and len(adapter.sessions) == 1
+    task = load_state(engine.run_dir).tasks[MIGRATE_KEY]
+    assert task.phase == Phase.TRIAGE_VERIFY and task.migration_recovery_format == 1
+    assert task.migration_rewrite_rejected is True  # persisted before the reset
+    assert not (engine.run_dir / "migrate-rewrite.md").exists()
+    assert project.deferred_work.read_text(encoding="utf-8") == _PARTIAL_MIGRATION
+    return engine
+
+
+@needs_dir_fd_recovery
+@pytest.mark.parametrize("ledger_mode", ["tracked", "ignored"])
+def test_interrupted_validation_retry_restores_the_snapshot_and_redispatches(
+    project, monkeypatch, ledger_mode
+):
+    """DW-436: a crash in the validation-retry leg leaves TRIAGE_VERIFY with the
+    marker, no rewrite record and the latch. The resume restores the snapshot
+    and dispatches one replacement session that sees the legacy input.
+
+    Ablation, performed: drop the latched TRIAGE_VERIFY arm in
+    `_ensure_migration` and both rows redden — the resume escalates on
+    "missing accepted rewrite record" and dispatches nothing."""
+    _write_ledger_in_mode(project, ledger_mode)
+    engine = _crash_in_validation_retry(project, monkeypatch)
+    observed: list[str] = []
+    resumed, adapter = resume_sweep(
+        project,
+        engine,
+        [_observing_migration(project, observed, engine.run_dir), triage_effect(_SKIP_DW2)],
+    )
+
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert observed == [LEGACY_LEDGER]
+    assert len(adapter.sessions) == 2 and "--migrate" in adapter.sessions[0].prompt
+    task = load_state(resumed.run_dir).tasks[MIGRATE_KEY]
+    assert task.phase == Phase.DONE and task.migration_rewrite_rejected is False
+    assert _records(resumed, "resume-restart")[0]["phase"] == str(Phase.TRIAGE_VERIFY)
+    assert _records(resumed, "sweep-migration-recovery-invalid") == []
+    assert project.deferred_work.read_text(encoding="utf-8") == migrated_ledger()
+
+
+@needs_dir_fd_recovery
+def test_validation_retry_snapshot_pause_resumes_through_the_restore(project, monkeypatch):
+    """DW-436, the #340 pause: the retry leg's reset cannot park unrelated dirt,
+    so it pauses in TRIAGE_VERIFY with the latch. Once the snapshot fault is
+    gone, the resume parks, resets, and redispatches over the legacy ledger,
+    reaching DONE with no evidence escalation.
+
+    Ablation, performed: drop the latched TRIAGE_VERIFY arm and this reddens —
+    the resume escalates on "missing accepted rewrite record"."""
+    (project.project / "notes.txt").write_text("committed\n", encoding="utf-8")
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    reject = migrate_effect(project, _PARTIAL_MIGRATION, _valid_migration_mapping())
+
+    def reject_beside_unrelated_work(spec):
+        (project.project / "notes.txt").write_text("operator edit\n", encoding="utf-8")
+        return reject(spec)
+
+    def fail_snapshot(*args, **kwargs):
+        raise verify.GitError("injected snapshot failure")
+
+    real_snapshot = verify.snapshot_worktree
+    monkeypatch.setattr(verify, "snapshot_worktree", fail_snapshot)
+    engine, adapter = make_sweep(project, [reject_beside_unrelated_work])
+
+    summary = engine.run()
+
+    assert summary.paused and len(adapter.sessions) == 1
+    assert "attempt-worktree-preserve-failed" in journal_kinds(engine)
+    task = load_state(engine.run_dir).tasks[MIGRATE_KEY]
+    assert task.phase == Phase.TRIAGE_VERIFY and task.migration_rewrite_rejected is True
+    assert (project.project / "notes.txt").read_text(encoding="utf-8") == "operator edit\n"
+
+    monkeypatch.setattr(verify, "snapshot_worktree", real_snapshot)
+    observed: list[str] = []
+    resumed, resumed_adapter = resume_sweep(
+        project,
+        engine,
+        [_observing_migration(project, observed, engine.run_dir), triage_effect(_SKIP_DW2)],
+    )
+
+    after = resumed.run()
+
+    assert not after.crashed and not after.paused
+    assert observed == [LEGACY_LEDGER]
+    assert len(resumed_adapter.sessions) == 2
+    assert load_state(resumed.run_dir).tasks[MIGRATE_KEY].phase == Phase.DONE
+    assert _records(resumed, "sweep-migration-recovery-invalid") == []
+    assert git(project.project, "for-each-ref", "refs/attempt-preserve-dirty/") != ""
+
+
+@needs_dir_fd_recovery
+def test_latched_triage_verify_leaves_an_inherited_doubt_to_the_cycle_stop(project, monkeypatch):
+    """DW-436 x DW-314: the latched TRIAGE_VERIFY recovery redispatches, which
+    publishes, so an inherited ledger doubt leaves it to the cycle doubt stop.
+
+    Ablation, performed: drop the latched clause from `_loop`'s pre-reader
+    TRIAGE_VERIFY arm and this reddens — the restore rewrites the doubted ledger
+    and a migration session is dispatched."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine = _crash_in_validation_retry(project, monkeypatch)
+    state = load_state(engine.run_dir)
+    state.sweep_ledger_in_doubt = True
+    save_state(engine.run_dir, state)
+    live = project.deferred_work.read_bytes()
+    resumed, adapter = resume_sweep(project, engine, [])
+
+    summary = resumed.run()
+
+    assert not summary.crashed and adapter.sessions == []
+    assert project.deferred_work.read_bytes() == live
+    stops = _records(resumed, "sweep-repeat-done")
+    assert [row["stop_cause"] for row in stops] == ["ledger-unreadable"]
+
+
+def _critical_migration(project, text: str):
+    """A migration session that leaves ``text`` on disk and escalates CRITICAL."""
+
+    def effect(spec):
+        project.deferred_work.write_text(text, encoding="utf-8")
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "deferred-sweep-migrate",
+                "mapping": [],
+                "escalations": [
+                    {"severity": "critical", "type": "ambiguous", "detail": "cannot decide"}
+                ],
+            },
+        )
+
+    return effect
+
+
+def _escalate_on_a_critical_rewrite(project):
+    engine, adapter = make_sweep(project, [_critical_migration(project, _LEGACY_BEARING_REWRITE)])
+    summary = engine.run()
+    assert summary.paused and len(adapter.sessions) == 1
+    task = load_state(engine.run_dir).tasks[MIGRATE_KEY]
+    assert task.phase == Phase.ESCALATED and task.migration_recovery_format == 1
+    assert project.deferred_work.read_text(encoding="utf-8") == _LEGACY_BEARING_REWRITE
+    return engine
+
+
+def _snapshot_restore_outcomes(engine) -> list[str]:
+    return [row["outcome"] for row in _records(engine, "sweep-migration-snapshot-restore")]
+
+
+@needs_dir_fd_recovery
+@pytest.mark.parametrize("ledger_mode", ["ignored", "baseline-untracked"])
+def test_escalated_restart_restores_the_snapshot_over_a_rejected_rewrite(project, ledger_mode):
+    """DW-439: a CRITICAL escalation leaves a legacy-bearing rewrite in a ledger
+    `reset --hard` does not republish. The plain resume restores
+    `migrate-baseline.md` by compare-and-set, and the replacement session grades
+    it, never the rewrite that dropped a legacy item.
+
+    Ablation, performed: skip the escalated restore (no `_escalated_snapshot_plan`
+    call in the generic restart) and both rows redden — the session observes
+    the rejected rewrite and no `restored` row is journaled."""
+    _write_ledger_in_mode(project, ledger_mode)
+    engine = _escalate_on_a_critical_rewrite(project)
+    observed: list[str] = []
+    resumed, adapter = resume_sweep(
+        project,
+        engine,
+        [_observing_migration(project, observed, engine.run_dir), triage_effect(_SKIP_DW2)],
+    )
+
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert observed == [LEGACY_LEDGER]
+    assert _snapshot_restore_outcomes(resumed) == ["restored"]
+    assert load_state(resumed.run_dir).tasks[MIGRATE_KEY].phase == Phase.DONE
+    assert project.deferred_work.read_text(encoding="utf-8") == migrated_ledger()
+
+
+@needs_dir_fd_recovery
+def test_escalated_snapshot_restore_repauses_on_a_rival_in_the_window(project, monkeypatch):
+    """DW-439: bytes that change between the observation and the locked
+    compare-and-set are a rival: journal `sweep-migration-restore-diverged`,
+    re-pause the ESCALATED task with its own remedy, latch
+    `migration_ledger_rival`, dispatch nothing, keep the rival. The next plain
+    resume keeps that rival as the input instead of restoring over it.
+
+    Ablation, performed: accept any live value in the compare-and-set and this
+    reddens — the rival is overwritten and a session is dispatched. Drop the
+    rival latch and the second resume reddens — the snapshot overwrites it."""
+    _write_ledger_in_mode(project, "ignored")
+    engine = _escalate_on_a_critical_rewrite(project)
+    rival = LEGACY_LEDGER + "- **Rival legacy thing** — landed during the restore\n"
+    resumed, adapter = resume_sweep(project, engine, [])
+    real_probe = resumed._ledger_baseline_text
+
+    def probe_then_rival(task):
+        answer = real_probe(task)
+        project.deferred_work.write_text(rival, encoding="utf-8")
+        return answer
+
+    monkeypatch.setattr(resumed, "_ledger_baseline_text", probe_then_rival)
+
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed and adapter.sessions == []
+    persisted = load_state(resumed.run_dir)
+    assert persisted.paused_stage == PAUSE_ESCALATION
+    task = persisted.tasks[MIGRATE_KEY]
+    assert task.phase == Phase.ESCALATED and task.migration_ledger_rival is True
+    reason = persisted.paused_reason or ""
+    assert "resume to migrate the ledger now on disk" in reason
+    assert "delete the migrate-*" not in reason
+    assert len(_records(resumed, "sweep-migration-restore-diverged")) == 1
+    assert _snapshot_restore_outcomes(resumed) == []
+    assert project.deferred_work.read_text(encoding="utf-8") == rival
+
+    monkeypatch.undo()
+    observed: list[str] = []
+
+    def observe(spec):
+        observed.append(project.deferred_work.read_text(encoding="utf-8"))
+        return _critical_migration(project, rival)(spec)
+
+    again, again_adapter = resume_sweep(project, resumed, [observe])
+    again.run()
+
+    assert len(again_adapter.sessions) == 1 and observed == [rival]
+    assert _snapshot_restore_outcomes(again) == []
+
+
+@needs_dir_fd_recovery
+def test_site3_refusal_over_an_ignored_ledger_restarts_from_the_snapshot(project, monkeypatch):
+    """DW-439 x site 3: the session commits, then its legacy-bearing rewrite is
+    rejected. The latch is persisted, the advanced-HEAD refusal escalates and
+    re-stamps it False. With HEAD kept and the tree clean, the resume restores
+    the snapshot over the ignored ledger's rejected rewrite and re-stamps the
+    baseline at the session's commit.
+
+    Ablation, performed: drop the anchor gate's restore arm (return None for
+    every anchor) and this reddens — the session observes the rejected rewrite."""
+    _write_ledger_in_mode(project, "ignored")
+    baseline = git(project.project, "rev-parse", "HEAD")
+    reject = migrate_effect(project, _LEGACY_BEARING_REWRITE, _valid_migration_mapping())
+    committed: list[str] = []
+
+    def commit_then_reject(spec):
+        committed.append(_operator_commit(project, "session.txt"))
+        return reject(spec)
+
+    engine, adapter = make_sweep(project, [commit_then_reject])
+    latched: list[bool] = []
+    real_refuse = engine._refuse_advanced_migration_head
+
+    def spy_refuse(task):
+        latched.append(load_state(engine.run_dir).tasks[MIGRATE_KEY].migration_rewrite_rejected)
+        real_refuse(task)
+
+    monkeypatch.setattr(engine, "_refuse_advanced_migration_head", spy_refuse)
+
+    summary = engine.run()
+
+    assert summary.paused and len(adapter.sessions) == 1
+    assert latched == [True]
+    _assert_advanced_head_refusal(engine, baseline, committed[0])
+    assert load_state(engine.run_dir).tasks[MIGRATE_KEY].migration_rewrite_rejected is False
+    assert project.deferred_work.read_text(encoding="utf-8") == _LEGACY_BEARING_REWRITE
+    assert worktree_clean(project.project, project=project.project)
+
+    observed: list[str] = []
+    baselines: list[str | None] = []
+    resumed, resumed_adapter = resume_sweep(
+        project,
+        engine,
+        [
+            _observing_migration(project, observed, engine.run_dir, baselines),
+            triage_effect(_SKIP_DW2),
+        ],
+    )
+
+    after = resumed.run()
+
+    assert not after.crashed and not after.paused
+    assert observed == [LEGACY_LEDGER]
+    assert baselines == [committed[0]]
+    assert _snapshot_restore_outcomes(resumed) == ["restored"]
+    assert _is_ancestor(project, committed[0])  # the session's commit was kept
+    assert load_state(resumed.run_dir).tasks[MIGRATE_KEY].phase == Phase.DONE
+
+
+@needs_dir_fd_recovery
+@pytest.mark.parametrize("remedy", ["dirty-reset", "operator-commit"])
+def test_escalated_restart_leaves_a_git_owned_ledger_to_git(project, remedy):
+    """DW-439 control: a TRACKED ledger is git's to republish. Over a dirty tree
+    the reset puts the committed blob back; over an operator commit at an
+    advanced HEAD (the DW-430 re-stamp) that commit IS the input. Neither
+    journals `restored`, and the session grades what git holds.
+
+    Ablation, performed: drop the anchor gate (restore on a BASELINE anchor with
+    text too) and the `operator-commit` row reddens — the snapshot overwrites the
+    committed ledger, and the dirty tracked input pauses at the DW-437 gate."""
+    _write_ledger_in_mode(project, "tracked")
+    engine = _escalate_on_a_critical_rewrite(project)
+    if remedy == "operator-commit":
+        git(project.project, "add", "--", ledger_rel(project))
+        git(project.project, "commit", "-q", "-m", "operator adopts the rewrite")
+        expected = _LEGACY_BEARING_REWRITE
+        manifest = legacy_manifest(expected)
+        mapping = [{"key": manifest[0]["key"], "dw_id": "DW-1"}]
+        migrated = (
+            "# Deferred Work\n\n### DW-1: Open legacy thing here\n\n"
+            "origin: migrated from legacy ledger, 2026-06-12\nlocation: src.txt\n"
+            "reason: mishandles em-dashes.\nstatus: open\n"
+        )
+        plan = triage_result(["DW-1"], skip=[{"id": "DW-1", "reason": "not this cycle"}])
+    else:
+        expected = LEGACY_LEDGER
+        mapping = _valid_migration_mapping()
+        migrated = migrated_ledger()
+        plan = _SKIP_DW2
+    observed: list[str] = []
+
+    def observe_then_migrate(spec):
+        observed.append(project.deferred_work.read_text(encoding="utf-8"))
+        return migrate_effect(project, migrated, mapping)(spec)
+
+    resumed, adapter = resume_sweep(project, engine, [observe_then_migrate, triage_effect(plan)])
+
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert observed == [expected]
+    assert _snapshot_restore_outcomes(resumed) == []
+    assert _records(resumed, "migrate-ledger-dirty") == []
+    assert load_state(resumed.run_dir).tasks[MIGRATE_KEY].phase == Phase.DONE
+
+
+@needs_dir_fd_recovery
+def test_escalated_restart_without_records_grades_the_live_ledger(project):
+    """DW-439: the operator deleted the migrate-* records (the escalation's own
+    remedy), so there is no snapshot: the live ledger is graded as before and
+    `no-snapshot` is journaled.
+
+    Ablation, performed: read the baseline record without `optional=True` and
+    this reddens — the resume re-pauses on "missing baseline record"."""
+    _write_ledger_in_mode(project, "ignored")
+    engine = _escalate_on_a_critical_rewrite(project)
+    for record in engine.run_dir.glob("migrate-*"):
+        record.unlink()
+    observed: list[str] = []
+
+    def observe(spec):
+        observed.append(project.deferred_work.read_text(encoding="utf-8"))
+        return _critical_migration(project, _LEGACY_BEARING_REWRITE)(spec)
+
+    resumed, adapter = resume_sweep(project, engine, [observe])
+
+    summary = resumed.run()
+
+    assert summary.paused and len(adapter.sessions) == 1
+    assert observed == [_LEGACY_BEARING_REWRITE]
+    assert _snapshot_restore_outcomes(resumed) == ["no-snapshot"]
+
+
+def test_fallback_escalated_restart_skips_the_snapshot_restore(project, monkeypatch):
+    """DW-439 x DW-315: without dir-fd anchoring the records are unreadable by
+    doctrine, so the restore is skipped (journaled `no-dir-fd`), no record is
+    opened, and the live ledger is graded as before.
+
+    Ablation, performed: drop the `DIR_FD_ANCHORED_WRITES` skip and this reddens
+    — the record read refuses and the resume re-pauses with no session."""
+    monkeypatch.setattr(sweep_mod, "DIR_FD_ANCHORED_WRITES", False)
+    _write_ledger_in_mode(project, "ignored")
+    engine = _escalate_on_a_critical_rewrite(project)
+    observed: list[str] = []
+
+    def observe(spec):
+        observed.append(project.deferred_work.read_text(encoding="utf-8"))
+        return _critical_migration(project, _LEGACY_BEARING_REWRITE)(spec)
+
+    resumed, adapter = resume_sweep(project, engine, [observe])
+
+    summary = resumed.run()
+
+    assert summary.paused and len(adapter.sessions) == 1
+    assert observed == [_LEGACY_BEARING_REWRITE]
+    assert _snapshot_restore_outcomes(resumed) == ["no-dir-fd"]
+
+
+@needs_dir_fd_recovery
+def test_escalated_restart_keeping_a_rival_skips_the_snapshot_restore(project, monkeypatch):
+    """DW-439 x DW-429: a latched rival is the input the restart keeps, so the
+    snapshot restore never runs.
+
+    Ablation, performed: drop `not keep_ledger` from the restore's gate and this
+    reddens — the plan helper is consulted for the kept rival."""
+    resumed = _escalate_on_a_tracked_rival(project, monkeypatch)
+    monkeypatch.undo()
+    assert load_state(resumed.run_dir).tasks[MIGRATE_KEY].migration_ledger_rival is True
+    calls: list[str] = []
+    again, _ = resume_sweep(project, resumed, [])
+    real_plan = again._escalated_snapshot_plan
+
+    def spy_plan(task):
+        calls.append(task.story_key)
+        return real_plan(task)
+
+    monkeypatch.setattr(again, "_escalated_snapshot_plan", spy_plan)
+
+    again.run()
+
+    assert calls == []
+    assert _snapshot_restore_outcomes(again) == []
+    assert project.deferred_work.read_text(encoding="utf-8") == _RIVAL_LEGACY_LEDGER
+
+
+def _in_lock_ledger_read_fault(project, monkeypatch) -> None:
+    """Fault `read_for_write` of the ledger only while `ledger_lock` is held."""
+    ledger = project.deferred_work
+    real_lock = deferredwork.ledger_lock
+    real_read = deferredwork.read_for_write
+    inside: list[bool] = []
+
+    @contextlib.contextmanager
+    def tracking_lock(path, *args, **kwargs):
+        with real_lock(path, *args, **kwargs):
+            inside.append(True)
+            try:
+                yield
+            finally:
+                inside.pop()
+
+    def faulting_read(path, *args, **kwargs):
+        if inside and Path(path) == ledger:
+            raise OSError(5, "Input/output error")
+        return real_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", tracking_lock)
+    monkeypatch.setattr(deferredwork, "read_for_write", faulting_read)
+
+
+@needs_dir_fd_recovery
+def test_escalated_snapshot_restore_read_fault_repauses_without_the_rival_latch(
+    project, monkeypatch
+):
+    """DW-439: a ledger read fault under the restore's lock is not a rival: it
+    journals `sweep-migration-restore-diverged` and re-pauses with its own
+    fix-the-fault remedy, latches nothing, and leaves the ledger untouched.
+
+    Ablation, performed: drop the `read_fault` distinction (treat it as a
+    readable divergence) and this reddens — the rival latch is set and the
+    reason names the migrate-the-ledger-on-disk remedy."""
+    _write_ledger_in_mode(project, "ignored")
+    engine = _escalate_on_a_critical_rewrite(project)
+    live = project.deferred_work.read_bytes()
+    resumed, adapter = resume_sweep(project, engine, [])
+    _in_lock_ledger_read_fault(project, monkeypatch)
+
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed and adapter.sessions == []
+    persisted = load_state(resumed.run_dir)
+    assert persisted.paused_stage == PAUSE_ESCALATION
+    task = persisted.tasks[MIGRATE_KEY]
+    assert task.phase == Phase.ESCALATED and task.migration_ledger_rival is False
+    reason = persisted.paused_reason or ""
+    assert "cannot be read for the escalated migration's snapshot restore" in reason
+    assert "fix the fault, then resume" in reason
+    assert "delete the migrate-*" not in reason
+    assert len(_records(resumed, "sweep-migration-restore-diverged")) == 1
+    assert project.deferred_work.read_bytes() == live
+
+
+def _escalate_site3_over_an_ignored_ledger(project):
+    """Site 3 over an ignored ledger: the session commits, its legacy-bearing
+    rewrite is rejected, the advanced-HEAD refusal escalates. Returns
+    (engine, pre-session baseline, session commit)."""
+    _write_ledger_in_mode(project, "ignored")
+    baseline = git(project.project, "rev-parse", "HEAD")
+    reject = migrate_effect(project, _LEGACY_BEARING_REWRITE, _valid_migration_mapping())
+    committed: list[str] = []
+
+    def commit_then_reject(spec):
+        committed.append(_operator_commit(project, "session.txt"))
+        return reject(spec)
+
+    engine, _ = make_sweep(project, [commit_then_reject])
+    assert engine.run().paused
+    assert load_state(engine.run_dir).tasks[MIGRATE_KEY].phase == Phase.ESCALATED
+    return engine, baseline, committed[0]
+
+
+@needs_dir_fd_recovery
+def test_escalated_snapshot_restore_divergence_keeps_a_stale_baseline(project, monkeypatch):
+    """DW-439: over a clean tree at an advanced HEAD, a diverged restore
+    re-pauses BEFORE the stale-baseline clear, so the persisted baseline still
+    names the escalated attempt's and the next plan's anchor probe can answer.
+
+    Ablation, performed: move the restore below the stale-baseline clear and
+    this reddens — the re-pause persists `baseline_commit=None`."""
+    engine, baseline, _head = _escalate_site3_over_an_ignored_ledger(project)
+    rival = LEGACY_LEDGER + "- **Rival legacy thing** — landed during the restore\n"
+    resumed, adapter = resume_sweep(project, engine, [])
+    real_probe = resumed._ledger_baseline_text
+
+    def probe_then_rival(task):
+        answer = real_probe(task)
+        project.deferred_work.write_text(rival, encoding="utf-8")
+        return answer
+
+    monkeypatch.setattr(resumed, "_ledger_baseline_text", probe_then_rival)
+
+    summary = resumed.run()
+
+    assert summary.paused and adapter.sessions == []
+    task = load_state(resumed.run_dir).tasks[MIGRATE_KEY]
+    assert task.phase == Phase.ESCALATED
+    assert task.baseline_commit == baseline
+    assert len(_records(resumed, "sweep-migration-restore-diverged")) == 1
+
+
+@needs_dir_fd_recovery
+def test_interrupted_final_validation_retry_escalates_on_the_attempt_cap(project, monkeypatch):
+    """DW-436 x the attempt cap: the latch precedes the leg's cap check, so an
+    interruption on the last allowed attempt restores the snapshot and then
+    escalates on the cap — never dispatching attempt max+1.
+
+    Ablation, performed: drop the cap check from the latched TRIAGE_VERIFY arm
+    and this reddens — the resume dispatches a third migration session."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    reject = migrate_effect(project, _PARTIAL_MIGRATION, _valid_migration_mapping())
+    engine, adapter = make_sweep(project, [reject, reject])
+    real_refuse = engine._refuse_advanced_migration_head
+    calls: list[int] = []
+
+    def die_on_last(task):
+        calls.append(task.attempt)
+        if task.attempt >= engine.policy.sweep.max_migration_attempts:
+            raise OSError("host died in the final validation-retry leg")
+        real_refuse(task)
+
+    monkeypatch.setattr(engine, "_refuse_advanced_migration_head", die_on_last)
+    assert engine.run().crashed and len(adapter.sessions) == 2
+    task = load_state(engine.run_dir).tasks[MIGRATE_KEY]
+    assert task.phase == Phase.TRIAGE_VERIFY and task.migration_rewrite_rejected is True
+    assert task.attempt == engine.policy.sweep.max_migration_attempts
+    resumed, resumed_adapter = resume_sweep(
+        project, engine, [migrate_effect(project, migrated_ledger(), _valid_migration_mapping())]
+    )
+
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed and resumed_adapter.sessions == []
+    persisted = load_state(resumed.run_dir)
+    assert persisted.paused_stage == PAUSE_ESCALATION
+    task = persisted.tasks[MIGRATE_KEY]
+    assert task.phase == Phase.ESCALATED and task.migration_rewrite_rejected is False
+    assert "migration failed deterministic validation" in (persisted.paused_reason or "")
+    assert project.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
+
+
+@needs_dir_fd_recovery
+def test_dispatch_clears_the_rejection_latch(project, monkeypatch):
+    """DW-436: a rejected attempt 1 sets the latch; attempt 2 is accepted but
+    its `migrate-rewrite.md` publication faults. The dispatch of attempt 2
+    cleared the latch, so the resume keeps the fail-closed escalation on
+    "missing accepted rewrite record", dispatches nothing and keeps the
+    accepted ledger.
+
+    Ablation, performed: drop the latch clear after
+    `advance(task, Phase.TRIAGE_RUNNING)` and this reddens — the resume takes
+    the latched restore (restoring the legacy ledger) instead."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, adapter = make_sweep(
+        project,
+        [
+            migrate_effect(project, _PARTIAL_MIGRATION, mapping),
+            migrate_effect(project, migrated_ledger(), mapping),
+        ],
+    )
+    real_write = sweep_mod.atomic_write_text_confined
+
+    def fail_rewrite(path, text, **kwargs):
+        if path.name == "migrate-rewrite.md":
+            raise OSError("rewrite publication fault")
+        return real_write(path, text, **kwargs)
+
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", fail_rewrite)
+    assert engine.run().crashed and len(adapter.sessions) == 2
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", real_write)
+    task = load_state(engine.run_dir).tasks[MIGRATE_KEY]
+    assert task.phase == Phase.TRIAGE_VERIFY and task.migration_rewrite_rejected is False
+    resumed, resumed_adapter = resume_sweep(project, engine, [])
+
+    summary = resumed.run()
+
+    assert summary.paused and resumed_adapter.sessions == []
+    assert _records(resumed, "sweep-migration-recovery-invalid")[-1]["detail"] == (
+        "missing accepted rewrite record"
+    )
+    assert project.deferred_work.read_text(encoding="utf-8") == migrated_ledger()
+
+
+@needs_dir_fd_recovery
+def test_escalated_snapshot_plan_refuses_an_unprobeable_baseline(project, monkeypatch):
+    """DW-439: a baseline probe that cannot answer (`_LedgerAnchor.NONE`) gives
+    no authority either way, so the restart re-pauses with its own remedy,
+    dispatches nothing and leaves the ledger bytes alone.
+
+    Ablation, performed: drop the NONE refusal in `_escalated_snapshot_plan`
+    and this reddens — the snapshot is restored and a session is dispatched."""
+    _write_ledger_in_mode(project, "ignored")
+    engine = _escalate_on_a_critical_rewrite(project)
+    live = project.deferred_work.read_bytes()
+    resumed, adapter = resume_sweep(project, engine, [])
+    monkeypatch.setattr(resumed, "_ledger_baseline_text", lambda _task: (_LedgerAnchor.NONE, None))
+
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed and adapter.sessions == []
+    persisted = load_state(resumed.run_dir)
+    assert persisted.paused_stage == PAUSE_ESCALATION
+    assert persisted.tasks[MIGRATE_KEY].phase == Phase.ESCALATED
+    detail = _records(resumed, "sweep-migration-recovery-invalid")[-1]["detail"]
+    assert "baseline cannot be probed" in detail
+    assert "delete the migrate-*" not in (persisted.paused_reason or "")
+    assert _snapshot_restore_outcomes(resumed) == []
+    assert project.deferred_work.read_bytes() == live
+
+
+@needs_dir_fd_recovery
+def test_escalated_restart_over_dirt_resets_then_restores_the_snapshot(project):
+    """DW-439 over a DIRTY tree: an unrelated tracked edit is parked and reset
+    by the dirty arm, and the ignored ledger's rejected rewrite — which the
+    reset cannot touch — is then replaced by the snapshot.
+
+    Ablation, performed: skip the escalated restore and this reddens — the
+    session observes the rejected rewrite."""
+    (project.project / "notes.txt").write_text("committed\n", encoding="utf-8")
+    _write_ledger_in_mode(project, "ignored")
+    engine = _escalate_on_a_critical_rewrite(project)
+    (project.project / "notes.txt").write_text("operator edit\n", encoding="utf-8")
+    observed: list[str] = []
+    resumed, _ = resume_sweep(
+        project,
+        engine,
+        [_observing_migration(project, observed, engine.run_dir), triage_effect(_SKIP_DW2)],
+    )
+
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert observed == [LEGACY_LEDGER]
+    assert _snapshot_restore_outcomes(resumed) == ["restored"]
+    assert (project.project / "notes.txt").read_text(encoding="utf-8") == "committed\n"
+    assert git(project.project, "for-each-ref", "refs/attempt-preserve-dirty/") != ""
+    assert load_state(resumed.run_dir).tasks[MIGRATE_KEY].phase == Phase.DONE

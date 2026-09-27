@@ -2015,8 +2015,15 @@ class SweepEngine(Engine):
                 and (
                     migrate_task.phase == Phase.COMMITTING
                     or (
+                        # DW-436: a latched (rejected-rewrite) recovery restores
+                        # and redispatches like the TRIAGE_RUNNING one below, so
+                        # an inherited doubt leaves it to the cycle doubt stop.
                         migrate_task.phase == Phase.TRIAGE_VERIFY
                         and migrate_task.migration_recovery_format != 0
+                        and not (
+                            migrate_task.migration_rewrite_rejected
+                            and self._ledger_unfit_to_publish()
+                        )
                     )
                     or (
                         # DW-314: a marked TRIAGE_RUNNING recovery redispatches,
@@ -3397,7 +3404,9 @@ class SweepEngine(Engine):
         commit-tail retry. ``migration_ledger_rival`` (DW-429) is re-stamped
         beside it from ``ledger_rival``: True only when this escalation refused a
         readable rival ledger, which the generic ESCALATED restart then keeps.
-        The already-ESCALATED re-pause arm leaves both untouched, and appends
+        ``migration_rewrite_rejected`` (DW-436) is re-stamped False: an
+        escalation ends the attempt whose rejection it latched.
+        The already-ESCALATED re-pause arm leaves all three untouched, and appends
         the restore-the-ledger remedy unless ``own_remedy`` says the reason
         already names one (DW-427: that remedy would recreate the dirty tree the
         advanced-HEAD refusal refused).
@@ -3438,6 +3447,7 @@ class SweepEngine(Engine):
             advance(task, Phase.TRIAGE_VERIFY)
         task.migration_commit_escalated = task.phase == Phase.COMMITTING
         task.migration_ledger_rival = ledger_rival
+        task.migration_rewrite_rejected = False
         super()._escalate(task, reason)
 
     def _resume_escalated_migration_commit(self, task: StoryTask) -> None:
@@ -3820,9 +3830,15 @@ class SweepEngine(Engine):
     def _restore_running_migration_baseline(self, task: StoryTask) -> str:
         """Put the durable baseline back under an interrupted marked session (DW-314).
 
-        Durable ``TRIAGE_RUNNING`` gives the interrupted session ownership of the
-        live residue, so the snapshot may replace bytes equal to the pre-reset
-        observation (or to the text the reset itself republished). Git
+        Two callers in :meth:`_ensure_migration`: the marked ``TRIAGE_RUNNING``
+        restore (a session died mid-rewrite), and the marked ``TRIAGE_VERIFY``
+        resume whose ``migration_rewrite_rejected`` latch proves the
+        validation-retry leg was interrupted after rejecting a rewrite (DW-436:
+        a crash, or a #340/``safe_reset`` pause before or inside its reset).
+        Durable ``TRIAGE_RUNNING`` — or that latch — gives the rejected
+        session's live residue to this restore, so the snapshot may replace
+        bytes equal to the pre-reset observation (or to the text the reset
+        itself republished). Git
         cleanliness decides nothing here: an ignored or baseline-untracked
         ledger holding the session's partial bytes leaves the tree clean. Only a
         value that changed after the observation is a rival, which escalates
@@ -3887,6 +3903,138 @@ class SweepEngine(Engine):
                 ledger_rival=not read_fault,
             )
         return baseline
+
+    def _escalated_snapshot_plan(self, task: StoryTask) -> tuple[str, str | None, bool] | None:
+        """Decide the input of a format-1 ESCALATED restart, read-only (DW-439).
+
+        A rejected rewrite that still carries legacy content survives into a
+        clean restart wherever ``reset --hard`` republishes no ledger text: an
+        ignored, baseline-untracked or external ledger. The critical-reason,
+        env-fault and parked escalations after a session, and the site-3
+        advanced-HEAD refusal, all leave it there, and the generic restart would
+        grade it — losing the legacy items it dropped. Runs BEFORE the
+        ESCALATED mutations (a refusal re-pauses persisting none of them, as
+        DW-427) and while ``task.baseline_commit`` still names the escalated
+        attempt's baseline, which the anchor probe needs.
+
+        Returns ``None`` to keep today's input (records unreadable by doctrine
+        on a fallback host, records deleted by the operator, or a ledger git
+        republishes at the baseline), else ``(snapshot, observed, restore)``:
+        the ``migrate-baseline.md`` text, the live ledger it was compared with,
+        and whether :meth:`_restore_escalated_snapshot` must write it back.
+        """
+        if not DIR_FD_ANCHORED_WRITES:
+            # DW-315: records are unreadable here; refusing would loop past the
+            # documented delete-the-records remedy.
+            self.journal.append(
+                "sweep-migration-snapshot-restore", story_key=MIGRATE_KEY, outcome="no-dir-fd"
+            )
+            return None
+        snapshot = self._migration_record_text(
+            task, self.run_dir / _MIGRATE_BASELINE_RECORD, "baseline", optional=True
+        )
+        if snapshot is None:
+            # The operator deleted the records (the escalation's own remedy).
+            self.journal.append(
+                "sweep-migration-snapshot-restore", story_key=MIGRATE_KEY, outcome="no-snapshot"
+            )
+            return None
+        remedy = "fix the fault, then resume — or resolve the escalation explicitly"
+        ledger = self.workspace.paths.deferred_work
+        try:
+            observed = deferredwork.read_for_write(ledger)
+        except (deferredwork.LedgerReadError, OSError):
+            self._migration_evidence_failure(
+                task,
+                "live ledger cannot be compared with the migration snapshot, so a "
+                f"plain resume cannot tell which input to migrate; {remedy}",
+                own_remedy=True,
+            )
+        if observed == snapshot:
+            return snapshot, observed, False
+        anchor, committed = self._ledger_baseline_text(task)
+        if anchor is _LedgerAnchor.BASELINE and committed is not None:
+            # Git owns the ledger: a clean tree holds a committed blob (the
+            # snapshot at an unchanged HEAD, an operator commit the DW-430
+            # re-stamp adopts at an advanced one) and a dirty one is reset.
+            return None
+        if anchor is _LedgerAnchor.NONE:
+            self._migration_evidence_failure(
+                task,
+                "the ledger's baseline cannot be probed, so a plain resume cannot tell "
+                f"whether the live ledger or the migration snapshot is the input; {remedy}",
+                own_remedy=True,
+            )
+        return snapshot, observed, True
+
+    def _restore_escalated_snapshot(
+        self, task: StoryTask, snapshot: str, observed: str | None
+    ) -> None:
+        """Write the DW-439 snapshot back by compare-and-set, never over a rival.
+
+        Runs after the restart's dirty-arm reset (if any), which cannot have
+        republished this ledger: the plan admits only ledgers git does not own
+        at the baseline. It runs BEFORE the stale-baseline clear, so a re-pause
+        here keeps the baseline the next plan's anchor probe needs. Pure text
+        under ``ledger_lock``. A value that is neither the snapshot nor the
+        pre-reset observation, or a read fault, journals
+        ``sweep-migration-restore-diverged`` and re-pauses (the task is still
+        ESCALATED, so ``_escalate`` takes its re-pause arm): that re-pause
+        persists only the attempt/generation mutations, like the DW-429 keep
+        path. A READABLE divergence also latches ``migration_ledger_rival``, so
+        the next restart keeps that value (DW-429) instead of restoring over
+        it; a read fault latches nothing. Each carries its own remedy.
+        """
+        ledger = self.workspace.paths.deferred_work
+        diverged = False
+        read_fault = False
+        wrote = False
+        with deferredwork.ledger_lock(ledger):
+            # PURE TEXT ONLY under the hold.
+            try:
+                current = deferredwork.read_for_write(ledger)
+            except (deferredwork.LedgerReadError, OSError):
+                current = None
+                diverged = True
+                read_fault = True
+            if diverged:
+                pass
+            elif current == snapshot:
+                pass
+            elif current == observed:
+                ledger.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write_text(ledger, snapshot)
+                wrote = True
+            else:
+                diverged = True
+        if diverged:
+            self.journal.append(
+                "sweep-migration-restore-diverged",
+                story_key=MIGRATE_KEY,
+                ledger=str(ledger),
+            )
+            if read_fault:
+                reason = (
+                    "the ledger cannot be read for the escalated migration's snapshot "
+                    "restore — fix the fault, then resume"
+                )
+            else:
+                # The already-ESCALATED arm re-stamps nothing, so latch here.
+                task.migration_ledger_rival = True
+                reason = (
+                    "the ledger changed underneath the escalated migration's snapshot "
+                    "restore — resume to migrate the ledger now on disk (restore the "
+                    "pre-migration ledger first to migrate that instead)"
+                )
+            self._escalate(task, reason, own_remedy=True)
+        if wrote:
+            # `outcome` is a closed slug (DW-201 convention).
+            self.journal.append(
+                "sweep-migration-snapshot-restore",
+                story_key=MIGRATE_KEY,
+                outcome="restored",
+                ledger=str(ledger),
+            )
 
     def _finish_migration_commit(
         self,
@@ -4223,11 +4371,35 @@ class SweepEngine(Engine):
                 task.baseline_commit = None
                 task.baseline_untracked = None
                 self._save()
+            elif task.migration_rewrite_rejected:
+                # DW-436: validation REJECTED this attempt's rewrite, so no
+                # rewrite record was ever owed; the retry leg was interrupted
+                # (crash, #340 snapshot pause, `safe_reset` preflight pause)
+                # before its restore finished. Restore the durable snapshot and
+                # redispatch exactly as the marked TRIAGE_RUNNING arm below does
+                # (DW-430: clear the baseline so the redispatch re-stamps HEAD).
+                text = self._restore_running_migration_baseline(task)
+                # The latch precedes the leg's attempt cap, so honour the cap
+                # here, restore-then-cap like the uninterrupted leg.
+                if task.attempt >= self.policy.sweep.max_migration_attempts:
+                    self._escalate(
+                        task,
+                        "migration failed deterministic validation: the validation-retry "
+                        f"leg was interrupted after rejecting attempt {task.attempt} of "
+                        f"{self.policy.sweep.max_migration_attempts}",
+                    )
+                task.phase = Phase.PENDING  # deliberate reset, not a normal transition
+                task.baseline_commit = None
+                task.baseline_untracked = None
+                task.migration_rewrite_rejected = False
+                self._save()
             else:
                 # Once a current-format task reaches TRIAGE_VERIFY the accepted
                 # rewrite is required evidence. Treat a publication failure or
                 # crash before that record as corruption; only an unmarked
-                # pre-upgrade task may use reset-and-reread recovery.
+                # pre-upgrade task may use reset-and-reread recovery. The
+                # DW-436 latch above is the one exception: it is written only
+                # after a rejection, which owes no record.
                 self._migration_evidence_failure(task, "missing accepted rewrite record")
         elif task.phase == Phase.TRIAGE_RUNNING and task.migration_recovery_format != 0:
             text = self._restore_running_migration_baseline(task)
@@ -4253,6 +4425,16 @@ class SweepEngine(Engine):
                 # DW-427/428: refused BEFORE the ESCALATED mutations below, so
                 # a re-pause persists none of them.
                 self._refuse_advanced_migration_head(task)
+            # DW-439: read-only too, so it also sits above the mutations, and
+            # its anchor probe must see the escalated attempt's baseline, which
+            # the stale-baseline clear below would erase.
+            snapshot_plan: tuple[str, str | None, bool] | None = None
+            if (
+                task.phase == Phase.ESCALATED
+                and task.migration_recovery_format == _MIGRATION_RECOVERY_FORMAT
+                and not keep_ledger
+            ):
+                snapshot_plan = self._escalated_snapshot_plan(task)
             # A clean tree over a moved HEAD is the refusal's remedy applied:
             # re-stamp the baseline there, never keep the stale one (DW-430).
             stale_baseline = (
@@ -4267,10 +4449,20 @@ class SweepEngine(Engine):
                 self._migration_reset(task, keep_ledger=keep_ledger)
                 # REPAIR/WRITE (DW-146): the restored text this migration grades.
                 text = deferredwork.read_for_write(ledger) or ""
-            elif stale_baseline:
+            if snapshot_plan is not None:
+                snapshot, observed, restore = snapshot_plan
+                if restore:
+                    # After the reset: only text the reset cannot republish
+                    # reaches here, so the reset window is part of the CAS. And
+                    # BEFORE the stale-baseline clear: a re-pause must keep the
+                    # baseline the next plan's anchor probe needs.
+                    self._restore_escalated_snapshot(task, snapshot, observed)
+                text = snapshot
+            if stale_baseline:  # implies a clean tree
                 task.baseline_commit = None
                 task.baseline_untracked = None
             task.migration_ledger_rival = False  # leaving ESCALATED consumes the latch
+            task.migration_rewrite_rejected = False  # and this attempt's rejection
             task.phase = Phase.PENDING  # deliberate reset, not a normal transition
         # DW-437/DW-440: two pre-dispatch guards, AFTER the whole entry chain so
         # they cover every path that reaches dispatch (fresh, PENDING-with-marker,
@@ -4405,6 +4597,7 @@ class SweepEngine(Engine):
         while True:
             task.attempt += 1
             advance(task, Phase.TRIAGE_RUNNING)
+            task.migration_rewrite_rejected = False  # DW-436: a new attempt, no rejection
             self._save()
             launch_floor_ns = time.time_ns()
             result = self._run_session(
@@ -4524,6 +4717,12 @@ class SweepEngine(Engine):
                     durable_rewrite,
                 )
                 return
+            # DW-436: latch the rejection durably BEFORE any refusal, pause or
+            # reset below can interrupt this leg. A resume in TRIAGE_VERIFY with
+            # no rewrite record then restores the snapshot and redispatches
+            # instead of reading the missing record as corruption.
+            task.migration_rewrite_rejected = True
+            self._save()
             # never re-prompt over a half-broken rewrite; the baseline reset
             # covers tracked files, the explicit write covers an untracked
             # ledger that `git reset` cannot restore. Never over a HEAD that

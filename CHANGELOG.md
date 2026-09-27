@@ -162,6 +162,16 @@ breaking changes may land in a minor release.
 - Complete a sweep migration with no legacy entries to convert (for example, a re-armed
   task over a non-legacy ledger) as DONE with no session, remove its recovery records,
   and go on to triage. Journals `migrate-empty-manifest` (DW-440).
+- Resume a sweep migration interrupted in its validation-retry leg (a crash, or a
+  `safe_reset`/snapshot pause) by restoring the pre-migration snapshot and
+  redispatching, instead of escalating on `missing accepted rewrite record`. A
+  persisted `migration_rewrite_rejected` latch tells it apart from a corrupt record
+  set; on the final allowed attempt it restores, then escalates (DW-436).
+- Restart an escalated sweep migration from `migrate-baseline.md`, not from a rejected
+  rewrite left in an ignored, untracked or external ledger that `git reset` cannot
+  restore; the restore is compare-and-set and re-pauses on a rival. A plain resume
+  now replaces a hand edit of such a ledger; resolve the escalation to keep it.
+  Journals `sweep-migration-snapshot-restore` (DW-439).
 - Warn in `validate` (`policy.extra-args-unservable`) when a role's resolved
   `extra_args` under an `opencode-http` profile repeat an adapter-owned serve flag
   (`--port`/`--hostname`/`--print-logs`, or a `--flag=` spelling): they land after the

@@ -430,6 +430,9 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     # here it is the run mode and the literal manifest name `stories.yaml`.
     "run-start": frozenset({"source"}),
     "deferred-close-declaration-unreadable": frozenset({"source"}),
+    # DW-439: a closed slug (`restored` | `no-dir-fd` | `no-snapshot`), never
+    # authored text; declared on this kind alone because `outcome` is generic.
+    "sweep-migration-snapshot-restore": frozenset({"outcome"}),
 }
 
 # Every OTHER field name journalled today: a declared inventory, not a per-name
@@ -1670,6 +1673,10 @@ JOURNAL_KINDS = frozenset(
         # diagnostics._JOURNAL_DROP_FIELDS.
         "sweep-migration-recovery-invalid",
         "sweep-migration-restore-diverged",
+        # DW-439: the format-1 ESCALATED restart's snapshot restore. `outcome` is a
+        # closed slug (`restored` | `no-dir-fd` | `no-snapshot`, DW-201 convention);
+        # `ledger` is the same path the diverged sibling above carries.
+        "sweep-migration-snapshot-restore",
         "sweep-nothing-open",
         # DW-176/DW-182/DW-197. `_prune_pre_answers` refusing to prune because the
         # deferred-work ledger could not be read for a write — ABSENT (DW-176),
