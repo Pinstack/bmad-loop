@@ -154,6 +154,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Prove ledger ownership on every harvested-deferral carry replay, keyed on the latch
+  being set before the pass: a replay after a crash between the latch save and the
+  append now pauses (`harvest-carry-foreign-dirt`) over an operator ledger edit instead
+  of committing it; a fresh first pass is unchanged (DW-413).
 - Create the missing GitHub release on a verified existing tag in
   `scripts/release.py publish` instead of reporting "nothing to publish"; a
   `gh release view` error other than "release not found" fails the publish (DW-411).

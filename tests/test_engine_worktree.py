@@ -3856,6 +3856,146 @@ def test_merged_unit_carry_replay_pauses_over_an_operator_ledger_edit(project, m
     assert worktree_clean(project.project)
 
 
+def _merged_unit_crashed_before_append(project, monkeypatch):
+    """A merged unit whose terminal carry saved the latch and then lost the host
+    BEFORE `append_entries` wrote anything: a tracked ledger still at HEAD, no row
+    on disk, the latch set (DW-413)."""
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    engine.state.target_branch = "main"
+    worktree = engine.run_dir / "worktrees" / "1-1-a"
+    worktree.mkdir(parents=True)
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        phase=Phase.DONE,
+        worktree_path=str(worktree),
+        branch="bmad-loop/test-run/1-1-a",
+        harvested_deferrals=[_harvest_record()],
+    )
+    engine.state.tasks[task.story_key] = task
+    engine.journal.append(
+        "unit-merged", story_key=task.story_key, branch=task.branch, target="main"
+    )
+    real_append = deferredwork.append_entries
+
+    def host_dies_before_append(*args, **kwargs):
+        raise SystemExit("host died before ledger append")
+
+    monkeypatch.setattr(deferredwork, "append_entries", host_dies_before_append)
+    with pytest.raises(SystemExit, match="host died"):
+        engine._carry_harvested_deferrals(task)
+    monkeypatch.setattr(deferredwork, "append_entries", real_append)
+
+    assert load_state(engine.run_dir).tasks[task.story_key].harvest_carry_commit_pending
+    assert _main_harvest_entries(project) == []
+    assert worktree_clean(project.project)
+    return engine, task
+
+
+def test_harvest_carry_replay_after_a_pre_append_crash_pauses_over_an_operator_edit(
+    project, monkeypatch
+):
+    """DW-413: a replay after a crash between the latch save and the append appends
+    the rows again, so `carried` is non-empty — and it is still proved, because the
+    latch was set before this pass. The operator's edit made while the run was down
+    is neither committed nor modified; the run pauses with the latch kept. Once the
+    operator commits their own edit, the next replay commits only the harvested row."""
+    from bmad_loop.engine import RunPaused
+
+    engine, task = _merged_unit_crashed_before_append(project, monkeypatch)
+    operator_text = f"# Deferred Work\n\n{_OPERATOR_LEDGER_LINE}\n"
+    project.deferred_work.write_text(operator_text, encoding="utf-8")
+    head = rev_parse_head(project.project)
+
+    paused, _ = resume_engine(project, engine)
+    with pytest.raises(RunPaused, match="Commit the whole ledger"):
+        paused._replay_unlatched_ledger_carries()
+
+    (dirt,) = _rows(paused, "harvest-carry-foreign-dirt")
+    assert "error" not in dirt  # real dirt, not a probe fault
+    assert _rows(paused, "harvest-carried") == []
+    assert rev_parse_head(project.project) == head
+    on_disk = project.deferred_work.read_text(encoding="utf-8")
+    assert _OPERATOR_LEDGER_LINE in on_disk  # the operator's line is untouched
+    assert _HARVEST_CARRY["summary"] in on_disk  # this pass's re-append, uncommitted
+    state = load_state(paused.run_dir).tasks[task.story_key]
+    assert state.harvest_carry_commit_pending is True
+    assert state.isolated_ledger_carried is False
+
+    # The operator commits only their own edit; the carried row stays on disk.
+    carried_bytes = project.deferred_work.read_bytes()
+    project.deferred_work.write_text(operator_text, encoding="utf-8")
+    git(project.project, "add", "--", str(project.deferred_work))
+    git(project.project, "commit", "-q", "-m", "operator commits their note")
+    project.deferred_work.write_bytes(carried_bytes)
+
+    resumed, _ = resume_engine(project, paused)
+    resumed._replay_unlatched_ledger_carries()
+
+    restored = load_state(resumed.run_dir).tasks[task.story_key]
+    assert restored.isolated_ledger_carried is True
+    assert restored.harvest_carry_commit_pending is False
+    added = _carry_commit_adds(project)
+    assert f"### DW-1: {_HARVEST_CARRY['summary']}" in added
+    assert not any(_OPERATOR_LEDGER_LINE in line for line in added)
+    assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
+    assert worktree_clean(project.project)
+
+
+def test_harvest_carry_replay_after_a_pre_append_crash_commits_its_own_rows(project, monkeypatch):
+    """DW-413: with no operator edit, the re-appending replay's own append over HEAD
+    is exactly what the proof recomputes, so it commits the row it carried and clears
+    the latch without a pause."""
+    engine, task = _merged_unit_crashed_before_append(project, monkeypatch)
+    head = rev_parse_head(project.project)
+
+    resumed, _ = resume_engine(project, engine)
+    resumed._replay_unlatched_ledger_carries()
+
+    assert _rows(resumed, "harvest-carry-foreign-dirt") == []
+    assert [event["dw_ids"] for event in _rows(resumed, "harvest-carried")] == [["DW-1"]]
+    restored = load_state(resumed.run_dir).tasks[task.story_key]
+    assert restored.isolated_ledger_carried is True
+    assert restored.harvest_carry_commit_pending is False
+    assert rev_parse_head(project.project) != head
+    assert f"### DW-1: {_HARVEST_CARRY['summary']}" in _carry_commit_adds(project)
+    assert worktree_clean(project.project)
+
+
+def test_fresh_harvest_carry_first_pass_commits_unproved(project):
+    """The decided DW-413 boundary: only a pass whose latch was set BEFORE it began
+    is proved. A fresh first pass that appends rows still commits the whole
+    working-tree ledger — an uncommitted edit already in it included — with no
+    pause, exactly as before DW-355."""
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    project.deferred_work.write_text(
+        f"# Deferred Work\n\n{_OPERATOR_LEDGER_LINE}\n", encoding="utf-8"
+    )
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        harvested_deferrals=[_harvest_record()],
+    )
+    engine.state.tasks[task.story_key] = task
+    engine._save()
+
+    engine._carry_harvested_deferrals(task)
+
+    assert _rows(engine, "harvest-carry-foreign-dirt") == []
+    assert [event["dw_ids"] for event in _rows(engine, "harvest-carried")] == [["DW-1"]]
+    added = _carry_commit_adds(project)
+    assert f"### DW-1: {_HARVEST_CARRY['summary']}" in added
+    assert _OPERATOR_LEDGER_LINE in added
+    assert worktree_clean(project.project)
+    assert load_state(engine.run_dir).tasks[task.story_key].harvest_carry_commit_pending is False
+
+
 def test_harvest_carry_replay_pauses_over_a_staged_operator_ledger_edit(project):
     """DW-355: the index is proved too. A staged operator edit distinct from HEAD and
     from the intended ledger, with the working tree restored to exactly the carry's

@@ -8632,20 +8632,22 @@ class Engine:
         """Whether ``ledger`` holds HEAD's blob plus this task's harvested rows and no
         more (DW-355).
 
-        The discrimination a LATCH-ONLY replay needs. An earlier pass appended the
-        rows and its commit failed, so this pass dedupes to ``carried == []`` and its
-        commit would stage whatever the working-tree ledger holds now (the same shape
-        arises on a FIRST pass whose novel rows the writer's cross-spec dedupe then
-        dropped against a twin already on disk, and is proved the same way) — an operator's
-        edit made while the run was down included, under a
-        ``carry harvested findings`` subject. Refusing on DIRT alone would break the
-        recovery the latch exists for: the crashed pass's own rows ARE uncommitted
-        dirt on exactly this path, and committing them is the point. So the question
-        is whether what is on disk is what this carry intends, recomputed from HEAD's
-        blob through the carry's own spec builder (``_harvested_carry_specs``) and the
-        writer's own fold (``deferredwork.appended_text``). A crashed pass's append
-        matches, the fold being deterministic; an operator's edit does not. The sibling
-        of :meth:`_board_carry_holds_only_this_advance`, and for its reasons.
+        The discrimination a REPLAY needs. An earlier pass appended the rows and its
+        commit failed, so this pass dedupes to ``carried == []`` — or the host died
+        between the latch save and the append, so this pass appends them again
+        (DW-413) — and its commit would stage whatever the working-tree ledger holds
+        now (the same shape arises on a FIRST pass whose novel rows the writer's
+        cross-spec dedupe then dropped against a twin already on disk, and is proved
+        the same way) — an operator's edit made while the run was down included,
+        under a ``carry harvested findings`` subject. Refusing on DIRT alone would
+        break the recovery the latch exists for: the crashed pass's own rows ARE
+        uncommitted dirt on exactly this path, and committing them is the point. So
+        the question is whether what is on disk is what this carry intends,
+        recomputed from HEAD's blob through the carry's own spec builder
+        (``_harvested_carry_specs``) and the writer's own fold (``deferredwork.appended_text``). A crashed pass's append,
+        or this replay's own re-append over an unedited HEAD, matches, the fold being
+        deterministic; an operator's edit does not. The sibling of
+        :meth:`_board_carry_holds_only_this_advance`, and for its reasons.
 
         HEAD's blob, not a snapshot taken earlier in the run: the baseline has to
         predate every writer, and only git holds one that does. When the fold adds
@@ -8702,8 +8704,8 @@ class Engine:
     def _pause_for_harvest_carry_foreign_dirt(
         self, task: StoryTask, ledger: Path, *, error: str | None = None
     ) -> NoReturn:
-        """Pause the run over a latch-only harvested carry the ledger's content does
-        not prove is its own (DW-355).
+        """Pause the run over a replayed or latch-only harvested carry the ledger's
+        content does not prove is its own (DW-355, DW-413).
 
         Mirrors :meth:`_pause_for_ledger_repair`'s shape — journal, ``ACTION REQUIRED``
         notice, ``_save()``, ``RunPaused`` at ``PAUSE_ESCALATION`` — and leaves the
@@ -8796,12 +8798,14 @@ class Engine:
         calls leave it false so subclasses cannot mistake a pre-terminal carry
         for the merged-unit recovery path.
 
-        A LATCH-ONLY commit — the latch set and nothing carried by this pass,
-        usually because an earlier pass appended the rows and its commit failed, or
-        because the writer's cross-spec dedupe dropped every novel row — first
-        proves the ledger holds only HEAD plus this task's rows
-        (:meth:`_harvest_carry_holds_only_this_carry`) and otherwise pauses for
-        the operator without committing or clearing the latch (DW-355).
+        A REPLAY — the latch already set when this pass began, whether an earlier
+        pass appended the rows and its commit failed or the host died between the
+        latch save and the append (DW-413) — and a LATCH-ONLY commit (the latch set
+        and nothing carried, which also covers a first pass whose novel rows the
+        writer's cross-spec dedupe all dropped) first prove the ledger holds only
+        HEAD plus this task's rows (:meth:`_harvest_carry_holds_only_this_carry`)
+        and otherwise pause for the operator without committing or clearing the
+        latch (DW-355). A fresh first pass that appends rows is not proved.
         """
         if not task.harvested_deferrals:
             return
@@ -8824,7 +8828,10 @@ class Engine:
                 terminal_composite=terminal_composite,
             )
         specs = _harvested_carry_specs(task, text)
-        if specs and not task.harvest_carry_commit_pending:
+        # Read BEFORE the latch below can set it (DW-413): a latch this pass did not
+        # set marks a replay, whose commit is proved even when it appends rows.
+        latched_before = task.harvest_carry_commit_pending
+        if specs and not latched_before:
             # Persist the commit obligation before the filesystem write. A host
             # loss after the append writes the rows but before it returns must
             # still make replay commit the now-deduplicated tracked/untracked row.
@@ -8895,16 +8902,22 @@ class Engine:
                     **extra,
                 )
             else:
-                if not carried and task.harvest_carry_commit_pending:
-                    # DW-355: a LATCH-ONLY commit — an earlier pass appended these
-                    # rows and its commit failed, so this replay deduped to
-                    # `carried == []` (or the writer's cross-spec dedupe dropped
-                    # every novel row of this pass) — stages whatever the
-                    # working-tree ledger holds now. Proved before `may_degrade`, which spawns git of
-                    # its own, and after the refusal above, which spawns none. A
-                    # pass that appends rows is NOT asked and still commits the
-                    # whole working-tree ledger, as before; only this retry is.
-                    # A probe fault fails closed, but pauses with its error named.
+                if latched_before or not carried:
+                    # Stages whatever the working-tree ledger holds now, so it is
+                    # proved on two shapes. A REPLAY (DW-413): the latch was set
+                    # before this pass — an earlier pass appended the rows and its
+                    # commit failed (this pass then dedupes to `carried == []`), or
+                    # the host died between the latch save and the append (this pass
+                    # appends them again). Either way an operator may have edited
+                    # the ledger while the run was down. A LATCH-ONLY commit
+                    # (DW-355): nothing carried, which inside `commit_needed` means
+                    # the latch is set — also a first pass whose novel rows the
+                    # writer's cross-spec dedupe all dropped. A FRESH first pass that
+                    # appends rows is NOT asked and still commits the whole
+                    # working-tree ledger, as before (the decided DW-413 boundary).
+                    # Proved before `may_degrade`, which spawns git of its own, and
+                    # after the refusal above, which spawns none. A probe fault
+                    # fails closed, but pauses with its error named.
                     try:
                         owned = self._harvest_carry_holds_only_this_carry(task, ledger)
                     except (verify.GitError, OSError, RuntimeError, ValueError) as e:
