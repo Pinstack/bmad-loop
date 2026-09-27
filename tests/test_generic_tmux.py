@@ -611,8 +611,57 @@ def test_kill_escalates_to_pane_pid_force_kill(tmp_path, monkeypatch):
     events = _lifecycle_lines(adapter)
     assert [e["event"] for e in events] == ["kill-escalated", "kill-outcome"]
     assert events[0]["pids"] == [4242]
+    assert events[0]["liveness_unknown"] is False  # every poll answered "alive" (DW-454)
     assert events[1]["alive"] is True  # honest outcome: the window survived even the escalation
     assert events[1]["escalated"] is True
+
+
+@pytest.mark.parametrize(
+    ("faulty_polls", "expected"),
+    [({"last"}, True), ({"first"}, False)],
+    ids=["last-poll-raised", "earlier-poll-raised"],
+)
+def test_kill_escalated_flags_liveness_unknown_from_last_poll(
+    tmp_path, monkeypatch, faulty_polls, expected
+):
+    """DW-454: `kill-escalated` says whether the poll that sent the kill to
+    escalation could answer. Only the LAST poll counts — its "not dead" reading
+    is what escalated; an earlier fault followed by a clean "alive" is known.
+    The escalation itself proceeds either way (unknown is not dead).
+
+    Ablation: pin `liveness_unknown=False` (or drop the reset on a clean poll)
+    and one of the two cases fails."""
+    monkeypatch.setattr(generic, "KILL_POLL_S", 0)
+    host = _RecordingHost()
+    monkeypatch.setattr(generic, "get_process_host", lambda: host)
+    mux = _TeardownMux(survives_kills=99, pids=[4242])
+    adapter = make_adapter(tmp_path, mux=mux, teardown_grace_s=0.05)
+    clock = {"t": 1000.0}
+
+    class _Clock:
+        monotonic = staticmethod(lambda: clock["t"])
+        time = staticmethod(lambda: 0.0)
+        sleep = staticmethod(lambda *_: None)
+        time_ns = staticmethod(lambda: 0)
+
+    monkeypatch.setattr(generic, "time", _Clock)
+    polls = {"n": 0}
+
+    def poll(handle):
+        # two polls inside the grace, then the post-escalation outcome probe
+        polls["n"] += 1
+        which = {1: "first", 2: "last"}.get(polls["n"])
+        if polls["n"] == 2:
+            clock["t"] += 1.0  # the second poll lands past the grace deadline
+        if which in faulty_polls:
+            raise MultiplexerError("tmux hang")
+        return True
+
+    adapter._window_alive = poll
+    adapter.kill(_kill_handle())
+    assert host.force_killed == [4242]  # escalation proceeded
+    (escalated,) = [e for e in _lifecycle_lines(adapter) if e["event"] == "kill-escalated"]
+    assert escalated["liveness_unknown"] is expected
 
 
 def test_kill_degrades_when_backend_offers_no_pids(tmp_path, monkeypatch):
@@ -1459,6 +1508,8 @@ def test_dev_stall_nudge_send_failure_reaches_liveness_verdict(tmp_path, monkeyp
     assert mux.sent == [("@1", generic.STALL_NUDGE_TEXT)]
     assert adapter.watcher.calls == 2
     assert result_reads == [False]  # dead-window _final performed ordinary artifact read-back
+    (failed,) = _lifecycle_events(adapter, "nudge-send-failed")  # DW-449
+    assert (failed["nudge"], failed["error"]) == ("stall", "MultiplexerError: window gone")
 
 
 def test_resultless_stop_nudge_send_failure_reaches_liveness_verdict(tmp_path, monkeypatch):
@@ -1499,6 +1550,62 @@ def test_resultless_stop_nudge_send_failure_reaches_liveness_verdict(tmp_path, m
     assert mux.sent == [("@1", generic.NUDGE_TEXT)]
     assert adapter.watcher.calls == 2
     assert result_reads == [True, False]  # Stop await, then dead-window artifact read-back
+    (failed,) = _lifecycle_events(adapter, "nudge-send-failed")  # DW-449
+    assert (failed["nudge"], failed["error"]) == ("stop", "MultiplexerError: window gone")
+
+
+def test_failed_stall_nudge_is_not_counted_as_sent(tmp_path, monkeypatch):
+    """DW-449: a stall nudge whose send raised is never reported as sent — a
+    `nudge-send-failed` crumb names it and heartbeat.json shows
+    `stall_nudges_sent=0`, `stall_nudges_failed=1`. The verdict inputs are
+    unchanged: the grace re-arms, the attempt spends `stall_nudges_left`, and
+    the #727 pre-nudge activity window closes on the ATTEMPT. `send_text` pastes
+    and presses Enter in separate calls, so a raise can follow a delivered
+    paste: the pane growing with that echo must not be credited as work.
+
+    Ablation: count the failure in `stall_nudges_sent` and the heartbeat
+    assertion fails; drop `stall_nudges_failed` from the pane-frame gate and
+    `produced_work` reads True; drop the crumb and its assertion fails."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    mux = _UnitMux()
+
+    def fail_send(window_id, text):
+        # the paste landed, then the Enter call raised
+        mux.sent.append((window_id, text))
+        raise MultiplexerError("window gone")
+
+    mux.send_text = fail_send
+    adapter, _ = make_dev_adapter(tmp_path, mux=mux)
+    adapter._stall_grace_s = 40.0
+    adapter._stall_nudges = 1
+    alive = {"v": True}
+    adapter._window_alive = lambda handle: alive["v"]
+    log = _pane_log(adapter, "3-1-dev-1", 0)
+    clock = _steerable_clock(monkeypatch)
+    heartbeats: list[dict] = []
+    adapter._write_heartbeat = lambda task_id, payload: heartbeats.append(payload)
+
+    def script(call_n):
+        if call_n == 1:
+            clock["t"] += 41.0  # grace elapses in silence -> the (failing) nudge
+        elif call_n == 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S + 1.0  # next heartbeat is due
+            _grow(log, b"\n> \nNo, exit\nGoodbye.\n")  # the pasted nudge's echo
+        else:
+            alive["v"] = False  # window dead next tick
+
+    adapter.watcher = _ScriptedWatcher([], on_call=script)
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=1000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+
+    assert result.status == "crashed"
+    assert [text for _, text in mux.sent] == [generic.STALL_NUDGE_TEXT]  # attempted once
+    counts = [(hb["stall_nudges_sent"], hb["stall_nudges_failed"]) for hb in heartbeats]
+    assert counts[0] == (0, 0)  # before the attempt
+    assert len(counts) >= 2 and set(counts[1:]) == {(0, 1)}  # every heartbeat after it
+    (failed,) = _lifecycle_events(adapter, "nudge-send-failed")
+    assert (failed["nudge"], failed["error"]) == ("stall", "MultiplexerError: window gone")
+    assert result.produced_work is False  # growth after a failed attempt is not work
 
 
 def test_dev_result_less_stop_awaits_reinvocation_then_completes(tmp_path, monkeypatch):
@@ -1740,6 +1847,10 @@ def test_dev_grace_expiry_stall_recheck_transport_error_still_stalls(tmp_path, m
     assert result.status == "stalled"
     assert result.result_json is None
     assert alive_calls["n"] == 2  # probe raised on the re-check, fell through to stall
+    # DW-454: the verdict reached with liveness unknown leaves a crumb
+    (failed,) = _lifecycle_events(adapter, "liveness-probe-failed")
+    assert failed["site"] == "stall"
+    assert failed["error"] == "MultiplexerError: tmux hang"
 
 
 def test_dev_log_activity_keeps_grace_window_alive(tmp_path, monkeypatch):
@@ -1929,6 +2040,36 @@ def test_workflow_cap_bounds_refilled_stall_nudges(tmp_path, monkeypatch):
     assert sent == [generic.STALL_NUDGE_TEXT] * 2
 
 
+def test_workflow_cap_counts_failed_stall_nudge_attempts(tmp_path, monkeypatch):
+    """DW-449 keeps the cap bound: a failed send is no longer counted as SENT, but
+    the cap counts ATTEMPTS, so a transport that always fails still hits it after
+    exactly cap attempts — never an unbounded refill loop.
+
+    Ablation: check the cap against `stall_nudges_sent` alone and this rides the
+    refills (more than 2 attempts)."""
+    adapter, _, clock, sent = _stall_loop_adapter(tmp_path, monkeypatch)
+
+    def fail_send(handle, text):
+        sent.append(text)
+        raise MultiplexerError("window gone")
+
+    adapter.send_text = fail_send
+
+    def advance(call_n):
+        if call_n >= 2:
+            clock["t"] += 11.0
+
+    stop = _stop_event("3-1-dev-1", "sess", "/run/events.jsonl")
+    adapter.watcher = _ScriptedWatcher(
+        [stop, None, stop, None, stop, None],
+        on_call=advance,
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _capped_spec(tmp_path, cap=2))
+    assert result.status == "stalled"
+    assert sent == [generic.STALL_NUDGE_TEXT] * 2
+    assert len(_lifecycle_events(adapter, "nudge-send-failed")) == 2
+
+
 def test_uncapped_spec_keeps_refilling_nudges_past_cap(tmp_path, monkeypatch):
     """cap=None (the raw SessionSpec default — the engine now caps every
     session it drives, dev/review included) preserves the uncapped adapter
@@ -2043,6 +2184,7 @@ def test_timeout_monotonic_expiry_is_instrumented(tmp_path, monkeypatch):
     assert fired[0]["expired_clock"] == "monotonic"
     assert fired[0]["timeout_s"] == 30.0
     assert fired[0]["mono_remaining_s"] <= 0
+    assert fired[0]["probe_failures"] == 0  # every probe answered (DW-447)
 
 
 def test_timeout_fires_on_wall_clock_when_monotonic_frozen(tmp_path, monkeypatch):
@@ -2114,6 +2256,12 @@ def test_heartbeat_written_and_throttled(tmp_path, monkeypatch):
         "stall_armed": True,
         "stall_nudges_sent": 0,
         "transcript_idle_s": None,  # no hook event has named a transcript (#680)
+        # DW-447/DW-449: the running liveness-probe failure streak and the
+        # failed stall-nudge attempts. A deliberate divergence from
+        # test_opencode_http.py's twin: DW-447 scoped the opencode-http loop
+        # out, so its heartbeat carries neither key.
+        "stall_nudges_failed": 0,
+        "probe_failures": 0,
     }
     assert [w["remaining_s"] for w in writes] == [100.0, 59.0]  # tick 2 was throttled
     hb = json.loads((adapter.tasks_dir / "3-1-dev-1" / "heartbeat.json").read_text())
@@ -2503,6 +2651,8 @@ def test_budget_enforce_nudges_then_terminates_over_budget(tmp_path, monkeypatch
     assert fired[0]["weighted"] == 5000
     assert fired[0]["budget"] == 1000
     assert fired[0]["zero_grace"] is False
+    assert fired[0]["liveness_unknown"] is False  # the expiry probe answered (DW-454)
+    assert _lifecycle_events(adapter, "liveness-probe-failed", "b-1") == []
 
 
 def test_budget_enforce_completion_within_grace_completes(tmp_path, monkeypatch):
@@ -2543,6 +2693,42 @@ def test_budget_enforce_zero_grace_is_immediate_no_nudge(tmp_path, monkeypatch):
     fired = [ln for ln in _lifecycle_lines(adapter, "b-1") if ln["event"] == "over-budget-fired"]
     assert len(fired) == 1
     assert fired[0]["zero_grace"] is True
+    assert fired[0]["liveness_unknown"] is False  # the trip probe answered (DW-454)
+
+
+@pytest.mark.parametrize("grace_s", [0.0, 50.0], ids=["zero-grace", "grace-expiry"])
+def test_budget_enforce_probe_fault_flags_liveness_unknown(tmp_path, monkeypatch, grace_s):
+    """DW-454: when the over-budget liveness probe raises, the verdict is still
+    `over_budget` (a transport fault is not proof of death), but the crumbs
+    record that it was reached with liveness unknown: a `liveness-probe-failed`
+    (`site="over-budget"`) and `over-budget-fired` with `liveness_unknown=True`.
+
+    Ablation: drop the `_probe_liveness` crumb, or pin `liveness_unknown=False`,
+    and this fails."""
+    adapter, clock, sent = _budget_adapter(tmp_path, monkeypatch)
+    transcript = tmp_path / "t.jsonl"
+    _write_claude_transcript(transcript, input_tokens=5000)
+
+    def hung(handle):
+        raise MultiplexerError("tmux hang")
+
+    adapter._window_alive = hung
+    # A SessionStart every tick is ignored by the loop and skips the no-event tick
+    # probe, so the only liveness probe that runs is the over-budget one.
+    adapter.watcher = _ScriptedWatcher([_start_event(transcript)] * 10, on_call=_advance_31(clock))
+    result = adapter.wait_for_completion(
+        _budget_handle(), _budget_spec(tmp_path, mode="enforce", grace_s=grace_s)
+    )
+
+    assert result.status == "over_budget"
+    assert result.budget_weighted == 5000
+    (failed,) = _lifecycle_events(adapter, "liveness-probe-failed", "b-1")
+    assert failed["site"] == "over-budget"
+    assert failed["error"] == "MultiplexerError: tmux hang"
+    (fired,) = _lifecycle_events(adapter, "over-budget-fired", "b-1")
+    assert fired["zero_grace"] is (grace_s == 0.0)
+    assert fired["liveness_unknown"] is True
+    assert sent == ([] if grace_s == 0.0 else [generic.BUDGET_NUDGE_TEXT])
 
 
 def test_budget_grace_expiry_reprobes_liveness_dead_window_is_crashed(tmp_path, monkeypatch):
@@ -2686,6 +2872,10 @@ def test_budget_nudge_send_failure_still_arms_grace(tmp_path, monkeypatch):
 
     assert result.status == "over_budget"
     assert result.budget_weighted == 5000
+    # DW-449: the undelivered wrap-up nudge leaves a crumb naming it
+    (failed,) = _lifecycle_events(adapter, "nudge-send-failed", "b-1")
+    assert failed["nudge"] == "budget"
+    assert failed["error"] == "MultiplexerError: window gone"
 
 
 def test_budget_notify_failure_does_not_break_trip(tmp_path, monkeypatch):
@@ -2872,6 +3062,33 @@ def test_post_kill_reconcile_probe_error_keeps_stall(tmp_path):
     (impl / "spec-3-1-foo.md").write_text(_DONE_SPEC)
     original = _unvouched()
     assert adapter._post_kill_reconcile(_dev_handle(), _dev_spec(tmp_path), original) is original
+    # DW-453: the probe fault is crumbed with its error, then the abandoned
+    # rescue names why it gave up.
+    (probe,) = _lifecycle_events(adapter, "liveness-probe-failed")
+    assert (probe["site"], probe["error"]) == ("post-kill", "MultiplexerError: tmux hang")
+    (crumb,) = _lifecycle_events(adapter, "post-kill-rescue-abandoned")
+    assert crumb["reason"] == "liveness-unknown"
+    assert crumb["status"] == "stalled"
+    assert "error" not in crumb  # the fault lives on the probe crumb
+    assert [e["event"] for e in _lifecycle_lines(adapter)] == [
+        "liveness-probe-failed",
+        "post-kill-rescue-abandoned",
+    ]
+
+
+def test_post_kill_reconcile_alive_or_dead_window_writes_no_abandon_crumb(tmp_path):
+    """The crumb marks only the two abandon arms: a window still alive after the
+    kill (the live-window invariant) and a dead window that rescues both stay
+    silent, so the crumb cannot be mistaken for "the reconcile ran"."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    (impl / "spec-3-1-foo.md").write_text(_DONE_SPEC)
+    adapter._window_alive = lambda handle: True
+    original = _unvouched()
+    assert adapter._post_kill_reconcile(_dev_handle(), _dev_spec(tmp_path), original) is original
+    adapter._window_alive = lambda handle: False
+    rescued = adapter._post_kill_reconcile(_dev_handle(), _dev_spec(tmp_path), _unvouched())
+    assert rescued.status == "completed"
+    assert _lifecycle_events(adapter, "post-kill-rescue-abandoned") == []
 
 
 def test_post_kill_reconcile_inconsistent_status_keeps_stall(tmp_path):
@@ -2971,6 +3188,11 @@ def test_post_kill_reconcile_synth_read_error_keeps_stall(tmp_path, monkeypatch)
         assert (
             adapter._post_kill_reconcile(_dev_handle(), _dev_spec(tmp_path), original) is original
         )
+    # DW-453: each abandon is crumbed with the fault that caused it
+    crumbs = _lifecycle_events(adapter, "post-kill-rescue-abandoned")
+    assert [(c["reason"], c["status"]) for c in crumbs] == [("unreadable-artifact", "stalled")] * 2
+    assert crumbs[0]["error"] == "OSError: I/O error"
+    assert crumbs[1]["error"].startswith("UnicodeDecodeError: ")
 
 
 def test_post_kill_reconcile_non_utf8_scan_artifact_keeps_stall(tmp_path):
@@ -3848,6 +4070,77 @@ def test_wait_for_completion_persistent_probe_failure_times_out_not_crashes(tmp_
     )
     result = adapter.wait_for_completion(_dev_handle(), spec)
     assert result.status == "timeout"  # bounded by spec.timeout_s, not crashed
+
+
+def test_tick_probe_failure_streak_crumbs_transitions_only(tmp_path, monkeypatch):
+    """DW-447: a streak of raising tick probes is crumbed at its transitions only —
+    one `liveness-probe-failed` (`site="tick"`, `error`) at failure 1 and one
+    `liveness-probe-recovered` (`failures=N`) at the first clean probe — never
+    once per failed tick. heartbeat.json carries the running streak meanwhile.
+
+    Ablation: crumb every failed tick and the single-crumb assertion fails; drop
+    the heartbeat key or the recovery crumb and theirs do."""
+    adapter, clock = _timeout_clock_adapter(tmp_path, monkeypatch)
+    adapter._stall_grace_s = 0.0  # isolate the probe from the stall path
+    heartbeats: list[dict] = []
+    adapter._write_heartbeat = lambda task_id, payload: heartbeats.append(payload)
+    probes = {"n": 0}
+
+    def flaky(handle):
+        probes["n"] += 1
+        if probes["n"] <= 3:
+            raise MultiplexerError(f"tmux hang {probes['n']}")
+        return True
+
+    adapter._window_alive = flaky
+
+    def advance(call_n):
+        clock["mono"] += generic.HEARTBEAT_INTERVAL_S + 1.0  # one heartbeat per tick
+
+    adapter.watcher = _ScriptedWatcher([], on_call=advance)
+    result = adapter.wait_for_completion(_dev_handle(), _short_spec(tmp_path, timeout_s=200.0))
+
+    assert result.status == "timeout"  # verdict unchanged
+    (failed,) = _lifecycle_events(adapter, "liveness-probe-failed")
+    assert failed["site"] == "tick"
+    assert failed["error"] == "MultiplexerError: tmux hang 1"  # the streak's first fault
+    (recovered,) = _lifecycle_events(adapter, "liveness-probe-recovered")
+    assert recovered["failures"] == 3
+    # each heartbeat is written at the top of a tick, before that tick's probe
+    assert [hb["probe_failures"] for hb in heartbeats][:5] == [0, 1, 2, 3, 0]
+    (fired,) = _lifecycle_events(adapter, "timeout-fired")
+    assert fired["probe_failures"] == 0  # the streak had recovered by the deadline
+
+
+def test_timeout_under_probe_failure_streak_carries_streak(tmp_path, monkeypatch):
+    """DW-447 acceptance: a probe raising on the last N no-event ticks up to the
+    deadline leaves one `liveness-probe-failed` crumb, `timeout-fired` carrying
+    `probe_failures=N`, and a heartbeat that showed the nonzero streak.
+
+    Ablation: drop `probe_failures` from `timeout-fired` and this fails."""
+    adapter, clock = _timeout_clock_adapter(tmp_path, monkeypatch)
+    adapter._stall_grace_s = 0.0
+    heartbeats: list[dict] = []
+    adapter._write_heartbeat = lambda task_id, payload: heartbeats.append(payload)
+
+    def wedged(handle):
+        raise MultiplexerError("tmux server wedged")
+
+    adapter._window_alive = wedged
+
+    def advance(call_n):
+        clock["mono"] += generic.HEARTBEAT_INTERVAL_S + 1.0
+
+    adapter.watcher = _ScriptedWatcher([], on_call=advance)
+    result = adapter.wait_for_completion(_dev_handle(), _short_spec(tmp_path, timeout_s=100.0))
+
+    assert result.status == "timeout"
+    assert adapter.watcher.calls == 4
+    assert len(_lifecycle_events(adapter, "liveness-probe-failed")) == 1
+    assert _lifecycle_events(adapter, "liveness-probe-recovered") == []
+    (fired,) = _lifecycle_events(adapter, "timeout-fired")
+    assert fired["probe_failures"] == 4
+    assert max(hb["probe_failures"] for hb in heartbeats) > 0
 
 
 def test_wait_for_completion_genuine_window_death_still_crashes(tmp_path, monkeypatch):
@@ -5066,13 +5359,23 @@ def test_contract_nudge_sent_on_first_pending_observation(tmp_path, monkeypatch)
     pending` verdict — the nudge is additive, not a replacement for the fallback."""
     adapter, impl = make_dev_adapter(tmp_path)
     monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
-    sent = _record_sent(adapter)
+    sent: list[str] = []
+    crumbs_at_send: list[list[dict]] = []
+
+    def record(handle, text):
+        # DW-449: the crumb is written only after the send succeeded
+        crumbs_at_send.append(_lifecycle_events(adapter, "contract-nudge-sent"))
+        sent.append(text)
+
+    adapter.send_text = record
     spec_file = impl / "spec-3-1-foo.md"
     spec_file.write_text(_MARKERLESS_DONE)
 
     assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
 
     assert sent == [generic.CONTRACT_NUDGE_TEXT.format(spec_path=spec_file, status="done")]
+    assert crumbs_at_send == [[]]  # not yet crumbed while the send was in flight
+    assert _lifecycle_events(adapter, "nudge-send-failed") == []
     (crumb,) = _lifecycle_events(adapter, "contract-nudge-sent")
     assert crumb["spec"] == str(spec_file) and crumb["status"] == "done"
     (verdict,) = _breadcrumbs(adapter)
@@ -5175,10 +5478,11 @@ def test_contract_nudge_not_sent_on_unmodified_refusal(tmp_path, monkeypatch):
     assert _lifecycle_events(adapter, "contract-nudge-sent") == []
 
 
-def test_contract_nudge_send_failure_marks_sent(tmp_path, monkeypatch):
-    """A raising transport still satisfies exactly-once: the task is marked (and
-    the crumb journaled) BEFORE the send, so a `MultiplexerError` is swallowed and
-    the next Stop attempts no retry."""
+def test_contract_nudge_send_failure_marks_attempted_not_sent(tmp_path, monkeypatch):
+    """A raising transport still satisfies exactly-once: the task is marked BEFORE
+    the send, so a `MultiplexerError` is swallowed and the next Stop attempts no
+    retry. The undelivered nudge is never crumbed as sent — it leaves a
+    `nudge-send-failed` (`nudge="contract"`) instead (DW-449)."""
     adapter, impl = make_dev_adapter(tmp_path)
     monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
     calls = {"n": 0}
@@ -5195,7 +5499,10 @@ def test_contract_nudge_send_failure_marks_sent(tmp_path, monkeypatch):
     assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
     assert calls["n"] == 1
     assert adapter._contract_nudge_sent == {"3-1-dev-1"}
-    assert len(_lifecycle_events(adapter, "contract-nudge-sent")) == 1  # marked before the send
+    assert _lifecycle_events(adapter, "contract-nudge-sent") == []  # never reported as sent
+    (failed,) = _lifecycle_events(adapter, "nudge-send-failed")
+    assert failed["nudge"] == "contract"
+    assert failed["error"] == "MultiplexerError: transport down"
 
     # second stable Stop: task already marked -> no retry, and it harvests
     rj = adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True)
@@ -6895,16 +7202,32 @@ def test_empty_transcript_creation_is_not_work(tmp_path, monkeypatch):
     assert (result.status, result.produced_work) == ("timeout", False)
 
 
-def test_post_nudge_transcript_growth_is_not_work(tmp_path, monkeypatch):
-    """Even an assistant-shaped append after the loop's wake nudge needs Stop.
+def _attempt_recorder(sent: list[str], fails: bool):
+    """A `send_text` stand-in that records every attempt, then raises
+    `MultiplexerError` when `fails` — a paste that landed before Enter raised."""
 
-    ABLATION: drop the `stall_nudges_sent == 0` guard on transcript evidence
-    and this becomes produced_work=True.
+    def send(handle, value):
+        sent.append(value)
+        if fails:
+            raise MultiplexerError("enter failed")
+
+    return send
+
+
+@pytest.mark.parametrize("send_fails", [False, True], ids=["delivered", "send-raised"])
+def test_post_nudge_transcript_growth_is_not_work(tmp_path, monkeypatch, send_fails):
+    """Even an assistant-shaped append after the loop's wake nudge needs Stop —
+    and so after a nudge ATTEMPT whose send raised (DW-449: a raise can follow a
+    delivered paste, so the window closes on the attempt).
+
+    ABLATION: drop the `stall_nudges_sent` (delivered) or `stall_nudges_failed`
+    (send-raised) term of the attempt guard on transcript evidence and that case
+    becomes produced_work=True.
     """
     adapter, _, _log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch, journal=False)
     adapter._stall_nudges = 1
     sent: list[str] = []
-    adapter.send_text = lambda handle, value: sent.append(value)
+    adapter.send_text = _attempt_recorder(sent, send_fails)
     alive = {"v": True}
     adapter._window_alive = lambda handle: alive["v"]
 
@@ -6923,15 +7246,18 @@ def test_post_nudge_transcript_growth_is_not_work(tmp_path, monkeypatch):
     assert (result.status, result.produced_work) == ("crashed", False)
 
 
-def test_post_nudge_usage_sample_is_not_work(tmp_path, monkeypatch):
-    """A spend first observed after the wake nudge cannot override no-work.
+@pytest.mark.parametrize("send_fails", [False, True], ids=["delivered", "send-raised"])
+def test_post_nudge_usage_sample_is_not_work(tmp_path, monkeypatch, send_fails):
+    """A spend first observed after the wake nudge — delivered, or attempted with
+    a raising send (DW-449) — cannot override no-work.
 
-    ABLATION: drop the nudge guard on `usage_seen` and this reads True.
+    ABLATION: drop the matching term of the attempt guard on `usage_seen` and
+    that case reads True.
     """
     adapter, _, _log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch, journal=False)
     adapter._stall_nudges = 1
     sent: list[str] = []
-    adapter.send_text = lambda handle, value: sent.append(value)
+    adapter.send_text = _attempt_recorder(sent, send_fails)
     adapter._sample_weighted_usage = lambda path, spec: 100 if sent else 0
     alive = {"v": True}
     adapter._window_alive = lambda handle: alive["v"]

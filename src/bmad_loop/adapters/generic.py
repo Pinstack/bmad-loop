@@ -414,8 +414,9 @@ class _ResultFileMixin:
         floor alone files a parked CLI as one that worked. The question the operator
         asks is "did the pane ever change after its first frame?", and only the loop
         that watched it tick by tick can answer. Growth after the first stall wake
-        nudge is excluded by construction (the caller never flips `activity_seen`
-        once `stall_nudges_sent` is positive): the nudge's `send-keys … Enter`
+        nudge attempt is excluded by construction (the caller never flips
+        `activity_seen` once a stall nudge was attempted, delivered or not — a
+        raising send may still have pasted its text, DW-449): the nudge's `send-keys … Enter`
         confirms a dialog's default and the pane grows with the echo and the exit
         text, which is the loop's own keystrokes, not work — a session that
         genuinely woke proves it with a `Stop`, the doctrine the nudge-budget refill
@@ -645,6 +646,15 @@ class _ResultFileMixin:
             task_id,
             "session-lifecycle.jsonl",
             {"ts": time.time_ns(), "event": event, **fields},
+        )
+
+    def _note_nudge_send_failed(self, handle: SessionHandle, nudge: str, e: Exception) -> None:
+        """Crumb a nudge whose send raised (DW-449): ``nudge`` names which one
+        (``stall``/``budget``/``stop``/``contract``), ``error`` the fault in the
+        ``session-probe-failed`` shape. The caller's verdict path is unchanged —
+        this only keeps an undelivered nudge from reading as a delivered one."""
+        self._note_lifecycle(
+            handle.task_id, "nudge-send-failed", nudge=nudge, error=f"{type(e).__name__}: {e}"
         )
 
     def _write_heartbeat(self, task_id: str, payload: dict) -> None:
@@ -878,13 +888,21 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # fresh Stop — proof it woke and acted — restores the budget; only an
         # unresponsive session burns through it. Bounded overall by spec.timeout_s.
         stall_nudges_left = self._stall_nudges
-        # monotonic total of stall nudges sent this session — never restored,
-        # unlike stall_nudges_left. When spec.stall_nudges_cap is set (the
-        # engine sets it for every session it drives), a session that keeps
-        # ending its turn without a result cannot ride the fresh-Stop refill
-        # forever: after cap total nudges it is declared stalled. cap=None
-        # (raw constructor default) skips the check.
+        # monotonic total of stall nudges DELIVERED this session — never
+        # restored, unlike stall_nudges_left. A send that raised is counted
+        # apart in stall_nudges_failed (DW-449), so heartbeat.json never reports
+        # an undelivered nudge as sent. Both counters feed the ATTEMPT total the
+        # cap check and the #727 pre-nudge activity window read: a raise may
+        # follow a delivered paste (`send_text` pastes and presses Enter in
+        # separate calls), so a failed attempt closes the window exactly as a
+        # delivered one does — its echo must never be credited as work. When
+        # spec.stall_nudges_cap is set (the engine sets it for every session it
+        # drives), a session that keeps ending its turn without a result cannot
+        # ride the fresh-Stop refill forever: after cap total ATTEMPTS it is
+        # declared stalled, so a transport that always fails still hits the cap.
+        # cap=None (raw constructor default) skips the check.
         stall_nudges_sent = 0
+        stall_nudges_failed = 0
         # latched on the first accepted `Stop`: the hook half of the #261 proof-of-work
         # gate. Tracked apart from session_id/transcript_path — those are populated by
         # SessionStart and SessionEnd too, which a CLI that launched and wedged emits
@@ -900,11 +918,15 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # the stall wake nudge, which it withholds (the nudge's Enter can answer
         # the prompt, #727), ending the session `stalled` + `parked`.
         parked_evidence: str | None = None
-        # internal observability counter: counts ticks where the liveness probe
-        # raised a transport error (e.g. a 30s tmux hang). It deliberately does
-        # NOT escalate to "crashed" — a transient transport hiccup is not proof
-        # of death; spec.timeout_s already bounds a persistent failure to a
-        # timeout.
+        # the running streak of no-event ticks whose liveness probe raised a
+        # transport error (e.g. a 30s tmux hang); reset by the next clean probe.
+        # It deliberately does NOT escalate to "crashed" — a transient transport
+        # hiccup is not proof of death; spec.timeout_s already bounds a
+        # persistent failure to a timeout. Surfaced (DW-447): heartbeat.json
+        # carries the live streak, `timeout-fired` the final one, and the streak's
+        # transitions are crumbed — `liveness-probe-failed` at its first failure,
+        # `liveness-probe-recovered` (with its length) at the first clean probe —
+        # never once per failed tick, so a persistent hang cannot flood the file.
         probe_failures = 0
         # monotonic ts of the last heartbeat.json overwrite; None = not yet
         # written, so the first tick always stamps one.
@@ -926,8 +948,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # variable: that one drives the stall re-arm and is re-baselined on Stop
         # and nudge, which is exactly the accounting this must not share. It flips
         # `activity_seen` when the key changes on a tick later than FIRST_FRAME_S
-        # after the loop started and before the first stall wake nudge went out;
-        # growth after a nudge is the loop's own keystrokes echoing (see
+        # after the loop started and before the first stall wake nudge attempt
+        # (delivered or not, DW-449); growth after it is the loop's own
+        # keystrokes echoing (see
         # `_work_verdict`). Latched: once seen, the session worked.
         loop_started = time.monotonic()
         frame_key = self._log_activity_key(handle.task_id)
@@ -941,13 +964,14 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             # arrives during `watcher.wait_for` and is followed by window death or a
             # `SessionEnd` in the same iteration would otherwise be judged on the
             # previous tick's key. The post-nudge exclusion holds on the re-sample
-            # too: `stall_nudges_sent` is already > 0 on every tick after the nudge.
+            # too: the attempt total is already > 0 on every tick after the nudge
+            # attempt, delivered or not (DW-449).
             nonlocal frame_key, activity_seen
             tick_key = self._log_activity_key(handle.task_id)
             if tick_key is not None and tick_key != frame_key:
                 if (
                     not activity_seen
-                    and stall_nudges_sent == 0
+                    and stall_nudges_sent + stall_nudges_failed == 0
                     and time.monotonic() - loop_started > FIRST_FRAME_S
                 ):
                     activity_seen = True
@@ -980,7 +1004,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 (prior_key is not None and current_key[1] > prior_key[1])
                 or (prior_key is None and was_absent and current_key[1] > 0)
             )
-            if grew and stall_nudges_sent == 0 and not transcript_work_seen:
+            if grew and stall_nudges_sent + stall_nudges_failed == 0 and not transcript_work_seen:
                 start = prior_key[1] if prior_key is not None else 0
                 transcript_work_seen = self._transcript_has_assistant_activity(path, start)
 
@@ -1022,6 +1046,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     expired_clock=expired,
                     timeout_s=spec.timeout_s,
                     mono_remaining_s=round(remaining, 3),
+                    # nonzero = the deadline landed while liveness was unknown
+                    probe_failures=probe_failures,
                 )
                 return SessionResult(
                     status="timeout",
@@ -1070,9 +1096,13 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         "remaining_s": round(remaining, 3),
                         "stall_armed": stall_deadline is not None,
                         "stall_nudges_sent": stall_nudges_sent,
+                        # stall nudges whose send raised (DW-449)
+                        "stall_nudges_failed": stall_nudges_failed,
                         # seconds since the live transcript last changed (#680);
                         # null until a hook event has named the transcript.
                         "transcript_idle_s": idle.idle_s,
+                        # the running liveness-probe failure streak (DW-447)
+                        "probe_failures": probe_failures,
                     },
                 )
                 # Mid-session spec-status transition sampling (#276 M2) rides the
@@ -1089,7 +1119,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     and transcript_path
                 ):
                     weighted = self._sample_weighted_usage(transcript_path, spec)
-                    if weighted is not None and weighted > 0 and stall_nudges_sent == 0:
+                    if (
+                        weighted is not None
+                        and weighted > 0
+                        and stall_nudges_sent + stall_nudges_failed == 0
+                    ):
                         usage_seen = True
                     if weighted is not None and weighted > spec.token_budget:
                         budget_tripped = True
@@ -1123,21 +1157,21 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                                 # zero grace = terminate at trip, no nudge — but
                                 # window death still wins (artifact honored via
                                 # the crash path), exactly like grace expiry; a
-                                # transport error is not proof of death.
-                                try:
-                                    if not self._window_alive(handle):
-                                        return self._final(
-                                            handle,
-                                            spec,
-                                            "crashed",
-                                            session_id,
-                                            transcript_path,
-                                            budget_weighted=weighted,
-                                            stop_seen=stop_seen,
-                                            produced_work=produced_work(),
-                                        )
-                                except MultiplexerError:
-                                    pass
+                                # transport error is not proof of death, and
+                                # the crumb records the verdict was reached
+                                # with liveness unknown (DW-454).
+                                alive = self._probe_liveness(handle, "over-budget")
+                                if alive is False:
+                                    return self._final(
+                                        handle,
+                                        spec,
+                                        "crashed",
+                                        session_id,
+                                        transcript_path,
+                                        budget_weighted=weighted,
+                                        stop_seen=stop_seen,
+                                        produced_work=produced_work(),
+                                    )
                                 self._note_lifecycle(
                                     handle.task_id,
                                     "over-budget-fired",
@@ -1145,6 +1179,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                                     budget=spec.token_budget,
                                     grace_s=spec.token_budget_grace_s,
                                     zero_grace=True,
+                                    liveness_unknown=alive is None,
                                 )
                                 return SessionResult(
                                     status="over_budget",
@@ -1156,11 +1191,12 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                                 )
                             try:
                                 self.send_text(handle, BUDGET_NUDGE_TEXT)
-                            except MultiplexerError:
+                            except MultiplexerError as e:
                                 # a dead/hung window can't take the nudge; the
                                 # grace still arms — the next tick's liveness
-                                # probe scores a dead window crashed.
-                                pass
+                                # probe scores a dead window crashed. The
+                                # undelivered nudge leaves a crumb (DW-449).
+                                self._note_nudge_send_failed(handle, "budget", e)
                             budget_deadline = time.monotonic() + spec.token_budget_grace_s
                             budget_wall_deadline = time.time() + spec.token_budget_grace_s
             if budget_deadline is not None and (
@@ -1174,21 +1210,19 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # over_budget WITHOUT reading the result file — an artifact
                 # under a live window is never trusted (#48/#53). A transport
                 # error is not proof of death, so it falls through to the
-                # over_budget verdict.
-                try:
-                    if not self._window_alive(handle):
-                        return self._final(
-                            handle,
-                            spec,
-                            "crashed",
-                            session_id,
-                            transcript_path,
-                            budget_weighted=budget_weighted,
-                            stop_seen=stop_seen,
-                            produced_work=produced_work(),
-                        )
-                except MultiplexerError:
-                    pass
+                # over_budget verdict, flagged `liveness_unknown` (DW-454).
+                alive = self._probe_liveness(handle, "over-budget")
+                if alive is False:
+                    return self._final(
+                        handle,
+                        spec,
+                        "crashed",
+                        session_id,
+                        transcript_path,
+                        budget_weighted=budget_weighted,
+                        stop_seen=stop_seen,
+                        produced_work=produced_work(),
+                    )
                 self._note_lifecycle(
                     handle.task_id,
                     "over-budget-fired",
@@ -1196,6 +1230,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     budget=spec.token_budget,
                     grace_s=spec.token_budget_grace_s,
                     zero_grace=False,
+                    liveness_unknown=alive is None,
                 )
                 return SessionResult(
                     status="over_budget",
@@ -1236,14 +1271,26 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             if event is None:
                 try:
                     alive = self._window_alive(handle)
-                except MultiplexerError:
+                except MultiplexerError as e:
                     # transport hiccup (e.g. a 30s tmux hang), not proof of
                     # death: never roll back a possibly-working session. Skip the
                     # crash check this tick; hook events still complete it, and
                     # spec.timeout_s bounds a persistent transport failure to an
-                    # honest "timeout".
+                    # honest "timeout". Crumbed on the streak's first failure
+                    # only (DW-447) — the heartbeat carries the running count.
                     probe_failures += 1
+                    if probe_failures == 1:
+                        self._note_lifecycle(
+                            handle.task_id,
+                            "liveness-probe-failed",
+                            site="tick",
+                            error=f"{type(e).__name__}: {e}",
+                        )
                     continue
+                if probe_failures:
+                    self._note_lifecycle(
+                        handle.task_id, "liveness-probe-recovered", failures=probe_failures
+                    )
                 probe_failures = 0
                 if not alive:
                     # died without a SessionEnd hook (killed, crashed hard)
@@ -1276,8 +1323,10 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         stall_deadline = time.monotonic() + self._stall_grace_s
                         continue
                 if stall_deadline is not None and time.monotonic() >= stall_deadline:
+                    # The cap bounds ATTEMPTS, delivered or not (DW-449).
                     nudge_due = stall_nudges_left > 0 and (
-                        spec.stall_nudges_cap is None or stall_nudges_sent < spec.stall_nudges_cap
+                        spec.stall_nudges_cap is None
+                        or stall_nudges_sent + stall_nudges_failed < spec.stall_nudges_cap
                     )
                     # Parked gate (DW-348/DW-350), the one decision point: a CLI
                     # waiting on a human must not be typed at, because the nudge's
@@ -1304,14 +1353,18 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         # nudge's own echoed keystrokes can't be mistaken for the
                         # agent waking; an unresponsive session keeps draining it.
                         stall_nudges_left -= 1
-                        stall_nudges_sent += 1
                         try:
                             self.send_text(handle, STALL_NUDGE_TEXT)
-                        except MultiplexerError:
+                        except MultiplexerError as e:
                             # A dead/hung window cannot take the nudge. The
-                            # bounded attempt is still spent, and the next tick's
-                            # ordinary liveness probe owns the verdict.
-                            pass
+                            # bounded attempt is still spent (the cap counts
+                            # it), and the next tick's ordinary liveness probe
+                            # owns the verdict — but it is not counted as sent
+                            # and it leaves a crumb (DW-449).
+                            stall_nudges_failed += 1
+                            self._note_nudge_send_failed(handle, "stall", e)
+                        else:
+                            stall_nudges_sent += 1
                         stall_deadline = time.monotonic() + self._stall_grace_s
                         last_activity = self._log_activity_key(handle.task_id)
                         continue
@@ -1324,21 +1377,19 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     # transport error is not proof of death (as at the top of the
                     # tick); fall through to the stall — spec.timeout_s bounds a
                     # persistent failure. A dead window is never labelled parked:
-                    # nothing is waiting on a human once the CLI is gone.
-                    try:
-                        if not self._window_alive(handle):
-                            return self._final(
-                                handle,
-                                spec,
-                                "crashed",
-                                session_id,
-                                transcript_path,
-                                budget_weighted=budget_weighted,
-                                stop_seen=stop_seen,
-                                produced_work=produced_work(),
-                            )
-                    except MultiplexerError:
-                        pass
+                    # nothing is waiting on a human once the CLI is gone. The
+                    # probe fault is crumbed (`site="stall"`, DW-454).
+                    if self._probe_liveness(handle, "stall") is False:
+                        return self._final(
+                            handle,
+                            spec,
+                            "crashed",
+                            session_id,
+                            transcript_path,
+                            budget_weighted=budget_weighted,
+                            stop_seen=stop_seen,
+                            produced_work=produced_work(),
+                        )
                     # Still alive: an artifact on disk cannot upgrade the stall to
                     # completed — it may be stale or mid-write; only a Stop or
                     # window death vouches for it.
@@ -1424,10 +1475,10 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     nudges_left -= 1
                     try:
                         self.send_text(handle, NUDGE_TEXT)
-                    except MultiplexerError:
+                    except MultiplexerError as e:
                         # The next deterministic liveness probe decides whether
                         # the un-nudgeable window is dead or merely unavailable.
-                        pass
+                        self._note_nudge_send_failed(handle, "stop", e)
                     continue
                 if self._stall_grace_s <= 0:
                     return self._final(
@@ -1599,6 +1650,24 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
     def _window_alive(self, handle: SessionHandle) -> bool:
         return handle.native_id in self.mux.list_window_ids(self.session_name)
 
+    def _probe_liveness(self, handle: SessionHandle, site: str) -> bool | None:
+        """`_window_alive` for a one-shot verdict site (DW-454): True/False as
+        answered, or None when the probe raised ``MultiplexerError`` — after a
+        ``liveness-probe-failed`` crumb (``site``, ``error``) records that the
+        verdict about to be reached was reached with liveness unknown. Callers
+        treat None as "not dead", exactly as before. The wait loop's per-tick
+        probe stays inline: it crumbs streak transitions, not every fault."""
+        try:
+            return self._window_alive(handle)
+        except MultiplexerError as e:
+            self._note_lifecycle(
+                handle.task_id,
+                "liveness-probe-failed",
+                site=site,
+                error=f"{type(e).__name__}: {e}",
+            )
+            return None
+
     def _parked_hook_evidence(self, kind: str, notification_type: str | None) -> str | None:
         """The parked-signal evidence a hook event carries, or None (DW-348).
 
@@ -1737,11 +1806,16 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # verifies it landed and chases the harvested tree.
         self.mux.kill_window(handle.native_id)
         deadline = time.monotonic() + grace
+        # Whether the LAST poll raised (DW-454): that poll's "not dead" reading is
+        # what sends the kill to escalation, so `kill-escalated` records it.
+        liveness_unknown = False
         while True:
             try:
                 dead = not self._window_alive(handle)
+                liveness_unknown = False
             except MultiplexerError:
                 dead = False  # transport hiccup — liveness unknown this tick, keep polling
+                liveness_unknown = True
             if dead:
                 # Window died within grace (the normal case): reap any harvested
                 # straggler that outlived the pane pgid, sharing this deadline.
@@ -1759,7 +1833,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # pid would pass — the ProcessHost contract forbids force-killing it, exactly
         # like the clean-path reap below. Then re-strike the window.
         repane = self.mux.window_pane_pids(handle.native_id)
-        self._note_lifecycle(handle.task_id, "kill-escalated", pids=repane)
+        self._note_lifecycle(
+            handle.task_id, "kill-escalated", pids=repane, liveness_unknown=liveness_unknown
+        )
         for pid in repane:
             try:
                 host.force_kill(pid)
@@ -2367,8 +2443,9 @@ class _DevSynthesisMixin(_ResultFileMixin):
         one ``CONTRACT_NUDGE_TEXT`` send asking the skill to append the marker it
         owed, then repair at the source rather than only synthesizing here. It is
         bounded by ``_contract_nudge_sent``, a set never cleared within the session
-        and evicted afterwards by ``run()``'s ``finally`` (marked before the send,
-        ``MultiplexerError`` swallowed) — exactly once per session,
+        and evicted afterwards by ``run()``'s ``finally`` (marked before the send;
+        a raising send is crumbed ``nudge-send-failed``, not ``contract-nudge-sent``,
+        and never retried) — exactly once per session,
         touching no stall counters, so an mtime bump that resets ``observations``
         to 1 never re-nudges. A compliant append is harvested by the ordinary
         marker scan on a later Stop, leaving synthesis as the backstop.
@@ -2504,23 +2581,26 @@ class _DevSynthesisMixin(_ResultFileMixin):
             # the send so a raising transport still satisfies exactly-once, and the
             # set — never cleared within the session, and not the mtime-resettable
             # observation counter — is the budget, so the #149 refill hazard cannot
-            # apply. Touches no stall counters.
+            # apply. Touches no stall counters. `contract-nudge-sent` is written
+            # only once the send succeeded; a raising send leaves
+            # `nudge-send-failed` instead and is not retried (DW-449).
             if (
                 self._contract_nudge_enabled
                 and observations == 1
                 and task_id not in self._contract_nudge_sent
             ):
                 self._contract_nudge_sent.add(task_id)
-                self._note_lifecycle(
-                    task_id, "contract-nudge-sent", spec=str(path), status=fm_status
-                )
                 try:
                     self.send_text(
                         handle,
                         CONTRACT_NUDGE_TEXT.format(spec_path=path, status=fm_status),
                     )
-                except MultiplexerError:
-                    pass
+                except MultiplexerError as e:
+                    self._note_nudge_send_failed(handle, "contract", e)
+                else:
+                    self._note_lifecycle(
+                        task_id, "contract-nudge-sent", spec=str(path), status=fm_status
+                    )
         return None
 
     def _stories_synth_result(
@@ -2715,14 +2795,23 @@ class _DevSynthesisMixin(_ResultFileMixin):
             # is still alive, so the live-window invariant still applies.
             return result
         if alive is None:
-            return result  # liveness unknowable: unknown is not dead
+            # liveness unknowable: unknown is not dead — but the abandoned
+            # rescue leaves a crumb (DW-453). The generic adapter's probe has
+            # already crumbed its fault (`liveness-probe-failed`, `post-kill`).
+            self._note_lifecycle(
+                handle.task_id,
+                "post-kill-rescue-abandoned",
+                reason="liveness-unknown",
+                status=result.status,
+            )
+            return result
         try:
             # dead_window: the probe above settled liveness, so the missing-
             # marker fallback (#224) may synthesize from a terminal frontmatter
             # on a single sighting — the gates below still refuse anything but
             # a self-consistent, escalation-free successful terminal.
             sr = self._synth_result(handle, spec, wait=False, dead_window=True)
-        except (OSError, UnicodeDecodeError):
+        except (OSError, UnicodeDecodeError) as e:
             # An unreadable artifact is not evidence a session finished. This
             # hook runs right after run()'s finally-kill — the moment a spec the
             # CLI was mid-write is truncated, possibly through a multi-byte UTF-8
@@ -2730,7 +2819,14 @@ class _DevSynthesisMixin(_ResultFileMixin):
             # anomaly. Keep the verdict: a best-effort rescue must never escalate
             # a clean stall/timeout into an exception, which the engine does not
             # contain per-task (it fails the whole run). UnicodeDecodeError is a
-            # ValueError, so both must be named.
+            # ValueError, so both must be named. The abandon is crumbed (DW-453).
+            self._note_lifecycle(
+                handle.task_id,
+                "post-kill-rescue-abandoned",
+                reason="unreadable-artifact",
+                error=f"{type(e).__name__}: {e}",
+                status=result.status,
+            )
             return result
         if sr is None or sr.result_json is None or not sr.status_consistent:
             return result
@@ -2790,10 +2886,9 @@ class GenericDevAdapter(_DevSynthesisMixin, GenericAdapter):
         self._configure_dev_knobs()
 
     def _probe_alive(self, handle: SessionHandle) -> bool | None:
-        try:
-            return self._window_alive(handle)
-        except MultiplexerError:
-            return None
+        # A raising probe is crumbed `liveness-probe-failed` (`site="post-kill"`,
+        # `error`) before the caller abandons the rescue (DW-453).
+        return self._probe_liveness(handle, "post-kill")
 
 
 # Back-compat alias: the adapter was ``GenericTmuxAdapter`` before tmux moved

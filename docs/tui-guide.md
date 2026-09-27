@@ -272,13 +272,20 @@ One row per story (or sweep bundle/triage task) in the selected run:
   end-of-session total, distinct from a tripped session's `budget_weighted`
   (the guard's mid-session sample at trip time). The
   matching `tasks/<id>/` dir holds the forensic breadcrumbs the adapter wrote
-  while the session ran: `session-lifecycle.jsonl` (timeout-fire,
-  budget-guard `budget-tripped` / `over-budget-fired`, kill-escalation,
-  `session-vanished` (the mux no longer reported the session during the run, #489), and the
+  while the session ran: `session-lifecycle.jsonl` (timeout-fire — its
+  `probe_failures` counts a liveness-probe failure streak open at the deadline —,
+  budget-guard `budget-tripped` / `over-budget-fired`, kill-escalation — both
+  of these carry `liveness_unknown`, true when the verdict's probe raised —,
+  `session-vanished` (the mux no longer reported the session during the run, #489),
+  mux transport faults `liveness-probe-failed` / `liveness-probe-recovered` /
+  `nudge-send-failed`, an abandoned post-kill rescue
+  `post-kill-rescue-abandoned` (liveness unknown or an unreadable artifact), and the
   #276 missing-marker forensics `spec-status-transition-observed` /
   `frontmatter-unmodified-refused` / `contract-nudge-sent`),
   `heartbeat.json` (the wait loop's proof-of-life —
-  stale under a live session means the orchestrator itself was frozen), and
+  stale under a live session means the orchestrator itself was frozen; on the
+  generic adapter it also carries `probe_failures`, the running liveness-probe
+  failure streak, and `stall_nudges_failed`), and
   `resultless-stops.jsonl` (each give-up Stop with its verdict: `no-artifact`,
   `ambiguous-frontmatter`, `unmodified-since-launch` — the spec's bytes were
   unchanged since review launch, so it is a prior `done` re-opened, not this

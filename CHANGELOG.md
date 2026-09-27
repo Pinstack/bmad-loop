@@ -128,8 +128,10 @@ breaking changes may land in a minor release.
   (either isolation), as `run` and `sweep` do, so dirt elsewhere in the monorepo now
   fails them; `validate`, the TUI launch guard, `run`, `sweep` and auto-sweep all
   ignore the project's own `policy.toml` at its offset there (DW-379).
-- Amend the AGENTS.md doctrine: an observation degrade must be journaled or counted, never
-  folded silently into a healthy-looking empty value (DW-347).
+- Amend the AGENTS.md doctrine: an observation degrade must be journaled, or counted
+  where an operator or durable record can see it (journal, `heartbeat.json`,
+  `SessionResult`, CLI/TUI output), never folded silently into a healthy-looking empty
+  value (DW-347, DW-476).
 - Commit hooks in the exact-path candidate worktree now see a worktree holding only the
   target: a hook that reads other tracked files (whole-tree lint or tests) sees them missing
   and may fail the publication, and one that stages the rest of the tree is refused by scope
@@ -154,6 +156,22 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Leave a crumb when a generic-adapter liveness probe raises: `liveness-probe-failed`
+  (`site`, `error`) at the first failed wait-loop tick and at the over-budget, stall
+  and post-kill re-probes, `liveness-probe-recovered` (`failures`) when a later tick
+  probes cleanly (a session ending mid-streak leaves none). The running streak rides
+  `heartbeat.json` and `timeout-fired` as `probe_failures` (DW-447). Verdicts
+  unchanged.
+- Stop reporting an undelivered nudge as sent in the generic adapter: a stall, budget,
+  stop or contract nudge whose send raises writes `nudge-send-failed` (`nudge`,
+  `error`), heartbeat `stall_nudges_sent` counts delivered nudges only beside a new
+  `stall_nudges_failed`, and `contract-nudge-sent` lands after a successful send. The
+  stall-nudge cap and the #727 activity window still count every attempt (DW-449).
+- Crumb an abandoned post-kill rescue: `post-kill-rescue-abandoned` with
+  `reason = "liveness-unknown"` or `"unreadable-artifact"` (+ `error`) and the kept
+  `status` (DW-453).
+- Flag verdicts reached with liveness unknown: `over-budget-fired` and `kill-escalated`
+  gain `liveness_unknown` (DW-454).
 - Name an untracked ledger or board whose leaf symlink targets a file outside the project
   in `worktree-seed-dropped` (DW-432). The file is still not seeded; only the silent drop
   is gone.
