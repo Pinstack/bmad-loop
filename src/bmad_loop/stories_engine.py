@@ -226,6 +226,22 @@ class StoriesEngine(Engine):
                 gates.notify(self.policy, self.run_dir, f"unresolved escalation: {key}", reason)
                 raise RunPaused(reason, PAUSE_ESCALATION, key)
 
+    def _unresolved_escalation_key(self) -> str | None:
+        """Only an in-run escalation (``attempt > 0``) blocks ``finished``. A
+        pick-time wedge / unknown-selector task (``attempt == 0``) is re-classified
+        from disk every pick (see ``_repause_inrun_escalation``), so reaching run end
+        means the human fixed it by hand; its stale ESCALATED record must not
+        re-pause the run, whose only way past would be a re-arm that re-drives the
+        fixed story."""
+        return next(
+            (
+                k
+                for k, t in self.state.tasks.items()
+                if t.phase == Phase.ESCALATED and t.attempt > 0
+            ),
+            None,
+        )
+
     def _pause_unknown_selector(self, selector: str) -> None:
         """The ``--story`` selector resolves to no manifest entry: pause for
         resolve keyed on the selector, the same ESCALATED shape a wedge leaves, so

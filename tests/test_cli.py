@@ -4205,6 +4205,213 @@ def test_resolve_no_interactive_rearms_and_resumes(tmp_path, monkeypatch, capsys
     assert "ready-for-dev" in spec.read_text()
 
 
+def _adoptable_run(tmp_path, run_id="r1", *, run_type="story", worktree=True, spec=True):
+    """An escalation-paused run whose ESCALATED task keeps a worktree + branch (DW-386)."""
+    from bmad_loop.journal import load_state, save_state
+
+    wt = tmp_path / "wt"
+    spec_file = None
+    if worktree:
+        wt.mkdir()
+    if spec:
+        spec_path = tmp_path / "spec.md"
+        spec_path.write_text("---\nstatus: in-review\n---\n", encoding="utf-8")
+        spec_file = str(spec_path)
+    run_dir = _escalated_run(
+        tmp_path, run_id, spec_file=spec_file, worktree_path=str(wt), run_type=run_type
+    )
+    state = load_state(run_dir)
+    state.tasks["s1"].branch = "bmad-loop/r1/s1"
+    save_state(run_dir, state)
+    return run_dir
+
+
+def _state_bytes(run_dir):
+    return (run_dir / "state.json").read_bytes()
+
+
+def test_resolve_adopt_branch_moves_to_committing_and_resumes(tmp_path, monkeypatch, capsys):
+    from bmad_loop.journal import Journal, load_state
+    from bmad_loop.model import Phase
+
+    run_dir = _adoptable_run(tmp_path)
+    resumed = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: resumed.append(rd) or 0)
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--adopt-branch", "--resume"])
+
+    assert rc == 0
+    assert resumed == [run_dir]
+    task = load_state(run_dir).tasks["s1"]
+    assert task.phase == Phase.COMMITTING and task.adopt_pending
+    assert "in-review" in (tmp_path / "spec.md").read_text()  # the engine flips it, not resolve
+    [row] = [e for e in Journal(run_dir).entries() if e["kind"] == "escalation-adopted"]
+    assert row["story_key"] == "s1" and row["branch"] == "bmad-loop/r1/s1"
+    err = capsys.readouterr().err
+    assert "bypasses automated checks" in err
+    assert "review" in err and "[verify]" in err and "pre_commit_gate" in err
+
+
+def test_resolve_adopt_branch_force_unknown_proceeds(tmp_path, monkeypatch, capsys):
+    """`--force` is the only way past an unverifiable engine pid, so the adopt leg's
+    under-lock liveness re-check must honor it exactly as the re-arm leg does.
+
+    Ablation, performed: drop `and not args.force` from `_resolve_adopt`'s in-lock
+    `unknown` refusal and this reddens on rc."""
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "unknown")
+    run_dir = _adoptable_run(tmp_path)
+    resumed = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: resumed.append(rd) or 0)
+
+    rc = cli.main(
+        ["resolve", "--project", str(tmp_path), "r1", "--adopt-branch", "--force", "--resume"]
+    )
+
+    assert rc == 0
+    assert "proceeding anyway (--force)" in capsys.readouterr().err
+    assert resumed == [run_dir]
+    task = load_state(run_dir).tasks["s1"]
+    assert task.phase == Phase.COMMITTING and task.adopt_pending
+
+
+def test_resolve_adopt_branch_no_resume_persists_the_latch(tmp_path, monkeypatch, capsys):
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import PAUSE_ESCALATION, Phase
+
+    run_dir = _adoptable_run(tmp_path)
+    monkeypatch.setattr(
+        cli, "_resume_paused_run", lambda *a, **k: pytest.fail("--no-resume must not resume")
+    )
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--adopt-branch", "--no-resume"])
+
+    assert rc == 0
+    state = load_state(run_dir)
+    assert state.paused_stage == PAUSE_ESCALATION
+    task = state.tasks["s1"]
+    assert task.phase == Phase.COMMITTING and task.adopt_pending
+    assert "bmad-loop resume r1" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "shape,msg",
+    [
+        ("no-worktree", "is gone"),
+        ("sweep", "not supported for sweep runs"),
+        ("no-spec", "no story spec"),
+    ],
+)
+def test_resolve_adopt_branch_refusals_leave_state_untouched(
+    tmp_path, monkeypatch, capsys, shape, msg
+):
+    run_dir = _adoptable_run(
+        tmp_path,
+        run_type="sweep" if shape == "sweep" else "story",
+        worktree=shape != "no-worktree",
+        spec=shape != "no-spec",
+    )
+    before = _state_bytes(run_dir)
+    monkeypatch.setattr(
+        cli, "_resume_paused_run", lambda *a, **k: pytest.fail("a refusal must not resume")
+    )
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--adopt-branch", "--resume"])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert msg in err
+    if shape != "sweep":
+        assert "bmad-loop resolve r1" in err  # names the re-arm alternative
+    assert _state_bytes(run_dir) == before
+
+
+def test_resolve_adopt_branch_refuses_a_task_with_no_recorded_worktree(tmp_path, capsys):
+    from bmad_loop.journal import load_state, save_state
+
+    run_dir = _adoptable_run(tmp_path)
+    state = load_state(run_dir)
+    state.tasks["s1"].worktree_path = ""
+    save_state(run_dir, state)
+    before = _state_bytes(run_dir)
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--adopt-branch", "--resume"])
+
+    assert rc == 1
+    assert "no kept worktree branch" in capsys.readouterr().err
+    assert _state_bytes(run_dir) == before
+
+
+def test_resolve_adopt_branch_refuses_a_newer_escalation_after_waiting_for_the_lock(
+    tmp_path, monkeypatch, capsys
+):
+    """The adopt leg's mutation-boundary generation re-check (DW-386).
+
+    Ablation, performed: delete the generation comparison in `_resolve_adopt` and this
+    stale gesture adopts the newer escalation its checks never saw."""
+    import contextlib
+
+    from bmad_loop.journal import load_state, save_state
+
+    run_dir = _adoptable_run(tmp_path)
+    original_generation = load_state(run_dir).tasks["s1"].generation
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "dead")
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda *_a: pytest.fail("resumed"))
+    monkeypatch.setattr(
+        runs, "adopt_escalated_branch", lambda *_a, **_k: pytest.fail("stale adopt")
+    )
+    rival_bytes: list[bytes] = []
+
+    @contextlib.contextmanager
+    def rival_first(_run_dir):
+        rival = load_state(run_dir)
+        rival.tasks["s1"].generation = original_generation + 1
+        save_state(run_dir, rival)
+        rival_bytes.append(_state_bytes(run_dir))
+        yield
+
+    monkeypatch.setattr(cli, "state_lock", rival_first)
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--adopt-branch", "--resume"])
+
+    assert rc == 1
+    assert "changed while resolve was in progress" in capsys.readouterr().err
+    assert rival_bytes and _state_bytes(run_dir) == rival_bytes[-1]
+
+
+def test_resolve_adopt_branch_cancel_writes_nothing(tmp_path, monkeypatch, capsys):
+    run_dir = _adoptable_run(tmp_path)
+    before = _state_bytes(run_dir)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: False)
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--adopt-branch"])
+
+    assert rc == 0
+    assert "cancelled" in capsys.readouterr().out
+    assert _state_bytes(run_dir) == before
+
+
+def test_resolve_adopt_branch_and_restore_patch_are_mutually_exclusive(tmp_path, capsys):
+    _adoptable_run(tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(
+            [
+                "resolve",
+                "--project",
+                str(tmp_path),
+                "r1",
+                "--adopt-branch",
+                "--restore-patch",
+                "p.patch",
+            ]
+        )
+    assert exc.value.code == 2
+    assert "not allowed with argument" in capsys.readouterr().err
+
+
 def test_resolve_rearms_the_spec_in_the_project_it_was_invoked_on(tmp_path, monkeypatch):
     """`--project` names the tree this invocation acts in, and the re-arm's spec writes
     have to land there.

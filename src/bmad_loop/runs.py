@@ -4612,6 +4612,79 @@ def rearm_escalation(
         )
 
 
+def adopt_refusal(state: RunState, task: StoryTask, story_key: str) -> str | None:
+    """Why `resolve --adopt-branch` cannot adopt this ESCALATED task's kept branch,
+    or None when it can (DW-386).
+
+    Shared by `cli.cmd_resolve`'s early exit and `adopt_escalated_branch`'s locked
+    re-check, so the two cannot drift. Only the kept-work preconditions: the
+    pause/phase checks stay with each caller, which words them for its surface."""
+    if state.run_type == "sweep":
+        return (
+            f"--adopt-branch is not supported for sweep runs ({story_key}); re-arm it "
+            f"with `bmad-loop resolve {state.run_id}` instead"
+        )
+    rearm_hint = f"; re-arm it for a fresh re-drive with `bmad-loop resolve {state.run_id}`"
+    if not task.worktree_path or not task.branch:
+        return f"story {story_key} has no kept worktree branch to adopt{rearm_hint}"
+    if not Path(task.worktree_path).is_dir():
+        return (
+            f"the kept worktree for {story_key} ({task.worktree_path}) is gone, so there "
+            f"is no branch to adopt{rearm_hint}"
+        )
+    if not task.spec_file:
+        return f"story {story_key} has no story spec to finish, so it cannot be adopted{rearm_hint}"
+    return None
+
+
+def adopt_escalated_branch(run_dir: Path, story_key: str | None = None) -> str:
+    """Adopt an escalation-paused story's kept worktree branch (DW-386), under the
+    run lock (reentrant, so a caller already holding it may call this).
+
+    The operator vouches that the escalated attempt's work is finished, so the task
+    moves straight from ESCALATED to COMMITTING and `adopt_pending` is latched. The
+    next resume's `Engine._finish_inflight` COMMITTING arm then reopens the kept
+    worktree, flips the spec to its terminal status and mirrors the board
+    (`Engine._apply_adoption`), squashes and marks the task DONE, and merges it —
+    the existing commit-window recovery path, so no session runs and review is
+    deliberately NOT re-run. Does not clear the pause; the caller resumes.
+
+    Returns the adopted branch. Raises RearmError, with state untouched, when the
+    run is not paused at an escalation, the story is not ESCALATED, or
+    `adopt_refusal` names a reason."""
+    with state_lock(run_dir):
+        state = load_state(run_dir)
+        if state.paused_stage != PAUSE_ESCALATION:
+            raise RearmError(
+                f"run {run_dir.name} is not paused at an escalation "
+                f"(stage: {state.paused_stage or 'none'})"
+            )
+        key = story_key or state.paused_story_key
+        if key is None:
+            raise RearmError(f"run {run_dir.name} has no escalated story to resolve")
+        task = state.tasks.get(key)
+        if task is None:
+            raise RearmError(f"run {run_dir.name} has no task for story {key}")
+        if task.phase != Phase.ESCALATED:
+            raise RearmError(f"story {key} is not escalated (phase: {task.phase})")
+        if (refusal := adopt_refusal(state, task, key)) is not None:
+            raise RearmError(refusal)
+        # Deliberate direct assignment, not a state-machine transition: ESCALATED has
+        # no legal exit (mirrors `_rearm_escalation_locked` and `escalate_unit`), and
+        # COMMITTING is the persisted "verified work, finish the commit" phase the
+        # engine's resume arm already completes without re-running any gate.
+        task.phase = Phase.COMMITTING
+        task.adopt_pending = True
+        save_state(run_dir, state)
+        Journal(run_dir).append(
+            "escalation-adopted",
+            story_key=key,
+            branch=task.branch,
+            worktree=task.worktree_path,
+        )
+        return task.branch
+
+
 def _rearm_escalation_locked(
     run_dir: Path,
     story_key: str | None = None,
@@ -4805,6 +4878,9 @@ def _rearm_escalation_locked(
     # Always (re)assign the latch: a None restore_patch clears a stale one left by
     # a prior restore attempt the human then chose to redo from scratch.
     task.restore_patch = restore_patch
+    # A re-arm abandons any adoption a prior `resolve --adopt-branch` latched (DW-386):
+    # the re-drive re-implements from the baseline, so no adopt leg may fire on it.
+    task.adopt_pending = False
 
     # The spec this re-arm writes to and the bytes it FOUND there — the two inputs the
     # rollback below needs. Declared out here because their consumers sit past every

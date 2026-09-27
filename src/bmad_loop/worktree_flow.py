@@ -4538,6 +4538,7 @@ class WorktreeFlow:
         which can fire mid-drive), and from :meth:`reopen_unit` for in-flight units.
         """
         task.phase = Phase.ESCALATED
+        task.adopt_pending = False  # an escalation spends any adoption (DW-386)
         self.journal.append("story-escalated", story_key=task.story_key, reason=reason)
         gates.notify(
             self.policy,

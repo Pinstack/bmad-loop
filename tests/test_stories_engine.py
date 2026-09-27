@@ -576,6 +576,34 @@ def test_bare_resume_does_not_leapfrog_a_wedged_story(project):
     assert not any(s.role == "dev" for s in radapter.sessions)  # story 2 never dispatched
 
 
+def test_bare_resume_finishes_after_a_wedge_is_fixed_by_hand(project):
+    """A pick-time wedge's designed exit is a hand fix plus a bare resume. The
+    run-end never-finish-over-ESCALATED guard (DW-386) must not re-pause on the
+    stale attempt-0 wedge record once the drained schedule has cleared it —
+    the only way past would be a re-arm that re-drives the finished story."""
+    folder = setup_stories(project, [entry("1"), entry("2")])
+    sp1 = folder / "stories" / "1-slug.md"
+    write_spec(sp1, "blocked", rev_parse_head(project.project))
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "story 1 blocked")
+
+    engine, _ = make_engine(project, [])
+    assert engine.run().paused
+    assert load_state(engine.run_dir).tasks["1"].phase == Phase.ESCALATED
+
+    write_spec(sp1, "done", rev_parse_head(project.project))
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "story 1 finished by hand")
+
+    resumed, radapter = resume_engine(project, engine, [stories_dev_effect()])
+    rsummary = resumed.run()
+    assert not rsummary.paused and rsummary.done == 1  # story 2 only
+    persisted = load_state(resumed.run_dir)
+    assert persisted.finished
+    dev_prompts = [s.prompt for s in radapter.sessions if s.role == "dev"]
+    assert dev_prompts == ["/bmad-dev-auto Spec folder: _bmad-output/epic-1. Story id: 2."]
+
+
 def test_bare_resume_repauses_inrun_escalation_with_resumable_spec(project):
     """A story that escalated AFTER a session ran (attempt > 0) can sit at a
     resumable spec status — e.g. a CRITICAL proof-of-work GitError fires only

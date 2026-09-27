@@ -7752,7 +7752,11 @@ def test_escalated_bundle_resume_skips_it_and_runs_rest(project):
         ],
     )
     summary = resumed.run()
-    assert not summary.paused
+    # DW-386: the run drained past an unresolved escalation, so it re-pauses on it
+    # rather than being stamped finished.
+    assert summary.paused and not resumed.state.finished
+    assert resumed.state.paused_stage == PAUSE_ESCALATION
+    assert resumed.state.paused_story_key == "dw-bad-fix"
     assert resumed.state.tasks["dw-good-fix"].phase == Phase.DONE
     # triage was NOT re-run: only the two bundle sessions
     assert len(adapter.sessions) == 2
@@ -21128,7 +21132,11 @@ def test_repeat_resume_mid_cycle_two(project):
 
     resumed, adapter = resume_sweep(project, engine, [])
     summary = resumed.run()
-    assert not summary.paused
+    # DW-386: the run drained past an unresolved escalation, so it re-pauses on it
+    # rather than being stamped finished.
+    assert summary.paused and not resumed.state.finished
+    assert resumed.state.paused_stage == PAUSE_ESCALATION
+    assert resumed.state.paused_story_key == "dw2-follow-up"
     # resume re-enters cycle 2 directly: triage-2.json reloads (no session),
     # the escalated bundle is dropped by the failed-ids filter, and the cycle
     # reports no progress
@@ -23441,7 +23449,11 @@ def test_escalated_unresolved_still_skipped_when_triage_json_lost(project):
     )
     summary = resumed.run()
 
-    assert not summary.paused
+    # DW-386: the run drained past an unresolved escalation, so it re-pauses on it
+    # rather than being stamped finished.
+    assert summary.paused and not resumed.state.finished
+    assert resumed.state.paused_stage == PAUSE_ESCALATION
+    assert resumed.state.paused_story_key == "dw-fix"
     assert "sweep-inflight-redrive" not in journal_text(resumed)
     assert [s.role for s in adapter.sessions] == ["triage", "dev", "review"]
     assert resumed.state.tasks["dw-fix"].phase == Phase.ESCALATED
@@ -35444,7 +35456,12 @@ def test_format_zero_escalation_keeps_the_cycle_reader_route(project, monkeypatc
 
     summary = resumed.run()
 
-    assert not summary.crashed and not summary.paused
+    assert not summary.crashed
+    # DW-386: the run drained past an unresolved escalation, so it re-pauses on it
+    # rather than being stamped finished.
+    assert summary.paused and not resumed.state.finished
+    assert resumed.state.paused_stage == PAUSE_ESCALATION
+    assert resumed.state.paused_story_key == "sweep-migrate"
     assert len(adapter.sessions) == 1 and "--migrate" not in adapter.sessions[0].prompt
     assert len(_records(resumed, "sweep-migration-recovery-invalid")) == invalid_before
     assert resumed.state.tasks["sweep-migrate"].phase == Phase.ESCALATED

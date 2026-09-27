@@ -53,6 +53,7 @@ from .escalation import (
     review_retry_or_exhaust,
     session_failure_reason,
 )
+from .frontmatter import FrontmatterWriteError
 from .install import dev_primitive_or_default
 from .journal import SELF_MINTED_FIELDS, Journal, save_state
 from .model import (
@@ -1018,6 +1019,15 @@ class Engine:
                 reset_owner_run_dir(owner_token)
             _run_depth.reset(token)
 
+    def _unresolved_escalation_key(self) -> str | None:
+        """The first ESCALATED task that still blocks ``finished`` at run end
+        (DW-386), or None. ``StoriesEngine`` narrows it: its pick-time wedges are
+        disk projections a drained schedule has already cleared."""
+        return next(
+            (k for k, t in self.state.tasks.items() if t.phase == Phase.ESCALATED),
+            None,
+        )
+
     def _run_inner(self) -> RunSummary:
         self._install_stop_signals()
         try:
@@ -1058,6 +1068,20 @@ class Engine:
                 # unpublished bundle source), and a run recorded finished refuses
                 # `bmad-loop resume`, the very remedy the pause names.
                 self._gc_run_worktrees()
+                # Never stamp `finished` over an unresolved escalation (DW-386). A
+                # `resume` past an ESCALATED task skips it and can drain the queue, but
+                # every consumer reads `finished` as "nothing left to do": `resume` and
+                # `resolve` refuse the run, and worktree reconciliation reclaims the
+                # escalated task's kept worktree. Pause at the escalation instead — the
+                # exact shape `resolve` accepts.
+                escalated = self._unresolved_escalation_key()
+                if escalated is not None:
+                    raise RunPaused(
+                        f"story {escalated!r} is still escalated — run "
+                        f"`bmad-loop resolve {self.state.run_id}`",
+                        PAUSE_ESCALATION,
+                        escalated,
+                    )
                 self.state.finished = True
                 self._emit("post_run")
                 self.journal.append("run-complete")
@@ -2153,11 +2177,24 @@ class Engine:
                 # and finalize_commit tolerates both the pre- and post-squash
                 # crash states (#115).
                 self.journal.append("resume-commit", story_key=task.story_key)
+                if task.adopt_pending:
+                    # `resolve --adopt-branch` (DW-386) moved this task here from
+                    # ESCALATED: the operator vouched for the kept branch, so it takes
+                    # this same finalize/merge path without re-running review.
+                    self.journal.append(
+                        "resume-adopt", story_key=task.story_key, branch=task.branch
+                    )
+                    if not mounted:
+                        # Adopt refuses a task without a kept worktree, so this is a
+                        # state it never writes; fail loud rather than commit in main.
+                        self._escalate(task, f"adopted story {task.story_key} has no kept worktree")
                 if mounted:
                     unit = self._reopen_unit(task)
                     prev = self.workspace
                     self.workspace = unit.workspace
                     try:
+                        if task.adopt_pending:
+                            self._apply_adoption(task)
                         self._finalize_commit_phase(task)
                     finally:
                         self.workspace = prev
@@ -3987,6 +4024,8 @@ class Engine:
             # (if any) decides afresh whether to restore again.
             task.resolved_redrive = False
             task.restore_patch = None
+            # An adopted branch (DW-386) is likewise committed; its latch is spent.
+            task.adopt_pending = False
             task.dispatched_spec_file = None
             task.dispatched_spec_snapshot = None
         except verify.GitError as e:
@@ -4550,6 +4589,60 @@ class Engine:
                 spec=str(spec_path),
                 status=fm_status,
             )
+
+    def _apply_adoption(self, task: StoryTask) -> None:
+        """Bring an adopted kept branch's spec and board to the story's terminal
+        stage before ``_finalize_commit_phase`` squashes it (DW-386).
+
+        Runs inside the reopened unit worktree (``self.workspace`` is the unit's),
+        so the spec flip rides the unit's squash and the board write lands in the
+        unit's board copy, carried to the main checkout by ``_integrate_unit``
+        through ``board_advance_intended``. The terminal stage is
+        ``awaiting-operator`` for a task that declared operator actions (so
+        ``_finalize_commit_phase`` parks it) and ``done`` otherwise.
+
+        A kept spec the dev session already parked (``awaiting-operator`` with
+        declared ``operator_actions``) latches those actions onto the task first,
+        as ``_park_awaiting_operator`` would have, so the adoption parks rather than
+        dropping what a human still owes.
+
+        Both writes are idempotent, so a crash replay re-enters this safely. A
+        spec that is gone, cannot be rewritten, or does not read back at the
+        target is not adoptable: the task re-escalates (COMMITTING→ESCALATED is
+        legal; ``_escalate`` spends the latch), which pauses the run."""
+        spec_file = task.spec_file or ""
+        spec = verify.resolve_spec_path(spec_file, self.workspace.paths) if spec_file else None
+        if spec is None or not spec.is_file():
+            self._escalate(
+                task,
+                f"cannot adopt {task.story_key}: story spec {spec_file or '(none)'} is "
+                "missing from the kept worktree",
+            )
+            return
+        try:
+            if not task.operator_actions and self._operator_park_enabled():
+                fm = verify.read_frontmatter(spec)
+                actions = verify.operator_actions_of(fm)
+                if verify.status_of(fm) == verify.AWAITING_OPERATOR and actions:
+                    task.operator_actions = list(actions)
+            target = verify.AWAITING_OPERATOR if task.operator_actions else "done"
+            verify.set_frontmatter_status(spec, target, confine_root=self.workspace.root)
+            status = verify.status_of(verify.read_frontmatter(spec))
+        except (OSError, FrontmatterWriteError) as e:
+            self._escalate(
+                task,
+                f"cannot adopt {task.story_key}: setting the status of {spec} failed "
+                f"({e.__class__.__name__}: {e})",
+            )
+            return
+        if status != target:
+            self._escalate(
+                task,
+                f"cannot adopt {task.story_key}: story spec {spec} has no frontmatter "
+                f"status to set to {target!r}",
+            )
+            return
+        self._post_dev_state_sync(task, {"spec_file": str(spec)})
 
     def _post_dev_state_sync(self, task: StoryTask, result_json: dict | None) -> None:
         """Single-writer for the on-disk bookkeeping the generic skill never touches.
@@ -9159,6 +9252,7 @@ class Engine:
 
     def _escalate(self, task: StoryTask, reason: str) -> None:
         advance(task, Phase.ESCALATED)
+        task.adopt_pending = False  # an escalation spends any adoption (DW-386)
         self.journal.append("story-escalated", story_key=task.story_key, reason=reason)
         displayed = display_critical_reason(reason, task.spec_file)
         gates.notify(

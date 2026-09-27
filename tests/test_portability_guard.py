@@ -256,6 +256,7 @@ SAVE_STATE_CALLERS = {
     ("cli.py", "_prepare_resume_locked"),
     ("engine.py", "_save"),
     ("runs.py", "_rearm_escalation_locked"),
+    ("runs.py", "adopt_escalated_branch"),
     ("runs.py", "restamp_code_root"),
     ("runs.py", "_stop_run_once"),
     ("runsetup.py", "compose_run"),
@@ -264,8 +265,10 @@ SAVE_STATE_CALLERS = {
 RUN_STATE_TRANSACTIONS = {
     ("cli.py", "_resume_paused_run"),
     ("cli.py", "cmd_resolve"),
+    ("cli.py", "_resolve_adopt"),
     ("journal.py", "save_state"),
     ("runs.py", "rearm_escalation"),
+    ("runs.py", "adopt_escalated_branch"),
     ("runs.py", "restamp_code_root"),
     ("runs.py", "_stop_run_once"),
     ("runs.py", "archive_run"),
@@ -1191,6 +1194,9 @@ JOURNAL_KINDS = frozenset(
         "plugin-veto",
         "plugins-active",
         "preference-escalation",
+        # DW-386: the resume leg of `resolve --adopt-branch` — the COMMITTING arm
+        # finishing an adopted kept branch. `story_key` and `branch` are routed.
+        "resume-adopt",
         "resume-defer",
         "resume-ledger-carry",
         "resume-review",
@@ -1300,6 +1306,11 @@ JOURNAL_KINDS = frozenset(
         "rollback-reset-failed",
         "rollback-skipped-clean",
         # runs.py
+        # DW-386: `resolve --adopt-branch` moved an ESCALATED task to COMMITTING to
+        # finish its kept branch without review. `story_key` and `branch` are routed;
+        # `worktree` is the declared-benign mount path `pinned-config-edit-refused`
+        # and `isolation-flip-orphan-preserved` also carry.
+        "escalation-adopted",
         "rearm-aborted",
         "rearm-baseline-advance-failed",
         "rearm-baseline-restamp-skipped",

@@ -73,7 +73,7 @@ from .documents import (
 from .engine import Engine, _publication_refusal
 from .escalation import display_pause_reason
 from .journal import Journal, load_state, save_state, state_lock
-from .model import RunState
+from .model import RunState, StoryTask
 from .platform_util import (
     MAX_SEGMENT,
     LockUnavailableError,
@@ -3879,6 +3879,12 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         print(refusal, file=sys.stderr)
         return ExitCode.FAILURE
 
+    # DW-386: adopt the kept branch instead of re-arming. Behind every gate above —
+    # the same gates, in the same order, as the re-arm path — and ahead of the
+    # interactive session, which adopting never runs.
+    if getattr(args, "adopt_branch", False):
+        return _resolve_adopt(args, project, run_dir, state, task, story_key)
+
     pol = policy_mod.load(_policy_path(project))
 
     # intent-gap patch-restore latch (#2564), explicit-flag path: everything about
@@ -4219,6 +4225,94 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         # We are inside the TUI's control-session window the user is attached to.
         # Tell them, hand the terminal back, and let the engine run on here — a
         # tmux pane keeps running after its client detaches.
+        print(
+            f"✓ resuming run {args.run_id} in the background — "
+            f"watch it in the TUI, or: bmad-loop attach {args.run_id}"
+        )
+        launch.detach_client()
+    return _resume_paused_run(project, run_dir)
+
+
+def _resolve_adopt(
+    args: argparse.Namespace,
+    project: Path,
+    run_dir: Path,
+    state: RunState,
+    task: StoryTask,
+    story_key: str,
+) -> int:
+    """`resolve --adopt-branch` (DW-386): finish an escalated story from its kept
+    worktree branch instead of re-driving it from scratch.
+
+    `cmd_resolve` has already run the shared gates (alias, paused-at-escalation,
+    liveness, ESCALATED story, sweep ledger). This adds the kept-work preconditions,
+    confirms, re-checks everything under the run lock and hands the state
+    transaction to `runs.adopt_escalated_branch`; the resumed engine then commits
+    and merges the branch through its COMMITTING recovery arm. No interactive
+    session runs, and review, the `[verify]` commands and `pre_commit_gate`
+    workflows are NOT re-run."""
+    from .model import PAUSE_ESCALATION, Phase
+
+    if (refusal := runs.adopt_refusal(state, task, story_key)) is not None:
+        print(f"error: {refusal}", file=sys.stderr)
+        return 1
+    print(
+        f"warning: adopting {task.branch} bypasses automated checks for {story_key} — "
+        "review, the [verify] commands and pre_commit_gate workflows are not re-run; the "
+        "kept branch is committed and merged as-is on your word that it is finished",
+        file=sys.stderr,
+    )
+    if args.resume is None and not _confirm(
+        f"adopt kept branch {task.branch} of {story_key} and resume run {args.run_id}?"
+    ):
+        print("cancelled — run is still paused at the escalation")
+        return 0
+    try:
+        with state_lock(run_dir):
+            # Same mutation-boundary re-check as the re-arm path: the checks above
+            # ran lock-free, so repeat them against the state left by the last writer.
+            fresh_state = load_state(run_dir)
+            if fresh_state.paused_stage != PAUSE_ESCALATION:
+                print(
+                    f"run {args.run_id} is not paused at an escalation "
+                    f"(stage: {fresh_state.paused_stage or 'none'})",
+                    file=sys.stderr,
+                )
+                return 1
+            fresh_live = runs.engine_liveness(run_dir)
+            if fresh_live == "alive":
+                print(f"run {args.run_id} is still live — stop it first", file=sys.stderr)
+                return 1
+            if fresh_live == "unknown" and not args.force:
+                print(
+                    f"run {args.run_id}: engine may still be live (unverifiable pid) — "
+                    "refusing to adopt. Confirm the engine process is gone, then re-run "
+                    "with --force (`stop` cannot verify or clear an unverifiable pid).",
+                    file=sys.stderr,
+                )
+                return 1
+            fresh_task = fresh_state.tasks.get(story_key)
+            if fresh_task is None or fresh_task.phase != Phase.ESCALATED:
+                print(f"no escalated story to resolve in run {args.run_id}", file=sys.stderr)
+                return 1
+            if fresh_task.generation != task.generation:
+                print(
+                    f"the escalation for {story_key} changed while resolve was in progress "
+                    "— not adopting",
+                    file=sys.stderr,
+                )
+                return 1
+            branch = runs.adopt_escalated_branch(run_dir, story_key)
+    except runs.RearmError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    print(f"adopted {branch} for {story_key} — it commits and merges on resume")
+    if args.resume is False:
+        print(f"resume when ready: bmad-loop resume {args.run_id}")
+        return 0
+    from .tui import launch  # import-safe: launch.py has no textual imports
+
+    if launch.in_ctl_session():
         print(
             f"✓ resuming run {args.run_id} in the background — "
             f"watch it in the TUI, or: bmad-loop attach {args.run_id}"
@@ -6004,13 +6098,23 @@ def main(argv: list[str] | None = None) -> int:
         action="store_false",
         help="skip the resolve agent (spec already fixed by hand); just re-arm + resume",
     )
-    resolve_p.add_argument(
+    resolve_mode = resolve_p.add_mutually_exclusive_group()
+    resolve_mode.add_argument(
         "--restore-patch",
         metavar="PATH",
         help="intent-gap patch-restore (#2564): re-arm the spec to `in-review` and "
         "re-apply this saved patch before the re-drive, resuming review on the "
         "attempted change instead of re-implementing (hand-driven; the interactive "
         "agent supplies it via resolution.json)",
+    )
+    resolve_mode.add_argument(
+        "--adopt-branch",
+        action="store_true",
+        help="finish the escalated story from its kept worktree branch instead of "
+        "re-driving it: commit and merge the branch as-is, mark the story done, and "
+        "resume. Skips the resolve agent and does NOT re-run review, [verify] commands or "
+        "pre_commit_gate workflows for the story "
+        "(worktree isolation only; not for sweep runs)",
     )
     resolve_p.add_argument(
         "--resume",

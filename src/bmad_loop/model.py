@@ -533,6 +533,16 @@ class StoryTask:
     # diff, and clears it once the corrected work commits. None = ordinary
     # from-scratch re-drive. Survives the resume serialization round-trip.
     restore_patch: str | None = None
+    # Latched by runs.adopt_escalated_branch (`bmad-loop resolve --adopt-branch`,
+    # DW-386): the operator vouched for an ESCALATED task's kept worktree branch, so
+    # the task was moved straight to COMMITTING. On resume, _finish_inflight's
+    # COMMITTING arm reads it to flip the spec to its terminal status and mirror the
+    # board before the ordinary finalize/merge. Cleared by _finalize_commit_phase on
+    # success, by runs.rearm_escalation, and by every re-escalation (Engine._escalate
+    # and WorktreeFlow.escalate_unit), so an ESCALATED task never carries it.
+    # Survives the resume serialization round-trip; deliberately absent from
+    # `documents.py`'s `--json` projection (schema 1).
+    adopt_pending: bool = False
     # sweep bundles only: the deferred-work ids this task closes and the
     # rendered intent file handed to dev sessions
     dw_ids: list[str] = field(default_factory=list)
@@ -645,6 +655,7 @@ class StoryTask:
             "plan_review_owed": self.plan_review_owed,
             "sentinel_kind": self.sentinel_kind,
             "restore_patch": self.restore_patch,
+            "adopt_pending": self.adopt_pending,
             "dw_ids": self.dw_ids,
             "bundle_file": self.bundle_file,
             "worktree_path": self.worktree_path,
@@ -909,6 +920,7 @@ class StoryTask:
             plan_review_owed=bool(d.get("plan_review_owed", False)),
             sentinel_kind=str(d.get("sentinel_kind", "")),
             restore_patch=d.get("restore_patch"),
+            adopt_pending=bool(d.get("adopt_pending", False)),
             dw_ids=[str(i) for i in d.get("dw_ids", [])],
             bundle_file=d.get("bundle_file"),
             worktree_path=str(d.get("worktree_path", "")),

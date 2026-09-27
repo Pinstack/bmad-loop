@@ -510,6 +510,17 @@ def test_journal_line_renders_the_unreadable_marker_red_without_restyling_produc
     assert kind_style(f"{UNREADABLE_LINE_KIND}-followup").dim is True
 
 
+def test_journal_line_renders_an_adopted_escalation_green():
+    """DW-386: `escalation-adopted` records an operator-approved completion, so it
+    must not fall to the `"escalat"` -> red substring rule.
+
+    Ablation, performed: drop its `_JOURNAL_STYLES` row and this reddens."""
+    console = Console(width=80)
+    entry = {"ts": 1_750_000_000, "kind": "escalation-adopted"}
+    [segment] = [s for s in console.render(journal_line(entry)) if "escalation-ad" in s.text]
+    assert segment.style.color is not None and segment.style.color.name == "green"
+
+
 def test_journal_line_wraps_fields_with_hanging_indent():
     entry = {
         "ts": 1_750_000_000,

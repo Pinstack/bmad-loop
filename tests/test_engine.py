@@ -11652,8 +11652,12 @@ def test_critical_escalation_pauses_and_resume_continues(project):
         [dev_effect(project, "1-2-b"), review_effect(project, "1-2-b", clean=True)],
     )
     summary2 = resumed.run()
-    assert summary2.done == 1 and not summary2.paused
-    assert resumed.state.finished
+    assert summary2.done == 1
+    # DW-386: the resumed queue drained past the unresolved escalation, so the run
+    # re-pauses on it instead of being stamped finished (which `resolve` refuses).
+    assert summary2.paused and not resumed.state.finished
+    assert resumed.state.paused_stage == PAUSE_ESCALATION
+    assert resumed.state.paused_story_key == "1-1-a"
 
 
 def test_critical_escalation_with_a_multiline_detail_keeps_attention_one_record_per_line(
@@ -14143,6 +14147,51 @@ def _escalate_blocked(project, story_key):
         )
 
     return effect
+
+
+def test_resume_past_an_escalation_pauses_instead_of_finishing(project):
+    """DW-386: a plain `resume` skips the terminal ESCALATED task and can drain the
+    queue, but the run must not then be stamped `finished` — `resume`/`resolve`
+    refuse a finished run and worktree reconciliation reclaims its kept worktree.
+    It re-pauses at the escalation instead, the shape `resolve` accepts.
+
+    Ablation, performed: delete the ESCALATED guard in `Engine._run_inner` and this
+    reddens on `finished`."""
+    write_sprint(project, {"1-1-a": "ready-for-dev", "1-2-b": "ready-for-dev"})
+    engine, _ = make_engine(project, [_escalate_blocked(project, "1-1-a")])
+    engine.run()
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
+
+    resumed, _ = resume_engine(
+        project,
+        engine,
+        [dev_effect(project, "1-2-b"), review_effect(project, "1-2-b", clean=True)],
+    )
+    summary = resumed.run()
+
+    assert resumed.state.tasks["1-2-b"].phase == Phase.DONE
+    saved = load_state(engine.run_dir)
+    assert not saved.finished and summary.paused
+    assert saved.paused_stage == PAUSE_ESCALATION
+    assert saved.paused_story_key == "1-1-a"
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "run-complete" not in kinds
+    paused = [e for e in resumed.journal.entries() if e["kind"] == "run-paused"][-1]
+    assert paused["stage"] == PAUSE_ESCALATION and paused["story_key"] == "1-1-a"
+
+
+def test_run_without_an_escalation_still_finishes(project):
+    """DW-386's guard is inert when no task is ESCALATED."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project, [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)]
+    )
+    summary = engine.run()
+
+    assert not summary.paused
+    assert load_state(engine.run_dir).finished
+    assert "run-complete" in [e["kind"] for e in engine.journal.entries()]
 
 
 def test_resume_with_epic_filter_stays_in_scoped_epic(project):

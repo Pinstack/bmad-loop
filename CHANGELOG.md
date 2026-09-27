@@ -9,6 +9,13 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Add `bmad-loop resolve <run> --adopt-branch`: finish an escalated worktree story
+  from its kept branch instead of re-driving it. The task moves to COMMITTING
+  (`escalation-adopted`); on resume (`resume-adopt`) the spec is set to `done` (or
+  `awaiting-operator` with operator actions), the board mirrored, and the branch
+  squashed and merged with no session. Review, `[verify]` commands and
+  `pre_commit_gate` workflows are not re-run (resolve warns). Refused for sweep runs
+  and tasks with no kept worktree or spec; exclusive with `--restore-patch` (DW-386).
 - Add `bmad-loop resume <run> --accept-baseline`: every in-place story the resume
   restarts adopts the current HEAD as its baseline before rolling back, so commits
   above the old baseline are kept instead of parked and reset over
@@ -93,6 +100,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Pause at the escalation instead of recording the run `finished` when a resume
+  drains the queue past a story still ESCALATED, so `resume`/`resolve` still accept
+  the run and its kept worktree is not reclaimed; `bmad-loop resolve` (re-arm or
+  `--adopt-branch`) is the way past it (DW-386).
 - Re-merge on resume a worktree story saved DONE (or awaiting-operator) before its
   merge started: the replay merges the recorded `commit_sha`, then carries the ledger
   and board writes, instead of skipping it and letting GC discard the unit branch

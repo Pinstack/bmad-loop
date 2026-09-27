@@ -3434,6 +3434,74 @@ def test_rearm_plain_mode_sets_ready_for_dev_and_clears_stale_latch(tmp_path):
     assert entry["restore"] is False
 
 
+def test_rearm_clears_a_stale_adopt_latch(tmp_path):
+    """DW-386: an adoption that re-escalated before its latch was spent (e.g. the
+    kept worktree vanished on resume) must not fire an adopt leg on the re-drive.
+
+    Ablation, performed: drop the `adopt_pending = False` in
+    `_rearm_escalation_locked` and this reddens."""
+    from bmad_loop.model import Phase
+
+    run_dir, _spec = _escalated_run(tmp_path, _SPEC_WITH_ARR)
+    state = load_state(run_dir)
+    state.tasks["1-1-a"].adopt_pending = True
+    save_state(run_dir, state)
+
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    task = load_state(run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.PENDING
+    assert task.adopt_pending is False
+
+
+def _adoptable(tmp_path):
+    """An escalation-paused run whose ESCALATED task keeps a worktree + branch + spec."""
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    run_dir, _spec = _escalated_run(tmp_path, _SPEC_WITH_ARR)
+    state = load_state(run_dir)
+    state.tasks["1-1-a"].worktree_path = str(wt)
+    state.tasks["1-1-a"].branch = "bmad-loop/r1/1-1-a"
+    save_state(run_dir, state)
+    return run_dir, wt
+
+
+def test_adopt_under_lock_refuses_a_task_no_longer_escalated(tmp_path):
+    """DW-386: the locked re-check, not the CLI's lock-free early exit, is what stops
+    a stale adopt gesture from latching a task a rival already moved.
+
+    Ablation, performed: drop the phase check in `adopt_escalated_branch` and this
+    reddens."""
+    from bmad_loop.model import Phase
+
+    run_dir, _wt = _adoptable(tmp_path)
+    state = load_state(run_dir)
+    state.tasks["1-1-a"].phase = Phase.PENDING
+    save_state(run_dir, state)
+    before = (run_dir / "state.json").read_bytes()
+
+    with pytest.raises(runs.RearmError, match="not escalated"):
+        runs.adopt_escalated_branch(run_dir)
+
+    assert (run_dir / "state.json").read_bytes() == before
+
+
+def test_adopt_under_lock_refuses_a_kept_worktree_gone_since_the_early_check(tmp_path):
+    """DW-386: a worktree removed between resolve's lock-free check and the lock is
+    refused under the lock, state untouched.
+
+    Ablation, performed: drop the `adopt_refusal` re-check in
+    `adopt_escalated_branch` and this reddens."""
+    run_dir, wt = _adoptable(tmp_path)
+    wt.rmdir()
+    before = (run_dir / "state.json").read_bytes()
+
+    with pytest.raises(runs.RearmError, match="is gone"):
+        runs.adopt_escalated_branch(run_dir)
+
+    assert (run_dir / "state.json").read_bytes() == before
+
+
 def test_rearm_reloads_state_after_waiting_for_the_run_lock(tmp_path, monkeypatch):
     """Ablation: load state before rearm_escalation's state_lock and this stale
     gesture re-arms after the rival has already completed it."""

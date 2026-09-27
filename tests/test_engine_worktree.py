@@ -58,6 +58,7 @@ from bmad_loop.policy import (
     GatesPolicy,
     LimitsPolicy,
     NotifyPolicy,
+    OperatorPolicy,
     Policy,
     ScmPolicy,
     VerifyPolicy,
@@ -9954,3 +9955,226 @@ def test_branch_checkout_path_answers_an_ordinary_mount_path_exactly(project):
 
     # the exemption still holds — this raises if the guard over-refuses its own mount
     _refuse_foreign_checkout(project.project, first.branch, first.path)
+
+
+# ------------------------------------------------- resolve --adopt-branch (DW-386)
+
+
+def _wt_escalating_dev(project, story_key, *, spec=True, status="in-review", operator_actions=None):
+    """A dev session that FINISHES the work inside the unit worktree (a committed
+    change plus a spec at `in-review`) and then raises a CRITICAL escalation — the
+    false-positive-on-finished-work shape `resolve --adopt-branch` exists for."""
+
+    def effect(spec_arg):
+        cwd = spec_arg.cwd
+        wt = project.rebased(cwd)
+        baseline = rev_parse_head(cwd)
+        src = cwd / "src.txt"
+        src.write_text(src.read_text() + f"change for {story_key}\n")
+        git(cwd, "add", "src.txt")
+        git(cwd, "commit", "-q", "-m", f"work for {story_key}")
+        sp = wt.implementation_artifacts / f"spec-{story_key}.md"
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        if spec:
+            write_spec(sp, status, baseline, operator_actions=operator_actions)
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": story_key,
+                "spec_file": str(sp),
+                "baseline_commit": baseline,
+                "escalations": [
+                    {"type": "gap", "severity": "CRITICAL", "detail": "reviewer unsure"}
+                ],
+            },
+        )
+
+    return effect
+
+
+def _escalate_with_kept_branch(project, **dev):
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [_wt_escalating_dev(project, "1-1-a", **dev)])
+    engine.run()
+    task = engine.state.tasks["1-1-a"]
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    assert task.phase == Phase.ESCALATED
+    assert task.worktree_path and Path(task.worktree_path).is_dir() and task.branch
+    return engine
+
+
+def test_adopt_escalated_branch_commits_merges_and_finishes(project):
+    """DW-386: adopting an escalated story's kept branch finishes it through the
+    existing COMMITTING recovery arm — no session, the change merged into the main
+    checkout, the spec and the MAIN board at `done`, and the run finished."""
+    engine = _escalate_with_kept_branch(project)
+
+    branch = runs.adopt_escalated_branch(engine.run_dir, "1-1-a")
+    adopted = load_state(engine.run_dir).tasks["1-1-a"]
+    assert branch == adopted.branch
+    assert adopted.phase == Phase.COMMITTING and adopted.adopt_pending
+
+    resumed, adapter = resume_engine(project, engine)
+    summary = resumed.run()
+
+    assert adapter.sessions == []
+    assert not summary.crashed and not summary.paused
+    saved = load_state(engine.run_dir)
+    assert saved.finished
+    task = saved.tasks["1-1-a"]
+    assert task.phase == Phase.DONE and not task.adopt_pending
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+    main_spec = project.implementation_artifacts / "spec-1-1-a.md"
+    assert verify.status_of(verify.read_frontmatter(main_spec)) == "done"
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+    kinds = journal_kinds(resumed)
+    assert "escalation-adopted" in kinds
+    assert "resume-adopt" in kinds and "unit-merged" in kinds
+    assert "resume-restart" not in kinds
+
+
+def test_adopt_with_a_vanished_spec_re_escalates(project):
+    """The latch is spent and the task re-ESCALATED (COMMITTING→ESCALATED is legal)
+    when the spec is gone from the reopened worktree — never committed half-adopted."""
+    engine = _escalate_with_kept_branch(project)
+    runs.adopt_escalated_branch(engine.run_dir, "1-1-a")
+    task = load_state(engine.run_dir).tasks["1-1-a"]
+    spec = verify.resolve_spec_path(task.spec_file or "", project.rebased(Path(task.worktree_path)))
+    spec.unlink()
+
+    resumed, adapter = resume_engine(project, engine)
+    summary = resumed.run()
+
+    assert adapter.sessions == []
+    assert summary.paused
+    saved = load_state(engine.run_dir)
+    assert not saved.finished
+    assert saved.paused_stage == PAUSE_ESCALATION and saved.paused_story_key == "1-1-a"
+    task = saved.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED and not task.adopt_pending
+    assert "change for 1-1-a" not in (project.project / "src.txt").read_text()
+    kinds = journal_kinds(resumed)
+    assert "resume-adopt" in kinds and "unit-merged" not in kinds
+
+
+def _kept_spec(project, engine):
+    task = load_state(engine.run_dir).tasks["1-1-a"]
+    return verify.resolve_spec_path(task.spec_file or "", project.rebased(Path(task.worktree_path)))
+
+
+def _assert_adoption_re_escalated(project, engine, resumed, summary):
+    assert summary.paused and not summary.crashed
+    saved = load_state(engine.run_dir)
+    assert not saved.finished
+    assert saved.paused_stage == PAUSE_ESCALATION and saved.paused_story_key == "1-1-a"
+    task = saved.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED and not task.adopt_pending
+    assert "change for 1-1-a" not in (project.project / "src.txt").read_text()
+    kinds = journal_kinds(resumed)
+    assert "resume-adopt" in kinds and "unit-merged" not in kinds
+
+
+def test_adopt_of_a_spec_with_no_status_re_escalates(project):
+    """A kept spec whose frontmatter carries no `status` cannot be set to the
+    terminal stage, so the adoption re-escalates instead of committing it."""
+    engine = _escalate_with_kept_branch(project)
+    runs.adopt_escalated_branch(engine.run_dir, "1-1-a")
+    _kept_spec(project, engine).write_text("---\ntitle: t\n---\n\nbody\n", encoding="utf-8")
+
+    resumed, adapter = resume_engine(project, engine)
+    summary = resumed.run()
+
+    assert adapter.sessions == []
+    _assert_adoption_re_escalated(project, engine, resumed, summary)
+
+
+def test_adopt_whose_spec_write_faults_re_escalates(project, monkeypatch):
+    """A spec the status write refuses (`FrontmatterWriteError`) re-escalates the
+    story and pauses the run rather than crashing it."""
+    from bmad_loop.frontmatter import FrontmatterWriteError
+
+    engine = _escalate_with_kept_branch(project)
+    runs.adopt_escalated_branch(engine.run_dir, "1-1-a")
+
+    def refuse(*_a, **_k):
+        raise FrontmatterWriteError("status line cannot be rewritten")
+
+    monkeypatch.setattr(verify, "set_frontmatter_status", refuse)
+    resumed, adapter = resume_engine(project, engine)
+    summary = resumed.run()
+
+    assert adapter.sessions == []
+    _assert_adoption_re_escalated(project, engine, resumed, summary)
+
+
+def test_adopt_of_a_kept_spec_already_parked_latches_its_actions(project):
+    """The kept spec is already at `awaiting-operator` with declared actions, but
+    the task never latched them (only the park path does). Adoption reads them off
+    the spec and parks, instead of adopting to `done` and dropping the owed actions.
+
+    Ablation: drop the operator-actions latch in `Engine._apply_adoption` and this
+    reddens with the story DONE."""
+    actions = ["rotate the staging key"]
+    engine = _escalate_with_kept_branch(
+        project, status="awaiting-operator", operator_actions=actions
+    )
+    assert load_state(engine.run_dir).tasks["1-1-a"].operator_actions == []
+    runs.adopt_escalated_branch(engine.run_dir, "1-1-a")
+
+    resumed, adapter = resume_engine(project, engine)
+    resumed.run()
+
+    assert adapter.sessions == []
+    task = load_state(engine.run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.AWAITING_OPERATOR
+    assert task.operator_actions == actions
+    main_spec = project.implementation_artifacts / "spec-1-1-a.md"
+    assert verify.status_of(verify.read_frontmatter(main_spec)) == "awaiting-operator"
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+
+
+def test_adopt_of_a_kept_parked_spec_with_park_disabled_adopts_to_done(project):
+    """With operator parking disabled, a kept spec at `awaiting-operator` is not a
+    park the policy recognises: adoption must not latch its actions, and the story
+    lands DONE with spec and board at `done`.
+
+    Ablation: drop the `_operator_park_enabled()` check in `Engine._apply_adoption`
+    and this reddens with the story parked."""
+    engine = _escalate_with_kept_branch(
+        project, status="awaiting-operator", operator_actions=["rotate the staging key"]
+    )
+    runs.adopt_escalated_branch(engine.run_dir, "1-1-a")
+
+    resumed, adapter = resume_engine(
+        project, engine, policy=replace(wt_policy(), operator=OperatorPolicy(enabled=False))
+    )
+    resumed.run()
+
+    assert adapter.sessions == []
+    task = load_state(engine.run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.DONE and task.operator_actions == []
+    main_spec = project.implementation_artifacts / "spec-1-1-a.md"
+    assert verify.status_of(verify.read_frontmatter(main_spec)) == "done"
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+
+
+def test_adopt_of_a_task_with_operator_actions_parks_it(project):
+    """A task that declared operator actions adopts to `awaiting-operator`, so
+    `_finalize_commit_phase` parks it rather than marking it DONE."""
+    engine = _escalate_with_kept_branch(project)
+    state = load_state(engine.run_dir)
+    state.tasks["1-1-a"].operator_actions = ["rotate the staging key"]
+    save_state(engine.run_dir, state)
+    runs.adopt_escalated_branch(engine.run_dir, "1-1-a")
+
+    resumed, adapter = resume_engine(project, engine)
+    resumed.run()
+
+    assert adapter.sessions == []
+    task = load_state(engine.run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.AWAITING_OPERATOR and not task.adopt_pending
+    main_spec = project.implementation_artifacts / "spec-1-1-a.md"
+    assert verify.status_of(verify.read_frontmatter(main_spec)) == "awaiting-operator"
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
