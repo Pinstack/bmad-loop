@@ -313,6 +313,6 @@ Two operational notes that apply to any external backend:
   workflow with `bmad-loop mux set <name> --force`.
 - **`capture_pane` is optional.** `TerminalMultiplexer.capture_pane(window_id)` (the
   window's visible screen as text) is non-abstract: its default raises
-  `MultiplexerError`, which the generic adapter reads as "no match" before a stall wake
-  nudge, so an existing backend keeps working unchanged. Override it to enable the
+  `MultiplexerError`, which the generic adapter reads as "no match" at a stall-grace
+  expiry, so an existing backend keeps working unchanged. Override it to enable the
   profile's `parked_prompt_patterns` (DW-350) on your transport.

@@ -205,7 +205,10 @@ def test_parked_signal_fields_parse_from_overlay(tmp_path):
 def test_claude_maps_its_parked_notification_subtypes():
     """The claude profile relays `Notification` and maps exactly the subtypes that
     mean "waiting on a human" (verified against code.claude.com/docs/en/hooks):
-    `quota_auto_resume_fired` means it already resumed, so it stays unmapped."""
+    `quota_auto_resume_fired` means it already resumed, so it stays unmapped. The
+    MCP elicitation dialogs block the session like a permission prompt (DW-434);
+    `agent_needs_input` also fires for another (background) session, so it stays
+    unmapped."""
     claude = get_profile("claude")
     assert claude.hooks.events["Notification"] == "Notification"
     assert claude.hooks.notification_types == {
@@ -213,7 +216,10 @@ def test_claude_maps_its_parked_notification_subtypes():
         "idle_prompt": "IdlePrompt",
         "quota_auto_resume_stale": "QuotaPrompt",
         "quota_auto_resume_disabled": "QuotaPrompt",
+        "elicitation_dialog": "PermissionPrompt",
+        "elicitation_url_dialog": "PermissionPrompt",
     }
+    assert "agent_needs_input" not in claude.hooks.notification_types
     # the other hook-driven built-ins opt in on their own evidence; none has yet
     for name, prof in load_profiles().items():
         if name != "claude":

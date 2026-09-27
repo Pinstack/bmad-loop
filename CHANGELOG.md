@@ -106,8 +106,8 @@ breaking changes may land in a minor release.
   table (the relay forwards `notification_type`), a `parked_prompt_patterns` profile list
   matched against the visible pane, a non-abstract `TerminalMultiplexer.capture_pane`, and
   `SessionResult.parked`/`parked_evidence`. The claude profile relays `Notification` and
-  maps its permission, idle and stale/disabled quota subtypes; re-run `bmad-loop init` to
-  register the relay (DW-348, DW-350).
+  maps its permission, idle, stale/disabled quota and MCP elicitation subtypes; re-run
+  `bmad-loop init` to register the relay (DW-348, DW-350, DW-434).
 
 ### Changed
 
@@ -154,6 +154,14 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Read the pane for `parked_prompt_patterns` at every stall-grace expiry, not only when a
+  wake nudge is due: a final stall (nudges spent, or `dev_stall_nudges = 0`) on a parked
+  dialog now pauses as parked instead of retrying (DW-433).
+- Map Claude's `elicitation_dialog` / `elicitation_url_dialog` Notification subtypes (MCP
+  form / open-URL dialogs) to `PermissionPrompt`, so the stall nudge no longer answers
+  them; `agent_needs_input` stays unmapped (one of its two triggers is another session;
+  the other needs experimental agent teams). Projects that already have the relay need no
+  re-init (DW-434).
 - Fold untrusted fragments (`{error}`, `{problem}`, `({exc})`, agent-authored operator
   actions) into ACTION REQUIRED and park notices through `gates.notice_line`, so a
   multi-line fault no longer lands in ATTENTION as loose, unprefixed lines; journal rows

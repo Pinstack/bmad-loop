@@ -676,7 +676,7 @@ class _UnitMux:
         self.sent.append((window_id, text))
 
     def capture_pane(self, window_id):
-        # The stall gate's pre-nudge screen read (DW-350), kept off the host
+        # The stall gate's screen read at grace expiry (DW-350/DW-433), kept off the host
         # binary like the two above.
         self.captures.append(window_id)
         return self.screen
@@ -7863,6 +7863,10 @@ def _stall_nudges(mux):
         ("idle_prompt", "IdlePrompt"),
         ("quota_auto_resume_stale", "QuotaPrompt"),
         ("quota_auto_resume_disabled", "QuotaPrompt"),
+        # an MCP server's form / open-this-URL dialog blocks like a permission
+        # prompt (DW-434)
+        ("elicitation_dialog", "PermissionPrompt"),
+        ("elicitation_url_dialog", "PermissionPrompt"),
     ],
 )
 def test_parked_notification_withholds_the_stall_nudge(tmp_path, monkeypatch, subtype, kind):
@@ -7932,10 +7936,14 @@ def test_the_wait_loop_asks_the_watcher_for_parked_kinds(tmp_path, monkeypatch):
     assert {"Notification", *PARKED_EVENTS} <= seen[0]
 
 
-@pytest.mark.parametrize("subtype", ["auth_success", "quota_auto_resume_fired", None])
+@pytest.mark.parametrize(
+    "subtype", ["auth_success", "quota_auto_resume_fired", "agent_needs_input", None]
+)
 def test_unmapped_notification_is_ignored(tmp_path, monkeypatch, subtype):
     """A subtype the profile does not map — or none at all (an older relay) — is
-    not a wait on a human: the grace expiry nudges exactly as today."""
+    not a wait on a human: the grace expiry nudges exactly as today.
+    `agent_needs_input` also fires for a different (background) session, and the
+    payload does not say which trigger fired, so claude leaves it unmapped (DW-434)."""
     adapter, mux = _parked_adapter(tmp_path, monkeypatch, [_hook_event("Notification", subtype)])
     result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
     assert result.status == "stalled"
@@ -8037,15 +8045,53 @@ def test_pane_matched_prompt_withholds_the_stall_nudge(tmp_path, monkeypatch, li
 
 def test_clean_pane_nudges_exactly_as_today(tmp_path, monkeypatch):
     """A screen with nothing parked-shaped on it changes nothing: both wake nudges
-    go out (one capture before each), then the ordinary stall."""
+    go out (one capture before each), then the ordinary stall — whose own expiry
+    reads the screen once more (DW-433)."""
     adapter, mux = _parked_adapter(
         tmp_path, monkeypatch, [], screen="Running the test suite…\n❯ \n"
     )
     result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
     assert (result.status, result.parked) == ("stalled", False)
     assert _stall_nudges(mux) == [generic.STALL_NUDGE_TEXT] * 2
-    # No capture once the nudges are spent: the gate only reads the screen when a
-    # nudge is actually due.
+    assert mux.captures == ["@1", "@1", "@1"]
+
+
+def test_pane_matched_prompt_marks_the_stall_when_no_nudges_are_configured(tmp_path, monkeypatch):
+    """`dev_stall_nudges = 0`: no nudge is ever due, yet the grace expiry still
+    reads the screen, so a parked dialog labels the stall parked and the engine
+    pauses instead of retrying (DW-433).
+
+    Ablation: restore `and nudge_due` on the pane read in the stall-expiry gate
+    and this fails on an unparked stall with no capture made."""
+    adapter, mux = _parked_adapter(tmp_path, monkeypatch, [], screen=BYPASS_FOOTER, nudges=0)
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.parked_evidence is not None
+    assert result.parked_evidence.endswith(BYPASS_FOOTER)
+    assert mux.sent == []
+    assert mux.captures == ["@1"]
+
+
+def test_pane_prompt_after_the_last_nudge_marks_the_final_stall(tmp_path, monkeypatch):
+    """The screen was clean when the one wake nudge went out; a dialog painted
+    after it is caught at the final expiry, with no nudge left to withhold
+    (DW-433). The nudge already sent is not retracted.
+
+    Ablation: restore `and nudge_due` on the pane read and this fails on an
+    unparked stall."""
+    adapter, mux = _parked_adapter(tmp_path, monkeypatch, [], nudges=1)
+    send = mux.send_text
+
+    def send_then_paint(window_id, text):
+        send(window_id, text)
+        mux.screen = f"  {BYPASS_HEADING}\n  {BYPASS_FOOTER}\n"
+
+    mux.send_text = send_then_paint
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.parked_evidence is not None
+    assert result.parked_evidence.endswith(BYPASS_HEADING)
+    assert _stall_nudges(mux) == [generic.STALL_NUDGE_TEXT]
     assert mux.captures == ["@1", "@1"]
 
 

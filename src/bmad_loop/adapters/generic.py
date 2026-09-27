@@ -1282,11 +1282,13 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     # Parked gate (DW-348/DW-350), the one decision point: a CLI
                     # waiting on a human must not be typed at, because the nudge's
                     # trailing Enter can ANSWER its prompt (#727). The hook latch
-                    # first; failing that, and only when a nudge would actually go
-                    # out, one look at the visible screen. Either way the nudge is
-                    # withheld and the session ends through the tail below.
+                    # first; failing that, one look at the visible screen — on
+                    # EVERY expiry, not only a nudging one, so the final stall
+                    # (nudges spent, or none configured) is labelled parked too
+                    # and pauses instead of retrying (DW-433). Either way no
+                    # nudge is typed and the session ends through the tail below.
                     parked_now = parked_evidence
-                    if parked_now is None and nudge_due:
+                    if parked_now is None:
                         parked_now = self._pane_parked_evidence(handle)
                     if parked_now is not None:
                         self._note_lifecycle(
@@ -1628,11 +1630,13 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         (DW-350): the evidence (pattern plus quoted line) of the first
         ``parked_prompt_patterns`` match, else None.
 
-        Read only at the instant a stall wake nudge is due. Observation that
+        Read only at a stall-grace expiry with no hook latch — whether a wake
+        nudge is due or the stall is final (DW-433). Observation that
         degrades: no patterns, a backend that cannot capture (the seam default
         raises ``MultiplexerError``; a duck-typed backend may lack the method),
         a capture fault, or a search that blows ``PARKED_PROMPT_MATCH_TIMEOUT_S``
-        all read as "no match", and the nudge goes out exactly as before."""
+        all read as "no match": a due nudge goes out, or the final stall ends
+        unparked, exactly as before."""
         patterns = self._parked_prompt_patterns
         if not patterns:
             return None

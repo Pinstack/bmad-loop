@@ -117,12 +117,23 @@ events = { SessionStart = "SessionStart", Stop = "Stop", SessionEnd = "SessionEn
 # .bmad-loop/profiles/ and drop the `idle_prompt` line below.
 #
 # Subtypes verified 2026-09-24 against code.claude.com/docs/en/hooks (12
-# documented); `quota_auto_resume_fired` means the CLI already resumed. The
-# auth, elicitation and agent subtypes are outside this mapping's scope
-# (permission/idle/quota) and stay unmapped (ignored); an overlay may map them
-# to a parked kind.
+# documented) and re-checked 2026-09-27; `quota_auto_resume_fired` means the CLI
+# already resumed. `elicitation_dialog` / `elicitation_url_dialog` are an MCP
+# server's form or open-this-URL dialog, gated like `permission_prompt` (fired
+# after ~6 s without typing): a blocking dialog on this session's screen, so they
+# map to PermissionPrompt (DW-434). `agent_needs_input` stays unmapped: one
+# subtype covers two triggers, and the payload does not say which. One is a
+# DIFFERENT (background) session waiting while agent view is open, so mapping it
+# would pause a session that is still working. The other, this session asking an
+# agent-team teammate's terminal-setup question, needs experimental agent teams,
+# which bmad-loop does not enable. Map it in an overlay if your sessions run
+# agent teams. `auth_success`, `agent_completed` and the `elicitation_complete` /
+# `elicitation_response` follow-ups are not waits. Unmapped subtypes are ignored;
+# an overlay may map them to a parked kind.
 [hooks.notification_types]
 permission_prompt = "PermissionPrompt"
 idle_prompt = "IdlePrompt"
 quota_auto_resume_stale = "QuotaPrompt"
 quota_auto_resume_disabled = "QuotaPrompt"
+elicitation_dialog = "PermissionPrompt"
+elicitation_url_dialog = "PermissionPrompt"
