@@ -1009,6 +1009,11 @@ def test_make_adapters_generic_shares_synthesizing_but_not_triage(
     assert isinstance(adapters["triage"], GenericAdapter)
     assert not isinstance(adapters["triage"], GenericDevAdapter)
     assert adapters["triage"] is not adapters["dev"]
+    # DW-389: the auto-retro session reads its own result.json, so it is the plain
+    # variant too (sharing triage's (cfg, False) key), never the synthesizing one.
+    assert isinstance(adapters["retro"], GenericAdapter)
+    assert not isinstance(adapters["retro"], GenericDevAdapter)
+    assert adapters["retro"] is adapters["triage"]
 
 
 def test_make_adapters_opencode_http_dispatch_unchanged(
@@ -1035,6 +1040,8 @@ def test_make_adapters_opencode_http_dispatch_unchanged(
     assert adapters["dev"].profile.adapter == "opencode-http"
     assert isinstance(adapters["triage"], OpencodeHttpAdapter)
     assert not isinstance(adapters["triage"], OpencodeDevAdapter)
+    assert isinstance(adapters["retro"], OpencodeHttpAdapter)  # plain, reads result.json
+    assert not isinstance(adapters["retro"], OpencodeDevAdapter)
 
 
 # --------------------------------------------------------------------------- #

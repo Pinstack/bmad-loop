@@ -2162,7 +2162,7 @@ def test_status_json_exposes_adapter_identity(project, capsys):
             "name": pol.adapter.resolved(role).name,
             "model": pol.adapter.resolved(role).model,
         }
-        for role in ("dev", "review", "triage")
+        for role in ("dev", "review", "triage", "retro")
     }
     # Concretely: dev/triage inherit claude/opus; the review client switch to codex
     # resets the model to "".
@@ -3260,6 +3260,9 @@ def test_make_adapters_review_synthesizes_from_spec(project, monkeypatch):
     assert isinstance(adapters["review"], GenericDevAdapter)
     assert isinstance(adapters["triage"], GenericAdapter)
     assert not isinstance(adapters["triage"], GenericDevAdapter)
+    # the auto-retro skill writes a real result.json too (DW-389)
+    assert isinstance(adapters["retro"], GenericAdapter)
+    assert not isinstance(adapters["retro"], GenericDevAdapter)
 
 
 def test_make_adapters_hookless_synthesizing_roles_get_dev_adapter(project, monkeypatch):
@@ -10235,8 +10238,8 @@ def test_validate_effort_warning_does_not_change_the_exit_code(project, capsys, 
     doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
     assert doc["ok"] is True
     warned = [f for f in doc["findings"] if f["check"] == "policy.effort-unsupported"]
-    # base effort inherits into every stage that keeps the client, so all three warn
-    assert sorted(f["detail"]["role"] for f in warned) == ["dev", "review", "triage"]
+    # base effort inherits into every stage that keeps the client, so all four warn
+    assert sorted(f["detail"]["role"] for f in warned) == ["dev", "retro", "review", "triage"]
     assert {f["severity"] for f in warned} == {"warning"}
 
 
@@ -10280,7 +10283,7 @@ def test_validate_warns_when_extra_args_drops_the_bypass_flags(project, capsys):
     findings = _bypass_findings(
         project, capsys, '[adapter]\nname = "claude"\nextra_args = ["--verbose"]\n'
     )
-    assert sorted(f["detail"]["role"] for f in findings) == ["dev", "review", "triage"]
+    assert sorted(f["detail"]["role"] for f in findings) == ["dev", "retro", "review", "triage"]
     assert {f["severity"] for f in findings} == {"warning"}
     dev = next(f for f in findings if f["detail"]["role"] == "dev")
     assert dev["detail"] == {
@@ -10367,7 +10370,7 @@ def test_validate_bypass_warning_does_not_change_the_exit_code(project, capsys, 
     doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
     assert doc["ok"] is True
     warned = [f for f in doc["findings"] if f["check"] == "policy.bypass-dropped"]
-    assert sorted(f["detail"]["role"] for f in warned) == ["dev", "review", "triage"]
+    assert sorted(f["detail"]["role"] for f in warned) == ["dev", "retro", "review", "triage"]
 
 
 def test_validate_bypass_message_names_the_full_include_sequence(project, capsys):
@@ -10396,7 +10399,7 @@ def test_validate_bypass_silent_for_a_stage_that_switches_client(project, capsys
     )
     findings = _bypass_findings(project, capsys, policy)
     roles = sorted(f["detail"]["role"] for f in findings)
-    assert roles == ["review", "triage"]
+    assert roles == ["retro", "review", "triage"]
     assert {f["detail"]["profile"] for f in findings} == {"codex"}
     loaded = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
     assert loaded.adapter.resolved("dev").extra_args is None
@@ -10438,6 +10441,23 @@ def test_dry_run_warns_on_stderr_when_extra_args_drops_the_bypass(project, capsy
     assert warned.out == baseline.out
     dev_line = next(ln for ln in warned.out.splitlines() if "dev:" in ln)
     assert dev_line.endswith("--verbose") and "bypassPermissions" not in dev_line
+
+
+def test_dry_run_warns_for_the_retro_role_under_auto_retrospective(project, capsys):
+    """DW-389: under `gates.retrospective = "auto"` the sprint preview also warns
+    for the retro session a real run would launch.
+
+    ABLATION: pass `("dev", "review")` instead of `_sprint_launch_roles(pol)` in
+    `_dry_run` and this reddens."""
+    policy = (
+        '[gates]\nretrospective = "auto"\n'
+        '[adapter]\nname = "claude"\n'
+        'extra_args = ["--permission-mode", "bypassPermissions", "--verbose"]\n'
+        '[adapter.retro]\nextra_args = ["--verbose"]\n'
+    )
+    lines = _bypass_err_lines(_sprint_dry_run(project, capsys, policy).err)
+    assert len(lines) == 1
+    assert lines[0].startswith("warning: retro adapter.extra_args replaces claude's bypass_args")
 
 
 def test_dry_run_silent_when_extra_args_keeps_the_bypass(project, capsys):
@@ -10648,6 +10668,32 @@ def test_real_run_warns_and_journals_when_extra_args_drops_the_bypass(project, m
     ]
 
 
+def test_real_run_warns_and_journals_the_retro_role_under_auto_retrospective(
+    project, monkeypatch, capsys
+):
+    """DW-389: under `gates.retrospective = "auto"` a sprint run also launches the
+    retro session, so an `[adapter.retro] extra_args` that drops the bypass warns
+    and journals `bypass-dropped` for role `retro` at launch.
+
+    ABLATION: pass `("dev", "review")` instead of `_sprint_launch_roles(pol)` in
+    `cmd_run` and this reddens."""
+    _launch_fixture(
+        project,
+        '[gates]\nretrospective = "auto"\n'
+        + _BYPASS_KEPT_POLICY
+        + '[adapter.retro]\nextra_args = ["--verbose"]\n',
+    )
+    seen = _err_at_engine_run(monkeypatch, capsys, "Engine")
+
+    run_id = "20990101-000000-b412"
+    assert cli.main(["run", "--project", str(project.project), "--run-id", run_id]) == 0
+    assert len(seen) == 1 and len(_bypass_err_lines(seen[0])) == 1
+    entries = _bypass_journal(project.project / ".bmad-loop" / "runs" / run_id)
+    assert [(e["role"], e["profile"], e["missing"]) for e in entries] == [
+        ("retro", "claude", ["--permission-mode", "bypassPermissions"]),
+    ]
+
+
 @pytest.mark.parametrize(
     "policy", [_BYPASS_KEPT_POLICY, '[adapter]\nname = "claude"\n'], ids=["kept", "unset"]
 )
@@ -10750,6 +10796,50 @@ def test_story_resume_warns_and_journals_for_dev_and_review(project, monkeypatch
     assert cli._resume_paused_run(project.project, run_dir) == 0
     assert [ln.split()[1] for ln in _bypass_err_lines(seen[0])] == ["dev", "review"]
     assert [e["role"] for e in _bypass_journal(run_dir)] == ["dev", "review"]
+
+
+@pytest.mark.parametrize(
+    ("source", "roles"),
+    [("sprint-status", ["retro"]), ("stories", [])],
+    ids=["sprint", "stories"],
+)
+def test_resume_warns_and_journals_retro_only_for_sprint_source_under_auto(
+    project, monkeypatch, capsys, source, roles
+):
+    """DW-389: under `gates.retrospective = "auto"` a resumed sprint run launches
+    the retro session too, so a dropping `[adapter.retro] extra_args` warns and
+    journals for `retro`; a stories resume never crosses an epic boundary and
+    stays silent.
+
+    ABLATION: pass `("dev", "review")` for the non-sweep arm of
+    `_resume_paused_run` and the sprint case reddens; drop its
+    `state.source == "stories"` arm and the stories case reddens."""
+    from bmad_loop import runs
+
+    _launch_fixture(
+        project,
+        '[gates]\nretrospective = "auto"\n'
+        + _BYPASS_KEPT_POLICY
+        + '[adapter.retro]\nextra_args = ["--verbose"]\n',
+    )
+    if source == "stories":
+        from conftest import install_build_auto_skill
+
+        install_build_auto_skill(project.project)  # the folder+id dispatch probe
+    run_dir = _make_run_with_state(
+        project.project,
+        "20990101-000000-b417",
+        source=source,
+        paused_reason="escalation",
+        paused_stage="escalation",
+    )
+    monkeypatch.setattr(runs, "kill_session", lambda rid: None)
+    seen = _err_at_engine_run(monkeypatch, capsys, "Engine", "StoriesEngine")
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+    assert len(seen) == 1
+    assert [ln.split()[1] for ln in _bypass_err_lines(seen[0])] == roles
+    assert [e["role"] for e in _bypass_journal(run_dir)] == roles
 
 
 def test_sweep_resume_warns_and_journals_for_triage_dev_and_review(project, monkeypatch, capsys):
@@ -11605,6 +11695,20 @@ def test_validate_json_warning_message_carries_no_severity_prefix(project, capsy
     for finding in warned:
         assert "warning:" not in finding["message"]
         assert not finding["message"].startswith(" ")
+
+
+def test_validate_policy_line_names_the_retro_adapter(project, capsys):
+    """DW-389: an `[adapter.retro]` override is named by `validate`'s policy finding,
+    in the message and the detail, beside the other roles.
+
+    Ablation: drop `retro=` from the policy-OK message and the message assert
+    reddens; drop `retro=_stage_adapter(...)` from `policy.loads` and both do."""
+    _write_policy(project.project, CLAUDE_ONLY_POLICY + '[adapter.retro]\nname = "codex"\n')
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    policy = next(f for f in doc["findings"] if f["check"] == "policy")
+    assert "retro=codex" in policy["message"]
+    assert policy["detail"]["adapters"]["retro"] == "codex"
+    assert policy["detail"]["adapters"]["dev"] == "claude"
 
 
 def test_validate_json_detail_round_trips_for_every_real_shape(capsys):

@@ -467,7 +467,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
             "policy",
             f"policy OK: gates={pol.gates.mode}, "
             f"adapter dev={role_names['dev']}, review={role_names['review']}, "
-            f"triage={role_names['triage']}",
+            f"triage={role_names['triage']}, retro={role_names['retro']}",
             {"gates_mode": pol.gates.mode, "adapters": dict(role_names)},
         )
         for name in dict.fromkeys(role_names.values()):
@@ -1408,6 +1408,13 @@ def _bypass_dropped_message(role: str, profile: CLIProfile, missing: tuple[str, 
         f"{' '.join(missing)} — unattended sessions may stall on permission prompts; "
         f"include `{' '.join(profile.bypass_args)}` in extra_args to keep the bypass"
     )
+
+
+def _sprint_launch_roles(pol) -> tuple[str, ...]:
+    """The roles a SPRINT-mode story run launches: dev + review, plus the auto
+    retrospective's ``retro`` session when ``gates.retrospective = "auto"``
+    (DW-389). Stories mode never crosses an epic boundary, so it stays dev + review."""
+    return ("dev", "review", "retro") if pol.gates.retrospective == "auto" else ("dev", "review")
 
 
 def _warn_bypass_dropped(
@@ -2528,7 +2535,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         profiles=profiles,
     )
     _warn_bypass_dropped(
-        pol, project, ("dev", "review"), profiles=profiles, journal=composed.journal
+        pol,
+        project,
+        ("dev", "review") if stories_on else _sprint_launch_roles(pol),
+        profiles=profiles,
+        journal=composed.journal,
     )
     print(f"run {composed.run_id} starting (attach: bmad-loop attach)")
     summary = composed.engine.run()
@@ -2602,7 +2613,7 @@ def _dry_run(
         return _dry_run_stories(paths, pol, args, spec_folder)
 
     _warn_preflight_would_abort(paths, pol)
-    _warn_bypass_dropped(pol, paths.project, ("dev", "review"))
+    _warn_bypass_dropped(pol, paths.project, _sprint_launch_roles(pol))
 
     def render(role: str, prompt: str) -> str:
         return _render_invocation(pol, paths.project, role, prompt)
@@ -3593,7 +3604,11 @@ def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = 
     _warn_bypass_dropped(
         pol,
         project,
-        ("triage", "dev", "review") if state.run_type == "sweep" else ("dev", "review"),
+        (
+            ("triage", "dev", "review")
+            if state.run_type == "sweep"
+            else ("dev", "review") if state.source == "stories" else _sprint_launch_roles(pol)
+        ),
         profiles=profiles,
         journal=composed.journal,
     )

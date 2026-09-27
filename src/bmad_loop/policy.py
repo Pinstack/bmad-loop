@@ -39,7 +39,7 @@ REVIEW_ON_STATUS_CONTRADICTION_MODES = {"escalate", "retry"}
 OPERATOR_ON_REVIEW_DEMOTION_MODES = {"escalate", "park"}
 # Session stages, in run order. Lives here rather than in the TUI because
 # settings_schema's expand_stages loop fans a template section out over it.
-STAGES = ("dev", "review", "triage")
+STAGES = ("dev", "review", "triage", "retro")
 # Where the run gets its story queue. "sprint-status" (default) is the classic
 # flow — bmad-sprint-planning writes sprint-status.yaml from prose epics.
 # "stories" is the opt-in folder+id dispatch flow (BMAD-METHOD #2549): a typed,
@@ -439,9 +439,17 @@ class AdapterPolicy:
     dev: StageAdapterPolicy = field(default_factory=StageAdapterPolicy)
     review: StageAdapterPolicy = field(default_factory=StageAdapterPolicy)
     triage: StageAdapterPolicy = field(default_factory=StageAdapterPolicy)
+    # The headless epic-boundary retrospective (`gates.retrospective = "auto"`,
+    # DW-389). Appended last: every other stage is keyword-constructed.
+    retro: StageAdapterPolicy = field(default_factory=StageAdapterPolicy)
 
     def resolved(self, role: str) -> ResolvedAdapter:
-        stage = {"dev": self.dev, "review": self.review, "triage": self.triage}.get(role)
+        stage = {
+            "dev": self.dev,
+            "review": self.review,
+            "triage": self.triage,
+            "retro": self.retro,
+        }.get(role)
         if stage is None:
             return ResolvedAdapter(
                 self.name,
@@ -522,7 +530,7 @@ def adapter_policy_from_snapshot(snapshot: dict[str, Any] | None) -> AdapterPoli
 
     ``snapshot`` is ``RunState.policy_snapshot`` — the json-round-tripped
     ``asdict(Policy)``. This reconstructs the ``[adapter]`` sub-tree (the base
-    plus the dev/review/triage :class:`StageAdapterPolicy` stages) so display
+    plus the dev/review/triage/retro :class:`StageAdapterPolicy` stages) so display
     paths can reuse the canonical :meth:`AdapterPolicy.resolved` instead of
     re-deriving its stage-inheritance / client-switch rules against a raw dict.
 
@@ -555,6 +563,7 @@ def adapter_policy_from_snapshot(snapshot: dict[str, Any] | None) -> AdapterPoli
             dev=_stage_from_snapshot(adapter_d.get("dev")),
             review=_stage_from_snapshot(adapter_d.get("review")),
             triage=_stage_from_snapshot(adapter_d.get("triage")),
+            retro=_stage_from_snapshot(adapter_d.get("retro")),
         )
     except Exception:
         return None
@@ -1104,6 +1113,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         dev=_stage_adapter(adapter_d, "dev"),
         review=_stage_adapter(adapter_d, "review"),
         triage=_stage_adapter(adapter_d, "triage"),
+        retro=_stage_adapter(adapter_d, "retro"),
     )
     sweep = SweepPolicy(
         auto=_typed_str(sweep_d, "sweep", "auto", SweepPolicy.auto),
@@ -1362,7 +1372,7 @@ POLICY_TEMPLATE = """\
 
 [gates]
 mode = "per-epic"            # none | per-epic | per-story-spec-approval
-retrospective = "notify"     # never | notify | auto (auto unsupported in v1)
+retrospective = "notify"     # never | notify | auto — auto runs a headless /bmad-retrospective -H session at each epic boundary ([adapter.retro]) and commits its doc + board
 
 [limits]
 max_review_cycles = 3
@@ -1447,11 +1457,11 @@ cleanup_session_on_finish = true  # kill the run's tmux session when it finishes
 # usage_grace_s = 8.0                # seconds to poll the transcript for token usage after a session ends
 # stop_without_result_nudges = 5     # result-less Stop signals tolerated before a session is called stalled
 
-# Per-stage overrides for the dev, review and sweep-triage passes. Unset keys
-# inherit from [adapter] when the stage runs the same client; a stage that
-# switches client falls back to that profile's defaults instead (model, effort
-# and extra_args are client-specific). Stage tables must come after the
-# [adapter] keys above.
+# Per-stage overrides for the dev, review, sweep-triage and auto-retrospective
+# passes. Unset keys inherit from [adapter] when the stage runs the same client;
+# a stage that switches client falls back to that profile's defaults instead
+# (model, effort and extra_args are client-specific). Stage tables must come
+# after the [adapter] keys above.
 # [adapter.dev]
 # model = "opus"
 # [adapter.review]
@@ -1459,6 +1469,8 @@ cleanup_session_on_finish = true  # kill the run's tmux session when it finishes
 # model = "gpt-5-codex"
 # stop_without_result_nudges = 5     # e.g. a multi-turn review needs more nudges than dev
 # [adapter.triage]
+# model = "opus"
+# [adapter.retro]                    # gates.retrospective = "auto" sessions
 # model = "opus"
 # With an opencode-http base, effort tunes reasoning per stage (opencode-http
 # only — a tmux CLI ignores it and `bmad-loop validate` warns):

@@ -28,6 +28,7 @@ key = "retrospective"
 kind = "select"
 options_ref = "RETRO_MODES"
 default_ref = "GatesPolicy.retrospective"
+description = "at each epic boundary: never, notify (suggest /bmad-retrospective), or auto (run a headless /bmad-retrospective session on [adapter.retro] and commit its doc + board)"
 # `on_escalation` is reserved and deliberately has no field here (HIDDEN in
 # tests/test_settings_schema.py): `pause` is its only documented value and the
 # default. policy.py parses it, but nothing reads it — CRITICAL escalations
@@ -265,7 +266,7 @@ default_ref = "AdapterPolicy.stop_without_result_nudges"
 placeholder = "inherit (copilot profile ships 5)"
 description = "result-less Stop signals tolerated before a session is called stalled; overrides the global limits value for this CLI"
 
-# Per-stage adapter overrides. One section per [adapter.dev|review|triage] table,
+# Per-stage adapter overrides. One section per [adapter.dev|review|triage|retro] table,
 # expanded from this single template by the STAGES loop so they never drift.
 [[section]]
 name = "adapter.{stage}"

@@ -1042,6 +1042,58 @@ def test_composition_persists_the_code_root(tmp_path, run_type):
     assert persisted.code_root != Path(persisted.project)
 
 
+@pytest.mark.parametrize("composer", ["run", "resume"])
+def test_story_compositions_wire_the_retro_adapter(tmp_path, monkeypatch, composer):
+    """DW-389: `compose_run` and the story branch of `compose_resume` hand the
+    engine the `retro` role's own adapter, so an `[adapter.retro]` override drives
+    the auto-retrospective session rather than silently falling back to dev.
+
+    Ablation: drop `retro_adapter=adapters["retro"]` from either composer and that
+    parametrization reddens alone (the kwarg is then absent)."""
+    built = {role: object() for role in runsetup.ROLES}
+
+    def make_adapters(*_a, **_k):
+        return dict(built)
+
+    if composer == "run":
+        composed = runsetup.compose_run(
+            project=tmp_path,
+            paths=_fake_paths(tmp_path),
+            policy=policy_mod.loads(""),
+            run_id=RUN_ID,
+            epic_filter=None,
+            story_filter=None,
+            max_stories=None,
+            stories_on=False,
+            spec_folder="",
+            sweep_factory=lambda _trigger, *, started: None,
+            make_adapters=make_adapters,
+            engine_cls=_CapturingEngine,
+            stories_engine_cls=_CapturingEngine,
+            trusted_config_digest="deadbeef",
+        )
+    else:
+        run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+        run_dir.mkdir(parents=True)
+        monkeypatch.setattr(runs, "kill_session", lambda _run_id: None)
+        composed = runsetup.compose_resume(
+            project=tmp_path,
+            paths=_fake_paths(tmp_path),
+            run_dir=run_dir,
+            state=RunState(run_id=RUN_ID, project=str(tmp_path), started_at="now"),
+            policy=policy_mod.loads(""),
+            journal=Journal(run_dir),
+            sweep_factory=lambda _trigger, *, started: None,
+            make_adapters=make_adapters,
+            engine_cls=_CapturingEngine,
+            stories_engine_cls=_CapturingEngine,
+            sweep_engine_cls=_CapturingEngine,
+        )
+
+    assert composed.engine.kwargs["retro_adapter"] is built["retro"]
+    assert composed.engine.kwargs["adapter"] is built["dev"]
+
+
 @pytest.mark.parametrize("run_type", ["run", "sweep"])
 def test_initial_state_and_pid_are_one_locked_publication(tmp_path, monkeypatch, run_type):
     """A rival explicit-id resume cannot enter after state.json becomes readable
@@ -1490,7 +1542,7 @@ def test_compose_sweep_unwinds_when_the_started_latch_raises(tmp_path):
     published: dict[str, bool] = {}
 
     def make_adapters(project, run_dir, policy, *, profiles=None):
-        return {"dev": object(), "review": object(), "triage": object()}
+        return {"dev": object(), "review": object(), "triage": object(), "retro": object()}
 
     def boom() -> None:
         published["run_dir"] = runs.run_dir_for(tmp_path, RUN_ID).is_dir()

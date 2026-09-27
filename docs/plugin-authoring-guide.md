@@ -389,6 +389,13 @@ there.
 | `pre_pick_next` / `post_pick_next`         | around selecting the next story |
 | `pre_epic_boundary` / `post_epic_boundary` | at an epic transition           |
 
+Under `[gates] retrospective = "auto"`, the epic transition also runs one headless
+retrospective session between those two stages. That session fires
+`pre_retro_session`, then the generic `pre_session` / `post_session`, with
+`role = "retro"` and the story key `epic-<N>-retrospective`. That key is not a
+story in the run's state. A veto on either pre-stage fails the retrospective
+(journaled `retro-auto-failed`); it does not pause the run.
+
 ### Story / unit
 
 | Stage                                              | When                                                                                                                                         | Mutable surface                                       |

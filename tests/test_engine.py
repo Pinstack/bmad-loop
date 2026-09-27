@@ -21497,3 +21497,594 @@ def test_resume_restart_park_notifies_once_without_accept(project):
     ]
     assert parked in lines[0]
     git(project.project, "merge-base", "--is-ancestor", human, f"refs/heads/{parked}")
+
+
+# ------------------------------------------- auto retrospective (DW-389)
+#
+# `gates.retrospective = "auto"` dispatches one headless `/bmad-retrospective -H N`
+# session at the epic boundary, judged only by deterministic on-disk checks, and
+# commits exactly the retro's own files. Each row below is one row of the spec's
+# I/O matrix.
+
+AUTO_RETRO = Policy(gates=GatesPolicy(mode="none", retrospective="auto"), notify=QUIET)
+RETRO_DOC = "epic-1-retro-2026-09-26.md"
+
+
+def _two_epic_sprint(project, retro_status: str = "optional") -> None:
+    write_sprint(
+        project,
+        {
+            "epic-1": "backlog",
+            "1-1-a": "ready-for-dev",
+            "epic-1-retrospective": retro_status,
+            "epic-2": "backlog",
+            "2-1-b": "ready-for-dev",
+            "epic-2-retrospective": "optional",
+        },
+    )
+
+
+def _commit_all(project) -> None:
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "seed")
+
+
+def retro_effect(
+    project,
+    epic: int = 1,
+    *,
+    board: bool = True,
+    doc: bool = True,
+    status: str = "completed",
+    rj_status: str | None = "done",
+    stray: str | None = None,
+):
+    """Simulate a `bmad-retrospective -H` session: it writes the retro doc, flips
+    `epic-N-retrospective: done` on the board (the SKILL writes the board, never
+    the engine), optionally touches a foreign file, and returns a result whose
+    result.json carries `rj_status`."""
+
+    def effect(spec: SessionSpec) -> SessionResult:
+        if doc:
+            (project.implementation_artifacts / f"epic-{epic}-retro-2026-09-26.md").write_text(
+                "# retro\n"
+            )
+        if board:
+            set_sprint(project, f"epic-{epic}-retrospective", "done")
+        if stray is not None:
+            (project.project / stray).write_text("stray retro write\n")
+        rj = None if rj_status is None else {"workflow": "bmad-retrospective", "status": rj_status}
+        return SessionResult(status=status, result_json=rj)
+
+    return effect
+
+
+def _record_notify(monkeypatch) -> list[tuple[str, str]]:
+    sent: list[tuple[str, str]] = []
+
+    def notify(policy, run_dir, title, message, **_kw):
+        sent.append((title, message))
+
+    monkeypatch.setattr(gates, "notify", notify)
+    return sent
+
+
+def _kinds(engine) -> list[str]:
+    return [e["kind"] for e in engine.journal.entries()]
+
+
+def _only(engine, kind: str) -> dict:
+    rows = [e for e in engine.journal.entries() if e["kind"] == kind]
+    assert len(rows) == 1, (kind, rows)
+    return rows[0]
+
+
+def _commit_of(project, subject: str) -> list[str]:
+    """The files the single commit titled ``subject`` touched."""
+    log = git(project.project, "log", "--format=%H %s").splitlines()
+    shas = [line.split(" ", 1)[0] for line in log if line.split(" ", 1)[1] == subject]
+    assert len(shas) == 1, (subject, log)
+    return sorted(git(project.project, "show", "--name-only", "--format=", shas[0]).split())
+
+
+def test_auto_retro_happy_path_runs_on_the_retro_adapter_and_commits_its_files(
+    project, monkeypatch
+):
+    """Epic 1 → 2 under `auto`: the retro adapter gets exactly one session whose
+    prompt is `/bmad-retrospective -H 1` plus the result.json clause, the doc and
+    the board land in one `chore(retro)` commit holding exactly them, and epic 2
+    runs. The notify-mode nudge is NOT sent, and the synthetic task never enters
+    `state.tasks`.
+
+    Ablation: make `_maybe_auto_retro`'s `!= "auto"` guard return unconditionally
+    (no dispatch branch) and this reddens on the retro adapter's empty session
+    list."""
+    sent = _record_notify(monkeypatch)
+    _two_epic_sprint(project)
+    retro = MockAdapter([retro_effect(project)])
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=True),
+            dev_effect(project, "2-1-b"),
+            review_effect(project, "2-1-b", clean=True),
+        ],
+        policy=AUTO_RETRO,
+        retro_adapter=retro,
+    )
+    summary = engine.run()
+
+    assert summary.done == 2 and not summary.paused
+    assert len(retro.sessions) == 1
+    spec = retro.sessions[0]
+    assert spec.role == "retro"
+    assert spec.prompt.startswith("/bmad-retrospective -H 1\n")
+    assert "$BMAD_LOOP_RUN_DIR/tasks/$BMAD_LOOP_TASK_ID/result.json" in spec.prompt
+    assert '{"workflow": "bmad-retrospective", "status": "done"}' in spec.prompt
+    assert spec.prompt.rstrip().endswith("then end your turn.")
+    assert spec.task_id == _session_task_id("epic-1-retrospective", "retro", 1, 0)
+    assert all(s.role != "retro" for s in adapter.sessions)
+
+    kinds = _kinds(engine)
+    assert kinds.index("retro-auto-start") < kinds.index("retro-auto-finished")
+    assert kinds.index("retro-auto-finished") < kinds.index(
+        "story-start", kinds.index("epic-boundary")
+    )
+    assert _only(engine, "retro-auto-finished")["docs"] == [RETRO_DOC]
+    assert "retro-auto-dirty" not in kinds and "retro-auto-failed" not in kinds
+
+    rel_doc = (project.implementation_artifacts / RETRO_DOC).relative_to(project.project)
+    rel_board = project.sprint_status.relative_to(project.project)
+    assert _commit_of(project, "chore(retro): epic 1 retrospective") == sorted(
+        [rel_doc.as_posix(), rel_board.as_posix()]
+    )
+    assert worktree_clean(project.project)
+    saved = load_state(engine.run_dir)
+    assert "epic-1-retrospective" not in saved.tasks
+    assert saved.current_epic == 2
+    assert not any("retrospective suggested" in msg for _t, msg in sent)
+    assert any(title == "epic 1 retrospective done" and RETRO_DOC in msg for title, msg in sent)
+
+
+def test_auto_retro_falls_back_to_the_dev_adapter(project):
+    """No distinct retro adapter: the retro session rides the dev adapter,
+    between epic 1's review and epic 2's dev session."""
+    _two_epic_sprint(project)
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=True),
+            retro_effect(project),
+            dev_effect(project, "2-1-b"),
+            review_effect(project, "2-1-b", clean=True),
+        ],
+        policy=AUTO_RETRO,
+    )
+    summary = engine.run()
+
+    assert summary.done == 2 and not summary.paused
+    assert [s.role for s in adapter.sessions] == ["dev", "review", "retro", "dev", "review"]
+
+
+@pytest.mark.parametrize("mode", ["notify", "never"])
+def test_auto_retro_is_inert_under_notify_and_never(project, monkeypatch, mode):
+    """Only `auto` dispatches; `notify` keeps its one nudge and `never` stays
+    silent. A retro session here would exhaust the script and fail the run."""
+    sent = _record_notify(monkeypatch)
+    _two_epic_sprint(project)
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=True),
+            dev_effect(project, "2-1-b"),
+            review_effect(project, "2-1-b", clean=True),
+        ],
+        policy=Policy(gates=GatesPolicy(mode="none", retrospective=mode), notify=QUIET),
+    )
+    summary = engine.run()
+
+    assert summary.done == 2 and not summary.paused
+    assert all(s.role != "retro" for s in adapter.sessions)
+    assert not any(k.startswith("retro-auto-") for k in _kinds(engine))
+    nudges = [msg for _t, msg in sent if "retrospective suggested" in msg]
+    assert len(nudges) == (1 if mode == "notify" else 0)
+
+
+def test_auto_retro_already_done_is_skipped_silently(project, monkeypatch):
+    """The board already says `epic-1-retrospective: done` (a human, an earlier
+    attempt, a crash-resume): no session, no notify.
+
+    Ablation: delete the `already-done` guard and the retro adapter's empty script
+    raises `ScriptExhausted` inside the session, which journals `retro-auto-failed`
+    and reddens every assertion below."""
+    sent = _record_notify(monkeypatch)
+    _two_epic_sprint(project, retro_status="done")
+    retro = MockAdapter([])
+    engine, _ = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=True),
+            dev_effect(project, "2-1-b"),
+            review_effect(project, "2-1-b", clean=True),
+        ],
+        policy=AUTO_RETRO,
+        retro_adapter=retro,
+    )
+    summary = engine.run()
+
+    assert summary.done == 2 and not summary.paused
+    assert retro.sessions == []
+    row = _only(engine, "retro-auto-skipped")
+    assert row["reason"] == "already-done" and row["epic"] == 1
+    assert "retro-auto-start" not in _kinds(engine)
+    assert not any("retrospective" in title for title, _m in sent)
+
+
+def _boundary_engine(project, script=(), **kwargs):
+    """An engine poised at epic 1's boundary: board seeded and committed, so the
+    tree is clean unless the test dirties it."""
+    _two_epic_sprint(project)
+    _commit_all(project)
+    retro = MockAdapter(list(script))
+    engine, _ = make_engine(project, [], policy=AUTO_RETRO, retro_adapter=retro, **kwargs)
+    return engine, retro
+
+
+@pytest.mark.parametrize("reason", ["dirty", "git-error", "stop-requested", "skill-missing"])
+def test_auto_retro_pre_dispatch_refusals_notify_and_return(project, monkeypatch, reason):
+    """Each refusal journals `retro-auto-skipped` with its closed reason, tells the
+    operator to run the retro by hand, and returns without a session — the run
+    continues.
+
+    Ablation: delete any one refusal arm and its parametrization reddens — the
+    retro adapter's empty script raises `ScriptExhausted` in a dispatched session,
+    so the row reads `retro-auto-failed` instead."""
+    sent = _record_notify(monkeypatch)
+    engine, retro = _boundary_engine(project)
+    if reason == "dirty":
+        (project.project / "src.txt").write_text("uncommitted\n")
+    elif reason == "git-error":
+
+        def boom(*_a, **_k):
+            raise GitError("git status timed out")
+
+        monkeypatch.setattr(verify, "worktree_clean", boom)
+    elif reason == "stop-requested":
+        _lodge_stop_request(engine.run_dir)
+    else:
+        from conftest import attach_profile
+
+        attach_profile(retro, "claude", project.project)
+
+    engine._maybe_auto_retro(1)
+
+    assert retro.sessions == []
+    row = _only(engine, "retro-auto-skipped")
+    assert row["reason"] == reason and row["epic"] == 1
+    assert "retro-auto-start" not in _kinds(engine)
+    assert any(
+        "retrospective" in title and "/bmad-retrospective" in msg and reason in msg
+        for title, msg in sent
+    )
+
+
+def test_auto_retro_skill_probe_passes_when_the_skill_is_installed(project):
+    """The `skill-missing` probe looks in the retro adapter's own skill tree; with
+    `bmad-retrospective/SKILL.md` there, the session dispatches."""
+    from conftest import attach_profile
+
+    engine, retro = _boundary_engine(project, [retro_effect(project)])
+    attach_profile(retro, "claude", project.project)
+    skill = project.project / retro.profile.skill_tree / "bmad-retrospective" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("---\nname: bmad-retrospective\n---\n")
+    _commit_all(project)
+
+    engine._maybe_auto_retro(1)
+
+    assert len(retro.sessions) == 1
+    assert "retro-auto-finished" in _kinds(engine)
+
+
+def test_auto_retro_unreadable_board_is_refused(project, monkeypatch):
+    sent = _record_notify(monkeypatch)
+    engine, retro = _boundary_engine(project)
+    project.sprint_status.write_text("development_status: [not, a, mapping\n")
+    _commit_all(project)
+
+    engine._maybe_auto_retro(1)
+
+    assert retro.sessions == []
+    assert _only(engine, "retro-auto-skipped")["reason"] == "board-unreadable"
+    assert any("board-unreadable" in msg for _t, msg in sent)
+
+
+def test_auto_retro_session_not_completed_fails_and_run_continues(project, monkeypatch):
+    """A stalled session that wrote nothing is a failed retro: `retro-auto-failed`
+    plus a notify naming the manual command; the tree is clean, so epic 2 runs.
+    No retry within the boundary."""
+    sent = _record_notify(monkeypatch)
+    _two_epic_sprint(project)
+    retro = MockAdapter(
+        [retro_effect(project, board=False, doc=False, status="stalled", rj_status=None)]
+    )
+    engine, _ = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=True),
+            dev_effect(project, "2-1-b"),
+            review_effect(project, "2-1-b", clean=True),
+        ],
+        policy=AUTO_RETRO,
+        retro_adapter=retro,
+    )
+    summary = engine.run()
+
+    assert summary.done == 2 and not summary.paused
+    assert len(retro.sessions) == 1
+    errors = _only(engine, "retro-auto-failed")["errors"]
+    assert any("stalled" in e for e in errors)
+    assert "retro-auto-finished" not in _kinds(engine)
+    assert any(
+        title == "auto retrospective failed" and "/bmad-retrospective" in msg for title, msg in sent
+    )
+
+
+def test_auto_retro_incomplete_session_is_never_success_and_its_output_pauses(project):
+    """A session that did everything — doc, board, even a `done` result.json — but
+    did not COMPLETE is still a failed retro: nothing is committed, and the
+    leftover doc + board pause the run at the boundary with `current_epic`
+    unchanged, so the next story's rollback cannot destroy or absorb them."""
+    engine, _ = _boundary_engine(project, [retro_effect(project, status="timeout")])
+    engine.state.current_epic = 1
+
+    with pytest.raises(RunPaused) as exc:
+        engine._maybe_auto_retro(1)
+
+    assert exc.value.stage == PAUSE_EPIC_BOUNDARY
+    assert "timeout" in " ".join(_only(engine, "retro-auto-failed")["errors"])
+    dirty = _only(engine, "retro-auto-dirty")
+    rel_doc = (project.implementation_artifacts / RETRO_DOC).relative_to(project.project)
+    assert rel_doc.as_posix() in dirty["paths"]
+    assert rel_doc.as_posix() in exc.value.reason
+    assert "chore(retro)" not in git(project.project, "log", "--format=%s")
+    assert engine.state.current_epic == 1
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "failed_check"),
+    [
+        ({"board": False}, "sprint-status epic-1-retrospective is optional"),
+        ({"doc": False}, "no epic-1-retro-*.md retrospective doc"),
+        ({"rj_status": "blocked"}, "result.json status is not done"),
+    ],
+    ids=["board-not-done", "no-doc", "result-blocked"],
+)
+def test_auto_retro_failed_checks_are_each_listed(project, kwargs, failed_check):
+    """A completed session is judged by every check; each one that fails is its own
+    `errors` line. Nothing is committed on failure, so whatever the session did
+    write stays dirty and pauses the boundary."""
+    engine, _ = _boundary_engine(project, [retro_effect(project, **kwargs)])
+
+    with pytest.raises(RunPaused):
+        engine._maybe_auto_retro(1)
+
+    errors = _only(engine, "retro-auto-failed")["errors"]
+    assert errors == [failed_check]
+    assert "chore(retro)" not in git(project.project, "log", "--format=%s")
+
+
+def test_auto_retro_blocked_with_a_clean_tree_continues(project):
+    engine, _ = _boundary_engine(
+        project, [retro_effect(project, board=False, doc=False, rj_status="blocked")]
+    )
+
+    engine._maybe_auto_retro(1)  # no pause: nothing was written
+
+    errors = _only(engine, "retro-auto-failed")["errors"]
+    assert "result.json status is not done" in errors
+    assert "retro-auto-dirty" not in _kinds(engine)
+
+
+def test_auto_retro_session_exception_is_a_failed_retro(project):
+    """Any exception other than a stop/pause out of the session is a failed retro,
+    not a crashed run; its text rides `error`."""
+
+    def boom(_spec):
+        raise RuntimeError("transport fell over")
+
+    engine, _ = _boundary_engine(project, [boom])
+
+    engine._maybe_auto_retro(1)
+
+    row = _only(engine, "retro-auto-failed")
+    assert row["errors"][0] == "session raised RuntimeError"
+    assert "transport fell over" in row["error"]
+
+
+@pytest.mark.parametrize("exc_type", [RunStopped, KeyboardInterrupt])
+def test_auto_retro_stop_propagates(project, exc_type):
+    def stop(_spec):
+        raise exc_type()
+
+    engine, _ = _boundary_engine(project, [stop])
+
+    with pytest.raises(exc_type):
+        engine._maybe_auto_retro(1)
+
+    assert "retro-auto-failed" not in _kinds(engine)
+
+
+def test_auto_retro_foreign_dirt_commits_expected_then_pauses_and_resumes(project):
+    """The session also edits `src.txt`: the doc + board are committed, then the
+    leftover pauses the run at the boundary (`current_epic` not advanced). After
+    the operator cleans up, resume re-enters the boundary, `already-done` keeps the
+    retro from running twice, and epic 2 runs.
+
+    Ablation: commit every dirty path instead of the expected set and the commit
+    assertion reddens on `src.txt`."""
+    _two_epic_sprint(project)
+    retro = MockAdapter([retro_effect(project, stray="src.txt")])
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=AUTO_RETRO,
+        retro_adapter=retro,
+    )
+    summary = engine.run()
+
+    assert summary.paused
+    saved = load_state(engine.run_dir)
+    assert saved.paused_stage == PAUSE_EPIC_BOUNDARY
+    assert saved.current_epic == 1
+    assert "2-1-b" not in saved.tasks
+    assert _only(engine, "retro-auto-dirty")["paths"] == ["src.txt"]
+    rel_doc = (project.implementation_artifacts / RETRO_DOC).relative_to(project.project)
+    rel_board = project.sprint_status.relative_to(project.project)
+    assert _commit_of(project, "chore(retro): epic 1 retrospective") == sorted(
+        [rel_doc.as_posix(), rel_board.as_posix()]
+    )
+
+    git(project.project, "checkout", "--", "src.txt")  # the operator cleans up
+    resumed, adapter = resume_engine(
+        project,
+        engine,
+        [dev_effect(project, "2-1-b"), review_effect(project, "2-1-b", clean=True)],
+    )
+    summary2 = resumed.run()
+
+    assert summary2.done == 2 and not summary2.paused
+    assert all(s.role != "retro" for s in adapter.sessions)
+    skipped = [e for e in resumed.journal.entries() if e["kind"] == "retro-auto-skipped"]
+    assert [e["reason"] for e in skipped] == ["already-done"]
+
+
+def test_auto_retro_commit_failure_degrades_then_pauses(project, monkeypatch):
+    """A `GitError` from the commit journals `retro-auto-uncommitted`; the retro's
+    files then stay dirty and the boundary pauses on them rather than letting the
+    next story's rollback destroy them."""
+    engine, _ = _boundary_engine(project, [retro_effect(project)])
+
+    def refuse(*_a, **_k):
+        raise GitError("index.lock exists")
+
+    monkeypatch.setattr(verify, "commit_paths", refuse)
+
+    with pytest.raises(RunPaused):
+        engine._maybe_auto_retro(1)
+
+    kinds = _kinds(engine)
+    assert kinds.index("retro-auto-finished") < kinds.index("retro-auto-uncommitted")
+    assert kinds.index("retro-auto-uncommitted") < kinds.index("retro-auto-dirty")
+
+
+def test_auto_retro_unreadable_tree_after_session_pauses(project, monkeypatch):
+    """A `GitError` reading the tree after the session pauses at the boundary with
+    a `retro-auto-dirty` row carrying the error, rather than escaping as a raw
+    exception that leaves the retro's files unprotected.
+
+    Ablation: narrow `_settle_retro_tree`'s outer `except verify.GitError` to the
+    commit call and this reddens — the `GitError` escapes instead of a pause."""
+    after = retro_effect(project)
+
+    def effect(spec):
+        result = after(spec)
+
+        def unreadable(*_a, **_k):
+            raise GitError("git status timed out")
+
+        monkeypatch.setattr(verify, "dirty_paths", unreadable)
+        return result
+
+    engine, _ = _boundary_engine(project, [effect])
+    epic_before = engine.state.current_epic
+
+    with pytest.raises(RunPaused) as exc:
+        engine._maybe_auto_retro(1)
+
+    assert exc.value.stage == PAUSE_EPIC_BOUNDARY
+    assert "could not read the worktree" in exc.value.reason
+    row = _only(engine, "retro-auto-dirty")
+    assert row["paths"] == [] and "git status timed out" in row["error"]
+    assert engine.state.current_epic == epic_before
+
+
+def test_auto_retro_undecodable_board_is_a_failed_retro_not_a_crash(project):
+    """A session that leaves sprint-status as invalid UTF-8 fails the board check
+    (`sprint-status unreadable`) and the tree is still settled — the undecodable
+    board is left dirty, so the boundary pauses on it.
+
+    Ablation: drop `UnicodeDecodeError` from `_verify_retro`'s except tuple and
+    this reddens — the decode error escapes before the tree is settled."""
+    after = retro_effect(project)
+
+    def effect(spec):
+        result = after(spec)
+        project.sprint_status.write_bytes(b"development_status:\n  x: \xff\xfe\n")
+        return result
+
+    engine, _ = _boundary_engine(project, [effect])
+
+    with pytest.raises(RunPaused):
+        engine._maybe_auto_retro(1)
+
+    assert "sprint-status unreadable" in _only(engine, "retro-auto-failed")["errors"]
+    assert "retro-auto-dirty" in _kinds(engine)
+
+
+def test_auto_retro_dirty_pause_reason_caps_the_path_list(project):
+    """The pause reason names at most ten leftover paths; the journal row keeps
+    them all."""
+    strays = [f"stray-{i:02d}.txt" for i in range(12)]
+
+    def many(spec):
+        result = retro_effect(project)(spec)
+        for name in strays:
+            (project.project / name).write_text("x\n")
+        return result
+
+    engine, _ = _boundary_engine(project, [many])
+
+    with pytest.raises(RunPaused) as exc:
+        engine._maybe_auto_retro(1)
+
+    row = _only(engine, "retro-auto-dirty")
+    assert row["paths"] == strays and row["count"] == 12
+    assert "stray-09.txt" in exc.value.reason and "stray-10.txt" not in exc.value.reason
+    assert "(+2 more)" in exc.value.reason
+
+
+def test_auto_retro_runs_before_the_per_epic_sweep(project):
+    """The retro settles its tree before the per-epic sweep asks for a clean one,
+    so the sweep sees the committed retro (and its action items, DW-388)."""
+    _two_epic_sprint(project)
+    calls: list = []
+    retro = MockAdapter([retro_effect(project)])
+    engine, _ = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=True),
+            dev_effect(project, "2-1-b"),
+            review_effect(project, "2-1-b", clean=True),
+        ],
+        policy=Policy(
+            gates=GatesPolicy(mode="none", retrospective="auto"),
+            notify=QUIET,
+            sweep=SweepPolicy(auto="per-epic"),
+        ),
+        retro_adapter=retro,
+        sweep_factory=recording_factory(calls),
+    )
+    summary = engine.run()
+
+    assert summary.done == 2
+    assert calls == ["epic-1"]
+    kinds = _kinds(engine)
+    assert kinds.index("retro-auto-finished") < kinds.index("sweep-auto-trigger")
+    assert "sweep-auto-skipped-dirty" not in kinds

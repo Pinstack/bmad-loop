@@ -9,6 +9,15 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Implement `[gates] retrospective = "auto"`: at each epic boundary, run one headless
+  `/bmad-retrospective -H <epic>` session on the new `retro` adapter role
+  (`[adapter.retro]`; unset keys inherit from `[adapter]`), before the per-epic auto-sweep.
+  Success needs all of: a completed session, `result.json` status `done`, the board at
+  `epic-N-retrospective: done`, and an `epic-N-retro-*.md` doc. On success, commit only
+  the doc and the board (`chore(retro): epic N retrospective`). Any leftover dirty path
+  pauses at the epic boundary. Journals `retro-auto-start` / `-finished` / `-failed` /
+  `-skipped` / `-dirty` / `-uncommitted`. `validate` and `status --json` name the retro
+  adapter (DW-389).
 - Ingest sprint-status retro `action_items` into the deferred-work ledger: a fresh
   `bmad-loop sweep` files each id-keyed, not-`done` item as a `DW-<n>` entry
   (`origin: retro action item <id>`, `severity: low`) and commits it before triage.
@@ -92,6 +101,14 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- `gates.retrospective = "auto"` no longer sends the "retrospective suggested" nudge;
+  it runs the retro instead (DW-389).
+- `validate`'s policy line and `--json` detail, and `status --json` `adapters`, gain a
+  `retro` role; `policy.bypass-dropped` and `policy.effort-unsupported` now also cover
+  it, and a sprint `run`/`resume`/`--dry-run` under `auto` warns and journals
+  `bypass-dropped` for it (DW-389).
+- `config_digest` now covers the retro role's launch fields; an auto-sweep pin
+  re-stamps on resume (DW-389).
 - Support `isolation = "worktree"` beside a `repo_root:` override that contains the
   project (a monorepo's `<repo>/app`): each unit worktree provisions `_bmad/`, skills,
   hook configs and seeds at the project's offset (`<worktree>/app/…`), and relative

@@ -61,6 +61,7 @@ SECTION_DC = {
     "adapter.dev": StageAdapterPolicy,
     "adapter.review": StageAdapterPolicy,
     "adapter.triage": StageAdapterPolicy,
+    "adapter.retro": StageAdapterPolicy,
     "sweep": SweepPolicy,
     "scm": ScmPolicy,
     "cleanup": CleanupPolicy,
@@ -99,6 +100,7 @@ HIDDEN = {
     ("adapter", "dev"),  # rendered as the adapter.dev section
     ("adapter", "review"),  # rendered as the adapter.review section
     ("adapter", "triage"),  # rendered as the adapter.triage section
+    ("adapter", "retro"),  # rendered as the adapter.retro section
     ("dev", "skill"),  # internal dev-skill seam; DEV_SKILLS has one legal value, no UI knob
     # Dashboard pane geometry — set by mouse-drag / the Ctrl+W resize mode, not a
     # form field, so no settings-screen control.
@@ -134,7 +136,13 @@ def test_extra_args_fields_explain_the_bypass_replace_rule():
     `extra_args` field (the base table and each stage) says so on the settings
     screen; the stage entry also names the client-match inheritance."""
     fields = {f.section: f for f in core_fields() if f.key == "extra_args"}
-    assert set(fields) == {"adapter", "adapter.dev", "adapter.review", "adapter.triage"}
+    assert set(fields) == {
+        "adapter",
+        "adapter.dev",
+        "adapter.review",
+        "adapter.triage",
+        "adapter.retro",
+    }
     for section, f in fields.items():
         assert "replaces" in f.description and "bypass_args" in f.description, section
     assert "only when the client matches" in fields["adapter.dev"].description

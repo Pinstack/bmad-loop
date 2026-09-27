@@ -472,6 +472,33 @@ produces. If you end your turn without it, the session is eventually declared
 stalled and its work may be discarded."""
 
 
+# The whole prompt of a `gates.retrospective = "auto"` session (DW-389). The retro
+# role runs a plain (non-synthesizing) adapter, so its completion signal is the
+# session-written `tasks/<task_id>/result.json` the adapter reads back on Stop —
+# the same channel the sweep triage session uses. The clause is spelled out
+# because `bmad-retrospective` is an upstream skill that knows nothing of that
+# convention. Success is never read off this document alone: `_verify_retro`
+# re-checks the board and the retro doc on disk as well.
+RETRO_AUTO_PROMPT = """/bmad-retrospective -H {epic}
+
+## Completion signal (required)
+When the retrospective is finished — or blocked — write
+$BMAD_LOOP_RUN_DIR/tasks/$BMAD_LOOP_TASK_ID/result.json as
+{{"workflow": "bmad-retrospective", "status": "done"}} (or "blocked" plus "reason"), \
+then end your turn."""
+
+# The skill `RETRO_AUTO_PROMPT` invokes; probed in the retro adapter's skill tree
+# before dispatch (`retro-auto-skipped reason=skill-missing`).
+RETRO_SKILL = "bmad-retrospective"
+
+# How many leftover paths a retro dirty-tree pause names in its reason.
+_RETRO_DIRTY_REASON_PATHS = 10
+
+
+def _retro_auto_prompt(epic: int) -> str:
+    return RETRO_AUTO_PROMPT.format(epic=epic)
+
+
 def _session_task_id(story_key: str, part: str, seq: int, generation: int) -> str:
     """Single composition point for session task ids. Sanitize the whole
     composition, not the parts: two individually capped parts can still compose
@@ -810,6 +837,7 @@ class Engine:
         review_adapter: CodingCLIAdapter | None = None,
         sweep_factory: SweepFactory | None = None,
         registry: PluginRegistry | None = None,
+        retro_adapter: CodingCLIAdapter | None = None,
     ):
         self.paths = paths
         # where code+git work + artifact reads happen. isolation="none" (today's
@@ -820,6 +848,8 @@ class Engine:
         self.adapters = {
             "dev": adapter,
             "review": review_adapter if review_adapter is not None else adapter,
+            # the headless epic-boundary retrospective (DW-389, `_maybe_auto_retro`)
+            "retro": retro_adapter if retro_adapter is not None else adapter,
         }
         self.run_dir = run_dir
         self.journal = journal
@@ -9592,11 +9622,219 @@ class Engine:
             latch()
             self.journal.append("sweep-auto-finished", trigger=trigger)
 
+    def _skip_auto_retro(self, epic: int, reason: str, error: str | None = None) -> None:
+        """Journal a pre-dispatch refusal of the auto retrospective and, unless the
+        retro is simply already done, tell the operator to run it by hand."""
+        extra = {} if error is None else {"error": error}
+        self.journal.append("retro-auto-skipped", epic=epic, reason=reason, **extra)
+        if reason != "already-done":
+            gates.notify(
+                self.policy,
+                self.run_dir,
+                f"auto retrospective skipped for epic {epic}",
+                f"{reason}: run /bmad-retrospective for epic {epic} by hand",
+            )
+
+    def _retro_docs(self, epic: int) -> list[Path]:
+        """The regular files matching ``epic-{epic}-retro-*.md`` in the
+        implementation-artifacts dir, sorted. ``lstat``-checked, so a symlink or a
+        directory of that name is not a retro doc. Raises ``OSError`` when the
+        directory cannot be listed; a single entry that vanishes or cannot be
+        stat'd is simply not counted."""
+        docs: list[Path] = []
+        for candidate in sorted(
+            self.paths.implementation_artifacts.glob(f"epic-{epic}-retro-*.md")
+        ):
+            try:
+                if S_ISREG(candidate.lstat().st_mode):
+                    docs.append(candidate)
+            except OSError:
+                continue
+        return docs
+
+    def _verify_retro(
+        self, epic: int, result: SessionResult | None
+    ) -> tuple[list[str], list[Path]]:
+        """Deterministic success checks for an auto-retro session (DW-389): every
+        failed check as one ``errors`` line, plus the retro docs found. Success is
+        an empty error list — a completed session, a ``result.json`` saying
+        ``done``, the board reading ``epic-N-retrospective: done``, and at least one
+        retro doc on disk. Each is re-read here; no session prose is consulted.
+        ``result`` is ``None`` when the session raised (the caller supplies that
+        error itself)."""
+        errors: list[str] = []
+        if result is not None:
+            if result.status != "completed":
+                errors.append(f"session status {result.status}, not completed")
+            elif result_mapping(result.result_json).get("status") != "done":
+                errors.append("result.json status is not done")
+        try:
+            board = load_sprint_status(self.paths.sprint_status).retros.get(epic)
+        except (SprintStatusError, OSError, UnicodeDecodeError):
+            errors.append("sprint-status unreadable")
+        else:
+            if board != "done":
+                errors.append(f"sprint-status epic-{epic}-retrospective is {board or 'absent'}")
+        try:
+            docs = self._retro_docs(epic)
+        except OSError:
+            docs = []
+            errors.append("implementation-artifacts unreadable")
+        else:
+            if not docs:
+                errors.append(f"no epic-{epic}-retro-*.md retrospective doc")
+        return errors, docs
+
+    def _repo_relpath(self, path: Path) -> str | None:
+        """``path`` as the repo-relative posix spelling ``verify.dirty_paths``
+        uses, or None when it lies outside the repo (a sibling artifacts tree)."""
+        try:
+            return path.resolve().relative_to(self.paths.repo_root.resolve()).as_posix()
+        except (OSError, RuntimeError, ValueError):
+            return None
+
+    def _settle_retro_tree(self, epic: int, ok: bool, docs: list[Path]) -> None:
+        """Leave the tree clean after an auto-retro session, or pause.
+
+        On success, commit exactly the dirty members of {sprint-status, the retro
+        docs} — the retro's own output, nothing the session happened to touch
+        besides. A commit ``GitError`` degrades to ``retro-auto-uncommitted`` (the
+        paths then stay dirty and the check below pauses on them). Then, success or
+        not, ANY dirty path left pauses the run at the epic boundary without
+        advancing ``state.current_epic``: the next story's rollback resets to its
+        baseline, so an uncommitted retro doc would be destroyed or swept into that
+        story's commit, and an LLM session's stray write must not enter history
+        silently. Resume re-enters this boundary; ``already-done`` keeps a
+        succeeded retro from running twice."""
+        repo = self.paths.repo_root
+        try:
+            dirty = verify.dirty_paths(repo)
+            if ok:
+                expected = {self.paths.sprint_status, *docs}
+                wanted = {rel for p in expected if (rel := self._repo_relpath(p)) is not None}
+                to_commit = sorted(rel for rel in dirty if rel in wanted)
+                if to_commit:
+                    try:
+                        verify.commit_paths(
+                            repo,
+                            f"chore(retro): epic {epic} retrospective",
+                            [repo / rel for rel in to_commit],
+                        )
+                    except verify.GitError as e:
+                        self.journal.append("retro-auto-uncommitted", epic=epic, error=str(e))
+                    dirty = verify.dirty_paths(repo)
+        except verify.GitError as e:
+            self.journal.append("retro-auto-dirty", epic=epic, paths=[], error=str(e))
+            raise RunPaused(
+                f"epic {epic} boundary — could not read the worktree after the auto "
+                f"retrospective ({e}); check it, then `bmad-loop resume {self.state.run_id}`",
+                PAUSE_EPIC_BOUNDARY,
+            ) from e
+        if not dirty:
+            return
+        leftover = sorted(dirty)
+        self.journal.append("retro-auto-dirty", epic=epic, paths=leftover, count=len(leftover))
+        shown = ", ".join(leftover[:_RETRO_DIRTY_REASON_PATHS])
+        more = len(leftover) - _RETRO_DIRTY_REASON_PATHS
+        if more > 0:
+            shown += f" (+{more} more)"
+        raise RunPaused(
+            f"epic {epic} boundary — the auto retrospective left uncommitted changes: "
+            f"{shown}; commit or clean them, then `bmad-loop resume {self.state.run_id}`",
+            PAUSE_EPIC_BOUNDARY,
+        )
+
+    def _maybe_auto_retro(self, epic: int) -> None:
+        """Run the headless ``/bmad-retrospective -H <epic>`` session when
+        ``gates.retrospective = "auto"`` (DW-389).
+
+        Deterministic end to end: the session completes only through the retro
+        adapter's Stop-with-``result.json`` / window-death path, and success is
+        judged by :meth:`_verify_retro` against the on-disk artifacts. The engine
+        never writes sprint-status here — the skill does, and it is only read back.
+
+        Refusals (journaled ``retro-auto-skipped`` with a closed ``reason``) return
+        without dispatching: ``already-done``, ``board-unreadable``,
+        ``stop-requested``, ``dirty`` / ``git-error`` and ``skill-missing``.
+
+        The session rides a synthetic ``StoryTask`` that is NEVER put in
+        ``state.tasks``, so ``--max-stories``, ``_pick_next`` and
+        ``_finish_inflight`` stay blind to it. Only a stop, a pause and a
+        ``KeyboardInterrupt`` escape the session; any other exception is a failed
+        retro. A failed retro is not retried within one pass of the boundary; a
+        resume after a ``retro-auto-dirty`` pause re-enters the boundary and
+        re-dispatches unless the board already reads done. The tree is settled
+        afterwards either way (:meth:`_settle_retro_tree`)."""
+        if self.policy.gates.retrospective != "auto":
+            return
+        try:
+            board = load_sprint_status(self.paths.sprint_status)
+        except (SprintStatusError, OSError, UnicodeDecodeError) as e:
+            self._skip_auto_retro(epic, "board-unreadable", str(e))
+            return
+        if board.retros.get(epic) == "done":
+            self._skip_auto_retro(epic, "already-done")
+            return
+        if graceful_stop_requested(self.run_dir):
+            self._skip_auto_retro(epic, "stop-requested")
+            return
+        try:
+            clean = verify.worktree_clean(self.workspace.root, project=self.workspace.paths.project)
+        except verify.GitError as e:
+            self._skip_auto_retro(epic, "git-error", str(e))
+            return
+        if not clean:
+            self._skip_auto_retro(epic, "dirty")
+            return
+        adapter = self.adapters["retro"]
+        tree = getattr(getattr(adapter, "profile", None), "skill_tree", None)
+        if tree and not (self.workspace.paths.project / tree / RETRO_SKILL / "SKILL.md").is_file():
+            self._skip_auto_retro(epic, "skill-missing")
+            return
+
+        task = StoryTask(story_key=f"epic-{epic}-retrospective", epic=epic)
+        self.journal.append("retro-auto-start", epic=epic)
+        result: SessionResult | None = None
+        raised: Exception | None = None
+        try:
+            result = self._run_session(task, role="retro", prompt=_retro_auto_prompt(epic), seq=1)
+        except (RunStopped, RunPaused):
+            raise
+        except Exception as e:  # a failed retro, never a failed run
+            raised = e
+        errors, docs = self._verify_retro(epic, result)
+        if raised is not None:
+            errors.insert(0, f"session raised {type(raised).__name__}")
+        ok = not errors
+        if ok:
+            names = [d.name for d in docs]
+            self.journal.append("retro-auto-finished", epic=epic, docs=names)
+            gates.notify(
+                self.policy,
+                self.run_dir,
+                f"epic {epic} retrospective done",
+                f"retrospective written: {', '.join(names)}",
+            )
+        else:
+            extra = {} if raised is None else {"error": str(raised)}
+            self.journal.append("retro-auto-failed", epic=epic, errors=errors, **extra)
+            gates.notify(
+                self.policy,
+                self.run_dir,
+                "auto retrospective failed",
+                f"epic {epic}: {'; '.join(errors)} — run /bmad-retrospective for epic "
+                f"{epic} by hand",
+            )
+        self._settle_retro_tree(epic, ok, docs)
+
     def _epic_boundary(self, finished_epic: int, next_epic: int) -> None:
         self.journal.append("epic-boundary", finished=finished_epic, next=next_epic)
         self._emit("pre_epic_boundary", epic=finished_epic)
+        # Before the per-epic sweep, so the sweep starts on a clean tree and sees
+        # the retro's committed action items (DW-388 ingests them).
+        self._maybe_auto_retro(finished_epic)
         self._maybe_auto_sweep("per-epic", f"epic-{finished_epic}")
-        if self.policy.gates.retrospective != "never":
+        if self.policy.gates.retrospective == "notify":
             gates.notify(
                 self.policy,
                 self.run_dir,

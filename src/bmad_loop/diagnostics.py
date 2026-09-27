@@ -438,6 +438,10 @@ _JOURNAL_KIND_COUNTLIST_FIELDS: dict[str, frozenset[str]] = {
     "merge-target-cleaned": frozenset({"paths"}),
     "merge-target-preserved": frozenset({"paths"}),
     "merge-target-tolerated": frozenset({"paths"}),
+    # The auto retrospective (DW-389): the worktree paths it left dirty (whatever
+    # the session touched, customer source included) and its retro doc filenames.
+    "retro-auto-dirty": frozenset({"paths"}),
+    "retro-auto-finished": frozenset({"docs"}),
     "stale-restore-excluded": frozenset({"files"}),
 }
 

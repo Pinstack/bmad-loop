@@ -78,10 +78,12 @@ if TYPE_CHECKING:
         ) -> dict[str, CodingCLIAdapter]: ...
 
 
-# The three adapter roles a run wires. Defined here (the composition layer that
+# The adapter roles a run wires. Defined here (the composition layer that
 # actually builds them) and re-exported as ``cli.ROLES``, which `cmd_validate`
-# and the test suite resolve.
-ROLES = ("dev", "review", "triage")
+# and the test suite resolve. ``retro`` drives the headless epic-boundary
+# retrospective (`gates.retrospective = "auto"`, DW-389); like ``triage`` it is a
+# plain adapter that reads the session's own result.json.
+ROLES = ("dev", "review", "triage", "retro")
 SWEEP_OPTIONS_VERSION = 2
 _MAX_SWEEP_OPTIONS_BYTES = 64 * 1024
 
@@ -120,7 +122,7 @@ def resolve_profiles(policy: Policy, project: Path) -> dict[str, CLIProfile]:
     and the composition. Profiles were the only surface read twice.
 
     Deduplicated by profile name, so the common single-CLI policy touches disk
-    once rather than three times. ``ProfileError`` propagates.
+    once rather than once per role. ``ProfileError`` propagates.
     """
     from .adapters.profile import get_profile
 
@@ -270,7 +272,7 @@ def config_digest(
       ``seed_files``) all reject absolute and parent refs.
 
       NOT excluded on "the parent execs it too" — that defence is false for the
-      ``triage`` role. Base ``Engine`` wires only dev+review; ``sweep.py`` holds
+      ``triage`` role. Base ``Engine`` wires only dev+review+retro; ``sweep.py`` holds
       the only ``adapters["triage"]`` assignment and the only two ``role="triage"``
       dispatches, so a ``[adapter.triage]`` profile override's target is exec'd by
       a sweep and by nothing else. ``sweep.auto = "run-end"`` and worktree
@@ -1225,6 +1227,7 @@ def compose_run(
             policy=policy,
             adapter=adapters["dev"],
             review_adapter=adapters["review"],
+            retro_adapter=adapters["retro"],
             run_dir=run_dir,
             journal=journal,
             state=state,
@@ -1499,6 +1502,7 @@ def compose_resume(
             policy=policy,
             adapter=adapters["dev"],
             review_adapter=adapters["review"],
+            retro_adapter=adapters["retro"],
             run_dir=run_dir,
             journal=journal,
             state=state,

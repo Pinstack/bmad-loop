@@ -1211,6 +1211,16 @@ JOURNAL_KINDS = frozenset(
         "resume-review",
         "resume-unit-merge",
         "resume-verify",
+        # DW-389: the headless epic-boundary retrospective
+        # (`gates.retrospective = "auto"`). `epic`, `count` and the closed `reason`
+        # / check-`errors` lines are benign or dropped; `paths` / `docs` are
+        # reduced to counts by `diagnostics._JOURNAL_KIND_COUNTLIST_FIELDS`.
+        "retro-auto-dirty",
+        "retro-auto-failed",
+        "retro-auto-finished",
+        "retro-auto-skipped",
+        "retro-auto-start",
+        "retro-auto-uncommitted",
         "review-budget-committed",
         "review-budget-ledger-unreadable",
         "review-followup-damped",

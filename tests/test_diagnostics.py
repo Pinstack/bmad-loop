@@ -995,6 +995,30 @@ def test_journal_alias_routes_accept_lone_unicode_surrogates(project):
 
 
 @pytest.mark.parametrize(
+    ("kind", "field", "values"),
+    [
+        ("retro-auto-dirty", "paths", ["src/AcmePayroll.py", "AcmeVault.txt"]),
+        ("retro-auto-finished", "docs", ["epic-1-retro-AcmeVault.md"]),
+    ],
+)
+def test_auto_retro_path_lists_reduce_to_counts(kind, field, values):
+    """DW-389: the auto retrospective's path lists (the leftover dirty paths, the
+    retro doc names) ship as counts, never as names.
+
+    Ablation: drop the kind's row from `_JOURNAL_KIND_COUNTLIST_FIELDS` and the
+    identifier-shaped names ride `scrub_json` into the dump."""
+    scrubbed = diagnostics._scrub_entry(
+        {"kind": kind, "epic": 1, field: values},
+        sanitize.Pseudonymizer(salt=b"fixed"),
+        {},
+        None,
+    )
+
+    assert scrubbed == {"kind": kind, "epic": 1, f"{field}_count": len(values)}
+    assert all(value not in json.dumps(scrubbed) for value in values)
+
+
+@pytest.mark.parametrize(
     ("kind", "field", "value"),
     [
         ("stale-restore-commits", "commits", "AcmeCommitResidue"),

@@ -253,7 +253,7 @@ def status_document(state: RunState, *, graceful_stop_pending: bool = False) -> 
     the recorded sessions — never live policy — and deliberately named apart:
 
     - Run-level ``adapters`` is the *configured-resolved* identity: the
-      dev/review/triage adapter the run's ``policy_snapshot`` resolves to, via
+      dev/review/triage/retro adapter the run's ``policy_snapshot`` resolves to, via
       :func:`policy.adapter_policy_from_snapshot` + ``AdapterPolicy.resolved`` so
       the stage-inheritance rules are the canonical ones, not re-derived here.
       ``None`` when the snapshot carries no rebuildable ``[adapter]`` block (a run
@@ -269,7 +269,7 @@ def status_document(state: RunState, *, graceful_stop_pending: bool = False) -> 
     adapters: dict[str, dict[str, str]] | None = None
     if adapter_policy is not None:
         adapters = {}
-        for role in ("dev", "review", "triage"):
+        for role in ("dev", "review", "triage", "retro"):
             resolved = adapter_policy.resolved(role)
             adapters[role] = {"name": resolved.name, "model": resolved.model}
     if state.finished:

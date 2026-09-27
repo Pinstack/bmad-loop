@@ -483,6 +483,8 @@ cleanup_session_on_finish = true  # kill the run's tmux session when it finishes
 # model = "gpt-5-codex"
 # [adapter.triage]            # sweep triage stage
 # model = "opus"
+# [adapter.retro]             # gates.retrospective = "auto" sessions (inherits [adapter])
+# model = "opus"
 # With an opencode-http base, effort tunes reasoning per stage (opencode-http
 # only — a tmux CLI ignores it and `bmad-loop validate` warns). An unrecognized
 # name is not rejected: the session silently runs at the provider default, so

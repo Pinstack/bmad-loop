@@ -247,11 +247,11 @@ effort = "high"
 """)
     pol = policy.load(p)
     assert pol.adapter.effort == "high"
-    for role in ("dev", "review", "triage"):
+    for role in ("dev", "review", "triage", "retro"):
         assert pol.adapter.resolved(role).effort == "high"
     # the base-only (unknown role) branch constructs ResolvedAdapter positionally
-    # and must carry effort too
-    assert pol.adapter.resolved("retro").effort == "high"
+    # and must carry effort too. (Not "retro": that became a stage in DW-389.)
+    assert pol.adapter.resolved("no-such-role").effort == "high"
 
 
 def test_stage_effort_overrides_base(tmp_path):
@@ -364,7 +364,7 @@ def test_adapter_policy_from_snapshot_roundtrips_resolved(body):
     pol = policy.loads(body)
     rebuilt = policy.adapter_policy_from_snapshot(_roundtrip_snapshot(pol))
     assert rebuilt is not None
-    for role in ("dev", "review", "triage"):
+    for role in ("dev", "review", "triage", "retro"):
         assert rebuilt.resolved(role) == pol.adapter.resolved(role)
 
 
@@ -1077,6 +1077,39 @@ def test_triage_client_switch_uses_profile_defaults(tmp_path):
     # base model/extra_args are client-specific and must not follow a client switch
     assert pol.adapter.resolved("triage") == policy.ResolvedAdapter("gemini", "", None)
     assert pol.adapter.resolved("dev") == policy.ResolvedAdapter("claude", "opus", ("--foo",))
+
+
+def test_retro_stage_adapter_parses_resolves_and_roundtrips():
+    """`[adapter.retro]` (DW-389) is a stage like `[adapter.triage]`: it parses,
+    resolves with the same client-switch rule, and survives the snapshot rebuild.
+
+    Ablation: drop `retro=_stage_adapter(adapter_d, "retro")` from `loads` and the
+    first assert fails (the stage falls back to the base `claude`); drop it from
+    `adapter_policy_from_snapshot` and the round-trip assert fails."""
+    pol = policy.loads(
+        '[adapter]\nmodel = "opus"\nextra_args = ["--foo"]\n'
+        '[adapter.retro]\nname = "codex"\nmodel = "gpt-5-codex"\n'
+    )
+    assert pol.adapter.resolved("retro").name == "codex"
+    assert pol.adapter.resolved("retro") == policy.ResolvedAdapter("codex", "gpt-5-codex", None)
+    # the other stages are untouched
+    assert pol.adapter.resolved("dev") == policy.ResolvedAdapter("claude", "opus", ("--foo",))
+    rebuilt = policy.adapter_policy_from_snapshot(_roundtrip_snapshot(pol))
+    assert rebuilt is not None
+    assert rebuilt.retro == pol.adapter.retro
+    assert rebuilt.resolved("retro") == pol.adapter.resolved("retro")
+    # without a stage table, retro inherits the base
+    assert policy.load(None).adapter.resolved("retro") == policy.ResolvedAdapter("claude", "", None)
+
+
+def test_retro_stage_adapter_must_be_a_table():
+    with pytest.raises(policy.PolicyError, match=r"\[adapter\.retro\] must be a table"):
+        policy.loads('[adapter]\nretro = "codex"\n')
+
+
+def test_retro_is_a_policy_stage():
+    # `STAGES` fans the `adapter.{stage}` settings template out (settings_schema)
+    assert "retro" in policy.STAGES
 
 
 def test_review_enabled_default_and_override(tmp_path):
