@@ -16,26 +16,30 @@ orchestrator's signal watcher is CLI-agnostic.
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import json
 import os
 import re
 import shlex
 import shutil
+import subprocess
 import sys
+import tempfile
 import tomllib
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack
 from importlib import resources
 from importlib.resources.abc import Traversable
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, NamedTuple
 
+from . import childrun
 from .adapters.profile import ALIASES, CANONICAL_EVENTS, CLIProfile, ProfileError, load_profiles
 from .checks import Finding
 from .platform_util import atomic_write_bytes, atomic_write_text, file_lock
 from .policy import POLICY_TEMPLATE
-from .process_host import get_process_host
+from .process_host import ProcessHostError, get_process_host
 from .verify import GitError, git_below_floor, git_bytes, git_floor_text, git_version_at_least
 
 # The probe-adapter capture hook participates in merge_hooks' dedup only (a
@@ -896,6 +900,293 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
             )
         )
     return problems
+
+
+RENDER_PROBE_CHECK = "skills.dev-render-probe"
+# Wall-clock budget for one render. The stub's launcher is typically
+# `uv run --no-cache`, which fetches the renderer's inline-script deps on every
+# probe (so the probe needs network access) before rendering.
+RENDER_PROBE_TIMEOUT_S = 120.0
+# The two placeholders a renderer stub's command names; the session substitutes
+# the absolute project root and skill dir for them before running it.
+RENDER_PROJECT_ROOT_PLACEHOLDER = "{project-root}"
+RENDER_SKILL_ROOT_PLACEHOLDER = "{skill-root}"
+# render_skill.py's stdout contract (`main()`): success prints the entry to follow
+# at rc 0; every handled failure prints one HALT line at rc 1.
+_RENDER_OK_PREFIX = "read and follow "
+_RENDER_HALT_PREFIX = "HALT: "
+_FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+
+
+def dev_renderer_probe(project: Path, trees: Sequence[str]) -> list[Finding]:
+    """Execute each renderer stub's own render command in a throwaway copy.
+
+    The ``skills.dev-renderer*`` checks in :func:`missing_base_skills` prove the
+    renderer's files exist; they cannot see a render that HALTs on a missing or
+    ambiguous config value, a bad ``customize.toml``, an import error or a launcher
+    that fails. Those surface in a run only as a result-less dev session. This probe
+    answers the session's first question — does the stub's render command succeed —
+    before a session is spent on it. One ``skills.dev-render-probe`` finding per
+    deduplicated tree whose dev primitive resolves to a renderer stub (``detail``
+    carries ``tree`` and ``skill``); when none does, a single ``ok`` saying there is
+    nothing to render (``detail["trees"]``).
+
+    Contract:
+
+    - The command is the first line inside a fenced code block of the stub's
+      SKILL.md that names ``render_skill.py``, split with :func:`shlex.split`
+      (posix). ``{project-root}`` / ``{skill-root}`` are replaced per argv element
+      with the temp project root / temp skill dir. No such line, a line that does
+      not split, or one missing either placeholder is a problem — never a
+      hand-built fallback argv, which would test a command no session runs. No
+      ``--set`` is appended: the engine's dev prompt names no route or review.
+    - The render runs in a :class:`tempfile.TemporaryDirectory` holding a copy of
+      ``<project>/_bmad/`` (minus its top-level ``render/``, per
+      :data:`BMAD_SEED_EXCLUDES`) and of ``<project>/<tree>/<skill>``, with that
+      temp dir as cwd. Render failures are path-independent, so the copy answers
+      the session's question while ``validate`` stays a non-writer: the project,
+      including ``_bmad/render/``, is never touched, and the temp dir is removed.
+    - rc 0 plus a stdout line starting ``read and follow `` is ``ok``; a stdout
+      ``HALT: `` line is a problem carrying the halt text (``detail["halt"]``);
+      anything else (e.g. a bare traceback) is a problem naming the rc and the last
+      stderr/stdout line. A launcher (argv[0]) absent from PATH, a spawn
+      ``OSError``, a timeout (:data:`RENDER_PROBE_TIMEOUT_S`) and a staging
+      ``OSError`` are each a problem.
+    - Every message and detail maps the temp root back to the project path.
+
+    Never raises: ``validate`` has no error path of its own, its rc is purely the
+    verdict (see :func:`bmad_loop.probe.binary_runs`).
+
+    Opt-in (``validate --render-probe``) because it executes project-controlled
+    content — the stub's argv and ``render_skill.py``, the same content a run
+    executes. Plain ``validate`` must stay non-executing for a fresh clone, as the
+    provenance note on the ``adapter.binary`` probe in ``cmd_validate`` records.
+    No coding CLI is launched and no prompt is sent.
+    """
+    unique = list(dict.fromkeys(trees))
+    findings: list[Finding] = []
+    for tree in unique:
+        resolved = resolve_dev_primitive(project, tree)
+        if resolved is None or not _is_renderer_stub(project / tree / resolved):
+            continue
+        findings.append(_probe_render(project, tree, resolved))
+    if not findings:
+        findings.append(
+            Finding(
+                RENDER_PROBE_CHECK,
+                "ok",
+                "no dev tree resolves a renderer stub — nothing to render",
+                {"trees": unique},
+            )
+        )
+    return findings
+
+
+def _render_command_line(skill_md: str) -> str | None:
+    """The first line inside a fenced code block that names the renderer script."""
+    fence: str | None = None
+    for line in skill_md.splitlines():
+        if fence is None:
+            opened = _FENCE_OPEN_RE.match(line)
+            if opened is not None:
+                fence = opened.group(1)
+            continue
+        stripped = line.strip()
+        if len(stripped) >= len(fence) and set(stripped) == {fence[0]}:
+            fence = None
+            continue
+        if RENDERER_SCRIPT_MARKER in line:
+            return stripped
+    return None
+
+
+def _render_path_unmapper(tmp_root: Path, project: Path) -> Callable[[str], str]:
+    """A ``str -> str`` that rewrites the temp root (every spelling) to the project."""
+    forms = {tmp_root}
+    try:
+        forms.add(tmp_root.resolve())
+    except (OSError, RuntimeError):
+        pass
+    pairs: dict[str, str] = {}
+    for form in forms:
+        pairs[str(form)] = str(project)
+        pairs[form.as_posix()] = project.as_posix()
+    ordered = sorted(pairs.items(), key=lambda pair: len(pair[0]), reverse=True)
+
+    def unmap(text: str) -> str:
+        for src, dst in ordered:
+            text = text.replace(src, dst)
+        return text
+
+    return unmap
+
+
+def _stage_render_copy(project: Path, skill_dir: Path, root: Path, tmp_skill: Path) -> None:
+    """Copy ``_bmad/`` (minus top-level ``render/``) and the skill dir under ``root``.
+
+    An absent ``_bmad/`` is not staged: the render then fails exactly as the
+    session's would, and the presence checks already name the missing files.
+    """
+    bmad_src = project / BMAD_DIR
+    if bmad_src.is_dir():
+        top = os.fspath(bmad_src)
+
+        def ignore(directory: str, names: list[str]) -> list[str]:
+            if directory != top:
+                return []
+            return [name for name in names if name in BMAD_SEED_EXCLUDES]
+
+        shutil.copytree(bmad_src, root / BMAD_DIR, symlinks=True, ignore=ignore)
+    tmp_skill.parent.mkdir(parents=True, exist_ok=True)
+    # dirs_exist_ok: a skill tree under `_bmad/` was already copied with it.
+    shutil.copytree(skill_dir, tmp_skill, symlinks=True, dirs_exist_ok=True)
+
+
+def _last_line(text: str) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return lines[-1] if lines else ""
+
+
+def _probe_render(project: Path, tree: str, skill: str) -> Finding:
+    """One tree's render verdict; see :func:`dev_renderer_probe` for the contract."""
+    rel = f"{tree}/{skill}"
+    detail: dict[str, Any] = {"tree": tree, "skill": skill}
+
+    def problem(message: str) -> Finding:
+        return _render_problem(detail, message)
+
+    skill_dir = project / tree / skill
+    unparsed = f"{rel}/SKILL.md: the render command could not be parsed"
+    try:
+        skill_md = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return problem(f"{unparsed} ({exc}); nothing was executed")
+    line = _render_command_line(skill_md)
+    if line is None:
+        return problem(
+            f"{unparsed} (no fenced code line names {RENDERER_SCRIPT_MARKER}); "
+            "nothing was executed"
+        )
+    detail["command"] = line
+    try:
+        template = shlex.split(line, posix=True)
+    except ValueError as exc:
+        return problem(f"{unparsed} ({exc}): {line}; nothing was executed")
+    absent = [
+        token
+        for token in (RENDER_PROJECT_ROOT_PLACEHOLDER, RENDER_SKILL_ROOT_PLACEHOLDER)
+        if not any(token in arg for arg in template)
+    ]
+    if absent:
+        return problem(
+            f"{unparsed} (it does not name {' or '.join(absent)}): {line}; nothing was executed"
+        )
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="bmad-loop-render-probe-", ignore_cleanup_errors=True
+        ) as tmp:
+            return _render_in(project, Path(tmp), template, detail)
+    except OSError as exc:
+        return problem(f"{rel}: could not create a throwaway render directory ({exc})")
+
+
+def _render_problem(detail: Mapping[str, Any], message: str, **extra: Any) -> Finding:
+    return Finding(RENDER_PROBE_CHECK, "problem", message, {**detail, **extra})
+
+
+def _render_in(
+    project: Path, root: Path, template: Sequence[str], detail: Mapping[str, Any]
+) -> Finding:
+    """Stage the copy under ``root``, run the substituted command there, classify it."""
+    tree, skill = str(detail["tree"]), str(detail["skill"])
+    rel = f"{tree}/{skill}"
+
+    def problem(message: str, **extra: Any) -> Finding:
+        return _render_problem(detail, message, **extra)
+
+    unmap = _render_path_unmapper(root, project)
+    tmp_skill = root / tree / skill
+    try:
+        _stage_render_copy(project, project / tree / skill, root, tmp_skill)
+    except OSError as exc:
+        return problem(f"{rel}: could not stage the throwaway render copy ({unmap(str(exc))})")
+    argv = [
+        arg.replace(RENDER_PROJECT_ROOT_PLACEHOLDER, str(root)).replace(
+            RENDER_SKILL_ROOT_PLACEHOLDER, str(tmp_skill)
+        )
+        for arg in template
+    ]
+    try:
+        launcher = shutil.which(argv[0])
+    except ValueError as exc:  # e.g. a NUL byte read from SKILL.md
+        return problem(f"{rel}: render launcher {unmap(argv[0])!r} is unusable ({exc})")
+    if launcher is None:
+        searched = os.environ.get("PATH", "")
+        shown = unmap(argv[0])
+        return problem(
+            f"{rel}: render launcher {shown!r} not found on PATH ({searched}) — a dev "
+            "session could not run the render command either",
+            launcher=shown,
+            path=searched,
+        )
+    try:
+        # Popen + tree kill, not subprocess.run(timeout=): run kills only the direct
+        # child, orphaning `uv run`'s renderer grandchild (POSIX) or blocking its
+        # post-kill drain on the pipes that grandchild still holds (Windows).
+        proc = subprocess.Popen(
+            [launcher, *argv[1:]],
+            cwd=root,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return problem(f"{rel}: render command could not be launched ({unmap(str(exc))})")
+    try:
+        raw_out, raw_err = proc.communicate(timeout=RENDER_PROBE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessHostError, OSError):
+            childrun.kill_tree(proc)
+        # Bounded drain: a straggler the tree kill could not reach may hold the pipes.
+        with contextlib.suppress(subprocess.TimeoutExpired, OSError, ValueError):
+            proc.communicate(timeout=childrun.DRAIN_S)
+        return problem(
+            f"{rel}: render command did not finish within {RENDER_PROBE_TIMEOUT_S:g}s",
+            timeout_s=RENDER_PROBE_TIMEOUT_S,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        with contextlib.suppress(ProcessHostError, OSError):
+            childrun.kill_tree(proc)
+        return problem(f"{rel}: render command output could not be read ({unmap(str(exc))})")
+    stdout = unmap(raw_out or "")
+    stderr = unmap(raw_err or "")
+    out_lines = stdout.splitlines()
+    halt = next((ln for ln in out_lines if ln.startswith(_RENDER_HALT_PREFIX)), None)
+    if halt is not None:
+        text = halt[len(_RENDER_HALT_PREFIX) :].strip()
+        return problem(
+            f"{rel}: render HALTs: {text} — a dev session would stop here without "
+            "writing a spec",
+            rc=proc.returncode,
+            halt=text,
+        )
+    entry = next((ln for ln in out_lines if ln.startswith(_RENDER_OK_PREFIX)), None)
+    if proc.returncode == 0 and entry is not None:
+        return Finding(
+            RENDER_PROBE_CHECK,
+            "ok",
+            f"{rel} renders cleanly (render command run in a throwaway copy; project untouched)",
+            {**detail, "rc": proc.returncode},
+        )
+    last = _last_line(stderr) or _last_line(stdout) or "(no output)"
+    return problem(
+        f"{rel}: render failed with rc {proc.returncode} and no HALT line (last output: "
+        f"{last}) — a dev session would stop without writing a spec",
+        rc=proc.returncode,
+        last_line=last,
+    )
 
 
 def dev_primitive_warnings(project: Path, trees: Sequence[str]) -> list[Finding]:

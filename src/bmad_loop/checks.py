@@ -91,6 +91,7 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "skills.dev-renderer",
         "skills.dev-renderer-config",
         "skills.dev-renderer-sources",
+        "skills.dev-render-probe",
         "skills.review-layer-missing",
         "skills.review-layer-unresolved",
         "skills.review-layers-empty",

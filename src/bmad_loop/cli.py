@@ -1070,6 +1070,12 @@ def cmd_validate(args: argparse.Namespace) -> int:
         )
     report.extend(base_findings)
     report.extend(install.dev_primitive_warnings(project, dev_trees))
+    # Opt-in only: the probe executes project-controlled content (the stub's argv and
+    # render_skill.py), and plain validate must stay non-executing for a fresh clone.
+    # Gated on `dev_trees` too, as `skills.base` is: an unloadable policy leaves it
+    # empty, and "nothing to render" would be a green line from an empty probe.
+    if dev_trees and getattr(args, "render_probe", False):
+        report.extend(install.dev_renderer_probe(project, dev_trees))
 
     # The triage tree's `bmad-loop-sweep`, probed exactly as `_require_sweep_skill`
     # probes it so validate and the sweep refusal agree. Only when a triage tree
@@ -5954,6 +5960,14 @@ def main(argv: list[str] | None = None) -> int:
         metavar="FOLDER",
         help="validate stories mode against this epic spec folder's stories.yaml "
         "(overrides [stories].source; skips the sprint-status gate)",
+    )
+    validate_p.add_argument(
+        "--render-probe",
+        action="store_true",
+        help="also execute each dev skill's render command (from its SKILL.md) in a "
+        "throwaway temp copy of _bmad/ + the skill (no coding CLI, project untouched; "
+        "the launcher, typically `uv run --no-cache`, fetches the renderer's deps on "
+        "each probe, so it needs network access)",
     )
     machine.add_json_flag(validate_p, "check findings")
 

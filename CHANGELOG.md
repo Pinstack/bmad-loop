@@ -9,6 +9,9 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Add opt-in `bmad-loop validate --render-probe`: runs each renderer stub's own
+  render command in a throwaway temp copy and reports `skills.dev-render-probe`
+  (a render `HALT:` fails validate). Needs network for `uv run --no-cache` (DW-381).
 - Add `[operator] on_review_demotion = "escalate" | "park"` (default `escalate`,
   unchanged behavior). Under `park` the review prompt offers the park, and a review
   pass that finalizes a `done` story at `awaiting-operator` moves the board

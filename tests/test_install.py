@@ -16,13 +16,18 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 import pytest
 from conftest import (
     NUL_PATH_RESOLVE_FAULTS,
+    RENDER_PROBE_HALT_BODY,
+    RENDER_PROBE_OK_BODY,
+    RENDER_PROBE_TRACEBACK_BODY,
     RENDERER_SCRIPT_IMPORTING_SIBLING,
     RENDERER_STUB_SKILL_MD,
     git,
     install_build_auto_skill,
     install_dev_shim,
+    install_render_probe_fixture,
     nested_repo_root_paths,
     refuse_to_resolve,
+    render_probe_stub_skill_md,
     windows_relay_builder,
 )
 
@@ -50,10 +55,12 @@ from bmad_loop.install import (
     _copy_traversable,
     _is_dev_primitive_shim,
     _register_hooks,
+    _render_path_unmapper,
     _shield_undo_extension,
     _worktree_local_exclude,
     dev_primitive_or_default,
     dev_primitive_warnings,
+    dev_renderer_probe,
     install_into,
     merge_hooks,
     missing_base_skills,
@@ -3089,6 +3096,344 @@ def test_renderer_walk_does_not_descend_a_symlinked_source_directory(tmp_path):
     )
 
     assert _absent_renderer_sources(skill) == ["linked/plan.md"]
+
+
+# --- validate --render-probe (DW-381) ------------------------------------------
+
+
+def _probe_project(tmp_path: Path, body: str, tree: str = ".claude/skills"):
+    """A project under tmp_path/project plus a marker path OUTSIDE it."""
+    project = tmp_path / "project"
+    project.mkdir()
+    marker = tmp_path / "ran.json"
+    primitive = install_render_probe_fixture(project, marker, body, tree)
+    return project, marker, primitive
+
+
+def _tree_snapshot(root: Path) -> set[str]:
+    return {p.relative_to(root).as_posix() for p in root.rglob("*")}
+
+
+def test_render_probe_passing_render_is_ok_and_leaves_the_project_untouched(tmp_path):
+    project, marker, _ = _probe_project(tmp_path, RENDER_PROBE_OK_BODY)
+    # A stale render dir must not be staged: the copy excludes top-level render/.
+    stale = project / RENDER_DIR_REL / "old"
+    stale.mkdir(parents=True)
+    (stale / "workflow.md").write_text("stale\n", encoding="utf-8")
+    before = _tree_snapshot(project)
+
+    findings = dev_renderer_probe(project, [".claude/skills", ".claude/skills"])
+
+    assert [(f.check, f.severity) for f in findings] == [("skills.dev-render-probe", "ok")]
+    assert findings[0].detail["tree"] == ".claude/skills"
+    assert findings[0].detail["skill"] == DEV_PRIMITIVE_NEW
+    # the renderer really ran, in a throwaway root that is gone afterwards
+    ran = json.loads(marker.read_text(encoding="utf-8"))
+    tmp_root = Path(ran["root"])
+    assert tmp_root != project and not tmp_root.exists()
+    assert Path(ran["cwd"]).resolve() == tmp_root.resolve()
+    assert Path(ran["skill"]) == tmp_root / ".claude/skills" / DEV_PRIMITIVE_NEW
+    assert ran["skill_md"] is True
+    assert ran["stale_render"] is False
+    assert not any("--set" in arg for arg in ran["argv"])
+    # the project gained nothing — no _bmad/render/<skill> output in particular
+    assert _tree_snapshot(project) == before
+    assert not (project / RENDER_DIR_REL / DEV_PRIMITIVE_NEW).exists()
+    # no temp-root spelling leaks into what the operator sees
+    shown = [findings[0].message, *map(str, findings[0].detail.values())]
+    assert not any(str(tmp_root) in text or tmp_root.as_posix() in text for text in shown)
+
+
+def test_render_probe_never_writes_the_projects_render_dir(tmp_path):
+    """Negative control for the untouched-project assertion: no render dir at all
+    beforehand, and none after a render that writes one under its project root."""
+    project, marker, _ = _probe_project(tmp_path, RENDER_PROBE_OK_BODY)
+
+    [finding] = dev_renderer_probe(project, [".claude/skills"])
+
+    assert finding.severity == "ok"
+    assert marker.is_file()
+    assert not (project / RENDER_DIR_REL).exists()
+
+
+def test_render_probe_halt_is_a_problem_carrying_the_halt_text(tmp_path):
+    project, _, _ = _probe_project(tmp_path, RENDER_PROBE_HALT_BODY)
+
+    [finding] = dev_renderer_probe(project, [".claude/skills"])
+
+    assert (finding.check, finding.severity) == ("skills.dev-render-probe", "problem")
+    expected = f"missing config value x under {project}"
+    assert finding.detail["halt"] == expected
+    assert expected in finding.message
+    assert finding.detail["rc"] == 1
+    assert "bmad-loop-render-probe-" not in finding.message
+
+
+def test_render_probe_escaped_failure_names_rc_and_last_stderr_line(tmp_path):
+    project, _, _ = _probe_project(tmp_path, RENDER_PROBE_TRACEBACK_BODY)
+
+    [finding] = dev_renderer_probe(project, [".claude/skills"])
+
+    assert finding.severity == "problem"
+    assert "halt" not in finding.detail
+    assert finding.detail["rc"] == 1
+    assert finding.detail["last_line"] == "RuntimeError: renderer exploded"
+    assert "rc 1" in finding.message
+    assert "RuntimeError: renderer exploded" in finding.message
+
+
+def test_render_probe_rc0_without_an_entry_line_is_not_ok(tmp_path):
+    project, _, _ = _probe_project(tmp_path, 'print("rendered, honest")\n')
+
+    [finding] = dev_renderer_probe(project, [".claude/skills"])
+
+    assert finding.severity == "problem"
+    assert finding.detail["rc"] == 0
+    assert finding.detail["last_line"] == "rendered, honest"
+
+
+@pytest.mark.parametrize(
+    "skill_md",
+    [
+        # names the script, but never inside a fence
+        "Run `python render_skill.py --project-root {project-root} --skill {skill-root}`.\n",
+        # fenced, but the quote never closes
+        '```bash\npython "{project-root}/_bmad/scripts/render_skill.py --skill {skill-root}\n```\n',
+        # fenced and splittable, but no {skill-root}
+        '```bash\npython "{project-root}/_bmad/scripts/render_skill.py"\n```\n',
+    ],
+    ids=["unfenced", "unbalanced-quote", "missing-token"],
+)
+def test_render_probe_unparseable_stub_is_a_problem_and_executes_nothing(tmp_path, skill_md):
+    project, marker, primitive = _probe_project(tmp_path, RENDER_PROBE_OK_BODY)
+    (primitive / "SKILL.md").write_text(skill_md, encoding="utf-8")
+
+    [finding] = dev_renderer_probe(project, [".claude/skills"])
+
+    assert finding.severity == "problem"
+    assert "could not be parsed" in finding.message
+    assert "nothing was executed" in finding.message
+    assert not marker.exists()
+
+
+def test_render_probe_first_fenced_render_line_wins_over_prose_and_later_fences(tmp_path):
+    project, marker, primitive = _probe_project(tmp_path, RENDER_PROBE_OK_BODY)
+    stub = render_probe_stub_skill_md()
+    (primitive / "SKILL.md").write_text(
+        "```text\nunrelated fence\n```\n"
+        + stub
+        + '```bash\nno-such-launcher "{project-root}/render_skill.py" {skill-root}\n```\n',
+        encoding="utf-8",
+    )
+
+    [finding] = dev_renderer_probe(project, [".claude/skills"])
+
+    assert finding.severity == "ok"
+    assert marker.exists()
+
+
+def test_render_probe_missing_launcher_names_it_and_the_path(tmp_path, monkeypatch):
+    project, marker, primitive = _probe_project(tmp_path, RENDER_PROBE_OK_BODY)
+    (primitive / "SKILL.md").write_text(
+        render_probe_stub_skill_md("bmad-loop-no-such-launcher"), encoding="utf-8"
+    )
+    monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
+
+    [finding] = dev_renderer_probe(project, [".claude/skills"])
+
+    assert finding.severity == "problem"
+    assert finding.detail["launcher"] == "bmad-loop-no-such-launcher"
+    assert finding.detail["path"] == str(tmp_path / "empty-bin")
+    assert "bmad-loop-no-such-launcher" in finding.message
+    assert str(tmp_path / "empty-bin") in finding.message
+    assert not marker.exists()
+
+
+def test_render_probe_timeout_tree_kills_and_is_a_problem(tmp_path, monkeypatch):
+    """A timeout kills the whole tree (uv run's renderer grandchild included) via
+    the childrun seam, then reports — never subprocess.run's root-only kill."""
+    project, _, _ = _probe_project(tmp_path, RENDER_PROBE_OK_BODY)
+    seen = {"timeouts": [], "killed": []}
+
+    class FakePopen:
+        def __init__(self, argv, **kwargs):
+            seen["kwargs"] = kwargs
+
+        def communicate(self, timeout=None):
+            seen["timeouts"].append(timeout)
+            raise subprocess.TimeoutExpired(cmd="render", timeout=timeout)
+
+    monkeypatch.setattr(install_mod.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(install_mod.childrun, "kill_tree", seen["killed"].append)
+
+    [finding] = dev_renderer_probe(project, [".claude/skills"])
+
+    assert finding.severity == "problem"
+    assert "did not finish within 120s" in finding.message
+    assert len(seen["killed"]) == 1 and isinstance(seen["killed"][0], FakePopen)
+    assert seen["timeouts"][0] == install_mod.RENDER_PROBE_TIMEOUT_S == 120
+    assert seen["kwargs"]["stdin"] is subprocess.DEVNULL
+    assert seen["kwargs"]["stdout"] is seen["kwargs"]["stderr"] is subprocess.PIPE
+
+
+def test_render_probe_spawn_oserror_is_a_problem_not_a_raise(tmp_path, monkeypatch):
+    project, _, _ = _probe_project(tmp_path, RENDER_PROBE_OK_BODY)
+
+    def refuse(argv, **_kwargs):
+        raise PermissionError("spawn refused")
+
+    monkeypatch.setattr(install_mod.subprocess, "Popen", refuse)
+
+    [finding] = dev_renderer_probe(project, [".claude/skills"])
+
+    assert finding.severity == "problem"
+    assert "could not be launched (spawn refused)" in finding.message
+
+
+def test_render_probe_nul_byte_argv_is_a_problem_not_a_raise(tmp_path):
+    """A NUL byte read from SKILL.md makes the spawn raise ValueError; the probe
+    reports it instead of crashing validate."""
+    project, marker, primitive = _probe_project(tmp_path, RENDER_PROBE_OK_BODY)
+    stub = render_probe_stub_skill_md().replace("--skill", "--sk\0ill")
+    (primitive / "SKILL.md").write_text(stub, encoding="utf-8")
+
+    [finding] = dev_renderer_probe(project, [".claude/skills"])
+
+    assert finding.severity == "problem"
+    assert "could not be launched" in finding.message
+    assert not marker.exists()
+
+
+def test_render_probe_launcher_lookup_valueerror_is_a_problem_not_a_raise(tmp_path, monkeypatch):
+    """`shutil.which` raises ValueError on a NUL in argv[0] where it consults the OS
+    (Windows' NeedCurrentDirectoryForExePath); POSIX answers None instead."""
+    project, marker, _ = _probe_project(tmp_path, RENDER_PROBE_OK_BODY)
+
+    def refuse(cmd, *_args, **_kwargs):
+        raise ValueError("embedded null character")
+
+    monkeypatch.setattr(install_mod.shutil, "which", refuse)
+
+    [finding] = dev_renderer_probe(project, [".claude/skills"])
+
+    assert finding.severity == "problem"
+    assert "is unusable (embedded null character)" in finding.message
+    assert not marker.exists()
+
+
+def test_render_probe_unreadable_skill_md_is_a_problem_not_a_raise(tmp_path, monkeypatch):
+    """SKILL.md turning non-UTF-8 between stub detection and the probe's own read."""
+    project, marker, primitive = _probe_project(tmp_path, RENDER_PROBE_OK_BODY)
+    (primitive / "SKILL.md").write_bytes(b"\xff\xfe render_skill.py \xff\n")
+    monkeypatch.setattr(install_mod, "_is_renderer_stub", lambda _skill_dir: True)
+
+    [finding] = dev_renderer_probe(project, [".claude/skills"])
+
+    assert finding.severity == "problem"
+    assert "could not be parsed" in finding.message
+    assert "nothing was executed" in finding.message
+    assert not marker.exists()
+
+
+def test_render_probe_tempdir_fault_is_a_problem_not_a_raise(tmp_path, monkeypatch):
+    project, marker, _ = _probe_project(tmp_path, RENDER_PROBE_OK_BODY)
+
+    def refuse(**_kwargs):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(install_mod.tempfile, "TemporaryDirectory", refuse)
+
+    [finding] = dev_renderer_probe(project, [".claude/skills"])
+
+    assert finding.severity == "problem"
+    assert "could not create a throwaway render directory" in finding.message
+    assert not marker.exists()
+
+
+def test_render_probe_output_read_fault_tree_kills_and_is_a_problem(tmp_path, monkeypatch):
+    project, _, _ = _probe_project(tmp_path, RENDER_PROBE_OK_BODY)
+    killed: list[object] = []
+
+    class FakePopen:
+        def __init__(self, argv, **_kwargs):
+            pass
+
+        def communicate(self, timeout=None):
+            raise OSError("broken pipe")
+
+    monkeypatch.setattr(install_mod.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(install_mod.childrun, "kill_tree", killed.append)
+
+    [finding] = dev_renderer_probe(project, [".claude/skills"])
+
+    assert finding.severity == "problem"
+    assert "output could not be read (broken pipe)" in finding.message
+    assert len(killed) == 1 and isinstance(killed[0], FakePopen)
+
+
+def test_render_probe_stages_a_skill_tree_that_lives_under_bmad(tmp_path):
+    """The skill copy lands inside the already-copied `_bmad/`: no false staging fault."""
+    project, marker, _ = _probe_project(tmp_path, RENDER_PROBE_OK_BODY, "_bmad/skills")
+
+    [finding] = dev_renderer_probe(project, ["_bmad/skills"])
+
+    assert finding.severity == "ok", finding.message
+    assert marker.exists()
+
+
+def test_render_path_unmapper_maps_the_resolved_temp_spelling(tmp_path):
+    """macOS /private/var and Windows 8.3 TEMP names: the renderer resolves its
+    project root, so the resolved spelling must map back too."""
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    try:
+        link.symlink_to(real, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+    project = tmp_path / "project"
+    unmap = _render_path_unmapper(link, project)
+
+    assert unmap(f"HALT: bad value under {real / 'x'}") == f"HALT: bad value under {project / 'x'}"
+    assert unmap(f"at {link}") == f"at {project}"
+
+
+def test_render_probe_staging_fault_is_a_problem_with_project_paths(tmp_path, monkeypatch):
+    project, marker, _ = _probe_project(tmp_path, RENDER_PROBE_OK_BODY)
+
+    def refuse(src, dst, **_kwargs):
+        raise OSError(f"cannot copy to {dst}")
+
+    monkeypatch.setattr(install_mod.shutil, "copytree", refuse)
+
+    [finding] = dev_renderer_probe(project, [".claude/skills"])
+
+    assert finding.severity == "problem"
+    assert "could not stage" in finding.message
+    assert f"cannot copy to {project / BMAD_DIR}" in finding.message
+    assert not marker.exists()
+
+
+def test_render_probe_inline_primitive_has_nothing_to_render(tmp_path):
+    install_build_auto_skill(tmp_path, ".claude/skills")
+
+    findings = dev_renderer_probe(tmp_path, [".claude/skills", ".claude/skills"])
+
+    assert [(f.check, f.severity) for f in findings] == [("skills.dev-render-probe", "ok")]
+    assert "nothing to render" in findings[0].message
+    assert findings[0].detail == {"trees": [".claude/skills"]}
+
+
+def test_render_probe_reports_one_finding_per_stub_tree(tmp_path):
+    project, _, _ = _probe_project(tmp_path, RENDER_PROBE_OK_BODY, ".claude/skills")
+    install_build_auto_skill(project, ".agents/skills")  # inline era: nothing to probe
+    other = tmp_path / "ran-2.json"
+    install_render_probe_fixture(project, other, RENDER_PROBE_OK_BODY, ".opencode/skills")
+
+    findings = dev_renderer_probe(project, [".claude/skills", ".agents/skills", ".opencode/skills"])
+
+    assert [f.detail["tree"] for f in findings] == [".claude/skills", ".opencode/skills"]
+    assert all(f.severity == "ok" for f in findings)
 
 
 @pytest.mark.parametrize("primitive", [DEV_PRIMITIVE_NEW, DEV_PRIMITIVE_LEGACY])

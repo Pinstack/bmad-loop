@@ -34,6 +34,7 @@ from conftest import (
     install_build_auto_skill,
     install_dev_base_skills,
     install_dev_shim,
+    install_render_probe_fixture,
     install_sweep_skill,
     machine_json,
     mark_ledger_done,
@@ -14908,6 +14909,95 @@ def test_validate_reports_each_renderer_problem_and_the_complete_surface_clears(
 
     cleared = _validate_findings(project, capsys)
     assert not {check for check in cleared if check.startswith("skills.dev-renderer")}
+
+
+def _render_probe_validate_fixture(project, monkeypatch, capsys, marker, body):
+    """A validate-passing project whose dev primitive is a renderer stub with a
+    fake render_skill.py that records every execution to ``marker`` (outside
+    the project). `_make_validate_pass` stubs `which` to `/usr/bin/<tool>`; the
+    stub's launcher is this interpreter's absolute path, so let absolute names
+    resolve to themselves while every other gate keeps its pin."""
+    _make_validate_pass(
+        project,
+        monkeypatch,
+        capsys,
+        skills=lambda root: install_render_probe_fixture(root, marker, body),
+    )
+    monkeypatch.setattr(
+        cli.shutil,
+        "which",
+        lambda tool: tool if os.path.isabs(tool) else f"/usr/bin/{tool}",
+    )
+
+
+def _validate_argv(project, *extra):
+    return ["validate", "--project", str(project.project), "--json", *extra]
+
+
+def test_validate_render_probe_reports_ok_for_a_healthy_render(
+    project, capsys, monkeypatch, tmp_path
+):
+    from conftest import RENDER_PROBE_OK_BODY
+
+    marker = tmp_path / "ran.json"
+    _render_probe_validate_fixture(project, monkeypatch, capsys, marker, RENDER_PROBE_OK_BODY)
+
+    doc = machine_json(_validate_argv(project, "--render-probe"), capsys)
+
+    assert doc["ok"] is True
+    [probe] = [f for f in doc["findings"] if f["check"] == "skills.dev-render-probe"]
+    assert probe["severity"] == "ok"
+    assert probe["detail"]["tree"] == ".claude/skills"
+    assert marker.is_file()
+    assert not (project.project / "_bmad" / "render").exists()
+    # the render left the worktree exactly as committed
+    assert git(project.project, "status", "--porcelain", "--untracked-files=all") == ""
+
+
+def test_validate_render_probe_halt_fails_validate_and_the_flag_gates_execution(
+    project, capsys, monkeypatch, tmp_path
+):
+    from conftest import RENDER_PROBE_HALT_BODY
+
+    marker = tmp_path / "ran.json"
+    _render_probe_validate_fixture(project, monkeypatch, capsys, marker, RENDER_PROBE_HALT_BODY)
+
+    # Flag absent: no probe finding, and the renderer never ran.
+    plain = machine_json(_validate_argv(project), capsys)
+    assert plain["ok"] is True
+    assert "skills.dev-render-probe" not in {f["check"] for f in plain["findings"]}
+    assert not marker.exists()
+
+    doc = machine_json(_validate_argv(project, "--render-probe"), capsys, rc=1)
+
+    assert doc["ok"] is False
+    [probe] = [f for f in doc["findings"] if f["check"] == "skills.dev-render-probe"]
+    assert probe["severity"] == "problem"
+    halt = f"missing config value x under {project.project}"
+    assert probe["detail"]["halt"] == halt
+    assert halt in probe["message"]
+    assert marker.is_file()
+    # the probe finding is the only problem: every other gate stayed green
+    assert [f["check"] for f in doc["findings"] if f["severity"] == "problem"] == [
+        "skills.dev-render-probe"
+    ]
+
+
+def test_validate_render_probe_is_silent_when_policy_is_unloadable(
+    project, capsys, monkeypatch, tmp_path
+):
+    """No dev trees resolve under a broken policy: the probe must not print a green
+    "nothing to render" line over a probe that checked nothing."""
+    from conftest import RENDER_PROBE_OK_BODY
+
+    marker = tmp_path / "ran.json"
+    _render_probe_validate_fixture(project, monkeypatch, capsys, marker, RENDER_PROBE_OK_BODY)
+    _write_policy(project.project, "[adapter]\nname = ")  # unparseable
+
+    doc = machine_json(_validate_argv(project, "--render-probe"), capsys, rc=1)
+
+    assert "skills.dev-render-probe" not in {f["check"] for f in doc["findings"]}
+    assert not marker.exists()
 
 
 def test_a_forwarding_shim_install_fails_validate_and_aborts_the_run(project, capsys, monkeypatch):

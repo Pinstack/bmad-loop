@@ -1326,6 +1326,72 @@ RENDERER_STUB_SKILL_MD = (
 RENDERER_WORKFLOW_MD = "Read [[bmad-snapshot:step-04-review.md]] fully.\n"
 RENDERER_SCRIPT_IMPORTING_SIBLING = "from config_utils import load_central_config\n"
 
+# `validate --render-probe` fixtures: a stub whose fenced render command launches
+# this interpreter, and fake renderers that record each execution to a marker file.
+# The prose line also names render_skill.py, so a parser that took the first line
+# anywhere (rather than the first FENCED line) would pick the wrong command.
+_RENDER_PROBE_PREAMBLE = """\
+import json, os, pathlib, sys
+args = sys.argv[1:]
+root = pathlib.Path(args[args.index("--project-root") + 1])
+skill = pathlib.Path(args[args.index("--skill") + 1])
+pathlib.Path({marker!r}).write_text(json.dumps({{
+    "root": str(root),
+    "skill": str(skill),
+    "cwd": os.getcwd(),
+    "argv": args,
+    "stale_render": (root / "_bmad" / "render").exists(),
+    "skill_md": (skill / "SKILL.md").is_file(),
+}}), encoding="utf-8")
+"""
+RENDER_PROBE_OK_BODY = """\
+out = root / "_bmad" / "render" / skill.name / "workflow.md"
+out.parent.mkdir(parents=True, exist_ok=True)
+out.write_text("rendered\\n", encoding="utf-8")
+print(f"read and follow {out}")
+"""
+RENDER_PROBE_HALT_BODY = """\
+print(f"HALT: missing config value x under {root}")
+sys.exit(1)
+"""
+RENDER_PROBE_TRACEBACK_BODY = 'raise RuntimeError("renderer exploded")\n'
+
+
+def render_probe_stub_skill_md(launcher: str | None = None) -> str:
+    """A renderer-stub SKILL.md shaped like upstream's, launching ``launcher``
+    (default: this interpreter) on the project's render_skill.py."""
+    import shlex
+
+    if launcher is None:
+        launcher = shlex.quote(Path(sys.executable).as_posix())
+    return (
+        "---\nname: bmad-build-auto\n---\n\n"
+        "Run the `render_skill.py` command below exactly once:\n\n"
+        "```bash\n"
+        f'{launcher} "{{project-root}}/_bmad/scripts/render_skill.py" '
+        '--project-root "{project-root}" --skill "{skill-root}"\n'
+        "```\n"
+    )
+
+
+def install_render_probe_fixture(
+    root: Path, marker: Path, body: str, tree: str = ".claude/skills"
+) -> Path:
+    """A renderer-stub dev primitive with a complete presence surface whose
+    render_skill.py is a fake that writes ``marker`` whenever it executes.
+    Returns the primitive's skill dir."""
+    from bmad_loop.install import CENTRAL_CONFIG_REL, DEV_PRIMITIVE_NEW, RENDERER_SCRIPT_REL
+
+    skills = install_build_auto_skill(root, tree, renderer_stub=True)
+    primitive = skills / DEV_PRIMITIVE_NEW
+    (primitive / "SKILL.md").write_text(render_probe_stub_skill_md(), encoding="utf-8")
+    script = Path(root) / RENDERER_SCRIPT_REL
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text(_RENDER_PROBE_PREAMBLE.format(marker=str(marker)) + body, encoding="utf-8")
+    config = Path(root) / CENTRAL_CONFIG_REL
+    config.write_text("[core]\nname = 'fixture'\n", encoding="utf-8")
+    return primitive
+
 
 def install_dev_base_skills(root: Path, tree: str = ".claude/skills", *, folder_id: bool) -> Path:
     """Lay down stubs of the upstream skills the orchestrator drives on every dev run
