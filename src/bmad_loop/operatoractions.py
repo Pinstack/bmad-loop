@@ -53,13 +53,18 @@ drifted entries itself, so nothing gates on the record.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import devcontract, sprintstatus, verify
 from .bmadconfig import ProjectPaths
 from .frontmatter import operator_actions_of, read_frontmatter, status_of
-from .platform_util import atomic_write_text_confined, safe_segment
+from .platform_util import (
+    atomic_write_text_confined,
+    require_root_pinned,
+    safe_segment,
+)
 
 RECORDS_REL = Path(".bmad-loop") / "operator"
 LEGACY_STORE_REL = Path(".bmad-loop") / "operator-actions.json"
@@ -141,6 +146,7 @@ def record_park(
     spec_file: str,
     run_id: str,
     parked_at: str,
+    root_identity: os.stat_result | None = None,
 ) -> Path:
     """Write a story's park record, returning its path. Re-parking the same key
     overwrites rather than accumulates: a story owes whatever its latest park
@@ -176,8 +182,21 @@ def record_park(
     writers of this same file — ``Engine._restore_park_record`` and ``confirm``'s
     prune — since write semantics belong to the FILE, not to whichever code path
     reached it last. An operator who marks a park record read-only gets the
-    ``PermissionError`` a bare ``Path.write_text`` raised before #379."""
+    ``PermissionError`` a bare ``Path.write_text`` raised before #379.
+
+    ``root_identity`` pins ``project`` (DW-445), forwarded to the confined
+    writer; ``None`` (the default) is the unpinned write. Only the engine passes
+    one, `runs.mount_root_identity` of its unit mount — under worktree isolation
+    ``project`` is the orchestrator-minted mount, not the operator's checkout.
+    Given one, a ``project`` that is no longer that directory refuses with
+    `UnconfinedWriteError` BEFORE the ``mkdir``, so a mount swapped for a link
+    gets no directories created at the link's target either. That pre-check is
+    ``lstat``-then-``mkdir`` (`platform_util.require_root_pinned`; the write
+    itself re-pins through its handle). The identity covers the unit worktree and
+    every directory down to ``project``; parent directories ABOVE the worktree are
+    still followed, the residual every DW-338 pin shares."""
     path = record_path(project, story_key)
+    require_root_pinned(project, root_identity)
     path.parent.mkdir(parents=True, exist_ok=True)
     record = {
         "story_key": story_key,
@@ -191,6 +210,7 @@ def record_park(
         json.dumps(record, indent=2, sort_keys=True),
         confine_root=project,
         require_writable_target=True,
+        root_identity=root_identity,
     )
     return path
 

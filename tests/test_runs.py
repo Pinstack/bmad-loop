@@ -7753,6 +7753,189 @@ def test_live_spec_root_identity_never_matches_a_gone_mount_without_raising(tmp_
     )
 
 
+def _same_dir(identity, path: Path) -> bool:
+    expected = os.lstat(path)
+    return (identity.st_dev, identity.st_ino, identity.st_mode) == (
+        expected.st_dev,
+        expected.st_ino,
+        expected.st_mode,
+    )
+
+
+def test_mount_root_identity_pins_an_intact_mount(tmp_path):
+    """DW-445's pin primitive answers an intact mount's own `lstat` identity.
+
+    Ablation: return `_UNPINNABLE_MOUNT` unconditionally and this reddens."""
+    mount = _mount(tmp_path)
+    mount.mkdir(parents=True)
+
+    assert _same_dir(runs.mount_root_identity(mount, mount=mount), mount)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_mount_root_identity_never_matches_a_linked_mount(tmp_path):
+    """A mount that is a link answers the never-matching identity, never None (the
+    unpinned write).
+
+    Ablation: return `pinned_root_identity(root)` raw and this reddens."""
+    mount = _mount(tmp_path)
+    mount.mkdir(parents=True)
+    _swap_mount_for_link(mount, tmp_path / "outside")
+
+    assert _never_matches(runs.mount_root_identity(mount, mount=mount))
+
+
+def test_mount_root_identity_never_matches_a_gone_or_non_directory_mount(tmp_path):
+    """A gone mount, and a mount name holding a regular file, answer the
+    never-matching identity without raising — the refusal belongs to the write.
+
+    Ablation: return `pinned_root_identity(root)` raw (None) and both rows redden."""
+    gone = _mount(tmp_path)  # never created
+    assert _never_matches(runs.mount_root_identity(gone, mount=gone))
+
+    a_file = tmp_path / "not-a-dir"
+    a_file.write_text("x", encoding="utf-8")
+    assert _never_matches(runs.mount_root_identity(a_file, mount=a_file))
+
+
+def test_mount_root_identity_pins_an_intact_nested_project(tmp_path):
+    """Under a nested project (DW-379) the pinned root is ``<worktree>/<offset>``,
+    and an intact chain answers THAT directory's identity — not the worktree's.
+
+    Ablation: answer the mount's own identity (`pinned_root_identity(mount)`) and
+    this reddens."""
+    mount = _mount(tmp_path)
+    nested = mount / "apps" / "web"
+    nested.mkdir(parents=True)
+
+    assert _same_dir(runs.mount_root_identity(nested, mount=mount), nested)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("swapped", ["worktree", "intermediate"])
+def test_mount_root_identity_never_matches_a_nested_chain_through_a_link(tmp_path, swapped):
+    """The worktree above a nested project — or any directory between it and the
+    project — swapped for a link to an outside copy answers the never-matching
+    identity, although a fresh `lstat` of ``<worktree>/<offset>`` would follow the
+    link to a real directory.
+
+    Ablation: pin only `root` (`pinned_root_identity(root)`, skipping the
+    components between `mount` and it) and both rows redden."""
+    mount = _mount(tmp_path)
+    nested = mount / "apps" / "web"
+    nested.mkdir(parents=True)
+    link_at = mount if swapped == "worktree" else mount / "apps"
+    _swap_mount_for_link(link_at, tmp_path / "outside")
+    assert nested.is_dir()  # the premise: the spelling still reaches a directory
+
+    assert _never_matches(runs.mount_root_identity(nested, mount=mount))
+
+
+def test_mount_root_identity_never_matches_a_root_outside_the_mount(tmp_path):
+    """A root that is not the mount or lexically under it — a sibling, or a
+    spelling climbing out through ``..`` — cannot be pinned by the mount chain.
+
+    Ablation: drop the `_below_mount` gate (pin `root` whatever `mount` is) and both
+    rows redden with a real directory's identity."""
+    mount = _mount(tmp_path)
+    mount.mkdir(parents=True)
+    sibling = tmp_path / "elsewhere"
+    sibling.mkdir()
+
+    assert _never_matches(runs.mount_root_identity(sibling, mount=mount))
+    assert _never_matches(runs.mount_root_identity(mount / ".." / "1", mount=mount))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_mount_root_identity_accepts_a_root_spelled_through_a_resolved_ancestor(tmp_path):
+    """``ProjectPaths.rebased`` resolves the mount, so a root may be spelled through
+    a resolved ancestor while ``mount`` keeps the link spelling. The mount is then
+    compared under its RESOLVED parent — the ancestor residual, not a refusal —
+    while the worktree itself stays pinned.
+
+    Ablation: drop the resolved-parent retry and this answers never-matching,
+    refusing every legitimate write under a linked `.bmad-loop`."""
+    real = tmp_path / "real-state"
+    (real / "runs" / "r1" / "worktrees" / "1").mkdir(parents=True)
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".bmad-loop").symlink_to(real, target_is_directory=True)
+    mount = _mount(project)  # spelled through the linked `.bmad-loop`
+    root = mount.resolve()
+
+    assert _same_dir(runs.mount_root_identity(root, mount=mount), root)
+
+
+def _nested_escalated_run(tmp_path: Path):
+    """An escalated run whose project is nested at ``<repo>/app`` (DW-379), mounted
+    at a unit worktree: `live_spec_root` is ``<worktree>/app``."""
+    repo = tmp_path
+    project = repo / "app"
+    project.mkdir()
+    mount = _mount(project)
+    (mount / "app" / "specs").mkdir(parents=True)
+    run = escalated_run(project, "r1", spec_file="specs/6-4.md", worktree_path=str(mount))
+    run.state.repo_root = str(repo)
+    assert runs.live_spec_root(run.task, run.state, project) == mount / "app"  # the premise
+    return run, project, mount
+
+
+def test_live_spec_root_identity_pins_an_intact_nested_mount_project(tmp_path):
+    """DW-423's pin under nesting: the mount PROJECT ``<worktree>/app`` is pinned.
+
+    Ablation: pass ``mount=live_spec_root(...)`` instead of the worktree and this
+    still passes — the negative row below is the one guarding the chain."""
+    run, project, mount = _nested_escalated_run(tmp_path)
+
+    identity = runs.live_spec_root_identity(run.task, run.state, project)
+
+    assert identity is not None
+    assert _same_dir(identity, mount / "app")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_live_spec_root_identity_never_matches_a_nested_mount_whose_worktree_is_a_link(
+    tmp_path,
+):
+    """The worktree above a nested mount project swapped for a link: the fresh
+    `lstat` of ``<worktree>/app`` follows it to a real directory, and the pin must
+    not accept that directory (DW-445 adopts the chain rule for DW-423's writers).
+
+    Ablation: pass ``mount=live_spec_root(...)`` (pin the project alone) and this
+    reddens with the outside directory's identity."""
+    run, project, mount = _nested_escalated_run(tmp_path)
+    _swap_mount_for_link(mount, tmp_path / "outside")
+
+    assert _never_matches(runs.live_spec_root_identity(run.task, run.state, project))
+
+
+@requires_symlinked_mount_swap
+def test_nested_rearm_flip_refuses_a_swapped_worktree(tmp_path):
+    """End to end on a DW-423 writer: the re-arm's status flip through a nested
+    mount whose worktree was swapped for a link refuses, and the outside copy keeps
+    its bytes; the unpinned control shows the same swap really lands outside.
+
+    Ablation: pass ``mount=live_spec_root(...)`` in `live_spec_root_identity` and the
+    flip lands in the outside copy."""
+    run, project, mount = _nested_escalated_run(tmp_path)
+    spec = mount / "app" / "specs" / "6-4.md"
+    spec.write_text(_PINNED_SPEC, encoding="utf-8")
+    outside = tmp_path / "outside"
+    _swap_mount_for_link(mount, outside)
+    outside_spec = outside / "app" / "specs" / "6-4.md"
+    confine_root = runs.live_spec_root(run.task, run.state, project)
+    identity = runs.live_spec_root_identity(run.task, run.state, project)
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        verify.set_frontmatter_status(
+            spec, "ready-for-dev", confine_root=confine_root, root_identity=identity
+        )
+    assert outside_spec.read_text(encoding="utf-8") == _PINNED_SPEC
+
+    assert verify.set_frontmatter_status(spec, "ready-for-dev", confine_root=confine_root)
+    assert "status: ready-for-dev" in outside_spec.read_text(encoding="utf-8")
+
+
 @requires_symlinked_mount_swap
 def test_restore_rearmed_spec_refuses_a_mount_swapped_for_a_link(tmp_path, monkeypatch):
     """The re-arm's undo is pinned like the three writes it undoes: a mount swapped
@@ -7780,6 +7963,38 @@ def test_restore_rearmed_spec_refuses_a_mount_swapped_for_a_link(tmp_path, monke
         runs._restore_rearmed_spec(spec, b"original\n", run.task, run.state, tmp_path) == "restored"
     )
     assert outside_spec.read_bytes() == b"original\n"
+
+
+@requires_symlinked_mount_swap
+def test_restore_rearmed_spec_external_arm_refuses_a_swapped_pinned_mount(tmp_path, monkeypatch):
+    """DW-445 keeps the undo's two arms in parity with its forward writers: handed the
+    spec's RESOLVED spelling after a mount swap (outside `live_spec_root`, so the
+    external arm), the undo pre-checks the pin and raises `RearmError` naming the
+    refusal; the outside copy is unchanged. Unpinned, the same call restores it.
+
+    Ablation: drop the `require_root_pinned` pre-check from `_restore_rearmed_spec`'s
+    external arm and the pinned row writes the preimage into the outside copy."""
+    mount = _mount(tmp_path)
+    (mount / "specs").mkdir(parents=True)
+    (mount / "specs" / "6-4.md").write_text("flipped\n", encoding="utf-8")
+    run = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(mount))
+    outside = tmp_path / "outside"
+    _swap_mount_for_link(mount, outside)
+    outside_spec = (outside / "specs" / "6-4.md").resolve()
+
+    with pytest.raises(runs.RearmError, match=_PIN_REFUSAL_RE):
+        runs._restore_rearmed_spec(outside_spec, b"original\n", run.task, run.state, tmp_path)
+    assert outside_spec.read_bytes() == b"flipped\n"
+
+    monkeypatch.setattr(runs, "live_spec_root_identity", lambda *a: None)  # control
+    assert (
+        runs._restore_rearmed_spec(outside_spec, b"original\n", run.task, run.state, tmp_path)
+        == "restored"
+    )
+    assert outside_spec.read_bytes() == b"original\n"
+
+
+_PIN_REFUSAL_RE = "no longer the directory it was pinned to"
 
 
 @requires_symlinked_mount_swap

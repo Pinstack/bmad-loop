@@ -1277,3 +1277,172 @@ def test_set_frontmatter_status_pinned_mount_refuses_a_mount_swapped_for_a_link(
     # Control: unpinned, the swap carries the write outside the repository.
     assert frontmatter.set_frontmatter_status(spec, "in-progress", confine_root=mount)
     assert "status: in-progress" in outside_spec.read_text(encoding="utf-8")
+
+
+@requires_symlinked_mount_swap
+def test_set_frontmatter_status_anchored_pinned_mount_refuses_a_mount_swapped_for_a_link(
+    tmp_path,
+):
+    """DW-445: the descriptor-anchored writer (recovery's attempt-owned
+    normalization) pins its in-project root the same way — a swapped mount refuses
+    with `UnconfinedWriteError` and the outside bytes are unchanged; the unpinned
+    control shows the same swap really lands outside.
+
+    Ablation: drop the `root_identity` forward from `set_frontmatter_status_anchored`
+    to `_open_anchored_parent` (or from there to `open_dir_confined`) and the pinned
+    call rewrites the outside copy instead of raising."""
+    text = "---\nstatus: done\n---\nbody\n"
+    mount, outside_spec, identity = _mount_swap_pair(tmp_path, text)
+    spec = mount / "specs" / "6-4.md"
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        frontmatter.set_frontmatter_status_anchored(
+            spec, "ready-for-dev", confine_root=mount, root_identity=identity
+        )
+    assert outside_spec.read_text(encoding="utf-8") == text
+
+    # Control: unpinned, the swap carries the write outside the repository.
+    frontmatter.set_frontmatter_status_anchored(spec, "ready-for-dev", confine_root=mount)
+    assert "status: ready-for-dev" in outside_spec.read_text(encoding="utf-8")
+
+
+@requires_symlinked_mount_swap
+def test_set_frontmatter_status_anchored_pinned_intact_mount_writes(tmp_path):
+    """The pin binds nothing extra on an intact mount: the identity matches and the
+    write lands in the mount."""
+    mount = tmp_path / "project" / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    (mount / "specs").mkdir(parents=True)
+    spec = mount / "specs" / "6-4.md"
+    spec.write_text("---\nstatus: done\n---\nbody\n", encoding="utf-8")
+
+    frontmatter.set_frontmatter_status_anchored(
+        spec, "ready-for-dev", confine_root=mount, root_identity=os.lstat(mount)
+    )
+    assert "status: ready-for-dev" in spec.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------- external-arm pin pre-check (DW-445)
+#
+# A pinned writer handed a path OUTSIDE its `confine_root` — here the spec's resolved
+# spelling after the mount was swapped for a link, which is what a reset or a relative
+# binding resolved through the swap produces — pre-checks that the root is still the
+# pinned directory. An intact mount whose `_bmad-output` is a link resolving outside
+# it passes that check and writes exactly as unpinned.
+
+
+def _external_after_swap(tmp_path, text: str) -> tuple[Path, Path, os.stat_result]:
+    """(mount, the spec's canonical OUTSIDE path, the mount's accepted identity) —
+    the mount already swapped for a link to the outside copy."""
+    mount, outside_spec, identity = _mount_swap_pair(tmp_path, text)
+    return mount, outside_spec.resolve(), identity
+
+
+def _external_behind_linked_output(tmp_path, text: str) -> tuple[Path, Path, os.stat_result]:
+    """(intact mount, the spec's canonical path under a `_bmad-output` link resolving
+    outside the mount, the mount's identity)."""
+    mount = tmp_path / "project" / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    mount.mkdir(parents=True)
+    shared = tmp_path / "shared-output"
+    (shared / "specs").mkdir(parents=True)
+    (shared / "specs" / "6-4.md").write_text(text, encoding="utf-8")
+    (mount / "_bmad-output").symlink_to(shared, target_is_directory=True)
+    return mount, (shared / "specs" / "6-4.md").resolve(), os.lstat(mount)
+
+
+@requires_symlinked_mount_swap
+def test_set_frontmatter_status_external_arm_refuses_a_swapped_pinned_root(tmp_path):
+    """The path writer's external arm pre-checks a given pin: the mount swapped
+    before the path was resolved refuses and the outside bytes are unchanged; the
+    unpinned control (None) writes them as before.
+
+    Ablation: drop the `require_root_pinned` pre-check from the external arm and
+    the pinned call rewrites the outside copy."""
+    text = "---\nstatus: done\n---\nbody\n"
+    mount, outside_spec, identity = _external_after_swap(tmp_path, text)
+
+    with pytest.raises(platform_util.UnconfinedWriteError, match="pinned to"):
+        frontmatter.set_frontmatter_status(
+            outside_spec, "in-progress", confine_root=mount, root_identity=identity
+        )
+    assert outside_spec.read_text(encoding="utf-8") == text
+
+    assert frontmatter.set_frontmatter_status(outside_spec, "in-progress", confine_root=mount)
+    assert "status: in-progress" in outside_spec.read_text(encoding="utf-8")
+
+
+@requires_symlinked_mount_swap
+def test_set_frontmatter_status_external_arm_writes_through_an_intact_pinned_root(tmp_path):
+    """An intact pinned mount whose `_bmad-output` resolves outside it: the external
+    arm's pre-check passes and the write lands as it does unpinned."""
+    text = "---\nstatus: done\n---\nbody\n"
+    mount, spec, identity = _external_behind_linked_output(tmp_path, text)
+
+    assert frontmatter.set_frontmatter_status(
+        spec, "in-progress", confine_root=mount, root_identity=identity
+    )
+    assert "status: in-progress" in spec.read_text(encoding="utf-8")
+
+
+@requires_symlinked_mount_swap
+def test_set_frontmatter_status_anchored_external_arm_refuses_a_swapped_pinned_root(tmp_path):
+    """The anchored writer's external arm (recovery's binding resolved through a
+    swapped mount is canonical OUTSIDE it) pre-checks a given pin: refused, outside
+    bytes unchanged; the unpinned control rewrites them.
+
+    Ablation: drop the `require_root_pinned` pre-check from `_open_anchored_parent`'s
+    external arm (or the `root_identity` forward from `set_frontmatter_status_anchored`)
+    and the pinned call rewrites the outside copy."""
+    text = "---\nstatus: done\n---\nbody\n"
+    mount, outside_spec, identity = _external_after_swap(tmp_path, text)
+
+    with pytest.raises(platform_util.UnconfinedWriteError, match="pinned to"):
+        frontmatter.set_frontmatter_status_anchored(
+            outside_spec, "ready-for-dev", confine_root=mount, root_identity=identity
+        )
+    assert outside_spec.read_text(encoding="utf-8") == text
+
+    frontmatter.set_frontmatter_status_anchored(outside_spec, "ready-for-dev", confine_root=mount)
+    assert "status: ready-for-dev" in outside_spec.read_text(encoding="utf-8")
+
+
+@requires_symlinked_mount_swap
+def test_set_frontmatter_status_anchored_external_arm_writes_through_an_intact_pinned_root(
+    tmp_path,
+):
+    """An intact pinned mount with a linked `_bmad-output`: the anchored external
+    arm writes as it does unpinned."""
+    text = "---\nstatus: done\n---\nbody\n"
+    mount, spec, identity = _external_behind_linked_output(tmp_path, text)
+
+    frontmatter.set_frontmatter_status_anchored(
+        spec, "ready-for-dev", confine_root=mount, root_identity=identity
+    )
+    assert "status: ready-for-dev" in spec.read_text(encoding="utf-8")
+
+
+@requires_symlinked_mount_swap
+def test_set_frontmatter_field_external_arm_refuses_a_swapped_pinned_root(tmp_path):
+    """`verify.set_frontmatter_field` shares the rule: a pinned external write
+    through a swapped mount refuses, outside bytes unchanged; the unpinned control
+    lands; an intact pinned mount behind a linked `_bmad-output` lands too.
+
+    Ablation: drop the `require_root_pinned` pre-check from its external arm and the
+    pinned call rewrites the outside copy."""
+    text = "---\nstatus: done\n---\nbody\n"
+    mount, outside_spec, identity = _external_after_swap(tmp_path / "swap", text)
+
+    with pytest.raises(platform_util.UnconfinedWriteError, match="pinned to"):
+        verify.set_frontmatter_field(
+            outside_spec, "baseline_revision", "abc", confine_root=mount, root_identity=identity
+        )
+    assert outside_spec.read_text(encoding="utf-8") == text
+    assert verify.set_frontmatter_field(
+        outside_spec, "baseline_revision", "abc", confine_root=mount
+    )
+    assert "baseline_revision: abc" in outside_spec.read_text(encoding="utf-8")
+
+    mount, spec, identity = _external_behind_linked_output(tmp_path / "intact", text)
+    assert verify.set_frontmatter_field(
+        spec, "baseline_revision", "abc", confine_root=mount, root_identity=identity
+    )
+    assert "baseline_revision: abc" in spec.read_text(encoding="utf-8")

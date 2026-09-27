@@ -8,6 +8,7 @@ under a real Engine stays covered by test_engine.py.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import socket
 import stat
@@ -2741,8 +2742,10 @@ def test_plain_normalization_restore_revalidates_parent_authority(project, tmp_p
         workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
     )
 
-    def retarget_after_normalize(path, target_status, *, confine_root):
-        RecoveryFlow._normalize_attempt_owned_spec(path, target_status, confine_root=confine_root)
+    def retarget_after_normalize(path, target_status, *, confine_root, root_identity=None):
+        RecoveryFlow._normalize_attempt_owned_spec(
+            path, target_status, confine_root=confine_root, root_identity=root_identity
+        )
         path.unlink()
         parent.rmdir()
         parent.symlink_to(victim_parent, target_is_directory=True)
@@ -3104,8 +3107,8 @@ def test_redrive_restore_then_operator_edit_pauses_and_keeps_operator_bytes(
     real_restore = RecoveryFlow._restore_attempt_owned_spec_bytes
     restores: list[Path] = []
 
-    def restore_then_operator_edits(spec_path, snapshot):
-        identity = real_restore(spec_path, snapshot)
+    def restore_then_operator_edits(spec_path, snapshot, **pin):
+        identity = real_restore(spec_path, snapshot, **pin)
         restores.append(spec_path)
         if edit == "in-place":
             with open(spec_path, "r+b") as fh:
@@ -5190,3 +5193,365 @@ def test_accept_current_baseline_git_fault_folds_a_multiline_error(project, tmp_
 
     _assert_fragment_folded(tmp_path)
     assert flow.journal.fields("baseline-accept-failed")["error"] == _MULTILINE_FAULT
+
+
+# ------------------------------------------ recovery worktree-mount writer pin (DW-445)
+#
+# Under worktree isolation the live workspace is a REAL unit mount
+# (`workspace.open_unit_workspace`), and every attempt-owned normalization and
+# restore confines to its `paths.project`. The call sites pass
+# `_mount_root_identity(workspace)`. The swap: the mount copied to an outside tree,
+# renamed aside, and a link planted at its name. Each row has an unpinned control
+# (`_mount_root_identity` answering None) showing the same swap really lands outside.
+
+requires_symlinked_mount_swap = pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES or sys.platform == "win32",
+    reason="dir-fd anchoring and POSIX symlinks",
+)
+
+_PIN_REFUSAL = "no longer the directory it was pinned to"
+
+
+def _real_unit(project):
+    """(unit workspace, run dir) — a real worktree mounted for ``1-1-a``."""
+    from bmad_loop.workspace import open_unit_workspace
+
+    run_dir = project.project / ".bmad-loop" / "runs" / "run-1"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    unit = open_unit_workspace(project.project, project, "run-1", "1-1-a", "main", "story", run_dir)
+    return unit.workspace, run_dir
+
+
+def _swap_unit_mount(workspace, outside: Path) -> None:
+    """Copy the unit mount to ``outside``, rename it aside and plant a link at its
+    name — the whole worktree, `.git` file included, so git still works through it."""
+    import shutil
+
+    shutil.copytree(workspace.root, outside, symlinks=True)
+    workspace.root.rename(workspace.root.with_name(workspace.root.name + "-aside"))
+    workspace.root.symlink_to(outside, target_is_directory=True)
+
+
+def _unit_flow(project, workspace, run_dir, monkeypatch, *, pinned: bool, rollback: bool):
+    flow = _make_flow(
+        workspace=workspace,
+        paths=project,
+        policy=_policy(rollback_on_failure=rollback),
+        run_dir=run_dir,
+    )
+    if not pinned:
+        monkeypatch.setattr(flow, "_mount_root_identity", lambda workspace: None)
+    return flow
+
+
+def _assert_pin_pause(flow, task: StoryTask, unsafe_context: str) -> None:
+    """The byte restore's pin refusal surfaced as the ordinary owned-spec pause at
+    the site named by ``unsafe_context``: the authority pair is cleared and the
+    journaled problem is the revalidation fault the pin pre-check maps to (the
+    canonical walk's own refusal reads "became unsafe" instead)."""
+    problem = flow.journal.fields("rollback-owned-spec-manual-required")["problem"]
+    assert unsafe_context in problem
+    assert "could not be revalidated" in problem
+    assert task.dispatched_spec_file is None
+    assert task.dispatched_spec_snapshot is None
+
+
+def test_recovery_mount_root_identity_follows_the_live_workspace(project):
+    """None for the default workspace (the operator's project); the mount project's
+    own identity once the workspace is a real unit mount.
+
+    Ablation: drop the `workspace.root == self.paths.repo_root` arm and the first
+    row reddens; answer None unconditionally and the second does."""
+    ws = Workspace.default(project)
+    assert _make_flow(workspace=ws, paths=project)._mount_root_identity(ws) is None
+
+    unit_ws, run_dir = _real_unit(project)
+    flow = _make_flow(workspace=unit_ws, paths=project, run_dir=run_dir)
+    identity = flow._mount_root_identity(unit_ws)
+    assert identity is not None
+    expected = os.lstat(unit_ws.paths.project)
+    assert (identity.st_dev, identity.st_ino) == (expected.st_dev, expected.st_ino)
+
+
+@requires_descriptor_restoration
+@requires_symlinked_mount_swap
+@pytest.mark.parametrize("pinned", [True, False], ids=["pinned", "unpinned-control"])
+def test_normalization_refuses_a_relative_binding_made_through_a_swapped_mount(
+    project, tmp_path, monkeypatch, pinned
+):
+    """The mount is swapped BEFORE recovery binds the persisted RELATIVE
+    `dispatched_spec_file`, so the binding resolves canonically OUTSIDE the mount
+    and the anchored normalization takes its external arm. That arm's pin
+    pre-check refuses (`UnconfinedWriteError`) and the outside copy keeps the
+    child's status; unpinned, the same swap lands the normalization outside.
+
+    Ablation: drop the `require_root_pinned` pre-check from `_open_anchored_parent`'s
+    external arm (or `root_identity=` at the plain normalization site) and the
+    pinned row rewrites the outside copy."""
+    spec_main = _tracked_spec(project)
+    ws, run_dir = _real_unit(project)
+    spec = ws.paths.implementation_artifacts / spec_main.name
+    task = _task(ws.root)
+    task.dispatched_spec_file = spec.relative_to(ws.paths.project).as_posix()
+    spec.write_text(spec.read_text().replace("ready-for-dev", "in-progress"))  # child flip
+    flow = _unit_flow(project, ws, run_dir, monkeypatch, pinned=pinned, rollback=False)
+    outside = tmp_path / "outside"
+    _swap_unit_mount(ws, outside)
+    outside_spec = outside / spec.relative_to(ws.root)
+
+    if pinned:
+        with pytest.raises(UnconfinedWriteError, match=_PIN_REFUSAL):
+            flow.rollback_or_pause(task)
+        assert _status(outside_spec) == "in-progress"
+    else:
+        with contextlib.suppress(_Pause):
+            flow.rollback_or_pause(task)
+        assert _status(outside_spec) == "ready-for-dev"
+
+
+@requires_descriptor_restoration
+@requires_symlinked_mount_swap
+@pytest.mark.parametrize("pinned", [True, False], ids=["pinned", "unpinned-control"])
+@pytest.mark.parametrize("redrive", [True, False], ids=["redrive", "plain"])
+def test_snapshot_restore_refuses_a_binding_made_through_a_swapped_mount(
+    project, tmp_path, monkeypatch, pinned, redrive
+):
+    """The snapshot restore ("before the baseline reset") of an untracked spec bound
+    through a mount swapped before binding — the latched re-drive's restore-and-route
+    and a plain attempt's byte-only restore: the path is canonical OUTSIDE the mount,
+    so the byte restore's canonical walk alone would accept it. Its pin pre-check
+    refuses before anything is written — surfacing as the owned-spec pause, like
+    any other unsafe restore target — and the outside copy keeps the failed
+    child's bytes; unpinned, the restore lands outside.
+
+    Ablation: drop the `require_root_pinned` pre-check from
+    `_restore_attempt_owned_spec_bytes` (or its `root_identity` forward from
+    `_restore_attempt_owned_spec` / `_restore_attempt_owned_spec_bytes_or_pause`)
+    and the pinned row writes the snapshot outside."""
+    ws, run_dir = _real_unit(project)
+    spec = ws.paths.implementation_artifacts / "untracked-redrive.md"
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    corrected = b"---\nstatus: ready-for-dev\n---\n\nhuman corrected untracked intent\n"
+    spec.write_bytes(corrected)
+    task = _task(ws.root)
+    task.baseline_untracked = [spec.relative_to(ws.root).as_posix()]
+    task.dispatched_spec_file = spec.relative_to(ws.paths.project).as_posix()
+    task.dispatched_spec_snapshot = corrected
+    task.resolved_redrive = redrive
+    child = b"---\nstatus: done\n---\n\nfailed child untracked body\n"
+    spec.write_bytes(child)
+    flow = _unit_flow(project, ws, run_dir, monkeypatch, pinned=pinned, rollback=False)
+    outside = tmp_path / "outside"
+    _swap_unit_mount(ws, outside)
+    outside_spec = outside / spec.relative_to(ws.root)
+
+    if pinned:
+        with pytest.raises(_Pause):
+            flow.rollback_or_pause(task)
+        _assert_pin_pause(flow, task, "before the baseline reset")
+        assert outside_spec.read_bytes() == child
+    else:
+        with contextlib.suppress(_Pause):
+            flow.rollback_or_pause(task)
+        assert outside_spec.read_bytes() == corrected
+
+
+@requires_descriptor_restoration
+@pytest.mark.parametrize("redrive", [True, False], ids=["redrive", "plain"])
+def test_snapshot_restore_on_an_intact_mount_lands_under_the_pin(project, monkeypatch, redrive):
+    """The positive half of the byte-restore pin: on an INTACT real unit mount, with
+    the pin live, the snapshot restore ("before the baseline reset") writes the
+    corrected bytes into the mount and never takes the owned-spec pause.
+
+    Ablation: pin the wrong directory in `_restore_attempt_owned_spec_bytes` (e.g.
+    `require_root_pinned(spec_path.parent, root_identity)`) and the restore pauses
+    for manual owned-spec recovery here while every swapped-mount row stays green."""
+    ws, run_dir = _real_unit(project)
+    spec = ws.paths.implementation_artifacts / "untracked-redrive.md"
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    corrected = b"---\nstatus: ready-for-dev\n---\n\nhuman corrected untracked intent\n"
+    task = _task(ws.root)
+    task.baseline_untracked = [spec.relative_to(ws.root).as_posix()]
+    task.dispatched_spec_file = spec.relative_to(ws.paths.project).as_posix()
+    task.dispatched_spec_snapshot = corrected
+    task.resolved_redrive = redrive
+    spec.write_bytes(b"---\nstatus: done\n---\n\nfailed child untracked body\n")
+    flow = _unit_flow(project, ws, run_dir, monkeypatch, pinned=True, rollback=False)
+    assert flow._mount_root_identity(ws) is not None
+
+    with contextlib.suppress(_Pause):
+        flow.rollback_or_pause(task)
+
+    assert "rollback-owned-spec-manual-required" not in flow.journal.events()
+    assert spec.read_bytes() == corrected
+
+
+@requires_descriptor_restoration
+@requires_symlinked_mount_swap
+@pytest.mark.parametrize("pinned", [True, False], ids=["pinned", "unpinned-control"])
+def test_redrive_post_reset_normalization_refuses_a_mount_swapped_during_the_reset(
+    project, tmp_path, monkeypatch, pinned
+):
+    """The `resolved` unwind's post-reset route repair on a real unit mount whose
+    worktree is swapped for a link while the baseline reset runs: the binding was
+    made through the intact mount, so the normalization takes the in-project arm,
+    and the pinned walk refuses the swapped root — the outside copy keeps the
+    escalated attempt's status. Unpinned, the same swap lands the repair outside.
+
+    Ablation: drop `root_identity=` at the post-reset normalization site (or the
+    forward in `_normalize_attempt_owned_spec_or_pause`) and the pinned row
+    rewrites the outside copy."""
+    spec_main = _tracked_spec(project)
+    ws, run_dir = _real_unit(project)
+    spec = ws.paths.implementation_artifacts / spec_main.name
+    spec.write_bytes(b"---\nstatus: done\n---\n\nescalated attempt\n")
+    task = _task(ws.root)
+    task.dispatched_spec_file = str(spec)
+    (ws.root / "src.txt").write_text("failed attempt residue\n")  # real dirt to undo
+    flow = _unit_flow(project, ws, run_dir, monkeypatch, pinned=pinned, rollback=False)
+    outside = tmp_path / "outside"
+    outside_spec = outside / spec.relative_to(ws.root)
+    real_safe_reset = flow.safe_reset
+
+    def swap_after_reset(reset_task, *, preserve=()):
+        real_safe_reset(reset_task, preserve=preserve)
+        _swap_unit_mount(ws, outside)
+
+    monkeypatch.setattr(flow, "safe_reset", swap_after_reset)
+
+    if pinned:
+        with pytest.raises(UnconfinedWriteError):
+            flow.rollback_or_pause(task, cause="resolved")
+        assert _status(outside_spec) == "done"
+    else:
+        with contextlib.suppress(_Pause):
+            flow.rollback_or_pause(task, cause="resolved")
+        assert _status(outside_spec) == "ready-for-dev"
+
+
+_BASE_SPEC = b"---\nstatus: ready-for-dev\n---\n\nbaseline intent\n"
+_EDITED_SPEC = b"---\nstatus: ready-for-dev\n---\n\nhuman corrected intent\n"
+_CHILD_SPEC = b"---\nstatus: done\n---\n\nfailed child body\n"
+
+
+def _site_retry_input(project, ws, flow, monkeypatch, outside):
+    """Latched re-drive, tracked spec already at its corrected snapshot, no other
+    dirt: the region's restore-and-route "while restoring the pre-attempt retry
+    input". Swapped before binding."""
+    spec = ws.paths.implementation_artifacts / "spec-1-1-a.md"
+    spec.write_bytes(_EDITED_SPEC)
+    task = _task(ws.root)
+    task.dispatched_spec_file = spec.relative_to(ws.paths.project).as_posix()
+    task.dispatched_spec_snapshot = _EDITED_SPEC
+    task.resolved_redrive = True
+    _swap_unit_mount(ws, outside)
+    return task, spec
+
+
+def _swap_after_normalization(flow, ws, monkeypatch, outside) -> None:
+    real = RecoveryFlow._normalize_attempt_owned_spec
+
+    def normalize_then_swap(path, target_status, **kwargs):
+        real(path, target_status, **kwargs)
+        _swap_unit_mount(ws, outside)
+
+    monkeypatch.setattr(flow, "_normalize_attempt_owned_spec", normalize_then_swap)
+
+
+def _site_operator_input(project, ws, flow, monkeypatch, outside):
+    """Plain attempt whose child reverted the operator's pre-launch edit to the
+    baseline: normalization, then the byte restore "while restoring the pre-launch
+    operator input". Normalization runs first under the SAME pin, so a mount
+    swapped before binding refuses there (raised) and never reaches this site; the
+    swap therefore lands right after normalization. The binding then names a path
+    THROUGH the swapped mount, which the canonical walk refuses too — only the
+    journaled problem ("could not be revalidated", not "became unsafe") tells the
+    pin's refusal apart."""
+    spec = ws.paths.implementation_artifacts / "spec-1-1-a.md"
+    task = _task(ws.root)
+    task.dispatched_spec_file = str(spec)
+    task.dispatched_spec_snapshot = _EDITED_SPEC  # the operator's pre-launch input
+    spec.write_bytes(_BASE_SPEC)  # the child reverted it to baseline
+    _swap_after_normalization(flow, ws, monkeypatch, outside)
+    return task, spec
+
+
+def _site_tentative_repair(project, ws, flow, monkeypatch, outside):
+    """Plain attempt whose child edited the tracked spec's body and status, no
+    snapshot: normalization fixes the status only, the re-probe stays dirty, and the
+    byte restore "while undoing a tentative lifecycle repair" puts the child's
+    bytes back. Swapped right after normalization, for `_site_operator_input`'s
+    reason (the pin refuses the normalization itself on an earlier swap)."""
+    spec = ws.paths.implementation_artifacts / "spec-1-1-a.md"
+    task = _task(ws.root)
+    task.dispatched_spec_file = str(spec)
+    spec.write_bytes(_CHILD_SPEC)
+    _swap_after_normalization(flow, ws, monkeypatch, outside)
+    return task, spec
+
+
+def _after_reset_site(redrive: bool):
+    def build(project, ws, flow, monkeypatch, outside):
+        """Baseline-untracked spec at its snapshot plus sibling residue: the reset
+        arm, no restore before the reset, then the after-reset restore — byte-only
+        (plain) or restore-and-route (re-drive). Swapped before binding."""
+        spec = ws.paths.implementation_artifacts / "untracked.md"
+        spec.write_bytes(_EDITED_SPEC)
+        task = _task(ws.root)
+        task.baseline_untracked = [spec.relative_to(ws.root).as_posix()]
+        task.dispatched_spec_file = spec.relative_to(ws.paths.project).as_posix()
+        task.dispatched_spec_snapshot = _EDITED_SPEC
+        task.resolved_redrive = redrive
+        (ws.root / "residue.txt").write_text("failed attempt residue\n")
+        _swap_unit_mount(ws, outside)
+        return task, spec
+
+    return build
+
+
+_RESTORE_SITES = {
+    "retry-input": (_site_retry_input, "while restoring the pre-attempt retry input"),
+    "operator-input": (_site_operator_input, "while restoring the pre-launch operator input"),
+    "tentative-repair": (_site_tentative_repair, "while undoing a tentative lifecycle repair"),
+    "after-reset-bytes": (_after_reset_site(False), "after the baseline reset"),
+    "after-reset-redrive": (_after_reset_site(True), "after the baseline reset"),
+}
+
+
+@requires_descriptor_restoration
+@requires_symlinked_mount_swap
+@pytest.mark.parametrize("site", sorted(_RESTORE_SITES))
+def test_owned_spec_restore_sites_pause_on_a_swapped_mount(project, tmp_path, monkeypatch, site):
+    """Each `rollback_or_pause` restore site on a real unit mount swapped for a
+    link: the byte restore's pin pre-check refuses before anything is written, the
+    refusal surfaces as the owned-spec pause at THAT site, and the outside copy's
+    bytes are unchanged.
+
+    Not covered: the byte restore "before the ordinary manual-recovery pause". That
+    arm is reached only when ``in_unit_worktree`` is False — a mounted workspace
+    always takes the auto-recovery arm — and off a mount the pin is None by the
+    same test, so there is no swapped mount for it to refuse.
+
+    Ablation: drop the site's ``root_identity=`` (or ``confine_root=``) forward in
+    `rollback_or_pause` and its row reddens — no pause at that site, or (for
+    operator-input and tentative-repair, swapped after normalization) the canonical
+    walk's "became unsafe" problem instead."""
+    _tracked_spec(project, body="baseline intent\n")
+    ws, run_dir = _real_unit(project)
+    flow = _unit_flow(project, ws, run_dir, monkeypatch, pinned=True, rollback=False)
+    outside = tmp_path / "outside"
+    build, unsafe_context = _RESTORE_SITES[site]
+    task, spec = build(project, ws, flow, monkeypatch, outside)
+    outside_spec = outside / spec.relative_to(ws.root)
+
+    with pytest.raises(_Pause):
+        flow.rollback_or_pause(task)
+
+    _assert_pin_pause(flow, task, unsafe_context)
+    if site == "operator-input":
+        expected = _BASE_SPEC  # normalized before the swap, never restored after
+    elif site == "tentative-repair":
+        expected = _CHILD_SPEC.replace(b"status: done", b"status: ready-for-dev")
+    else:
+        expected = _EDITED_SPEC
+    assert outside_spec.read_bytes() == expected

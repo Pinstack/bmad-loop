@@ -1045,11 +1045,14 @@ def pinned_root_identity(root: Path) -> os.stat_result | None:
     For roots the ORCHESTRATOR mints or validates whose callers opt in — today
     the artifact-publication root, the run dir for the verify-stream write, the
     exact-path candidate worktree, the integration snapshot directory's
-    no-dir-fd arms and the ``live_spec_root`` spec writers — re-arm and TUI
-    replan (DW-423, through ``runs.live_spec_root_identity``, which turns this
-    None into a never-matching identity so the refusal lands at the write): their
-    contract refuses a linked root, so a root that is a symlink, a win32 link reparse point
-    (:data:`_LINK_REPARSE_TAGS`), not a directory, or cannot be probed answers
+    no-dir-fd arms, the ``live_spec_root`` spec writers — re-arm and TUI
+    replan (DW-423, through ``runs.live_spec_root_identity``) — and the engine's
+    and ``recovery_flow``'s worktree-mount writers (DW-445). Both mount-writer
+    families go through ``runs.mount_root_identity``, which applies this to the
+    unit worktree and every directory down to the pinned root and turns a None
+    into a never-matching identity so the refusal lands at the write. Their
+    contract refuses a linked root, so a root that is a symlink, a win32 link
+    reparse point (:data:`_LINK_REPARSE_TAGS`), not a directory, or cannot be probed answers
     None, and a pinned caller treats None as a refusal — never as "open it
     unpinned". Pass the result to :func:`open_dir_confined`'s ``root_identity``
     (or a confined writer's), which refuses unless the root it actually opened
@@ -1090,6 +1093,24 @@ def _root_still_pinned(root: Path, root_identity: os.stat_result) -> bool:
     except OSError:
         return False
     return _same_dir_identity(root_identity, current)
+
+
+def require_root_pinned(root: Path, root_identity: os.stat_result | None) -> None:
+    """The external-arm pin pre-check (DW-445): raise `UnconfinedWriteError` unless
+    ``root_identity`` is None or ``root`` still ``lstat``s as that same directory.
+
+    For a pinned writer whose target lies OUTSIDE its ``confine_root`` (a
+    configured artifacts folder, or a path already resolved through a swapped
+    mount) and for path-based acts — unlink, ``mkdir`` — that have no walked handle
+    to ``fstat``. A root swapped for a link refuses here while that swap still
+    stands, including when the path was resolved through it; an INTACT root whose
+    artifacts folder is a link resolving elsewhere passes, and the write proceeds
+    exactly as unpinned. Check-then-write, the residual :func:`_root_still_pinned`
+    documents: a swap reverted between resolution and this check passes it, and
+    one landing after it is not seen. ``None`` is a no-op, so the unpinned call
+    stays byte-for-byte what it was."""
+    if root_identity is not None and not _root_still_pinned(root, root_identity):
+        raise UnconfinedWriteError(f"{root} is no longer the directory it was pinned to")
 
 
 def _win32_filesystem_name(path: Path) -> str:
@@ -1260,16 +1281,25 @@ def open_dir_confined(
     exact-path candidate worktree and the worktree-mount spec writers
     (frontmatter/devcontract/runs and the TUI replan with
     ``confine_root=live_spec_root(...)``, pinned by
-    ``runs.live_spec_root_identity`` — DW-423). The integration snapshot
+    ``runs.live_spec_root_identity`` — DW-423), and the engine's and
+    ``recovery_flow``'s mount writers — repair/reset/review, marker repair,
+    reconcile, adoption, park-record write and restore, attempt-owned status
+    normalization and snapshot restore — which confine to
+    ``workspace.paths.project``/``workspace.root`` and, when that workspace is a
+    unit mount, pin it through ``runs.mount_root_identity`` (DW-445). A pinned
+    spec writer's EXTERNAL arm (a target outside ``confine_root``) pre-checks the
+    pin with :func:`require_root_pinned` before writing, so a path resolved
+    through a swapped mount refuses there too while the swap still stands
+    (check-then-write). The integration snapshot
     directory is held by its own ``O_NOFOLLOW`` root open on the dir-fd arm (a
     leaf check, not this identity compare) and by :func:`pinned_root_identity`
-    pre-checks on the others. NOT yet pinned: the engine's and ``recovery_flow``'s
-    spec writers, which confine to ``workspace.paths.project`` — under worktree
-    isolation that IS the mount, so they still follow a mount swapped for a link.
-    A pin taken by a fresh ``lstat`` covers the root ITSELF: a link at one of its
-    parent directories is followed, a residual every pin above shares.
-    The confined writers' no-handle fallback re-``lstat``s the root instead —
-    check-then-write, the residual :func:`path_is_confined` documents (DW-295)."""
+    pre-checks on the others. A pin taken by a fresh ``lstat`` covers the root
+    ITSELF — and, for the mount pins, every directory from the unit worktree
+    down to it — while a link at a parent directory above that (for a mount,
+    ``worktrees/`` or ``runs/<id>/``) is followed, a residual every pin above
+    shares. The confined writers' no-handle fallback re-``lstat``s the root
+    instead — check-then-write, the residual :func:`path_is_confined` documents
+    (DW-295)."""
     if not HANDLE_ANCHORED_WRITES:
         return None
     try:

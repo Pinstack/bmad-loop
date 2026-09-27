@@ -10491,6 +10491,94 @@ def test_nested_reopen_reanchors_on_the_mount_project(project):
     assert task.dispatched_spec_file == str(unit.path / "app" / "_bmad-output/dispatched.md")
 
 
+def test_nested_mount_writers_pin_the_mount_project_and_still_write(project):
+    """DW-445 under nesting: the engine's mount writers pin ``<mount>/app`` — the
+    ``confine_root`` they open, `RunState.mount_project`'s anchor — not the mount
+    root, and a real repair reset through that pin lands in the mount's project.
+
+    Ablation: pin ``workspace.root`` in `_mount_root_identity` (answer the mount
+    root's identity) and the reset refuses with `UnconfinedWriteError` — this row
+    guards the pinned root."""
+    import os
+
+    _paths, engine, unit = _nested_unit(project)
+    engine.workspace = unit.workspace
+    mount_project = unit.workspace.paths.project
+    assert mount_project == unit.path.resolve() / "app"  # the premise (DW-379)
+    identity = engine._mount_root_identity(mount_project)
+    assert identity is not None
+    assert (identity.st_dev, identity.st_ino) == (
+        os.lstat(mount_project).st_dev,
+        os.lstat(mount_project).st_ino,
+    )
+
+    spec = mount_project / "_bmad-output" / "implementation-artifacts" / "spec-1-1-a.md"
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    spec.write_text(
+        "---\nstatus: done\n---\n\nbody\n\n## Auto Run Result\n\nStatus: done\n",
+        encoding="utf-8",
+    )
+    task = StoryTask("1-1-a", 1, phase=Phase.DEV_VERIFY)
+    task.worktree_path = str(unit.path)
+    task.spec_file = str(spec)
+
+    engine._reset_spec_for_repair(task)
+
+    text = spec.read_text(encoding="utf-8")
+    assert "status: in-progress" in text
+    assert "## Auto Run Result" not in text
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_nested_mount_writers_refuse_a_worktree_swapped_for_a_link(project, tmp_path, monkeypatch):
+    """DW-445 under nesting: the unit worktree ABOVE ``<mount>/app`` swapped for a
+    link to an outside copy. A fresh `lstat` of ``<mount>/app`` follows the link to a
+    real directory, so pinning the project alone would accept the outside tree; the
+    chain pin refuses, the marker repair journals `spec-marker-repair-failed`, and
+    the outside copy is unchanged. The unpinned control shows the same swap really
+    appends the marker outside.
+
+    Ablation: pin only the root in `runs.mount_root_identity` (skip the components
+    from ``mount`` down) and the marker lands in the outside copy."""
+    import os
+
+    from bmad_loop import platform_util
+
+    if not platform_util.DIR_FD_ANCHORED_WRITES:
+        pytest.skip("dir-fd anchoring")
+    _paths, engine, unit = _nested_unit(project)
+    engine.workspace = unit.workspace
+    mount_project = unit.workspace.paths.project
+    spec = mount_project / "_bmad-output" / "implementation-artifacts" / "spec-1-1-a.md"
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    original = "---\nstatus: done\n---\n\n## Intent\n\nbody\n"
+    spec.write_text(original, encoding="utf-8")
+    worktree = unit.workspace.root
+    outside = tmp_path / "outside"
+    shutil.copytree(worktree, outside, symlinks=True)
+    worktree.rename(worktree.with_name(worktree.name + "-aside"))
+    worktree.symlink_to(outside, target_is_directory=True)
+    outside_spec = outside / spec.relative_to(worktree)
+    assert os.path.isdir(mount_project)  # the premise: the spelling still reaches a dir
+    task = StoryTask("1-1-a", 1, spec_file=str(spec))
+
+    engine._repair_spec_marker(task, {"spec_file": str(spec), "status": "done"})
+
+    (failed,) = [e for e in engine.journal.entries() if e["kind"] == "spec-marker-repair-failed"]
+    # The spec is spelled under the mount project, so the write takes the CONFINED
+    # arm, where a pin mismatch is `open_dir_confined`'s refusal of the opened root:
+    # "cannot reach … without a redirect" (the "pinned to" wording is the external
+    # arm's pre-check). Nothing below the root is a link, so only the pin can refuse
+    # here — the unpinned control below walks the same path and writes.
+    assert "UnconfinedWriteError" in failed["error"]
+    assert "without a redirect" in failed["error"]
+    assert outside_spec.read_text(encoding="utf-8") == original
+
+    monkeypatch.setattr(Engine, "_mount_root_identity", lambda self, root: None)  # control
+    engine._repair_spec_marker(task, {"spec_file": str(spec), "status": "done"})
+    assert "## Auto Run Result" in outside_spec.read_text(encoding="utf-8")
+
+
 def test_nested_finish_inflight_reanchors_on_the_mount_project(project, monkeypatch):
     """`_finish_inflight`'s pre-discard re-anchor uses the mount PROJECT too.
 

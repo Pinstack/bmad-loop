@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -4824,11 +4825,15 @@ def test_a_failed_park_record_rollback_is_journaled_not_raised(project, monkeypa
     engine, record = _park_over_an_earlier_record(project, ["the earlier park's action"])
     real = platform_util.atomic_write_text_confined
 
-    def boom(path, text, *, confine_root, require_writable_target=False):
+    def boom(path, text, *, confine_root, require_writable_target=False, root_identity=None):
         if Path(path).name == record.name:
             raise OSError(30, "Read-only file system")
         return real(
-            path, text, confine_root=confine_root, require_writable_target=require_writable_target
+            path,
+            text,
+            confine_root=confine_root,
+            require_writable_target=require_writable_target,
+            root_identity=root_identity,
         )
 
     monkeypatch.setattr("bmad_loop.engine.atomic_write_text_confined", boom)
@@ -22145,3 +22150,358 @@ def test_auto_retro_runs_before_the_per_epic_sweep(project):
     kinds = _kinds(engine)
     assert kinds.index("retro-auto-finished") < kinds.index("sweep-auto-trigger")
     assert "sweep-auto-skipped-dirty" not in kinds
+
+
+# ------------------------------------------ engine worktree-mount writer pin (DW-445)
+#
+# Under worktree isolation `self.workspace` is the unit mount, and every engine spec /
+# park-record writer confines to it. `Engine._mount_root_identity` answers the pin:
+# None for the default workspace (the operator's project), the mount's identity
+# otherwise. The swap: the mount renamed aside and a link planted at its name to an
+# outside copy carrying the same subpaths. Each row has an unpinned control
+# (`_mount_root_identity` answering None) showing the same swap really lands outside.
+
+requires_symlinked_mount_swap = pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES or sys.platform == "win32",
+    reason="dir-fd anchoring and POSIX symlinks",
+)
+
+_PIN_REFUSAL = "no longer the directory it was pinned to"
+
+
+def _unpin(monkeypatch) -> None:
+    monkeypatch.setattr(Engine, "_mount_root_identity", lambda self, root: None)
+
+
+def _mount_engine_on(project, mount: Path) -> Engine:
+    """An engine whose live workspace is a unit mount at ``mount`` (a plain copy of
+    the project's artifact tree — the writers under test never touch git)."""
+    from bmad_loop.workspace import Workspace
+
+    engine, _ = make_engine(project, [])
+    mount.mkdir(parents=True)
+    engine.workspace = Workspace(root=mount, paths=project.rebased(mount))
+    return engine
+
+
+def _swap_engine_mount(engine: Engine, outside: Path) -> Path:
+    """Copy the mount to ``outside``, rename it aside and plant a link at its name.
+    Returns the mount (now the link)."""
+    mount = engine.workspace.root
+    shutil.copytree(mount, outside)
+    mount.rename(mount.with_name(mount.name + "-aside"))
+    mount.symlink_to(outside, target_is_directory=True)
+    return mount
+
+
+def _unswap_engine_mount(engine: Engine, outside: Path) -> None:
+    """Undo `_swap_engine_mount` so a control can replay the same swap."""
+    mount = engine.workspace.root
+    mount.unlink()
+    mount.with_name(mount.name + "-aside").rename(mount)
+    shutil.rmtree(outside)
+
+
+def _mount_dir(project) -> Path:
+    return project.project / ".bmad-loop" / "runs" / "test-run" / "worktrees" / "1"
+
+
+def test_engine_mount_root_identity_is_none_for_the_default_workspace(project):
+    """The default workspace is the operator's project: unpinned.
+
+    Ablation: drop the `workspace.root == paths.repo_root` arm and this reddens with
+    the project's identity."""
+    engine, _ = make_engine(project, [])
+    assert engine.workspace.root == engine.paths.repo_root  # the premise
+    assert engine._mount_root_identity(project.project) is None
+
+
+def test_engine_mount_root_identity_pins_a_unit_mount(project):
+    """A unit workspace answers the mount's own `lstat` identity for the root handed
+    in — `workspace.paths.project` or `workspace.root`, whichever the site confines to.
+
+    Ablation: answer None unconditionally and this reddens."""
+    engine = _mount_engine_on(project, _mount_dir(project))
+
+    identity = engine._mount_root_identity(engine.workspace.paths.project)
+
+    assert identity is not None
+    expected = os.lstat(engine.workspace.paths.project)
+    assert (identity.st_dev, identity.st_ino) == (expected.st_dev, expected.st_ino)
+
+
+_MARKERLESS_DONE_SPEC = "---\nstatus: done\n---\n\n## Intent\n\nbody\n"
+_TERMINAL_SPEC = (
+    "---\nstatus: done\n---\n\n## Intent\n\nbody\n\n## Auto Run Result\n\nStatus: done\n"
+)
+
+
+def _mounted_spec(project, tmp_path, text: str):
+    """(engine, spec, the spec's path in the outside copy, task) — an engine on a
+    unit mount holding ``spec-1-1-a.md``, not yet swapped."""
+    mount = _mount_dir(project)
+    engine = _mount_engine_on(project, mount)
+    sp = spec_path(engine.workspace.paths, "1-1-a")
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    sp.write_text(text, encoding="utf-8")
+    outside_spec = tmp_path / "outside" / sp.relative_to(mount)
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(sp))
+    return engine, sp, outside_spec, task
+
+
+@requires_symlinked_mount_swap
+def test_repair_spec_marker_refuses_a_mount_swapped_for_a_link(project, tmp_path, monkeypatch):
+    """The marker repair through a swapped mount refuses at the write and journals
+    its existing `spec-marker-repair-failed`; the outside copy is unchanged.
+
+    Ablation: drop `root_identity=` from `_repair_spec_marker`'s
+    `append_auto_run_result` call (or make `_mount_root_identity` answer None) and
+    the marker lands in the outside copy."""
+    engine, sp, outside_spec, task = _mounted_spec(project, tmp_path, _MARKERLESS_DONE_SPEC)
+    _swap_engine_mount(engine, tmp_path / "outside")
+
+    engine._repair_spec_marker(task, {"spec_file": str(sp), "status": "done"})
+
+    (failed,) = [e for e in engine.journal.entries() if e["kind"] == "spec-marker-repair-failed"]
+    assert "UnconfinedWriteError" in failed["error"]
+    assert outside_spec.read_text(encoding="utf-8") == _MARKERLESS_DONE_SPEC
+
+    _unpin(monkeypatch)  # control
+    engine._repair_spec_marker(task, {"spec_file": str(sp), "status": "done"})
+    assert "## Auto Run Result" in outside_spec.read_text(encoding="utf-8")
+
+
+@requires_symlinked_mount_swap
+@pytest.mark.parametrize("reset", ["_reset_spec_for_repair", "_reset_spec_for_review"])
+def test_spec_resets_refuse_a_mount_swapped_before_the_spec_is_resolved(
+    project, tmp_path, monkeypatch, reset
+):
+    """A mount swapped BEFORE the reset resolves the spec: the reset writes the
+    RESOLVED spelling, which lies outside the mount and takes the writers' external
+    arm. That arm's pin pre-check refuses (raised — repair-write doctrine), and the
+    outside copy is unchanged.
+
+    Ablation: drop the `require_root_pinned` pre-check from `_atomic_write_spec`'s
+    external arm (or the reset's `root_identity=`) and the reset rewrites the
+    outside copy."""
+    engine, _sp, outside_spec, task = _mounted_spec(project, tmp_path, _TERMINAL_SPEC)
+    if reset == "_reset_spec_for_review":
+        monkeypatch.setattr(Engine, "_generic_dev", lambda self: True)
+    _swap_engine_mount(engine, tmp_path / "outside")
+
+    with pytest.raises(platform_util.UnconfinedWriteError, match=_PIN_REFUSAL):
+        getattr(engine, reset)(task)
+    assert outside_spec.read_text(encoding="utf-8") == _TERMINAL_SPEC
+
+    _unpin(monkeypatch)  # control
+    getattr(engine, reset)(task)
+    assert "## Auto Run Result" not in outside_spec.read_text(encoding="utf-8")
+
+
+@requires_symlinked_mount_swap
+@pytest.mark.parametrize(
+    ("reset", "late_writer"),
+    [
+        ("_reset_spec_for_repair", "reset_spec_status"),
+        ("_reset_spec_for_repair", "strip_auto_run_result"),
+        ("_reset_spec_for_review", "strip_auto_run_result"),
+    ],
+)
+def test_spec_resets_refuse_a_mount_swapped_after_resolution(
+    project, tmp_path, monkeypatch, reset, late_writer
+):
+    """A swap landing after the reset resolved the spec, just before one of its
+    writes (for the repair's strip: after the flip already landed in the mount): the
+    pinned confined arm refuses with `UnconfinedWriteError` and the outside copy is
+    unchanged. The swap happens INSIDE the writer call, after the engine took the
+    identity beside ``confine_root`` — the race the pin exists for.
+
+    Ablation: drop that write's `root_identity=` in the reset (or make
+    `_mount_root_identity` answer None) and the write lands in the outside copy."""
+    engine, _sp, outside_spec, task = _mounted_spec(project, tmp_path, _TERMINAL_SPEC)
+    if reset == "_reset_spec_for_review":
+        monkeypatch.setattr(Engine, "_generic_dev", lambda self: True)
+    outside = tmp_path / "outside"
+    real = getattr(devcontract, late_writer)
+    swapped: list[bool] = []
+
+    def swap_then_write(path, *args, **kwargs):
+        if not swapped:
+            _swap_engine_mount(engine, outside)
+            swapped.append(True)
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(devcontract, late_writer, swap_then_write)
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        getattr(engine, reset)(task)
+    before = outside_spec.read_text(encoding="utf-8")
+    if late_writer == "reset_spec_status":
+        assert before == _TERMINAL_SPEC  # the flip never reached the outside copy
+    else:
+        assert "## Auto Run Result" in before  # the late strip never reached it
+        if reset == "_reset_spec_for_repair":
+            assert "status: in-progress" in before  # the flip landed in the mount, pre-swap
+
+    # Control: undo the swap, replay it unpinned — the write follows the link out.
+    _unswap_engine_mount(engine, outside)
+    (engine.workspace.root / _sp.relative_to(engine.workspace.root)).write_text(
+        _TERMINAL_SPEC, encoding="utf-8"
+    )
+    swapped.clear()
+    _unpin(monkeypatch)
+    getattr(engine, reset)(task)
+    after = outside_spec.read_text(encoding="utf-8")
+    if late_writer == "reset_spec_status":
+        assert "status: in-progress" in after
+    else:
+        assert "## Auto Run Result" not in after
+
+
+@requires_symlinked_mount_swap
+def test_reconcile_generic_terminal_frontmatter_refuses_a_mount_swapped_for_a_link(
+    project, tmp_path, monkeypatch
+):
+    """The generic reconcile's status flip through a swapped mount refuses (raised,
+    as its repair-write doctrine leaves it) and the outside copy keeps its status.
+
+    Ablation: drop `root_identity=` from the reconcile's `reset_spec_status` call and
+    the flip lands in the outside copy."""
+    text = "---\nstatus: in-progress\n---\n\nbody\n\n## Auto Run Result\n\nStatus: done\n"
+    engine, sp, outside_spec, task = _mounted_spec(project, tmp_path, text)
+    fm = verify.read_frontmatter(sp)
+    _swap_engine_mount(engine, tmp_path / "outside")
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        engine._reconcile_generic_terminal_frontmatter(task, None, sp, fm)
+    assert outside_spec.read_text(encoding="utf-8") == text
+
+    _unpin(monkeypatch)  # control
+    engine._reconcile_generic_terminal_frontmatter(task, None, sp, fm)
+    assert "status: in-progress" not in outside_spec.read_text(encoding="utf-8")
+
+
+@requires_symlinked_mount_swap
+def test_apply_adoption_escalates_through_a_mount_swapped_for_a_link(
+    project, tmp_path, monkeypatch
+):
+    """Adoption's status flip — confined to ``workspace.root`` and pinned there —
+    refuses through a swapped mount and escalates through its existing arm; the
+    outside copy keeps its status.
+
+    Ablation: drop `root_identity=` from `_apply_adoption`'s `set_frontmatter_status`
+    call and the adoption flips the outside copy instead of escalating."""
+    text = "---\nstatus: in-progress\n---\n\nbody\n"
+    engine, _sp, outside_spec, task = _mounted_spec(project, tmp_path, text)
+    task.phase = Phase.COMMITTING
+    engine.state.tasks[task.story_key] = task
+    _swap_engine_mount(engine, tmp_path / "outside")
+
+    with pytest.raises(RunPaused, match="UnconfinedWriteError"):
+        engine._apply_adoption(task)
+    assert outside_spec.read_text(encoding="utf-8") == text
+
+    _unpin(monkeypatch)  # control: unpinned, the flip follows the link out
+    task.phase = Phase.COMMITTING
+    monkeypatch.setattr(Engine, "_post_dev_state_sync", lambda self, t, r: None)
+    engine._apply_adoption(task)
+    assert "status: done" in outside_spec.read_text(encoding="utf-8")
+
+
+@requires_symlinked_mount_swap
+def test_write_park_record_refuses_a_mount_swapped_for_a_link(project, tmp_path, monkeypatch):
+    """The park-record write through a swapped mount refuses at `record_park`'s pin
+    pre-check and journals its existing `operator-index-failed`; nothing — record or
+    directory — lands under the link target.
+
+    Ablation: drop `root_identity=` from `_write_park_record`'s `record_park` call
+    (or make `_mount_root_identity` answer None) and the record lands outside."""
+    from bmad_loop import operatoractions
+
+    engine = _mount_engine_on(project, _mount_dir(project))
+    outside = tmp_path / "outside"
+    _swap_engine_mount(engine, outside)
+    task = StoryTask(story_key="1-1-a", epic=1, operator_actions=["buy the domain"])
+
+    assert engine._write_park_record(task) is None
+    (failed,) = [e for e in engine.journal.entries() if e["kind"] == "operator-index-failed"]
+    assert _PIN_REFUSAL in failed["error"]
+    assert list(outside.iterdir()) == []
+
+    _unpin(monkeypatch)  # control
+    assert engine._write_park_record(task) is not None
+    assert operatoractions.record_path(outside, "1-1-a").is_file()
+
+
+def _park_record_in_mount(project, tmp_path, *, prior: str | None):
+    """(engine, record path in the mount, its path in the outside copy, the restore's
+    ``record`` tuple, task) — a record the park wrote, not yet swapped."""
+    from bmad_loop import operatoractions
+
+    engine = _mount_engine_on(project, _mount_dir(project))
+    record = operatoractions.record_path(engine.workspace.paths.project, "1-1-a")
+    record.parent.mkdir(parents=True)
+    record.write_text('{"written": "by this park"}', encoding="utf-8")
+    outside_record = tmp_path / "outside" / record.relative_to(engine.workspace.root)
+    task = StoryTask(story_key="1-1-a", epic=1)
+    return engine, record, outside_record, (record, prior), task
+
+
+@requires_symlinked_mount_swap
+@pytest.mark.parametrize(
+    "prior", [None, '{"written": "by an earlier park"}'], ids=["unlink", "put-back"]
+)
+def test_restore_park_record_refuses_a_mount_swapped_for_a_link(
+    project, tmp_path, monkeypatch, prior
+):
+    """Both arms of the park rollback refuse through a swapped mount and journal
+    `park-record-rollback-failed`: the put-back through the confined writer's pin,
+    the ``prior is None`` unlink arm through its pre-check BEFORE any unlink/rmdir —
+    outside files untouched either way.
+
+    Ablation: drop the `require_root_pinned` pre-check from the unlink arm (or the
+    `root_identity=` from the put-back) and the outside record is deleted (or
+    overwritten)."""
+    engine, _record, outside_record, record, task = _park_record_in_mount(
+        project, tmp_path, prior=prior
+    )
+    _swap_engine_mount(engine, tmp_path / "outside")
+    written = outside_record.read_text(encoding="utf-8")
+
+    engine._restore_park_record(task, record)
+
+    (failed,) = [e for e in engine.journal.entries() if e["kind"] == "park-record-rollback-failed"]
+    assert "UnconfinedWriteError" in failed["error"]
+    if prior is None:
+        assert _PIN_REFUSAL in failed["error"]  # the pre-check, not a later refusal
+    assert outside_record.read_text(encoding="utf-8") == written
+
+    _unpin(monkeypatch)  # control: unpinned, the same swap reaches the outside files
+    engine._restore_park_record(task, record)
+    if prior is None:
+        assert not outside_record.exists()
+    else:
+        assert outside_record.read_text(encoding="utf-8") == prior
+
+
+@pytest.mark.parametrize(
+    "prior", [None, '{"written": "by an earlier park"}'], ids=["unlink", "put-back"]
+)
+def test_restore_park_record_on_an_intact_mount_rolls_back_under_the_pin(project, tmp_path, prior):
+    """The positive half of the park-rollback pin: on an INTACT mount, with the pin
+    live, both arms still roll back — the record is deleted (``prior is None``) or
+    holds the earlier bytes — and nothing journals `park-record-rollback-failed`.
+
+    Ablation: pin the wrong directory (e.g. `require_root_pinned(path.parent, …)` in
+    the unlink arm, or `self._mount_root_identity(path.parent)` for the put-back) and
+    the rollback refuses here while every swapped-mount row stays green."""
+    engine, record, _outside, restore, task = _park_record_in_mount(project, tmp_path, prior=prior)
+    assert engine._mount_root_identity(engine.workspace.paths.project) is not None
+
+    engine._restore_park_record(task, restore)
+
+    assert "park-record-rollback-failed" not in _kinds(engine)
+    if prior is None:
+        assert not record.exists()
+    else:
+        assert record.read_text(encoding="utf-8") == prior

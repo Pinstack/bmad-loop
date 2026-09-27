@@ -64,6 +64,7 @@ from .platform_util import (
     is_link_like,
     open_at,
     open_dir_confined,
+    require_root_pinned,
     stat_at,
 )
 
@@ -523,22 +524,30 @@ def set_frontmatter_status(
     checkout the spec belongs to is a pyright error rather than an unconfined
     write, which is how every call site of this and its two siblings was found.
 
-    ``root_identity`` pins ``confine_root`` on the confined arm (DW-423), forwarded
-    to `platform_util.atomic_write_bytes_confined`; the external arm ignores it and
-    ``None`` (the default) is the unpinned write. The pin rule: a caller pins only
-    an ORCHESTRATOR-MINTED worktree mount (``<project>/.bmad-loop/runs/<id>/
-    worktrees/<unit>``), whose parent is session-writable, so a mount swapped for a
-    link would otherwise carry the write outside the repository; the project root
-    the operator chose stays unpinned. `runs.live_spec_root_identity` answers the
-    identity beside the ``live_spec_root`` it pins. The pin catches the mount
-    ITSELF swapped, not a swapped parent directory (``worktrees/``,
-    ``runs/<id>/``) — the per-write ``lstat`` follows that, the residual every
-    DW-338 pin shares. `verify.set_frontmatter_field` and
-    `devcontract._atomic_write_spec` take the keyword on the same terms;
-    `set_frontmatter_status_anchored` does not, and the engine's and
-    `recovery_flow`'s callers pass none — under isolation their
-    ``workspace.paths.project`` is the mount, so they remain unpinned mount
-    writers.
+    ``root_identity`` pins ``confine_root`` (DW-423): on the confined arm it is
+    forwarded to `platform_util.atomic_write_bytes_confined`, and on the external
+    arm it is pre-checked (`platform_util.require_root_pinned`, DW-445) before
+    anything is written, so a path resolved through a mount swapped for a link —
+    which lands it outside ``confine_root`` — refuses with `UnconfinedWriteError`
+    while that swap still stands at the write, and an intact mount whose
+    ``_bmad-output`` is a link resolving outside it writes as before. A swap
+    reverted between resolution and the pre-check passes it: the documented
+    check-then-write residual. ``None`` (the default) is the
+    unpinned write on both arms. The pin rule: a caller pins only an
+    ORCHESTRATOR-MINTED worktree mount (``<project>/.bmad-loop/runs/<id>/
+    worktrees/<unit>``, or ``<worktree>/<offset>`` under a nested project), whose
+    parent is session-writable, so a mount swapped for a link would otherwise
+    carry the write outside the repository; the project root the operator chose
+    stays unpinned. `runs.mount_root_identity` answers the identity — through
+    `runs.live_spec_root_identity` for the re-arm/replan writers (DW-423), and
+    directly for the engine's and `recovery_flow`'s writers when their workspace
+    is a unit mount (DW-445; under isolation ``workspace.paths.project`` IS the
+    mount project) — and it covers the unit worktree and every directory down to
+    the pinned root. A swapped parent directory ABOVE the worktree
+    (``worktrees/``, ``runs/<id>/``) is not caught — the per-write ``lstat``
+    follows it, the residual every DW-338 pin shares.
+    `verify.set_frontmatter_field`, `devcontract._atomic_write_spec` and
+    `set_frontmatter_status_anchored` take the keyword on the same terms.
 
     ``require_writable_target=True`` on both arms (#597): a spec is
     operator-editable, and a temp-and-replace write needs write permission on the
@@ -583,6 +592,7 @@ def set_frontmatter_status(
             root_identity=root_identity,
         )
     else:
+        require_root_pinned(confine_root, root_identity)
         atomic_write_bytes(path, payload, follow_symlinks=False, require_writable_target=True)
     return True
 
@@ -709,21 +719,31 @@ def _read_bound(dir_fd: int, name: str, path: Path) -> FileIdentity:
         os.close(fd)
 
 
-def _open_anchored_parent(path: Path, confine_root: Path) -> tuple[int, bool]:
+def _open_anchored_parent(
+    path: Path, confine_root: Path, root_identity: os.stat_result | None = None
+) -> tuple[int, bool]:
     """The parent directory handle ``path`` is written through, and whether it
     was reached by the EXTERNAL arm.
 
     In-project (``path`` lexically under ``confine_root``): exactly the gates of
     `platform_util._atomic_write_confined` — no ``..`` below the root, then
     `open_dir_confined(confine_root, path.parent)`, which refuses a link at any
-    component below the root.
+    component below the root. ``root_identity`` pins ``confine_root`` there
+    (DW-445), forwarded to `open_dir_confined`: a root that is not that same
+    directory refuses like any other unreachable parent.
 
     External (a configured artifacts folder outside the project): no root
     vouches for that tree, so the parent must be spelled canonically
     (``path.parent.resolve(strict=True) == path.parent``, which also rejects any
     ``..`` and any link along the way), the final name must not be a link, and
     the walk starts at the filesystem root with ``search_only=True`` — the model
-    `recovery_flow`'s owned-spec restoration established.
+    `recovery_flow`'s owned-spec restoration established. A given
+    ``root_identity`` is pre-checked first (`platform_util.require_root_pinned`,
+    DW-445): a path bound through a mount swapped before binding is canonical
+    OUTSIDE the mount, and only the root no longer being the pinned directory
+    tells it apart from a legitimately external artifacts folder. It refuses while
+    the swap still stands at this check; a swap reverted in between passes — the
+    check-then-write residual `platform_util.require_root_pinned` documents.
 
     A parent either arm cannot reach raises `platform_util.UnconfinedWriteError`,
     as the confined path writer does, so a caller's existing handling of that
@@ -731,12 +751,13 @@ def _open_anchored_parent(path: Path, confine_root: Path) -> tuple[int, bool]:
     if path.is_relative_to(confine_root):
         if has_parent_ref(path.relative_to(confine_root)):
             raise UnconfinedWriteError(f"{path} climbs back out of {confine_root} through '..'")
-        dir_fd = open_dir_confined(confine_root, path.parent)
+        dir_fd = open_dir_confined(confine_root, path.parent, root_identity=root_identity)
         if dir_fd is None:
             raise UnconfinedWriteError(
                 f"cannot reach {path.parent} from {confine_root} without a redirect"
             )
         return dir_fd, False
+    require_root_pinned(confine_root, root_identity)
     unsafe = f"cannot reach external target {path} by its canonical spelling"
     try:
         canonical = path.is_absolute() and path.parent.resolve(strict=True) == path.parent
@@ -804,6 +825,7 @@ def set_frontmatter_status_anchored(
     *,
     confine_root: Path,
     expected: FileIdentity | None = None,
+    root_identity: os.stat_result | None = None,
 ) -> FileIdentity:
     """`set_frontmatter_status`'s edit, as ONE descriptor-anchored transaction
     over one bound inode (DW-319/DW-323). Returns the identity the name holds
@@ -846,6 +868,14 @@ def set_frontmatter_status_anchored(
     retried. A parent that cannot be reached without a redirect raises
     `platform_util.UnconfinedWriteError`, as the confined path writer does.
 
+    ``root_identity`` pins ``confine_root`` exactly as `set_frontmatter_status`
+    pins it (DW-445) — forwarded to the in-project walk, pre-checked on the
+    external arm: recovery's attempt-owned normalization passes
+    `runs.mount_root_identity` of the unit mount project it confines to, so a
+    mount swapped for a link refuses with `UnconfinedWriteError`, whether the
+    path was bound before or after the swap. ``None`` (the default) is the
+    unpinned walk.
+
     No path-based fallback: without handle-anchored writes
     (`platform_util.HANDLE_ANCHORED_WRITES` False) this raises
     `FrontmatterWriteError` before reading anything."""
@@ -853,7 +883,7 @@ def set_frontmatter_status_anchored(
         raise FrontmatterWriteError(
             f"cannot rewrite {path}: descriptor-anchored writes are unavailable on this host"
         )
-    dir_fd, external = _open_anchored_parent(path, confine_root)
+    dir_fd, external = _open_anchored_parent(path, confine_root, root_identity)
     name = path.name
     try:
         current = _read_bound(dir_fd, name, path)

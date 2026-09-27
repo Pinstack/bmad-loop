@@ -504,12 +504,20 @@ breaking changes may land in a minor release.
   their check accepted: one replaced by a symlink before the root open is refused instead
   of followed outside the repository. A run dir that is already a link now fails
   verify-stream writes (the journal records `capture_error`). Operator-chosen roots may
-  still be links; the engine's and recovery flow's spec writes into a worktree mount are
-  not yet pinned (DW-338).
+  still be links; worktree-mount spec writes are pinned by DW-423 and DW-445 (DW-338).
 - Refuse re-arm and TUI replan spec writes through a worktree mount that was itself
   replaced by a link (`RearmError`, or the replan's error notice), instead of following
   the link. A replaced parent directory of the mount is still followed, and a
   non-isolated run's project root may still be a link (DW-423).
+- Refuse the engine's spec repair/reset/review, marker-repair, reconcile, adoption and
+  park-record writes (including the park rollback's delete), and recovery's attempt-owned
+  status normalization and snapshot restore, through a worktree mount — or, under a
+  nested project, any directory from the worktree down to the project — replaced by a
+  link, including when the spec path was resolved through a swap that still stands;
+  each site fails through its existing path (raise, journal, escalate or pause)
+  instead of writing outside the repository. The re-arm/replan pin (DW-423) gains the
+  same nested and resolved-path coverage. Parent directories above the worktree are
+  still followed (DW-445).
 - Harden the exact-path candidate worktree: check it out `--no-checkout` with
   fsmonitor off and fill its index by `read-tree`, so no repo-configured smudge/process
   filter or fsmonitor command runs before the accepted bytes land (DW-401); re-check the

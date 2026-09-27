@@ -57,6 +57,7 @@ from .platform_util import (
     is_link_like,
     names_tree_root,
     pinned_root_identity,
+    require_root_pinned,
     retrying_unlink,
     safe_segment,
 )
@@ -3632,26 +3633,91 @@ def live_spec_root_identity(
     the project checkout and may keep it behind a link — the pin rule in
     `platform_util.open_dir_confined` leaves it unpinned.
 
-    The mount's identity when the root IS the orchestrator-minted mount
-    (``<project>/.bmad-loop/runs/<id>/worktrees/<unit>``). Its parent is
-    session-writable, so a mount swapped for a link would otherwise carry the flip,
-    strip, re-stamp, undo and the TUI replan outside the repository, since the
-    confined writers open their root following links (DW-338 class).
+    Otherwise `mount_root_identity` of that root, with the rebased
+    ``task.worktree_path`` — the unit worktree the root sits in — as ``mount``:
+    ``<project>/.bmad-loop/runs/<id>/worktrees/<unit>``, or ``<worktree>/<offset>``
+    under a nested project (DW-379). Its parent is session-writable, so a worktree
+    (or a directory between it and the root) swapped for a link would otherwise
+    carry the flip, strip, re-stamp, undo and the TUI replan outside the
+    repository, since the confined writers open their root following links
+    (DW-338 class). An unpinnable mount answers the never-matching identity, so
+    the refusal happens AT THE WRITE: every re-arm writer answers a missing spec
+    with ``False`` before any open, and a gone mount keeps that no-op rather than
+    becoming an abort here. The residual — parent directories ABOVE the unit
+    worktree — is `mount_root_identity`'s."""
+    if not task.worktree_path or task_spec_root(task, state) != state.mount_project(task):
+        return None
+    mount = rebase_recorded_project_path(Path(task.worktree_path), state, project_root)
+    return mount_root_identity(live_spec_root(task, state, project_root), mount=mount)
 
-    A mount that cannot be pinned — a link, a reparse point, not a directory, gone —
-    answers `_UNPINNABLE_MOUNT`, never ``None`` and never a raise. The refusal then
-    happens AT THE WRITE: every re-arm writer answers a missing spec with ``False``
-    before any open, and a gone mount must keep that no-op rather than become an
-    abort here, while a mount that is itself a link cannot be written through.
 
-    The pin covers the mount ITSELF, not its parent directories: a fresh
-    ``os.lstat`` follows a link at ``worktrees/`` or ``runs/<id>/``, so an ancestor
+def _below_mount(root: Path, mount: Path) -> tuple[str, ...] | None:
+    """``root``'s components below ``mount`` (``()`` for ``mount`` itself), or None
+    when ``root`` is not lexically at or under ``mount`` or climbs through ``..``."""
+    try:
+        parts = root.relative_to(mount).parts
+    except ValueError:
+        return None
+    return None if ".." in parts else parts
+
+
+def mount_root_identity(root: Path, *, mount: Path) -> os.stat_result:
+    """The ``root_identity`` pinning ``root``, the ``confine_root`` a writer is about
+    to open inside the unit worktree ``mount`` — ``root``'s own ``lstat`` identity
+    when it can be pinned, else `_UNPINNABLE_MOUNT`, never ``None`` and never a
+    raise. Take it fresh at each write, beside the ``confine_root`` it pins, and
+    pass the SAME root that write opens: an identity for another directory would
+    refuse every legitimate write.
+
+    The one pin primitive for worktree-mount writers: `live_spec_root_identity`
+    answers it for the re-arm/replan writers (DW-423), and the engine's
+    repair/reset/review, marker-repair, reconcile, adoption and park-record writers
+    plus ``recovery_flow``'s attempt-owned status normalization and snapshot restore
+    answer it for their ``workspace.paths.project``/``workspace.root`` when that
+    workspace is a unit mount (DW-445). The caller decides mountedness; this only
+    pins — an operator-chosen project root is never handed here.
+
+    Pinnable means ``root`` is ``mount`` or lexically under it with no ``..``, and
+    EVERY component from ``mount`` down to ``root`` ``lstat``s as a non-link
+    directory (`platform_util.pinned_root_identity` per component). A nested project
+    (DW-379) pins ``<worktree>/<offset>``, and a ``<worktree>`` — or any directory
+    between it and ``<offset>`` — swapped for a link answers the never-matching
+    identity, not the ``lstat`` of the directory the link leads to. A swap after the
+    identity is taken changes the identity of the root the writer then opens, so the
+    write refuses (``fstat`` of the opened root on the handle arm, a re-``lstat`` on
+    the no-handle fallback and on every writer's external-arm pre-check).
+
+    A ``root`` spelled through a resolved parent (``ProjectPaths.rebased`` resolves
+    the mount it rebases onto) is compared against ``mount``'s own name under its
+    resolved parent: resolving the parent follows only the ancestors above the
+    unit worktree, never the worktree itself.
+
+    A mount that is a link, a reparse point, not a directory, or gone answers the
+    never-matching identity so the refusal lands AT THE WRITE: a writer's own
+    missing-file no-op still runs first, and a root reached through a link cannot be
+    written through.
+
+    Residual: the parent directories ABOVE the unit worktree (``worktrees/``,
+    ``runs/<id>/``, …). A fresh ``lstat`` follows a link there, so an ancestor
     swapped for a link to a tree holding a real ``<unit>`` matches the outside
     directory, and one gesture's writes may land in different directories. That
     residual is shared by every DW-338 pin and deferred for all of them at once."""
-    if not task.worktree_path or task_spec_root(task, state) != state.mount_project(task):
-        return None
-    identity = pinned_root_identity(live_spec_root(task, state, project_root))
+    parts = _below_mount(root, mount)
+    if parts is None:
+        try:
+            mount = mount.parent.resolve() / mount.name
+        except (OSError, RuntimeError):
+            return _UNPINNABLE_MOUNT
+        parts = _below_mount(root, mount)
+        if parts is None:
+            return _UNPINNABLE_MOUNT
+    cursor = mount
+    identity = pinned_root_identity(cursor)
+    for part in parts:
+        if identity is None:
+            break
+        cursor = cursor / part
+        identity = pinned_root_identity(cursor)
     return _UNPINNABLE_MOUNT if identity is None else identity
 
 
@@ -4111,9 +4177,9 @@ def _restore_rearmed_spec(
     otherwise identical (right file, right bytes, `rollback="restored"`), which is why
     nothing downstream could catch it and why the parity is asserted at this seam. The
     arm-selection RULE above is unchanged; only the root it compares against is corrected.
-    The confined arm also pins that root with `live_spec_root_identity`, as the three
-    forward writers do (DW-423): a worktree mount swapped for a link raises here, the
-    same refusal the forward writes hit.
+    Both arms also pin that root with `live_spec_root_identity`, as the three forward
+    writers do (DW-423; the external arm's pre-check is DW-445's): a worktree mount
+    swapped for a link raises here, the same refusal the forward writes hit.
 
     Calling the confined helper unconditionally looked stricter and was strictly
     worse — an artifacts folder configured OUTSIDE both the mount and the project is
@@ -4154,15 +4220,17 @@ def _restore_rearmed_spec(
         pass
     confine_root = live_spec_root(task, state, live_project)
     try:
+        root_identity = live_spec_root_identity(task, state, live_project)
         if spec_path.is_relative_to(confine_root):
             atomic_write_bytes_confined(
                 spec_path,
                 original,
                 confine_root=confine_root,
                 require_writable_target=True,
-                root_identity=live_spec_root_identity(task, state, live_project),
+                root_identity=root_identity,
             )
         else:
+            require_root_pinned(confine_root, root_identity)
             atomic_write_bytes(
                 spec_path, original, follow_symlinks=False, require_writable_target=True
             )

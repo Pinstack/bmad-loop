@@ -43,7 +43,7 @@ from typing import Any
 from . import deferredwork
 from .fences import fenced as _fenced
 from .frontmatter import _edit_frontmatter_block, auto_dev_baseline_of, status_of
-from .platform_util import atomic_write_bytes, atomic_write_bytes_confined
+from .platform_util import atomic_write_bytes, atomic_write_bytes_confined, require_root_pinned
 from .verify import DEV_WORKFLOW, operator_actions_of, read_frontmatter
 
 # The section the skill appends on EVERY terminal path (success and blocked),
@@ -717,13 +717,17 @@ def _atomic_write_spec(
     calls (#379); this wrapper stays for its callers' ``str``-in signature and
     this docstring.
 
-    ``root_identity`` pins ``confine_root`` on the confined arm (DW-423), on the
-    terms `frontmatter.set_frontmatter_status` states; ``None`` is the unpinned
-    write. Threaded only through the writers a ``live_spec_root`` caller reaches
-    (`reset_spec_status`, `strip_auto_run_result`, `reset_spec_for_replan`). The
-    engine's calls pass none: they confine to ``workspace.paths.project``, which
-    under worktree isolation IS the mount, so they are still-unpinned mount
-    writers (deferred), not project-rooted ones."""
+    ``root_identity`` pins ``confine_root`` on the terms
+    `frontmatter.set_frontmatter_status` states — forwarded on the confined arm
+    (DW-423), pre-checked on the external arm (DW-445); ``None`` is the unpinned
+    write on both. Threaded through the writers a mount-rooted caller reaches
+    (`reset_spec_status`, `strip_auto_run_result`, `reset_spec_for_replan`,
+    `append_auto_run_result`): the ``live_spec_root`` re-arm/replan writers pin
+    via `runs.live_spec_root_identity` (DW-423), and the engine's writers — which
+    confine to ``workspace.paths.project``, under worktree isolation the mount —
+    pin via `runs.mount_root_identity` when their workspace is a unit mount
+    (DW-445). `append_operator_confirmation` is project-rooted (``bmad-loop
+    confirm``) and stays unpinned."""
     payload = text.encode("utf-8")
     if spec_path.is_relative_to(confine_root):
         atomic_write_bytes_confined(
@@ -734,6 +738,7 @@ def _atomic_write_spec(
             root_identity=root_identity,
         )
     else:
+        require_root_pinned(confine_root, root_identity)
         atomic_write_bytes(spec_path, payload, follow_symlinks=False, require_writable_target=True)
 
 
@@ -962,7 +967,12 @@ OPERATOR_CONFIRM_NOTE = (
 
 
 def append_auto_run_result(
-    spec_path: Path, status: str, *, confine_root: Path, detail: str = ""
+    spec_path: Path,
+    status: str,
+    *,
+    confine_root: Path,
+    detail: str = "",
+    root_identity: os.stat_result | None = None,
 ) -> bool:
     """Append a synthesized ``## Auto Run Result`` marker section — the inverse of
     `strip_auto_run_result`.
@@ -996,7 +1006,11 @@ def append_auto_run_result(
     blank / ``Status: <status>`` / blank / the provenance note (plus an optional
     detail paragraph). ``status`` is normalized lowercase and MUST be the spec's
     own frontmatter ``status`` — the caller passes exactly that — so
-    `synthesize_result`'s ``consistent`` cross-check holds on every later re-read."""
+    `synthesize_result`'s ``consistent`` cross-check holds on every later re-read.
+
+    ``root_identity`` pins ``confine_root`` as `_atomic_write_spec` states: the
+    engine's marker repair passes `runs.mount_root_identity` of its unit mount
+    (DW-445), ``None`` otherwise."""
     if not spec_path.is_file():
         return False
     # Raw read (not read_text): preserve the file's exact line endings, and let an
@@ -1021,7 +1035,9 @@ def append_auto_run_result(
     section = f"## Auto Run Result{nl}{nl}Status: {status}{nl}{nl}{ORCHESTRATOR_SYNTH_NOTE}{nl}"
     if detail:
         section += f"{nl}{detail.strip()}{nl}"
-    _atomic_write_spec(spec_path, text + section, confine_root=confine_root)
+    _atomic_write_spec(
+        spec_path, text + section, confine_root=confine_root, root_identity=root_identity
+    )
     return True
 
 

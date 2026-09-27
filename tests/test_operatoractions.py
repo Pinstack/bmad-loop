@@ -10,6 +10,7 @@ drifted.
 from __future__ import annotations
 
 import json
+import os
 import sys
 
 import pytest
@@ -936,3 +937,88 @@ def test_the_legacy_prune_refuses_a_readonly_store(project):
     assert store.read_bytes() == before  # the prune never landed
     assert sorted(operatoractions.load(project.project)) == ["1-1-a", "2-2-b"]
     assert [p.name for p in store.parent.iterdir()] == [store.name]  # no temp residue
+
+
+# --------------------------------------------- worktree-mount pin (DW-445)
+#
+# Under worktree isolation the engine's `record_park` project IS the unit mount and
+# passes its identity. The swap: the mount renamed aside and a link planted at its
+# name to an outside directory.
+
+requires_symlinked_mount_swap = pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES or sys.platform == "win32",
+    reason="dir-fd anchoring and POSIX symlinks",
+)
+
+
+def _swapped_mount(tmp_path):
+    """(mount, outside, the mount's accepted identity), the swap already made."""
+    mount = tmp_path / "project" / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    mount.mkdir(parents=True)
+    identity = os.lstat(mount)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    mount.rename(mount.with_name("1-aside"))
+    mount.symlink_to(outside, target_is_directory=True)
+    return mount, outside, identity
+
+
+def _park_into(project, **kw):
+    return operatoractions.record_park(
+        project,
+        "1-1-a",
+        actions=ACTIONS,
+        spec_file="spec.md",
+        run_id="run-1",
+        parked_at="2026-07-28",
+        **kw,
+    )
+
+
+@requires_symlinked_mount_swap
+def test_record_park_pinned_mount_refuses_a_mount_swapped_for_a_link(tmp_path):
+    """A pinned park write through a swapped mount refuses BEFORE its `mkdir`: no
+    record and no directories land under the link target. The unpinned control shows
+    the same swap really creates both outside.
+
+    Ablation: drop the `require_root_pinned` pre-check and the `.bmad-loop/` tree is
+    created outside before the (still pinned) write refuses with a different message
+    — the message match and the no-dirs assertion redden; drop both it and the
+    forward and the record lands outside."""
+    mount, outside, identity = _swapped_mount(tmp_path)
+
+    with pytest.raises(
+        platform_util.UnconfinedWriteError, match="no longer the directory it was pinned to"
+    ):
+        _park_into(mount, root_identity=identity)
+    assert list(outside.iterdir()) == []
+
+    _park_into(mount)  # control
+    assert operatoractions.record_path(outside, "1-1-a").is_file()
+
+
+@requires_symlinked_mount_swap
+def test_record_park_pinned_write_refuses_even_past_the_precheck(tmp_path, monkeypatch):
+    """The identity is also forwarded to the confined writer, so a swap landing
+    after the pre-check still refuses at the write. Modelled by pre-creating the
+    records dir outside and disarming the pre-check.
+
+    Ablation: drop the `root_identity=` forward to `atomic_write_text_confined` and
+    the record lands outside."""
+    mount, outside, identity = _swapped_mount(tmp_path)
+    operatoractions.record_path(outside, "1-1-a").parent.mkdir(parents=True)
+    monkeypatch.setattr(operatoractions, "require_root_pinned", lambda *a: None)
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        _park_into(mount, root_identity=identity)
+    assert not operatoractions.record_path(outside, "1-1-a").exists()
+
+
+def test_record_park_pinned_intact_mount_writes(tmp_path):
+    """An intact mount's own identity binds nothing extra: the record lands."""
+    mount = tmp_path / "mount"
+    mount.mkdir()
+
+    path = _park_into(mount, root_identity=os.lstat(mount))
+
+    assert json.loads(path.read_text(encoding="utf-8"))["story_key"] == "1-1-a"

@@ -76,6 +76,7 @@ from .platform_util import (
     atomic_replace,
     atomic_write_text,
     atomic_write_text_confined,
+    require_root_pinned,
     retrying_unlink,
     safe_segment,
 )
@@ -89,6 +90,7 @@ from .runs import (
     events_dir_for,
     graceful_stop_requested,
     kill_session,
+    mount_root_identity,
     owner_run_dir,
     pinned_state_env,
     read_stop_request_mode,
@@ -1348,6 +1350,27 @@ class Engine:
     @property
     def _isolated(self) -> bool:
         return self._worktree_flow.isolated
+
+    def _mount_root_identity(self, root: Path) -> os.stat_result | None:
+        """The ``root_identity`` a mount writer pins ``root`` with (DW-445) — take it
+        fresh at each write, beside the ``confine_root`` it pins, and pass the SAME
+        root: an identity for another directory would refuse every legitimate write.
+
+        ``None`` (unpinned) when the workspace in hand is the default one
+        (``workspace.root == paths.repo_root``): ``root`` is then the operator's
+        project, which the pin rule leaves unpinned. Otherwise ``root`` is inside
+        the orchestrator-minted unit mount ``workspace.root``, whose parent is
+        session-writable, so `runs.mount_root_identity` pins it — the worktree and
+        every directory from it down to ``root`` (``<worktree>/<offset>`` under a
+        nested project) — answering never-matching when it cannot, so the refusal
+        lands AT THE WRITE, through the site's existing handling. Mountedness is
+        read off the live workspace, not ``task.worktree_path``: the writes go
+        wherever ``self.workspace`` points, including a mount ``_finish_inflight``
+        reopened. Parent directories ABOVE the unit worktree stay followed — the
+        residual every DW-338 pin shares."""
+        if self.workspace.root == self.paths.repo_root:
+            return None
+        return mount_root_identity(root, mount=self.workspace.root)
 
     def _ensure_target_branch(self) -> None:
         self._worktree_flow.ensure_target_branch()
@@ -3757,8 +3780,17 @@ class Engine:
             # than silently proceeding stale (see _reset_spec_for_repair).
             reset_from = fm_status
             confine_root = self.workspace.paths.project
-            devcontract.reset_spec_status(spec_path, "done", confine_root=confine_root)
-            devcontract.strip_auto_run_result(spec_path, confine_root=confine_root)
+            devcontract.reset_spec_status(
+                spec_path,
+                "done",
+                confine_root=confine_root,
+                root_identity=self._mount_root_identity(confine_root),
+            )
+            devcontract.strip_auto_run_result(
+                spec_path,
+                confine_root=confine_root,
+                root_identity=self._mount_root_identity(confine_root),
+            )
         # A timed-out review can still have recorded new frontmatter findings.
         # Normalize first so the success-status gate sees `done`, then mirror the
         # normal review path before deterministic verification and commit.
@@ -4301,6 +4333,7 @@ class Engine:
                 spec_file=self._park_spec_relpath(task),
                 run_id=self.state.run_id,
                 parked_at=self._today(),
+                root_identity=self._mount_root_identity(self.workspace.paths.project),
             )
         except (OSError, RuntimeError) as e:
             self.journal.append("operator-index-failed", story_key=task.story_key, error=str(e))
@@ -4348,12 +4381,24 @@ class Engine:
         `validate` reports a board parked with no record but never a record left
         over for a park that is in no commit, so nothing else would ever surface
         this. The journal call is itself suppressed — a restore that must not
-        raise cannot be allowed to raise on the way to saying it failed."""
+        raise cannot be allowed to raise on the way to saying it failed.
+
+        Under worktree isolation both arms pin the mount project (DW-445,
+        `_mount_root_identity`): the put-back through the confined writer's
+        ``root_identity``, and the ``prior is None`` arm — which unlinks and
+        rmdirs BY PATH — through a `platform_util.require_root_pinned` pre-check
+        that refuses before anything is touched, so a mount swapped for a link
+        never has files deleted at the link's target. That pre-check is
+        check-then-act, the no-handle fallback's documented residual; either
+        refusal is an `UnconfinedWriteError` and is journaled like any other."""
         if record is None:
             return
         path, prior = record
+        root = self.workspace.paths.project
         try:
+            root_identity = self._mount_root_identity(root)
             if prior is None:
+                require_root_pinned(root, root_identity)
                 path.unlink(missing_ok=True)
                 parent = path.parent
                 if parent.is_dir() and not any(parent.iterdir()):
@@ -4362,8 +4407,9 @@ class Engine:
                 atomic_write_text_confined(
                     path,
                     prior,
-                    confine_root=self.workspace.paths.project,
+                    confine_root=root,
                     require_writable_target=True,
+                    root_identity=root_identity,
                 )
         except OSError as e:
             with contextlib.suppress(Exception):
@@ -4644,7 +4690,10 @@ class Engine:
         # the reader can see but no line edit can move raises instead, and that raise
         # is deliberately left uncaught (see _reset_spec_for_repair).
         if not devcontract.reset_spec_status(
-            spec_path, success_status, confine_root=self.workspace.paths.project
+            spec_path,
+            success_status,
+            confine_root=self.workspace.paths.project,
+            root_identity=self._mount_root_identity(self.workspace.paths.project),
         ):
             return fm_status
         # Keep the in-place result_json the rest of _dev_phase reads consistent with
@@ -4744,6 +4793,7 @@ class Engine:
                 fm_status,
                 confine_root=self.workspace.paths.project,
                 detail=detail,
+                root_identity=self._mount_root_identity(self.workspace.paths.project),
             )
         except (OSError, UnicodeDecodeError) as e:
             # UnicodeDecodeError as well as OSError: the writer reads the spec's raw
@@ -4803,7 +4853,12 @@ class Engine:
                 if verify.status_of(fm) == verify.AWAITING_OPERATOR and actions:
                     task.operator_actions = list(actions)
             target = verify.AWAITING_OPERATOR if task.operator_actions else "done"
-            verify.set_frontmatter_status(spec, target, confine_root=self.workspace.root)
+            verify.set_frontmatter_status(
+                spec,
+                target,
+                confine_root=self.workspace.root,
+                root_identity=self._mount_root_identity(self.workspace.root),
+            )
             status = verify.status_of(verify.read_frontmatter(spec))
         except (OSError, FrontmatterWriteError) as e:
             self._escalate(
@@ -7869,8 +7924,17 @@ class Engine:
         # attempt against a spec still reading `done` — step-01 would ingest it as
         # context and not resume, re-wedging silently (cf. runs.rearm_escalation).
         confine_root = self.workspace.paths.project
-        devcontract.reset_spec_status(resolved, "in-progress", confine_root=confine_root)
-        devcontract.strip_auto_run_result(resolved, confine_root=confine_root)
+        devcontract.reset_spec_status(
+            resolved,
+            "in-progress",
+            confine_root=confine_root,
+            root_identity=self._mount_root_identity(confine_root),
+        )
+        devcontract.strip_auto_run_result(
+            resolved,
+            confine_root=confine_root,
+            root_identity=self._mount_root_identity(confine_root),
+        )
 
     def _reset_spec_for_review(self, task: StoryTask) -> SpecSnapshot | None:
         """Strip the prior pass's stale `## Auto Run Result` before a review launch,
@@ -7945,7 +8009,11 @@ class Engine:
             raise RuntimeError(
                 "recorded spec became unsafe before review prompt construction"
             ) from exc
-        devcontract.strip_auto_run_result(resolved, confine_root=self.workspace.paths.project)
+        devcontract.strip_auto_run_result(
+            resolved,
+            confine_root=self.workspace.paths.project,
+            root_identity=self._mount_root_identity(self.workspace.paths.project),
+        )
         try:
             raw = resolved.read_bytes()
             mtime_ns = resolved.stat().st_mtime_ns

@@ -2641,3 +2641,105 @@ def test_reset_spec_for_replan_pinned_restore_refuses_a_mount_swapped_mid_replan
     swapped_in = outside_spec.read_text(encoding="utf-8")
     assert "status: draft" in swapped_in  # the reset's bytes, never the undo's preimage
     assert swapped_in != _MOUNT_SPEC
+
+
+_MARKERLESS_SPEC = "---\nstatus: done\n---\n\n## Intent\n\nbody\n"
+
+
+@requires_symlinked_mount_swap
+def test_append_auto_run_result_pinned_mount_refuses_a_mount_swapped_for_a_link(tmp_path):
+    """DW-445: the marker-repair append is pinned like the DW-423 writers — a mount
+    swapped for a link refuses and the outside copy is unchanged. The unpinned
+    control shows the same swap really appends to the outside copy.
+
+    Ablation: drop the `root_identity=` forward from `append_auto_run_result` to
+    `_atomic_write_spec` and the pinned call appends the marker outside."""
+    mount = tmp_path / "project" / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    (mount / "specs").mkdir(parents=True)
+    (mount / "specs" / "6-4.md").write_text(_MARKERLESS_SPEC, encoding="utf-8")
+    identity = os.lstat(mount)
+    outside = tmp_path / "outside"
+    (outside / "specs").mkdir(parents=True)
+    outside_spec = outside / "specs" / "6-4.md"
+    outside_spec.write_text(_MARKERLESS_SPEC, encoding="utf-8")
+    mount.rename(mount.with_name("1-aside"))
+    mount.symlink_to(outside, target_is_directory=True)
+    spec = mount / "specs" / "6-4.md"
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        devcontract.append_auto_run_result(spec, "done", confine_root=mount, root_identity=identity)
+    assert outside_spec.read_text(encoding="utf-8") == _MARKERLESS_SPEC
+
+    assert devcontract.append_auto_run_result(spec, "done", confine_root=mount)  # control
+    assert "## Auto Run Result" in outside_spec.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("writer", ["reset_spec_status", "append_auto_run_result"])
+def test_pinned_writers_keep_the_missing_spec_no_op_for_a_gone_mount(tmp_path, writer):
+    """DW-445 "mount gone" row: the engine takes the identity of a mount that no
+    longer exists — `runs.mount_root_identity` answers never-matching, not a raise —
+    and the pinned writer still answers its missing-spec ``False`` before any open,
+    so a gone mount stays the no-op it was rather than becoming a refusal."""
+    from bmad_loop import runs
+
+    mount = tmp_path / "project" / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    identity = runs.mount_root_identity(mount, mount=mount)
+    spec = mount / "specs" / "6-4.md"
+
+    if writer == "reset_spec_status":
+        wrote = devcontract.reset_spec_status(
+            spec, "in-progress", confine_root=mount, root_identity=identity
+        )
+    else:
+        wrote = devcontract.append_auto_run_result(
+            spec, "done", confine_root=mount, root_identity=identity
+        )
+
+    assert wrote is False
+    assert not mount.exists()
+
+
+@requires_symlinked_mount_swap
+@pytest.mark.parametrize("writer", ["reset_spec_status", "append_auto_run_result"])
+def test_atomic_write_spec_external_arm_refuses_a_swapped_pinned_root(tmp_path, writer):
+    """DW-445: `_atomic_write_spec`'s external arm pre-checks a given pin. The spec's
+    RESOLVED spelling after a mount swap lies outside ``confine_root`` — what the
+    engine's resets write — so the pinned write refuses and the outside bytes are
+    unchanged; the unpinned control writes them as before.
+
+    Ablation: drop the `require_root_pinned` pre-check from `_atomic_write_spec`'s
+    external arm and the pinned call rewrites the outside copy."""
+    text = _MARKERLESS_SPEC if writer == "append_auto_run_result" else _MOUNT_SPEC
+    mount, outside_spec, identity = _mount_swap_pair(tmp_path)
+    outside_spec = outside_spec.resolve()
+    outside_spec.write_text(text, encoding="utf-8")
+
+    def write(**kw):
+        if writer == "reset_spec_status":
+            return devcontract.reset_spec_status(outside_spec, "in-progress", **kw)
+        return devcontract.append_auto_run_result(outside_spec, "done", **kw)
+
+    with pytest.raises(platform_util.UnconfinedWriteError, match="pinned to"):
+        write(confine_root=mount, root_identity=identity)
+    assert outside_spec.read_text(encoding="utf-8") == text
+
+    assert write(confine_root=mount)  # control: unpinned, unchanged behaviour
+    assert outside_spec.read_text(encoding="utf-8") != text
+
+
+@requires_symlinked_mount_swap
+def test_atomic_write_spec_external_arm_writes_through_an_intact_pinned_root(tmp_path):
+    """An intact pinned mount whose `_bmad-output` is a link resolving outside it:
+    the pre-check passes and the write lands exactly as unpinned."""
+    mount = tmp_path / "project" / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    mount.mkdir(parents=True)
+    shared = tmp_path / "shared-output"
+    (shared / "specs").mkdir(parents=True)
+    spec = (shared / "specs" / "6-4.md").resolve()
+    spec.write_text(_MOUNT_SPEC, encoding="utf-8")
+    (mount / "_bmad-output").symlink_to(shared, target_is_directory=True)
+
+    assert devcontract.reset_spec_status(
+        spec, "in-progress", confine_root=mount, root_identity=os.lstat(mount)
+    )
+    assert "status: in-progress" in spec.read_text(encoding="utf-8")

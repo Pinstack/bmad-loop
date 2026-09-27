@@ -8009,7 +8009,8 @@ def set_frontmatter_field(
     there. So is ``require_writable_target=True`` (#597): this rewrites an
     operator-editable spec, and a read-only one is answered rather than routed
     around by a replace that only needs the directory writable. ``root_identity``
-    pins ``confine_root`` on the confined arm on the terms stated there (DW-423).
+    pins ``confine_root`` on the terms stated there: forwarded on the confined arm
+    (DW-423), pre-checked on the external arm (DW-445).
 
     Use the BYTES helper and not the text one:
     `atomic_write_text` keeps ``Path.write_text``'s translating newline default,
@@ -8035,6 +8036,7 @@ def set_frontmatter_field(
             root_identity=root_identity,
         )
     else:
+        platform_util.require_root_pinned(confine_root, root_identity)
         atomic_write_bytes(path, payload, follow_symlinks=False, require_writable_target=True)
     return True
 
