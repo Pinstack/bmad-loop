@@ -1952,7 +1952,7 @@ class RecoveryFlow:
         *,
         allow_pause: bool,
         force_include: tuple[str, ...] = (),
-    ) -> None:
+    ) -> str | None:
         """Before an auto-rollback's hard reset, park the attempt's *uncommitted*
         working-tree changes (tracked edits + run-created untracked files) under a
         named recovery ref, so `reset --hard baseline` and its untracked cleanup
@@ -1983,10 +1983,15 @@ class RecoveryFlow:
         uncommitted) still resets instead of halting an unattended run. The failure
         is journaled either way, and ``preserve_partial`` is latched either way —
         on the best-effort re-drive path the reset still runs, so the defer notice
-        must still downgrade its claim to the committed half (#338)."""
+        must still downgrade its claim to the committed half (#338).
+
+        Returns the snapshot ref this call parked, or ``None`` when it parked
+        nothing — a clean tree, no baseline, or a capture failure that did not
+        pause. Rollback callers ignore it; the sweep's kept-rival migration reset
+        reads the ledger back from it to detect a third writer (DW-435)."""
         baseline = task.baseline_commit
         if not baseline:
-            return
+            return None
         workspace = self._workspace_get()
         # Same ref-sanitized slug as preserve_attempt_commits so an exotic/overlong
         # --run-id can't blow the ref-name limit and drop the ref.
@@ -2074,13 +2079,13 @@ class RecoveryFlow:
             # short-circuits on the ref first.
             task.preserve_partial = True
             if not allow_pause:
-                return  # re-drive: never pause — proceed to the (human-directed) reset
+                return None  # re-drive: never pause — proceed to the (human-directed) reset
             # Refuse the reset rather than destroy what the snapshot failed to save
             # (#340) — but only when something unparked is actually at stake, so a
             # git fault over a harmless reset can't halt an unattended run.
             if force_include or self._reset_would_destroy(task):
                 self.pause_for_manual_recovery(task, baseline, snapshot_failed=True)
-            return
+            return None
         if parked:
             # Last writer wins over preserve_attempt_commits' branch on purpose:
             # the snapshot is commit-tree'd parented at the attempt's HEAD
@@ -2090,6 +2095,7 @@ class RecoveryFlow:
             # snapshot failed and the commits branch is all that survived.
             task.preserve_ref = parked
             self.journal.append("attempt-worktree-preserved", story_key=task.story_key, ref=parked)
+        return parked
 
     def _reset_would_destroy(self, task: StoryTask) -> bool:
         """True when the pending `safe_reset` would still erase uncommitted work —

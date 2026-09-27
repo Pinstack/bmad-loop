@@ -1826,8 +1826,8 @@ class Engine:
     ) -> tuple[str, int] | None:
         return self._recovery_flow.preserve_attempt_commits(task, allow_pause=allow_pause)
 
-    def _preserve_attempt_worktree(self, task: StoryTask, *, allow_pause: bool) -> None:
-        self._recovery_flow.preserve_attempt_worktree(task, allow_pause=allow_pause)
+    def _preserve_attempt_worktree(self, task: StoryTask, *, allow_pause: bool) -> str | None:
+        return self._recovery_flow.preserve_attempt_worktree(task, allow_pause=allow_pause)
 
     def _pause_for_manual_recovery(
         self,

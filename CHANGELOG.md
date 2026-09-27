@@ -154,6 +154,12 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Stop an escalated sweep migration restart from republishing an older kept rival over
+  a ledger write that landed before its reset. The restart reads the ledger back from
+  the worktree snapshot parked just before the reset. If it differs, the restart skips
+  the reset and re-pauses with the newer text live, journaling
+  `sweep-migration-restore-diverged` with `snapshot_ref`. A snapshot read fault journals
+  `ledger-snapshot-probe-failed` and re-pauses the same way (DW-435).
 - Pause a sweep migration before dispatch when its input is a tracked ledger that
   differs from its committed version (or the check faults), instead of spending a
   session whose accepted rewrite then fails with

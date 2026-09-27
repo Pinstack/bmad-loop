@@ -3726,6 +3726,21 @@ class SweepEngine(Engine):
         writer inside the reset window is never overwritten — it journals
         ``sweep-migration-restore-diverged`` and re-pauses (the task is still
         ESCALATED), keeping the latch, and the rival stays in the recovery ref.
+
+        A third writer landing between that observation and the reset (DW-435)
+        is caught BEFORE the reset: the worktree snapshot just parked is read
+        back, and when it binds the ledger (:meth:`_snapshot_bound_ledger`) to
+        text other than the observed rival, the reset never runs — journal
+        ``sweep-migration-restore-diverged`` naming ``snapshot_ref`` and re-pause
+        with the newer bytes still live, so the next resume keeps THEM rather
+        than the older rival. Both re-pauses carry their own remedy, because the
+        default restore-the-ledger one would overwrite those bytes. A snapshot
+        probe fault re-pauses the same way (fail closed). Two residuals remain.
+        The window between the snapshot and the reset: closing it needs a
+        path-scoped or locked reset (the DW-312 class). And a third writer that
+        leaves the tree clean (a tracked rival reverted to its committed blob)
+        mints no snapshot, so the compare-and-set below cannot tell its bytes
+        from the reset's republish and restores the older rival.
         """
         ledger = self.workspace.paths.deferred_work
         observed: str | None = None
@@ -3741,7 +3756,44 @@ class SweepEngine(Engine):
                     "re-run the sweep",
                 )
         self._preserve_attempt_commits(task, allow_pause=True)
-        self._preserve_attempt_worktree(task, allow_pause=True)
+        snapshot = self._preserve_attempt_worktree(task, allow_pause=True)
+        if keep_ledger and snapshot is not None:
+            # DW-435: git probes, so outside any ledger_lock (#286, #735).
+            bound, parked, fault = False, None, None
+            try:
+                bound, parked = self._snapshot_bound_ledger(snapshot)
+            except (verify.GitError, OSError, RuntimeError, ValueError) as exc:
+                fault = str(exc)
+            if fault is not None:
+                self.journal.append(
+                    "ledger-snapshot-probe-failed",
+                    story_key=MIGRATE_KEY,
+                    snapshot_ref=snapshot,
+                    error=fault,
+                )
+                self._escalate(
+                    task,
+                    f"the kept rival migration input cannot be checked against snapshot "
+                    f"{snapshot}, so no reset ran — repair the repository, then resume",
+                    own_remedy=True,
+                )
+            elif bound and parked != observed:
+                self.journal.append(
+                    "sweep-migration-restore-diverged",
+                    story_key=MIGRATE_KEY,
+                    ledger=str(ledger),
+                    snapshot_ref=snapshot,
+                )
+                # Own remedy: the default restore-the-ledger one would overwrite
+                # the newer bytes this re-pause exists to keep.
+                self._escalate(
+                    task,
+                    f"the ledger changed after the kept rival migration input was read "
+                    f"(the newer text is also parked on {snapshot}), so no reset ran — "
+                    "resume to keep the ledger now on disk as the migration input "
+                    "(it must still hold legacy entries)",
+                    own_remedy=True,
+                )
         self._safe_reset(task)
         if not keep_ledger:
             return
@@ -3776,6 +3828,38 @@ class SweepEngine(Engine):
                 "the ledger changed underneath the kept rival migration input — "
                 "re-run the sweep",
             )
+
+    def _snapshot_bound_ledger(self, ref: str) -> tuple[bool, str | None]:
+        """The ledger text a just-minted worktree snapshot captured (DW-435).
+
+        ``(True, text)`` when the snapshot binds the ledger: it holds the path
+        as a regular blob (``add -u`` of a tracked ledger, or a run-created
+        untracked one), newline-normalized like :meth:`_ledger_baseline_text`
+        for comparison with :func:`deferredwork.read_for_write`. ``(True,
+        None)`` when a ledger tracked at the snapshot's parent is absent from
+        it — ``add -u`` recorded its deletion. ``(False, None)`` when the
+        snapshot says nothing about the live ledger: it is proven external, a
+        non-regular entry, or absent at both revisions (a baseline-untracked or
+        ignored ledger the snapshot never staged). Raises on a probe fault or
+        an unresolvable ledger path; the caller fails closed.
+        """
+        rel, fault = self._ledger_rel()
+        if fault is not None:
+            raise fault
+        if rel is None:
+            return False, None
+        root = self.workspace.root
+        parent = f"{ref}^"
+        if verify.path_is_non_regular_at_revision(root, ref, rel):
+            return False, None
+        if verify.path_is_non_regular_at_revision(root, parent, rel):
+            return False, None
+        blob = verify.worktree_file_bytes_at_revision(root, ref, rel)
+        if blob is None:
+            tracked = verify.worktree_file_bytes_at_revision(root, parent, rel) is not None
+            return tracked, None
+        text = blob.decode("utf-8")
+        return True, text.replace("\r\n", "\n").replace("\r", "\n")
 
     def _restore_accepted_migration(self, task: StoryTask, baseline: str, rewrite: str) -> None:
         """Restore a validated rewrite by compare-and-set, never over a rival."""

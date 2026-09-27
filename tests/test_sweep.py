@@ -34326,6 +34326,155 @@ def test_escalated_restart_refuses_a_third_writer_over_the_kept_rival(project, m
 
 
 @needs_dir_fd_recovery
+def test_escalated_restart_refuses_a_third_writer_before_its_reset(project, monkeypatch):
+    """DW-435: a ledger write landing between the kept-rival read and the
+    restart's reset is caught from the worktree snapshot parked just before
+    that reset. The reset never runs, and the older rival is never republished
+    over the newer bytes. The restart journals `sweep-migration-restore-diverged`
+    naming the snapshot ref, then re-pauses still ESCALATED with the latch kept.
+    The third writer's text stays live and is also parked on that ref.
+
+    Ablation, performed: drop the `elif bound and parked != observed:` arm in
+    `_migration_reset` and this reddens. The reset wipes the third writer, the
+    compare-and-set republishes the older rival, and the dirty-input guard then
+    pauses at the story gate instead."""
+    escalated = _escalate_on_a_tracked_rival(project, monkeypatch)
+    third = LEGACY_LEDGER + "- **Third writer** — landed before the restart's reset\n"
+    head = git(project.project, "rev-parse", "HEAD")
+    resumed, adapter = resume_sweep(project, escalated, [])
+    real_preserve = resumed._preserve_attempt_commits
+
+    def third_writer_then_preserve(task, **kwargs):
+        # after `_migration_reset` read the rival, before the snapshot and reset
+        project.deferred_work.write_text(third, encoding="utf-8")
+        return real_preserve(task, **kwargs)
+
+    monkeypatch.setattr(resumed, "_preserve_attempt_commits", third_writer_then_preserve)
+
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed and adapter.sessions == []
+    persisted = load_state(resumed.run_dir)
+    assert persisted.paused_stage == PAUSE_ESCALATION
+    task = persisted.tasks["sweep-migrate"]
+    assert task.phase == Phase.ESCALATED and task.migration_ledger_rival is True
+    assert project.deferred_work.read_text(encoding="utf-8") == third
+    assert git(project.project, "rev-parse", "HEAD") == head
+    ref = _records(resumed, "attempt-worktree-preserved")[-1]["ref"]
+    diverged = _records(resumed, "sweep-migration-restore-diverged")
+    assert len(diverged) == 2 and diverged[-1]["snapshot_ref"] == ref
+    assert ref in persisted.paused_reason
+    assert "restore the pre-migration ledger" not in persisted.paused_reason
+    parked = git(project.project, "show", f"{ref}:{ledger_rel(project)}")
+    assert parked == third.rstrip("\n")
+
+    # The next resume converges on the newer text: the latched restart observes
+    # it, the snapshot binds it equal, and the compare-and-set republishes it
+    # after the reset. The DW-437 guard then refuses it (it is an uncommitted
+    # tracked rival) at the story gate, with no new divergence.
+    converged, adapter = resume_sweep(project, resumed, [])
+
+    summary = converged.run()
+
+    assert summary.paused and not summary.crashed and adapter.sessions == []
+    persisted = load_state(converged.run_dir)
+    assert persisted.paused_stage == PAUSE_STORY_GATE
+    assert persisted.tasks["sweep-migrate"].migration_ledger_rival is False
+    assert project.deferred_work.read_text(encoding="utf-8") == third
+    assert len(_records(converged, "sweep-migration-restore-diverged")) == 2
+
+
+@needs_dir_fd_recovery
+def test_escalated_restart_refuses_a_kept_rival_it_cannot_check_against_the_snapshot(
+    project, monkeypatch
+):
+    """DW-435, fail closed: when reading the ledger back from the just-parked
+    snapshot faults, the restart cannot tell whether a third writer landed. It
+    journals `ledger-snapshot-probe-failed`, runs no reset, and re-pauses
+    ESCALATED with the rival still live and the latch kept.
+
+    Ablation, performed: replace `fault = str(exc)` in `_migration_reset` with
+    `pass`, so the fault reads as an unbound snapshot, and this reddens. The
+    reset runs and the dirty-input guard pauses at the story gate."""
+    escalated = _escalate_on_a_tracked_rival(project, monkeypatch)
+    real_blob = verify.worktree_file_bytes_at_revision
+
+    def fault_the_snapshot_read(repo, revision, rel):
+        if sys._getframe(1).f_code.co_name == "_snapshot_bound_ledger":
+            raise verify.GitError("injected snapshot read fault")
+        return real_blob(repo, revision, rel)
+
+    monkeypatch.setattr(verify, "worktree_file_bytes_at_revision", fault_the_snapshot_read)
+    head = git(project.project, "rev-parse", "HEAD")
+    resumed, adapter = resume_sweep(project, escalated, [])
+    resets: list[str] = []
+    monkeypatch.setattr(
+        resumed, "_safe_reset", lambda task, **kwargs: resets.append(task.story_key)
+    )
+
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed and adapter.sessions == []
+    persisted = load_state(resumed.run_dir)
+    assert persisted.paused_stage == PAUSE_ESCALATION
+    task = persisted.tasks["sweep-migrate"]
+    assert task.phase == Phase.ESCALATED and task.migration_ledger_rival is True
+    faults = _records(resumed, "ledger-snapshot-probe-failed")
+    assert len(faults) == 1 and "injected snapshot read fault" in faults[0]["error"]
+    assert faults[0]["snapshot_ref"] in persisted.paused_reason
+    assert project.deferred_work.read_text(encoding="utf-8") == _RIVAL_LEGACY_LEDGER
+    assert resets == [] and git(project.project, "rev-parse", "HEAD") == head
+
+
+@pytest.mark.parametrize("shape", ["edited", "deleted", "baseline-untracked", "symlink"])
+def test_snapshot_bound_ledger_reports_what_the_snapshot_captured(project, shape):
+    """DW-435 binding rule, at its own layer. A tracked ledger binds either
+    to its edited text (newline-normalized) or to its recorded deletion. A
+    baseline-untracked ledger, which the snapshot never stages, or a symlinked
+    one, whose blob is a target pathname, says nothing about the live ledger.
+
+    Ablation, performed: return `True, None` for a blob absent from the
+    snapshot (drop the parent probe), and the baseline-untracked row reddens.
+    Drop both `path_is_non_regular_at_revision` guards, and the symlink row
+    reddens."""
+    engine, _ = make_sweep(project, [])
+    root = project.project
+    ledger = project.deferred_work
+    (root / "notes.txt").write_text("committed\n", encoding="utf-8")
+    if shape == "symlink":
+        target = ledger.with_name("ledger-target.md")
+        target.write_text(LEGACY_LEDGER, encoding="utf-8")
+        try:
+            ledger.symlink_to(target.name)
+        except OSError as exc:
+            pytest.skip(f"symlinks unavailable on this host: {exc}")
+    elif shape != "baseline-untracked":
+        ledger.write_text(LEGACY_LEDGER, encoding="utf-8")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "baseline")
+    if shape == "baseline-untracked":
+        ledger.write_text(LEGACY_LEDGER, encoding="utf-8")
+    baseline_untracked = sorted(verify.untracked_files(root))
+    (root / "notes.txt").write_text("dirty\n", encoding="utf-8")
+    if shape == "edited":
+        ledger.write_bytes(b"# edited\r\nline\r\n")
+    elif shape == "deleted":
+        ledger.unlink()
+    ref = verify.snapshot_worktree(
+        root, "refs/attempt-preserve-dirty/dw435-probe", baseline_untracked=baseline_untracked
+    )
+    assert ref is not None
+
+    expected = {
+        "edited": (True, "# edited\nline\n"),
+        "deleted": (True, None),
+        "baseline-untracked": (False, None),
+        "symlink": (False, None),
+    }[shape]
+    assert engine._snapshot_bound_ledger(ref) == expected
+
+
+@needs_dir_fd_recovery
 def test_escalated_restart_refuses_an_unreadable_kept_rival(project, monkeypatch):
     """DW-429: when the keep-ledger read before the restart's reset faults, there
     is no rival text to put back, so the restart re-pauses ESCALATED with the
