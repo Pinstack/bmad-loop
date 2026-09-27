@@ -3247,7 +3247,7 @@ class SweepEngine(Engine):
             # mount-relative re-anchor itself. Accepted receipts reopen this mount
             # regardless of live policy; restart is the only path allowed to release
             # or discard its ownership before future work begins.
-            task.rebase_spec_paths_on(Path(task.worktree_path))
+            task.rebase_spec_paths_on(self._mount_project(task))
         mounted = bool(task.worktree_path)
         restart_isolated = self._isolated and mounted
         if task.phase == Phase.COMMITTING:
@@ -3828,7 +3828,9 @@ class SweepEngine(Engine):
         self.journal.append("resume-restart", story_key=MIGRATE_KEY, phase=str(task.phase))
         anchor: _LedgerAnchor = _LedgerAnchor.NONE
         committed: str | None = None
-        if task.baseline_commit and not verify.worktree_clean(self.workspace.root):
+        if task.baseline_commit and not verify.worktree_clean(
+            self.workspace.root, project=self.workspace.paths.project
+        ):
             # Non-ledger residue of the dead session; the ledger itself is
             # decided below against the snapshot, never re-baselined.
             self._refuse_advanced_migration_head(task)
@@ -4116,7 +4118,9 @@ class SweepEngine(Engine):
             # refused a readable rival ledger, so the reset must put that rival
             # back and let it become the migration input, not erase it.
             keep_ledger = task.phase == Phase.ESCALATED and task.migration_ledger_rival
-            dirty = bool(task.baseline_commit) and not verify.worktree_clean(self.workspace.root)
+            dirty = bool(task.baseline_commit) and not verify.worktree_clean(
+                self.workspace.root, project=self.workspace.paths.project
+            )
             if dirty:
                 # DW-427/428: refused BEFORE the ESCALATED mutations below, so
                 # a re-pause persists none of them.
@@ -5177,10 +5181,11 @@ class SweepEngine(Engine):
         from . import decisions as decisions_store  # lazy: decisions imports sweep
 
         decisions_path = self.run_dir / "decisions.json"
-        # The project that OWNS `run_dir`, not `self.workspace.root`: under the
-        # supported `repo_root` override (isolation = "none") the workspace root
-        # is the separate code repo while the run dir — and the project-level
-        # pre-answer store — stay under the PROJECT, so a workspace-rooted
+        # The project that OWNS `run_dir`, not `self.workspace.root`: under a
+        # `repo_root` override (in place, or a nested project under worktree
+        # isolation, DW-379) the workspace root is the code repo while the run
+        # dir — and the project-level pre-answer store — stay under the PROJECT,
+        # so a workspace-rooted
         # confinement refused every write here and a workspace-rooted read
         # silently ignored the store. Derived from the run dir's own shape, which
         # no workspace swap moves.

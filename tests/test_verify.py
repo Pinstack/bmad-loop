@@ -4162,10 +4162,11 @@ def _review_gate_at_done(project, mode):
 def test_verify_review_gates_run_commands_in_repo_root(project, tmp_path, mode):
     """`[verify] commands` run in the git root, not the BMAD project root (#695).
 
-    The two are the same path everywhere except under an explicit `repo_root:`
-    with `isolation = "none"` — `ProjectPaths.rebased` sets both, so worktree
-    isolation never diverges — and the `project` fixture sets no `repo_root`, so
-    no pre-existing row can tell the two apart. These three gates were the sole
+    The two are the same path everywhere except under an explicit `repo_root:` (in
+    place, or under worktree isolation with the project nested inside it, where
+    `ProjectPaths.rebased` keeps the project's offset in the mount — DW-379) — and the
+    `project` fixture sets no `repo_root`, so no pre-existing row can tell the two
+    apart. These three gates were the sole
     callers running the commands in `paths.project`; the dev side and
     `cli._reverify` both already used `repo_root`.
 
@@ -8146,11 +8147,12 @@ def test_read_frontmatter_ignores_triple_dash_in_value(project):
 
 # ------------------------------------------- repo_root override (divergent roots)
 #
-# `isolation = "none"` plus a `repo_root:` key in _bmad/bmm/config.yaml is the ONE
-# supported shape where `paths.project` and `paths.repo_root` name different
-# directories (`bmadconfig.worktree_isolation_conflict` refuses the other). The
-# `project` fixture sets no override, so `repo_root == project` and no pre-existing
-# row here can tell the two apart — which is why the wrong-root bug survived.
+# A `repo_root:` key in _bmad/bmm/config.yaml is the shape where `paths.project` and
+# `paths.repo_root` name different directories (in place, or nested in a worktree
+# mount since DW-379; `bmadconfig.worktree_isolation_conflict` refuses a disjoint one
+# under worktree isolation). The `project` fixture sets no override, so
+# `repo_root == project` and no pre-existing row here can tell the two apart — which
+# is why the wrong-root bug survived.
 
 
 def _repo_root_override(project, tmp_path):
@@ -13826,3 +13828,27 @@ def test_set_frontmatter_field_pinned_mount_refuses_a_mount_swapped_for_a_link(t
     # Control: unpinned, the swap carries the write outside the repository.
     assert verify.set_frontmatter_field(spec, "baseline_revision", "new", confine_root=mount)
     assert "baseline_revision: new" in outside_spec.read_text(encoding="utf-8")
+
+
+def test_worktree_clean_excludes_a_nested_projects_policy_at_its_offset(project):
+    """DW-379: probing the CODE root of a nested layout must still ignore the project's
+    own policy.toml, which sits at `app/.bmad-loop/policy.toml` there — a TUI settings
+    edit is not a dirty tree — while any other change still reads dirty. Tracked here
+    (force-added past the nested `.gitignore`) so the edit is a real modification.
+
+    Ablation: spell the exclusion as the bare `POLICY_FILE_REL` whatever `project` says
+    and the first assertion reddens."""
+    paths = nested_repo_root_paths(project)
+    repo, app = paths.repo_root, paths.project
+    policy_file = app / ".bmad-loop" / "policy.toml"
+    policy_file.parent.mkdir(parents=True, exist_ok=True)
+    policy_file.write_text("[scm]\n", encoding="utf-8")
+    git(repo, "add", "-f", "app/.bmad-loop/policy.toml")
+    git(repo, "commit", "-q", "-m", "track the nested policy")
+    policy_file.write_text("[scm]\n# edited in the settings screen\n", encoding="utf-8")
+
+    assert verify.worktree_clean(repo, project=app)
+    assert not verify.worktree_clean(repo), "without the project the edit reads dirty"
+
+    (app / "src.txt").write_text("real work\n", encoding="utf-8")
+    assert not verify.worktree_clean(repo, project=app)

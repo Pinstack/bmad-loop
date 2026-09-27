@@ -9,9 +9,10 @@ lives in the main repo and is passed separately — it never moves.
 - isolation = worktree → per unit: a git worktree mounted under the run dir
   (.bmad-loop/runs/<run_id>/worktrees/, which `bmad-loop init` gitignores, so it
   stays invisible to the main checkout's `git status`), with paths rebased onto
-  it. open_unit_workspace / close_unit_workspace manage the branch + worktree
-  lifecycle; the engine merges the unit branch back into the target branch from
-  the main repo between units.
+  it — a project nested inside `repo_root` keeps its offset there (DW-379), while
+  `root` stays the checkout root either way. open_unit_workspace /
+  close_unit_workspace manage the branch + worktree lifecycle; the engine merges
+  the unit branch back into the target branch from the main repo between units.
 """
 
 from __future__ import annotations
@@ -64,7 +65,9 @@ def _rmtree_confined(wt: Path, run_dir: Path) -> bool:
 @dataclass(frozen=True)
 class Workspace:
     root: Path  # where sessions run (cwd) and git operates
-    paths: ProjectPaths  # artifact paths rebased onto `root`
+    # artifact paths rebased onto `root`; under isolation `paths.project` is the
+    # mount project (`root` itself, or `root/<offset>` for a nested project)
+    paths: ProjectPaths
 
     @classmethod
     def default(cls, paths: ProjectPaths) -> Workspace:

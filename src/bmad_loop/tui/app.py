@@ -195,7 +195,8 @@ class BmadLoopApp(App[None]):
 
     def _guarded(self, go: Callable[[], None]) -> None:
         """Pre-launch guard mirroring the CLI: the git support floor refused first,
-        then the #414 isolation/repo_root conflict, then a clean worktree required,
+        then the #414 isolation/repo_root conflict (a project outside `repo_root`
+        under worktree isolation), then a clean code root (`repo_root`) required,
         plus a confirm when another engine is already live."""
         # First, in `cmd_run`'s own order, and for the reason that order exists: this
         # is a fact about the HOST, so every other answer here would be advice about
@@ -233,17 +234,33 @@ class BmadLoopApp(App[None]):
         # into their own typed error, so the two named here are the whole surface;
         # a raw `UnicodeDecodeError` would be a ValueError and escape.
         try:
-            conflict = bmadconfig.worktree_isolation_conflict(
-                bmadconfig.load_paths(self.project),
-                policy.load(self.project / POLICY_FILE).scm.isolation,
+            loaded = bmadconfig.load_paths(self.project)
+        except (bmadconfig.BmadConfigError, OSError):
+            loaded = None
+        try:
+            conflict = (
+                None
+                if loaded is None
+                else bmadconfig.worktree_isolation_conflict(
+                    loaded, policy.load(self.project / POLICY_FILE).scm.isolation
+                )
             )
-        except (bmadconfig.BmadConfigError, policy.PolicyError, OSError):
+        except (policy.PolicyError, OSError):
             conflict = None
         if conflict is not None:
             self.notify(conflict, severity="error")
             return
+        # The clean-tree gate probes the CODE root, as `cmd_run`/`cmd_sweep` do
+        # (`verify.worktree_clean(paths.repo_root, ...)`), so a `repo_root:` override
+        # whose checkout is dirty outside the project is refused here as it is there
+        # (DW-379). An unreadable config falls through to probing the project, for the
+        # fall-through reason above: the detached CLI re-reads the same file and fails
+        # loudly on it.
+        clean_root = loaded.repo_root if loaded is not None else self.project
         try:
-            if not verify.worktree_clean(self.project):
+            if not verify.worktree_clean(
+                clean_root, project=loaded.project if loaded is not None else None
+            ):
                 self.notify(
                     "git worktree is not clean — commit or stash first",
                     severity="error",

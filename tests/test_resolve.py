@@ -5577,3 +5577,32 @@ def test_journal_entries_or_none_drops_a_non_mapping_line(tmp_path):
 
     assert entries is not None
     assert [e["kind"] for e in entries] == ["a", "b"]
+
+
+def test_build_context_absolutizes_a_nested_mount_spec_onto_the_mount_project(
+    tmp_path, monkeypatch
+):
+    """DW-379: under a `repo_root` that CONTAINS the project (`<repo>/app`), an isolated
+    unit's spec is persisted relative to the MOUNT PROJECT, `<mount>/app`, so the
+    context names that copy — not `<mount>/<rel>`, the outer tree's same-named path,
+    which is planted here as a decoy.
+
+    Ablation: anchor `runs.task_spec_root` on the raw `worktree_path` and this reddens
+    on the decoy."""
+    rel = "_bmad-output/specs/6-4-cli-list-command.md"
+    repo = tmp_path / "repo"
+    app = repo / "app"
+    wt = tmp_path / "wt"
+    for root in (wt / "app", wt, app):  # the run's copy, an outer decoy, main's twin
+        spec = root / rel
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        spec.write_text(SPEC, encoding="utf-8")
+
+    run_dir, state, _ = _escalated_run(
+        app, spec_file=rel, worktree_path=str(wt), repo_root=str(repo)
+    )
+    monkeypatch.chdir(app)
+
+    path = _context(state, run_dir, "6-4-cli-list-command", isolation="worktree")
+    ctx = json.loads(path.read_text(encoding="utf-8"))
+    assert ctx["spec_file"] == (wt / "app" / rel).as_posix()

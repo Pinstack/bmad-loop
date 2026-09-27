@@ -936,10 +936,11 @@ def project(tmp_path: Path, _project_template: Path) -> ProjectPaths:
 
 # --------------------------------------- divergent roots (`repo_root` override)
 #
-# `isolation = "none"` plus a `repo_root:` key in _bmad/bmm/config.yaml is the ONE
-# supported shape where `paths.project` and `paths.repo_root` name different
-# directories (`bmadconfig.worktree_isolation_conflict` refuses the other, and
-# `ProjectPaths.rebased` sets both roots, so worktree isolation never diverges).
+# A `repo_root:` key in _bmad/bmm/config.yaml is the shape where `paths.project` and
+# `paths.repo_root` name different directories. Under `isolation = "none"` any such
+# key is supported; under `isolation = "worktree"` only a `repo_root` that CONTAINS
+# the project is (`bmadconfig.worktree_isolation_conflict` refuses a disjoint one),
+# and `ProjectPaths.rebased` keeps the project's offset inside the mount (DW-379).
 # The `project` fixture above sets no override, so `repo_root == project` there and
 # nothing built on it can tell the two apart. These helpers centralize the shared
 # marker probes, config writer, and nested builder so new coverage does not have to
@@ -1009,11 +1010,11 @@ _ARTIFACT_PATH_KEYS = (
 def write_repo_root_override(paths: ProjectPaths, code_root: Path) -> None:
     """Rewrite `_bmad/bmm/config.yaml` with a `repo_root:` pointing at `code_root`.
 
-    The one supported divergent-roots config: `isolation = "none"` plus a
-    `repo_root:` key (`bmadconfig.worktree_isolation_conflict` refuses the other
-    combination, and `ProjectPaths.rebased` sets both roots, so worktree isolation
-    never diverges). Overwrites rather than appends, so it is exact whether or not
-    `install_bmad_config` ran first.
+    The divergent-roots config: a `repo_root:` key, supported beside
+    `isolation = "none"` for any `code_root` and beside `isolation = "worktree"` only
+    when `code_root` contains the project (`bmadconfig.worktree_isolation_conflict`
+    refuses a disjoint one, DW-379). Overwrites rather than appends, so it is exact
+    whether or not `install_bmad_config` ran first.
 
     `code_root` need not be a git checkout, and several rows deliberately pass a
     plain directory or a missing one.

@@ -383,7 +383,7 @@ def build_context(
         "project_root": current_project_root.as_posix(),
         "code_root": current_code_root.as_posix(),
         # Absolute, matching the shape `bmad-loop-resolve/SKILL.md` documents: an
-        # isolated unit's `spec_file` is persisted RELATIVE to the mounted worktree
+        # isolated unit's `spec_file` is persisted RELATIVE to the mount project
         # (`model.StoryTask._serialized_worktree_path`) and the agent session runs
         # from the project root, where the main checkout carries the same
         # implementation-artifacts-relative path — the raw value would name the wrong

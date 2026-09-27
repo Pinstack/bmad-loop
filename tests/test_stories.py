@@ -695,8 +695,9 @@ def _symlinked_project_root(tmp_path: Path) -> Path:
     The two rows above cannot see a mixed-spelling message on their own: measured
     here, `tmp_path.resolve() == tmp_path`, so a raw operand and a dereferenced one
     are the same text and every spelling assertion passes either way.
-    Follows `test_bmadconfig.py`'s `worktree_isolation_conflict` symlink row,
-    including its skip for a Windows host without SeCreateSymbolicLink."""
+    Follows `test_bmadconfig.py`'s symlink row for `worktree_isolation_conflict`
+    (the disjoint-layout refusal's raw-equality fast path), including its skip for a
+    Windows host without SeCreateSymbolicLink."""
     target = tmp_path / "target"
     target.mkdir()
     root = tmp_path / "p"

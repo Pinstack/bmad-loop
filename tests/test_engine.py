@@ -13488,6 +13488,38 @@ def test_auto_sweep_skips_a_dirty_tree_and_keeps_the_trigger(project):
     assert saved.sweeps_refused == {"run-end": SWEEP_REFUSED_DIRTY}
 
 
+def test_auto_sweep_ignores_a_nested_projects_policy_edit(project):
+    """Under nested roots the auto-sweep gate probes the code root with the PROJECT's
+    policy.toml excluded at its offset (`app/.bmad-loop/policy.toml`, DW-379), so a
+    settings edit to a tracked nested policy does not refuse the sweep — while any
+    other dirt still does (the second half, so the first cannot pass on a gate that
+    stopped probing).
+
+    Ablation: drop `project=` from `_maybe_auto_sweep`'s `worktree_clean` call and
+    the first half reddens — the exclusion falls back to `.bmad-loop/policy.toml`
+    relative to the code root, which matches nothing, and the edit reads as dirt."""
+    paths = nested_repo_root_paths(project)
+    policy_file = paths.project / ".bmad-loop" / "policy.toml"
+    policy_file.parent.mkdir(parents=True, exist_ok=True)
+    policy_file.write_text("# nested policy\n", encoding="utf-8")
+    git(paths.repo_root, "add", "-f", policy_file.relative_to(paths.repo_root).as_posix())
+    git(paths.repo_root, "commit", "-qm", "track the nested policy")
+    policy_file.write_text("# nested policy\n# edited\n", encoding="utf-8")
+    calls = []
+    engine = _sweep_gate_engine(paths, recording_factory(calls))
+
+    engine._maybe_auto_sweep("run-end", "run-end")
+
+    assert calls == ["run-end"]
+    assert _skipped_dirty(engine) == []
+
+    # a fresh trigger: the first one is spent by the sweep that ran above
+    (paths.repo_root / "other.txt").write_text("uncommitted\n", encoding="utf-8")
+    engine._maybe_auto_sweep("run-end", "run-end-again")
+    assert calls == ["run-end"]
+    assert [e["reason"] for e in _skipped_dirty(engine)] == ["dirty"]
+
+
 def test_auto_sweep_skips_a_git_fault_and_keeps_the_trigger(project, monkeypatch):
     """The arm that motivated the reordering, and the one a `reason` field now
     tells apart from a genuinely dirty tree. `verify.worktree_clean` fails closed

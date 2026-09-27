@@ -125,10 +125,14 @@ class StoriesEngine(Engine):
         return stories.relativize_spec_folder(self.paths.project, spec_folder)
 
     def _stories_folder(self) -> Path:
-        """The spec folder resolved against the current workspace root (project
-        root at pick time, the unit worktree during a driven story)."""
+        """The spec folder resolved against the current workspace's PROJECT (the
+        project at pick time, the unit's mount project during a driven story).
+
+        The folder is stored project-relative (:meth:`_relativize`), so it joins on
+        ``workspace.paths.project`` — not ``workspace.root``, the code root, which a
+        ``repo_root:`` override moves away from the project (DW-379)."""
         rel = Path(self._spec_folder_rel)
-        return rel if rel.is_absolute() else self.workspace.root / rel
+        return rel if rel.is_absolute() else self.workspace.paths.project / rel
 
     def _load_stories(self) -> stories.Stories:
         return stories.load_stories(self._stories_folder())
@@ -381,8 +385,10 @@ class StoriesEngine(Engine):
         if label is not None:
             return {}
         # Let the dev/review adapter resolve the story spec deterministically by
-        # id (skip the mtime scan). Project-relative — the adapter rebases it
-        # against spec.cwd, so it is correct in place and under worktree isolation.
+        # id (skip the mtime scan). Project-relative — the adapter anchors it on the
+        # project's place in spec.cwd (`mountpaths.rebased_project`, the offset a
+        # nested `repo_root:` adds, DW-379), matching `_stories_folder`, so it is
+        # correct in place and under worktree isolation.
         env = {"BMAD_LOOP_SPEC_FOLDER": self._spec_folder_rel}
         # On a plan-halt leg tell the adapter to synthesize the ready-for-dev spec
         # as a *successful* terminal (plan done), not died-mid-flight. Keyed off the

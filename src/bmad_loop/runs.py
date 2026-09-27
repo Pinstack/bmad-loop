@@ -42,6 +42,7 @@ from .adapters.multiplexer import (
 from .frontmatter import auto_dev_baseline_of, parse_frontmatter, status_of
 from .journal import STATE_FILE, VERIFY_DIR, Journal, load_state, save_state, state_lock
 from .model import PAUSE_ESCALATION, Phase, RunState, StoryTask
+from .mountpaths import project_offset
 from .platform_util import (
     MAX_SEGMENT,
     UnconfinedWriteError,
@@ -3433,7 +3434,9 @@ def task_spec_path(task: StoryTask, state: RunState) -> Path:
     file exists.
 
     `StoryTask._serialized_worktree_path` (`model.py`) persists a worktree-local spec
-    RELATIVE to the mounted worktree root, and `from_dict` reads it back raw. Resolving
+    RELATIVE to the mount project (`RunState.mount_project`: the mounted worktree root
+    unless the project is nested inside the code root, DW-379), and `from_dict` reads
+    it back raw. Resolving
     that against the process cwd is not merely unreachable — it is actively wrong:
     `bmad-loop resolve` runs from the project root, where the MAIN CHECKOUT carries the
     same implementation-artifacts-relative path, so a bare `Path(task.spec_file)` names
@@ -3459,6 +3462,10 @@ def task_spec_path(task: StoryTask, state: RunState) -> Path:
 
 def task_spec_root(task: StoryTask, state: RunState) -> Path:
     """The tree a `task.spec_file` is anchored on — and confined to.
+
+    For a mounted task that tree is the MOUNT PROJECT (`RunState.mount_project`): the
+    worktree root in the default config, ``<worktree>/<offset>`` for a project nested
+    in the code root (DW-379). "Worktree" and "mount" below mean that tree.
 
     One definition backs both halves because they must not disagree: the root
     `task_spec_path` resolves against and the `confine_root` the writers validate the
@@ -3524,18 +3531,20 @@ def task_spec_root(task: StoryTask, state: RunState) -> Path:
     it, but matching that here would diverge from the gate this value is measured
     against and change writes that are correct today.
     """
-    worktree = task.worktree_path
-    if not worktree:
+    mount_project = state.mount_project(task)
+    if mount_project is None:
         return Path(state.project)
     raw = Path(task.spec_file or "")
-    if raw.is_absolute() and not raw.is_relative_to(worktree):
+    if raw.is_absolute() and not raw.is_relative_to(mount_project):
         return Path(state.project)
-    return Path(worktree)
+    return mount_project
 
 
 def task_stories_root(task: StoryTask | None, state: RunState) -> Path:
-    """The tree this run's STORIES FOLDER lives in — the workspace root, not a
-    confinement root.
+    """The tree this run's STORIES FOLDER lives in — the workspace's PROJECT (the
+    mount project for a mounted task, `RunState.mount_project`: the mount root in the
+    default config, ``<mount>/<offset>`` for a nested project, DW-379), not a
+    confinement root. "Mount" below means that tree.
 
     Deliberately NOT `task_spec_root`, which the sentinel and stories-block readers
     used to borrow. That function answers "which tree can CONFINE a write to
@@ -3580,7 +3589,9 @@ def task_stories_root(task: StoryTask | None, state: RunState) -> Path:
             return Path(state.project)
     except OSError:
         return Path(state.project)
-    return mount
+    # The mount's PROJECT, as `_stories_folder` joins on `workspace.paths.project`
+    # (DW-379): the mount itself unless the project is nested in the code root.
+    return state.mount_project(task) or mount
 
 
 def live_spec_path(task: StoryTask, state: RunState, project_root: Path) -> Path:
@@ -3638,7 +3649,7 @@ def live_spec_root_identity(
     swapped for a link to a tree holding a real ``<unit>`` matches the outside
     directory, and one gesture's writes may land in different directories. That
     residual is shared by every DW-338 pin and deferred for all of them at once."""
-    if not task.worktree_path or task_spec_root(task, state) != Path(task.worktree_path):
+    if not task.worktree_path or task_spec_root(task, state) != state.mount_project(task):
         return None
     identity = pinned_root_identity(live_spec_root(task, state, project_root))
     return _UNPINNABLE_MOUNT if identity is None else identity
@@ -3653,6 +3664,10 @@ def live_stories_root(task: StoryTask | None, state: RunState, project_root: Pat
     locator answering the recorded `state.project` after a project move reads the
     manifest from a tree the re-arm no longer writes: absent once the old tree is
     gone, stale while it lingers.
+
+    "Mount" here is the recorded mount's PROJECT (`RunState.mount_project`), as in
+    `task_stories_root` — ``<mount>/<offset>`` for a project nested in the code root
+    (DW-379).
 
     The mount is probed on its REBASED spelling FIRST, and that ordering is the whole
     content of this function. `RUNS_DIR` is ``.bmad-loop/runs``, so a mount is spelled
@@ -3673,7 +3688,8 @@ def live_stories_root(task: StoryTask | None, state: RunState, project_root: Pat
     tree that always exists.
     """
     if task is not None and task.worktree_path:
-        recorded_mount = Path(task.worktree_path)
+        # The mount's project, for `task_stories_root`'s reason (DW-379).
+        recorded_mount = state.mount_project(task) or Path(task.worktree_path)
         live_mount = rebase_recorded_project_path(recorded_mount, state, project_root)
         if live_mount != recorded_mount:
             try:
@@ -3769,8 +3785,9 @@ def _spec_is_inside_the_mount(task: StoryTask) -> bool:
     project can see it reaches. Only the mount is out of reach.
 
     A relative spelling beside a recorded mount is inside it BY CONSTRUCTION —
-    `_serialized_worktree_path` relativizes exactly when `relative_to(worktree_path)`
-    succeeds — so it needs no filesystem probe and gets none. Absolute spellings are
+    `_serialized_worktree_path` relativizes exactly when `relative_to(<mount project>)`
+    succeeds, and the mount project lies inside the mount (DW-379) — so it needs no
+    filesystem probe and gets none. Absolute spellings are
     canonicalized for the same reason the shared test does it (a `..` segment or a
     symlinked component puts a physically-inside path outside lexically), and a host
     that cannot canonicalize degrades to "inside": the safe direction here is the one
@@ -4348,7 +4365,9 @@ def _redrive_spec_status(state: RunState, task: StoryTask, *, isolated_redrive: 
     this task once `release_mount_owned_state` runs.
 
     Degrades to ``""`` on every uncertainty: a spec recorded absolute (nothing names
-    its position in the tree), an absent or non-blob path at that ref, a non-UTF-8 blob,
+    its position in the tree), an absent or non-blob path at that ref (including a
+    recorded pair that looks disjoint — a moved default-config project, read at the raw
+    spelling — whose spec is not at that spelling in the code root), a non-UTF-8 blob,
     or any `GitError` — which includes the project simply not being a repository, and a
     `target_branch` the code root no longer carries. ``""`` never equals a target
     status, so the caller's record still fires. Suppression therefore requires PROOF
@@ -4372,11 +4391,18 @@ def _redrive_spec_status(state: RunState, task: StoryTask, *, isolated_redrive: 
         except (OSError, UnicodeDecodeError):
             return ""
         return status_of(parse_frontmatter(text))
+    # The blob path is REPO-relative while `spec_file` is project-relative, so the
+    # project's offset inside the code root is prefixed (DW-379) — `app/...` for a
+    # project nested at `<repo>/app`, nothing in the default config. A pair that looks
+    # disjoint takes the raw spelling, as `RunState.mount_project` anchors on the
+    # mount: no mount is made for a disjoint layout, so such a pair is a default-config
+    # project that moved after launch (`state.project` stale, `repo_root` re-stamped).
+    offset = project_offset(Path(state.project), state.code_root) or "."
     try:
         blob = verify.file_bytes_at_revision(
             state.code_root,
             redrive_base_ref(state, isolated_redrive=isolated_redrive),
-            raw.as_posix(),
+            raw.as_posix() if offset == "." else f"{offset}/{raw.as_posix()}",
         )
     except verify.GitError:
         return ""
@@ -5325,20 +5351,20 @@ def _rearm_escalation_locked(
         # it, so under `isolation = "worktree"` the run-level `repo_root` is the main
         # checkout and the baseline is stamped in the worktree.
         #
-        # `bmadconfig.worktree_isolation_conflict` refuses worktree isolation beside a
-        # `repo_root:` OVERRIDE — a narrower fact than it looks. It forces
-        # `repo_root == project`; it says nothing about `repo_root` vs `workspace.root`.
-        # Under plain isolation with NO override those two still diverge and isolation is
-        # ON, so "wherever the roots could diverge, isolation is off" is false, and a rule
-        # built on it licenses treating `state.code_root` as the tree the dev writer
-        # stamped — which under isolation it is not.
+        # Nothing forces `repo_root == project`: since DW-379 a `repo_root:` override
+        # that CONTAINS the project may sit beside either isolation mode
+        # (`bmadconfig.worktree_isolation_conflict` refuses only a disjoint layout under
+        # worktree isolation). And nothing forces `repo_root == workspace.root` either:
+        # under isolation the two diverge, so a rule treating `state.code_root` as the
+        # tree the dev writer stamped is false there.
         #
-        # What is true, and the only claim to carry forward: `repo_root == project` in
-        # every reachable configuration, so reading HEAD here is right for the in-place
-        # case; and under isolation this value is deliberately SUPERSEDED rather than
-        # relied on — `engine._finish_inflight` discards the worktree and `_dev_phase`
-        # re-stamps `task.baseline_commit` from the fresh worktree's HEAD before any gate
-        # reads it. Do not carry an identity into new code; carry this argument.
+        # What is true, and the only claim to carry forward: in place,
+        # `workspace.root == paths.repo_root == state.code_root`, so reading HEAD here is
+        # right for the in-place case; and under isolation this value is deliberately
+        # SUPERSEDED rather than relied on — `engine._finish_inflight` discards the
+        # worktree and `_dev_phase` re-stamps `task.baseline_commit` from the fresh
+        # worktree's HEAD before any gate reads it. Do not carry an identity into new
+        # code; carry this argument.
         #
         # A pre-upgrade state.json with no recorded root degrades to `project` exactly as
         # before.

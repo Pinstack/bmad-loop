@@ -290,8 +290,10 @@ def _reject_bad_run_id(run_id: str | None) -> int | None:
 
 
 def _reject_isolation_conflict(paths: bmadconfig.ProjectPaths, pol) -> int | None:
-    """Refuse `isolation = "worktree"` under a `repo_root` override (#414). Returns
-    1 to abort, None to proceed — the `_reject_bad_run_id` shape.
+    """Refuse `isolation = "worktree"` when the project is not inside `repo_root` — a
+    DISJOINT layout (#414, narrowed to that layout by DW-379; a project nested in
+    `repo_root` is supported). Returns 1 to abort, None to proceed — the
+    `_reject_bad_run_id` shape.
 
     Called from the four sites that return an rc to a human: `cmd_run`, `cmd_sweep`,
     `_resume_paused_run` — the shared helper behind both `resume` and `resolve`'s
@@ -479,10 +481,12 @@ def cmd_validate(args: argparse.Namespace) -> int:
         report.fail("policy", str(e))
 
     # #414: the one configuration where every gate below reports on a surface the
-    # isolated run will never see. Reported only when it fires — there is no `ok`
-    # twin, because the supported case is "no such conflict", which would print a
-    # line about a coupling most projects have never configured either half of.
-    # Needs both halves loaded; either failing already has its own finding above.
+    # isolated run will never see — worktree isolation beside a `repo_root` the
+    # project does not lie inside (a disjoint layout; a nested one is supported since
+    # DW-379). Reported only when it fires — there is no `ok` twin, because the
+    # supported case is "no such conflict", which would print a line about a coupling
+    # most projects have never configured either half of. Needs both halves loaded;
+    # either failing already has its own finding above.
     if paths is not None and pol is not None:
         conflict = bmadconfig.worktree_isolation_conflict(paths, pol.scm.isolation)
         if conflict is not None:
@@ -542,14 +546,30 @@ def cmd_validate(args: argparse.Namespace) -> int:
     # going to return, and each further probe re-pays the entire `GIT_TIMEOUT_S` to
     # learn what this one already reported. Three probes against one hung git is
     # three deadlines — on the 120s default, six minutes to print one line.
+    #
+    # Probes the CODE root, as `cmd_run` and `cmd_sweep` do, so validate's verdict and
+    # their abort cannot disagree under a `repo_root:` override whose checkout is dirty
+    # outside the project (DW-379) — with the project's own policy.toml excluded at its
+    # offset there. A config that failed to load already failed above; the project is
+    # probed then, as before.
+    #
+    # The probed root is named (text and detail) only under a `repo_root` override,
+    # so the default config's output stays byte-identical.
     git_answers = True
+    clean_root = paths.repo_root if paths is not None else project
+    overridden = clean_root != project
+    where = f" ({clean_root})" if overridden else ""
     try:
-        if not verify.worktree_clean(project):
+        if not verify.worktree_clean(
+            clean_root, project=paths.project if paths is not None else None
+        ):
             report.fail(
-                "git.worktree-clean", "git worktree is not clean — commit or stash before running"
+                "git.worktree-clean",
+                f"git worktree is not clean{where} — commit or stash before running",
+                {"root": str(clean_root)} if overridden else None,
             )
         else:
-            report.ok("git.worktree-clean", "git worktree clean")
+            report.ok("git.worktree-clean", f"git worktree clean{where}")
     except verify.GitError as e:
         git_answers = not isinstance(e, (verify.GitSpawnError, verify.GitTimeoutError))
         report.fail("git.probe", f"git check failed: {e}")
@@ -2458,7 +2478,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             print(e, file=sys.stderr)
             return 1
 
-    if not verify.worktree_clean(paths.repo_root):
+    if not verify.worktree_clean(paths.repo_root, project=paths.project):
         print("git worktree is not clean — commit or stash first", file=sys.stderr)
         return 1
 
@@ -2896,7 +2916,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     if (rc := _reject_isolation_conflict(paths, pol)) is not None:
         return rc
 
-    if not verify.worktree_clean(paths.repo_root):
+    if not verify.worktree_clean(paths.repo_root, project=paths.project):
         print("git worktree is not clean — commit or stash first", file=sys.stderr)
         return 1
 
@@ -4109,8 +4129,9 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         # The SAME refusal `_resume_paused_run` makes, hoisted ahead of both writes
         # below — because aiming the mirror at the tree config.yaml names is only
         # correct for a configuration the orchestrator will actually run, and this is
-        # not one. `worktree_isolation_conflict` fires exactly when `repo_root` is an
-        # override beside `isolation = "worktree"`, so on that config the re-stamp
+        # not one. `worktree_isolation_conflict` fires exactly when `repo_root` does
+        # not contain the project beside `isolation = "worktree"` (a disjoint layout;
+        # DW-379 supports the nested one), so on that config the re-stamp
         # persisted the unsupported root and `rearm_escalation` then advanced the
         # attempt baseline (and re-stamped the spec's `baseline_revision`) against it
         # — all of it before `_resume_paused_run` at the bottom of this function
@@ -4121,11 +4142,11 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         # requires an escalation — could not re-run to correct it. The escalation was
         # burned on a gesture the orchestrator had already decided it would not honor.
         #
-        # It also falsified the premise the baseline advance is built on. `runs`
-        # reasons that `repo_root == project` "in every reachable configuration"
-        # BECAUSE this refusal exists, and reads the code tree's HEAD on that basis;
-        # a path that mutates first and refuses second made the unreachable
-        # configuration reachable, in the one function that had ruled it out.
+        # It also reached a configuration the baseline advance is not built for:
+        # `runs` reads the code tree's HEAD, which is right in place and superseded
+        # under isolation, but a disjoint isolated layout never runs at all — a path
+        # that mutates first and refuses second made that configuration reachable, in
+        # the one function that had ruled it out.
         #
         # Ordered after the confirm with the re-stamp, not before it: a cancelled
         # resolve still writes nothing, and an operator who declines is not owed a

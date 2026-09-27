@@ -46,6 +46,7 @@ from pathlib import Path
 
 import yaml
 
+from .mountpaths import rebased_project
 from .platform_util import resolve_or_lexical
 
 
@@ -88,20 +89,30 @@ class ProjectPaths:
 
     def rebased(self, new_root: Path) -> ProjectPaths:
         """Re-resolve the project and its artifact dirs onto `new_root` (a full
-        checkout, e.g. a git worktree). Artifact dirs configured outside the
-        project tree are shared, not per-checkout, so they don't move. The new
-        ProjectPaths is rooted at `new_root` for both `project` and `repo_root`."""
+        checkout of `repo_root`, e.g. a git worktree).
+
+        `repo_root` becomes `new_root`. The project becomes the MOUNT PROJECT —
+        :func:`mountpaths.rebased_project`, the single definition: the project's
+        offset inside `repo_root` re-joined onto `new_root` (``new_root`` itself in
+        the default config, ``<new_root>/app`` for a project at ``<repo>/app``), or
+        the project itself, unmoved, when it does not lie inside `repo_root`
+        (a disjoint layout, which worktree isolation refuses — see
+        :func:`worktree_isolation_conflict`). Artifact dirs move with the project:
+        each is re-joined onto the new project at its offset inside the old one, and
+        one configured outside the project tree is shared, not per-checkout, so it
+        doesn't move (DW-379)."""
         new_root = new_root.resolve()
+        new_project = rebased_project(self.project, self.repo_root, new_root)
 
         def rebase(p: Path) -> Path:
             try:
                 rel = p.relative_to(self.project)
             except ValueError:
                 return p  # configured outside the project tree; doesn't move
-            return (new_root / rel).resolve()
+            return (new_project / rel).resolve()
 
         return ProjectPaths(
-            project=new_root,
+            project=new_project,
             implementation_artifacts=rebase(self.implementation_artifacts),
             planning_artifacts=rebase(self.planning_artifacts),
             output_folder=rebase(self.output_folder),
@@ -110,40 +121,34 @@ class ProjectPaths:
 
 
 def worktree_isolation_conflict(paths: ProjectPaths, isolation: str) -> str | None:
-    """The refusal message for ``isolation = "worktree"`` under a `repo_root`
-    override, or None when the combination is supported (#414).
+    """The refusal message for ``isolation = "worktree"`` when the project directory
+    does not lie inside `repo_root` (a DISJOINT layout), or None when the combination
+    is supported (#414, narrowed by DW-379).
 
-    Worktree provisioning reads ``repo_root`` for every surface it seeds *off disk*
-    — the upstream skill trees, `_bmad/` and the `_bmad/custom/` overrides inside
-    it, and each `seed_files`/`seed_globs` entry — while `init`, `validate` and the
-    run preflight write and probe those same surfaces under ``project``. (The hook
-    relay depends on neither root: every hook config registers this installation's
-    own `bmad-loop relay <Event>` executable. The `MODULE_SKILLS` this wheel bundles
-    are seeded from package data and are unaffected by either root too; nothing is
-    seeded from ``project``, which `provision_worktree` is never even passed.)
-    `load_paths` *requires* its config under `project/_bmad/`, so `_bmad/` is under
-    `project` by definition and `repo_root/_bmad/` generally does not exist. When
-    the two diverge the preflight therefore approves a surface the isolated run
-    never receives, and the seed-completeness gates go inert rather than fire: an
-    isolated session dispatches into a worktree with no dev primitive and no
-    renderer, and stops with no result and nothing journaled naming the cause.
+    A unit worktree is a checkout of `repo_root`, so it can carry the project-local
+    surfaces provisioning seeds — `_bmad/` and the `_bmad/custom/` overrides inside
+    it, the upstream and bundled skill trees, the hook configs, each
+    `seed_files`/`seed_globs` entry — only when they live inside that checkout.
+    `load_paths` *requires* its config under `project/_bmad/`, so those surfaces are
+    under `project` by definition. A NESTED layout (the default `repo_root ==
+    project` included, or a monorepo whose BMAD project is `<repo>/app`) is
+    supported: the mount mirrors the main checkout and provisioning lands every
+    surface at the project's offset inside it (`worktree_flow.provision_worktree`'s
+    ``project=``). A disjoint layout — a sibling project, or `repo_root` nested inside
+    the project such as ``project/moved-code`` — has no mirror to build: the
+    checkout carries no copy of the project at all, so an isolated session would
+    dispatch into a worktree with no dev primitive and no renderer and stop with
+    nothing journaled naming the cause (the #414 silent stall). That layout is
+    refused by design, not pending a fix.
 
-    **This function exists to be deleted.** The real fix is DW-379 — plumb
-    ``project`` through provisioning for the non-git reads — and landing it removes this
-    function, all five of its call sites, the `policy.isolation-repo-root` id and
-    both doc sentences. It is a refusal rather than the fix because "which root
-    wins" is a separate decision per seeded surface (`_bmad/` only exists under
-    `project`; operator-configured `seed_files` may legitimately name a path outside
-    it), and `ProjectPaths.rebased` encodes `project == repo_root` besides. So the
-    message names only remediations that exist today. Both are named because either
-    alone is sufficient and which one is right is the operator's call: the override
-    buys a decoupled git root, the isolation mode buys per-unit worktrees, and until
-    DW-379 lands the orchestrator cannot give both.
+    The message names three remediations, because which one is right is the
+    operator's call: move the project inside `repo_root` (or point `repo_root` at
+    an ancestor of it), drop the `repo_root` override, or give up per-unit worktrees.
 
-    Sole producer of the text, shared by `cmd_validate`, the run/sweep preflight,
-    the dry-run honesty banner and the TUI's pre-launch guard, so the four cannot
-    drift. Compares resolved paths: `load_paths` resolves both sides, but a
-    hand-built :class:`ProjectPaths` (tests) need not have."""
+    Sole producer of the text, shared by `cmd_validate`, the run/sweep/resume/resolve
+    preflights, the dry-run honesty banner, the auto-sweep factory and the TUI's
+    guards, so they cannot drift. Compares canonical paths: `load_paths` resolves
+    both sides, but a hand-built :class:`ProjectPaths` (tests) need not have."""
     if isolation != "worktree":
         return None
     # The default config — no `repo_root` key, so `__post_init__` makes the two the
@@ -153,7 +158,8 @@ def worktree_isolation_conflict(paths: ProjectPaths, isolation: str) -> str | No
     # a persistent WinError 64) could have one side degrade to lexical while the other
     # succeeds and canonicalizes, making one path unequal to itself and refusing an
     # ordinary isolated run with the #414 text. Comparing raw first means the common
-    # shape cannot reach that window at all.
+    # shape cannot reach that window at all. (Only equality is settled raw: a lexical
+    # containment test would accept `repo/../elsewhere`, which canonicalizes outside.)
     if paths.repo_root == paths.project:
         return None
     # Degrades rather than raises (#552): this gate runs in `cmd_validate` *before*
@@ -163,19 +169,22 @@ def worktree_isolation_conflict(paths: ProjectPaths, isolation: str) -> str | No
     # degrade below covers only hand-built instances and a share flapping between
     # the load and this gate. Both sides take the same treatment, so a host that
     # cannot canonicalize compares lexical to lexical; the cost, stated rather than
-    # hidden: two spellings that only canonicalization folds together (`p/../p` vs
-    # `p`) would be refused with a wrong message, where the alternative is no
-    # message and no command at all.
-    if resolve_or_lexical(paths.repo_root) == resolve_or_lexical(paths.project):
+    # hidden: two spellings that only canonicalization relates (`p/../p` vs `p`)
+    # would be refused with a wrong message, where the alternative is no message
+    # and no command at all.
+    project = resolve_or_lexical(paths.project)
+    if project.is_relative_to(resolve_or_lexical(paths.repo_root)):
         return None
     return (
-        'isolation = "worktree" is not supported when repo_root differs from the project '
-        f"directory: worktree provisioning seeds from repo_root ({paths.repo_root}) while "
-        f"init, validate and the run preflight read the project ({paths.project}), so an "
-        "isolated session would get none of the skills the preflight just approved. "
-        "Remove the `repo_root` key from the BMAD config (_bmad/bmm/config.yaml or a "
-        "_bmad/ TOML layer), or set "
-        '`isolation = "none"` under [scm] in .bmad-loop/policy.toml.'
+        'isolation = "worktree" needs the project directory to be inside repo_root: '
+        f"the project ({paths.project}) is not inside repo_root ({paths.repo_root}), "
+        "and a unit worktree is a checkout of repo_root, so it can only carry the "
+        "project-local surfaces (_bmad/, skills, hooks) found inside it — an isolated "
+        "session would get none of the skills the preflight just approved. Move the "
+        "project inside repo_root (or point `repo_root` at an ancestor of the project), "
+        "remove the `repo_root` key from the BMAD config (_bmad/bmm/config.yaml or a "
+        '_bmad/ TOML layer), or set `isolation = "none"` under [scm] in '
+        ".bmad-loop/policy.toml."
     )
 
 

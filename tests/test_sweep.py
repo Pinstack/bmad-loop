@@ -35465,3 +35465,43 @@ def test_format_zero_escalation_keeps_the_cycle_reader_route(project, monkeypatc
     assert len(adapter.sessions) == 1 and "--migrate" not in adapter.sessions[0].prompt
     assert len(_records(resumed, "sweep-migration-recovery-invalid")) == invalid_before
     assert resumed.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
+
+
+def test_nested_recover_inflight_bundle_reanchors_on_the_mount_project(project, monkeypatch):
+    """DW-379: the sweep's copy of `Engine._finish_inflight`'s re-anchor uses the
+    mount PROJECT, `<mount>/app` under a nested `repo_root`, so a recorded mount's
+    project-relative spec spelling is rebound onto the tree that actually holds it.
+    Graded at `_release_orphaned_mount` (live policy is in-place, so the mounted
+    restart releases there), the first thing after the re-anchor.
+
+    Ablation: re-anchor on `Path(task.worktree_path)` in `_recover_inflight_bundle`
+    and this reddens on `<mount>/_bmad-output/...`."""
+    paths = nested_repo_root_paths(project)
+    engine, _ = make_sweep(
+        paths,
+        [],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            scm=ScmPolicy(isolation="none", rollback_on_failure=True),
+        ),
+    )
+    mount = engine.run_dir / "worktrees" / "dw-fix"
+    rel = "_bmad-output/implementation-artifacts/spec-dw-fix.md"
+    task = StoryTask("dw-fix", 0, phase=Phase.DEV_RUNNING, worktree_path=str(mount), spec_file=rel)
+    engine.state.tasks[task.story_key] = task
+    seen: list[str | None] = []
+
+    class _Stop(Exception):
+        pass
+
+    def spy(_task):
+        seen.append(_task.spec_file)
+        raise _Stop
+
+    monkeypatch.setattr(engine, "_release_orphaned_mount", spy)
+
+    with pytest.raises(_Stop):
+        engine._recover_inflight_bundle(task)
+
+    assert seen == [str(mount / "app" / rel)]

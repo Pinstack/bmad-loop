@@ -20,6 +20,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from .mountpaths import project_offset, rebased_project
+
 
 class Phase(StrEnum):
     PENDING = "pending"
@@ -587,7 +589,9 @@ class StoryTask:
             return
         raise KeyError(task_id)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, mount_project: Path | None = None) -> dict[str, Any]:
+        """``mount_project`` anchors the relative spec spellings: see
+        :meth:`_serialized_worktree_path`. ``RunState.to_dict`` passes each task's."""
         return {
             "story_key": self.story_key,
             "epic": self.epic,
@@ -636,8 +640,10 @@ class StoryTask:
             "artifact_payload": deepcopy(self.artifact_payload),
             "artifact_publication_complete": self.artifact_publication_complete,
             "integration_attempt": deepcopy(self.integration_attempt),
-            "spec_file": self._serialized_worktree_path(self.spec_file),
-            "dispatched_spec_file": self._serialized_worktree_path(self.dispatched_spec_file),
+            "spec_file": self._serialized_worktree_path(self.spec_file, mount_project),
+            "dispatched_spec_file": self._serialized_worktree_path(
+                self.dispatched_spec_file, mount_project
+            ),
             "dispatched_spec_snapshot": (
                 base64.b64encode(self.dispatched_spec_snapshot).decode("ascii")
                 if self.dispatched_spec_snapshot is not None
@@ -665,23 +671,32 @@ class StoryTask:
             "token_budget_warned": self.token_budget_warned,
         }
 
-    def _serialized_worktree_path(self, path: str | None) -> str | None:
-        """Persist a worktree-local spec path relative to its mounted root.
+    def _serialized_worktree_path(
+        self, path: str | None, mount_project: Path | None = None
+    ) -> str | None:
+        """Persist a worktree-local spec path relative to its mount PROJECT.
 
         Both the accepted/result spec and the attempt-owned dispatched spec use
         this one normalization path so their state.json representations cannot
-        drift. In-place and outside-worktree paths remain verbatim.
+        drift. In-place and outside-mount-project paths remain verbatim.
+
+        A relative spelling is always project-relative (DW-379): ``mount_project`` is
+        ``ProjectPaths.rebased(<mount>).project`` — the mount root itself unless the
+        project is nested inside ``repo_root`` (then ``<mount>/<offset>``). It
+        defaults to ``worktree_path``, which is exactly that answer for the default
+        config, so a state.json written before the offset existed keeps its meaning.
         """
         if not path or not self.worktree_path:
             return path
+        anchor = mount_project if mount_project is not None else Path(self.worktree_path)
         try:
             # as_posix: persist the relative path with forward slashes so state.json
             # stays portable across OSes (matches the in-worktree spec layout).
-            return Path(path).relative_to(self.worktree_path).as_posix()
+            return Path(path).relative_to(anchor).as_posix()
         except ValueError:
-            return path  # spec lives outside the worktree; keep absolute
+            return path  # spec lives outside the mount project; keep absolute
 
-    def release_spec_paths_from_mount(self) -> None:
+    def release_spec_paths_from_mount(self, mount_project: Path | None = None) -> None:
         """Give up the spec ownership a mount being DISCARDED carried.
 
         The counterpart to :meth:`rebase_spec_paths_on`, and deliberately not its
@@ -704,16 +719,17 @@ class StoryTask:
         unbound attempt is a legal state. `_record_dev_spec` cannot repair it either
         — it no-ops while `spec_file` is set.
 
-        Uses the same relativization as `to_dict`, so the discarded-mount spelling
-        and the persisted one cannot drift, which also means a spec OUTSIDE the mount
-        stays verbatim: it was never the mount's to give up. MUST be called while
-        `worktree_path` still names the mount.
+        Uses the same relativization as `to_dict` — ``mount_project`` is the same
+        anchor, defaulting to `worktree_path` — so the discarded-mount spelling and
+        the persisted one cannot drift, which also means a spec OUTSIDE the mount
+        project stays verbatim: it was never the mount's to give up. MUST be called
+        while `worktree_path` still names the mount.
         """
         self.dispatched_spec_file = None
         self.dispatched_spec_snapshot = None
-        self.spec_file = self._serialized_worktree_path(self.spec_file)
+        self.spec_file = self._serialized_worktree_path(self.spec_file, mount_project)
 
-    def release_mount_owned_state(self) -> None:
+    def release_mount_owned_state(self, mount_project: Path | None = None) -> None:
         """Give up EVERYTHING a mount owned: its spec ownership and the measurements
         taken inside it.
 
@@ -736,9 +752,10 @@ class StoryTask:
         no-op instead of a probe of the wrong tree.
 
         MUST be called while `worktree_path` still names the mount — the spec
-        relativization is measured against it.
+        relativization is measured against it (or against ``mount_project``, the
+        mount's project, when the caller knows it: see `release_spec_paths_from_mount`).
         """
-        self.release_spec_paths_from_mount()
+        self.release_spec_paths_from_mount(mount_project)
         self.artifact_baseline = None
         self.artifact_destination = None
         self.artifact_source_digests = None
@@ -770,8 +787,9 @@ class StoryTask:
         Idempotent: an absolute value is already anchored (a spec outside the mount
         is persisted verbatim) and passes through untouched, so re-running this
         against the same root cannot double-join. `root` is the tree the values were
-        persisted relative to — `task.worktree_path` — never the caller's cwd or
-        project.
+        persisted relative to — the MOUNT PROJECT, ``ProjectPaths.rebased(
+        task.worktree_path).project`` (`task.worktree_path` itself unless the project
+        is nested, DW-379) — never the caller's cwd or the main project.
         """
         self.spec_file = _rebased_on(self.spec_file, root)
         self.dispatched_spec_file = _rebased_on(self.dispatched_spec_file, root)
@@ -1132,6 +1150,28 @@ class RunState:
         rather than to a path that does not exist."""
         return Path(self.repo_root or self.project)
 
+    def mount_project(self, task: StoryTask) -> Path | None:
+        """The mount project of ``task``'s recorded mount, or None without one.
+
+        ``ProjectPaths.rebased(<mount>).project`` recomputed from what this state
+        records — ``project`` and :attr:`code_root` — through the one shared
+        definition, :func:`mountpaths.rebased_project`: the mount itself unless the
+        project is nested inside the code root (DW-379). The anchor every relative
+        spec spelling of that task is persisted against and read back from.
+
+        A recorded pair that looks DISJOINT answers the mount itself, the pre-DW-379
+        anchor. No mount is ever made for a disjoint layout (worktree isolation refuses
+        it), so a recorded mount beside such a pair means the recorded spellings went
+        stale — a project moved in the default config keeps its launch-time `project`
+        while resume re-stamps `repo_root` — and the default config's answer is the
+        mount root."""
+        if not task.worktree_path:
+            return None
+        mount = Path(task.worktree_path)
+        if project_offset(Path(self.project), self.code_root) is None:
+            return mount
+        return rebased_project(Path(self.project), self.code_root, mount)
+
     def handled_keys(self) -> set[str]:
         """Story keys this run already drove to a terminal phase."""
         return {k for k, t in self.tasks.items() if t.terminal}
@@ -1199,7 +1239,7 @@ class RunState:
             "sweeps_refused": self.sweeps_refused,
             "target_branch": self.target_branch,
             "plugin_shared": self.plugin_shared,
-            "tasks": {k: t.to_dict() for k, t in self.tasks.items()},
+            "tasks": {k: t.to_dict(self.mount_project(t)) for k, t in self.tasks.items()},
         }
 
     @classmethod

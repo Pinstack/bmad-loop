@@ -702,6 +702,37 @@ def make_dev_adapter(tmp_path, profile_name="claude", policy=None, mux=None):
     return adapter, impl
 
 
+def test_artifact_dirs_is_identity_in_place_under_a_nested_repo_root(tmp_path):
+    """DW-379, `isolation = "none"` beside a nested `repo_root:` override: the session
+    cwd is the CODE root `<repo>`, while the project (and its artifacts) sit at
+    `<repo>/app`. `_artifact_dirs(cwd)` rebases onto that cwd, which must be the
+    identity in place — the scan searches the project's REAL implementation-artifacts
+    dir, and only it.
+
+    Ablation: restore the pre-DW-379 `project=new_root` in `ProjectPaths.rebased` and
+    this fails — the primary becomes `<repo>/_bmad-output/impl`, the OUTER tree's
+    path, with the real dir demoted to the fallback."""
+    repo = tmp_path / "repo"
+    app = repo / "app"
+    impl = app / "_bmad-output" / "impl"
+    impl.mkdir(parents=True)
+    paths = ProjectPaths(
+        project=app,
+        implementation_artifacts=impl,
+        planning_artifacts=app / "_bmad-output" / "plan",
+        repo_root=repo,
+    )
+    adapter = GenericDevAdapter(
+        run_dir=tmp_path / "run",
+        policy=Policy(limits=LimitsPolicy()),
+        profile=get_profile("claude"),
+        paths=paths,
+        mux=_UnitMux(),
+    )
+
+    assert adapter._artifact_dirs(repo) == [impl]
+
+
 class _ScriptedWatcher:
     """SignalWatcher stand-in: yields a scripted HookEvent per wait_for call, then
     None. on_call(n) fires before the nth return so a test can flush an on-disk
@@ -967,6 +998,40 @@ def test_stories_readback_resolves_by_id_not_mtime_scan(tmp_path, monkeypatch):
     assert rj["status"] == "done"
     assert rj["story_key"] == "1"
     assert rj["baseline_commit"] == "story1base"  # the story spec, not the stray
+
+
+def test_stories_readback_anchors_on_the_project_under_a_nested_repo_root(tmp_path):
+    """DW-379: `BMAD_LOOP_SPEC_FOLDER` is project-relative and
+    `StoriesEngine._stories_folder` joins it on the project, so with a nested
+    `repo_root` (session cwd = the code root `<repo>`, the project `<repo>/app`) the
+    read-back must look under `<cwd>/app/<folder>` — the same place the engine reads.
+    An outer-tree decoy at `<cwd>/<folder>` is planted to separate the two by value.
+
+    Ablation: anchor a relative folder on `spec.cwd` again and this reddens on the
+    decoy's baseline."""
+    repo = tmp_path / "repo"
+    app = repo / "app"
+    impl = app / "_bmad-output" / "impl"
+    impl.mkdir(parents=True)
+    adapter = GenericDevAdapter(
+        run_dir=tmp_path / "run",
+        policy=Policy(limits=LimitsPolicy()),
+        profile=get_profile("claude"),
+        paths=ProjectPaths(
+            project=app,
+            implementation_artifacts=impl,
+            planning_artifacts=app / "_bmad-output" / "plan",
+            repo_root=repo,
+        ),
+        mux=_UnitMux(),
+    )
+    done = "---\nstatus: done\nbaseline_revision: {}\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    _write_story_spec(app, "1", "real", done.format("projectbase"))
+    _write_story_spec(repo, "1", "decoy", done.format("outerbase"))
+
+    rj = adapter._result_json(_dev_handle(), _stories_spec(repo), wait=True)
+
+    assert rj is not None and rj["baseline_commit"] == "projectbase"
 
 
 def test_stories_readback_sentinel_is_blocked_escalation(tmp_path):

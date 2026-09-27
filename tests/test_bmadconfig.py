@@ -1,11 +1,13 @@
 """ProjectPaths.repo_root / rebased and load_paths(repo_root) — the Phase 1
 Workspace-seam foundation. repo_root defaults to project (today's behavior);
-rebased re-roots artifacts onto a worktree-style checkout. Plus
-worktree_isolation_conflict, the #414 refusal predicate built on the same pair, and
-load_paths' two sources: the four-layer central TOML and the legacy YAML (#769)."""
+rebased re-roots artifacts onto a worktree-style checkout, keeping a nested project's
+offset (DW-379). Plus worktree_isolation_conflict, the #414 refusal predicate built
+on the same pair (narrowed by DW-379 to a project outside repo_root), and load_paths'
+two sources: the four-layer central TOML and the legacy YAML (#769)."""
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import os
 import sys
@@ -15,14 +17,16 @@ import pytest
 from conftest import (
     CENTRAL_TEAM_CONFIG,
     CENTRAL_USER_CONFIG,
+    NESTED_SUBDIR,
     NUL_PATH_RESOLVE_FAULTS,
     UNRESOLVABLE,
     install_bmad_central_config,
     install_bmad_config,
+    nested_repo_root_paths,
     refuse_to_resolve,
 )
 
-from bmad_loop import bmadconfig, cli, platform_util
+from bmad_loop import bmadconfig, cli, mountpaths, platform_util
 from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.workspace import Workspace
 
@@ -119,6 +123,141 @@ def test_rebased_leaves_external_artifacts_in_place(tmp_path: Path) -> None:
     # configured outside the project tree → shared, not per-checkout
     assert rebased.implementation_artifacts == external
     assert rebased.planning_artifacts == (tmp_path / "worktree" / "out" / "plan").resolve()
+
+
+def test_rebased_keeps_a_nested_projects_offset(project) -> None:
+    """DW-379, nested monorepo: `repo_root` is the checkout, the project `<repo>/app`.
+    The mount mirrors the main checkout, so the rebased project is `<mount>/app` and
+    `repo_root` the mount itself. Artifact dirs follow the project to the same offset,
+    and one outside the project (here the checkout's own `shared/`) stays unmoved.
+
+    Ablation: restore `project=new_root` in `rebased` and the project and artifact
+    assertions fail, landing on `<mount>/_bmad-output/...` — the OUTER tree's path."""
+    paths = nested_repo_root_paths(project)
+    assert paths.project == paths.repo_root / NESTED_SUBDIR, "premise: nested roots"
+    shared = paths.repo_root / "shared" / "impl"
+    with_external = dataclasses.replace(paths, planning_artifacts=shared)
+    wt = paths.repo_root.parent / "mount"
+    wt.mkdir()
+
+    rebased = with_external.rebased(wt)
+
+    mount = wt.resolve()
+    assert rebased.repo_root == mount
+    assert rebased.project == mount / NESTED_SUBDIR
+    assert rebased.project == mountpaths.rebased_project(paths.project, paths.repo_root, mount)
+    assert rebased.implementation_artifacts == (
+        mount / NESTED_SUBDIR / "_bmad-output" / "implementation-artifacts"
+    )
+    assert rebased.output_folder == mount / NESTED_SUBDIR / "_bmad-output"
+    # outside the PROJECT (though inside the checkout): shared, never moved
+    assert rebased.planning_artifacts == shared
+
+
+def test_rebased_onto_repo_root_is_identity_for_a_nested_project(project) -> None:
+    """In place (`isolation = "none"`) callers rebase onto the session cwd, which is
+    `repo_root`: for a nested project that must hand back the project's REAL paths,
+    not `<repo>/_bmad-output/...` (the adapter's `_artifact_dirs` does exactly this).
+
+    Ablation: restore `project=new_root` in `rebased` and this reddens on the outer
+    tree's artifact dir."""
+    paths = nested_repo_root_paths(project)
+
+    rebased = paths.rebased(paths.repo_root)
+
+    assert rebased.project == paths.project
+    assert rebased.implementation_artifacts == paths.implementation_artifacts
+    assert rebased.output_folder == paths.output_folder
+
+
+def test_rebased_leaves_a_disjoint_project_unmoved(tmp_path: Path) -> None:
+    """A project NOT inside `repo_root` has no copy in a checkout of it, so `rebased`
+    leaves the project and its artifacts unmoved — a pure fallback (worktree isolation
+    refuses this layout, so no mount is ever made for it); only `repo_root` moves."""
+    project = tmp_path / "bmad"
+    paths = ProjectPaths(
+        project=project,
+        implementation_artifacts=project / "out" / "impl",
+        planning_artifacts=project / "out" / "plan",
+        repo_root=tmp_path / "code",
+    )
+    wt = tmp_path / "worktree"
+
+    rebased = paths.rebased(wt)
+
+    assert rebased.repo_root == wt.resolve()
+    assert rebased.project == project
+    assert rebased.implementation_artifacts == project / "out" / "impl"
+    assert rebased.planning_artifacts == project / "out" / "plan"
+
+
+def test_rebased_project_is_identity_offset_for_the_default_config(tmp_path: Path) -> None:
+    """The default config (`repo_root == project`) has offset `.`, so the mount project
+    is the mount root spelled exactly as passed — the byte-identical arm every existing
+    isolated run takes."""
+    root = tmp_path / "p"
+    wt = tmp_path / "wt"
+    assert str(mountpaths.rebased_project(root, root, wt)) == str(wt)
+    assert mountpaths.project_offset(root, root) == "."
+    assert mountpaths.project_offset(root / "app", root) == "app"
+    assert mountpaths.project_offset(tmp_path / "other", root) is None
+
+
+def _paths(project: Path, repo_root: Path) -> ProjectPaths:
+    return ProjectPaths(
+        project=project,
+        implementation_artifacts=project / "impl",
+        planning_artifacts=project / "plan",
+        repo_root=repo_root,
+    )
+
+
+@pytest.mark.parametrize(
+    "layout",
+    ["sibling", "repo-root-inside-project", "dotdot-escape"],
+)
+def test_worktree_isolation_conflict_refuses_a_disjoint_layout(tmp_path: Path, layout) -> None:
+    """The narrowed #414 predicate (DW-379): refused exactly when the project is NOT
+    inside `repo_root`. Both disjoint shapes refuse, and so does a `repo_root` that is
+    lexically an ancestor but canonically is not (`repo/../elsewhere` is compared after
+    canonicalization, never by spelling). The message names the three remediations.
+
+    Ablation: make the predicate return None for every layout (the retired refusal)
+    and each row reddens."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    if layout == "sibling":
+        repo_root = tmp_path / "code"
+    elif layout == "repo-root-inside-project":
+        repo_root = project / "moved-code"
+    else:
+        (tmp_path / "repo").mkdir()
+        repo_root = tmp_path / "repo"
+        project = tmp_path / "repo" / ".." / "proj"
+        assert project.is_relative_to(repo_root), "premise: lexically nested"
+    repo_root.mkdir(exist_ok=True)
+
+    conflict = bmadconfig.worktree_isolation_conflict(_paths(project, repo_root), "worktree")
+
+    assert conflict is not None
+    assert conflict.startswith('isolation = "worktree" needs the project directory')
+    assert "Move the project inside repo_root" in conflict
+    assert "remove the `repo_root` key" in conflict
+    assert '`isolation = "none"`' in conflict
+    assert bmadconfig.worktree_isolation_conflict(_paths(project, repo_root), "none") is None
+
+
+def test_worktree_isolation_conflict_allows_a_nested_layout(tmp_path: Path) -> None:
+    """A project INSIDE `repo_root` (the monorepo shape) is supported (DW-379).
+
+    Ablation: widen the predicate back to "any `repo_root` override" and this
+    reddens."""
+    repo_root = tmp_path / "repo"
+    (repo_root / "app").mkdir(parents=True)
+    paths = _paths(repo_root / "app", repo_root)
+    assert paths.repo_root != paths.project, "premise: the roots really diverge"
+
+    assert bmadconfig.worktree_isolation_conflict(paths, "worktree") is None
 
 
 def test_workspace_default_uses_repo_root(tmp_path: Path) -> None:

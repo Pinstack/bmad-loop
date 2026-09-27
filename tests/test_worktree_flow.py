@@ -1813,3 +1813,53 @@ def test_gc_legacy_bundle_with_already_removed_mount_stays_compatible(project, t
     flow = _make_flow(tmp_path, paths=project, state=state, policy=_policy(isolation="worktree"))
     flow.gc_run_worktrees()
     assert flow.calls.pauses == []
+
+
+# ------------------------------------------------ nested repo_root (DW-379)
+
+
+def test_nested_ledger_board_and_accepted_spec_seeds_land_under_the_mount_project(
+    project, tmp_path
+):
+    """DW-379: under a nested `repo_root` the orchestrator-owned seeds are spelled
+    PROJECT-relative (`_artifact_seed` against the main project) and provisioning,
+    handed the project, lands them at the mount project `<worktree>/app/...` — never at
+    the checkout root, where the same relative spelling names the outer tree. The
+    accepted spec's locator targets the mount project too.
+
+    Ablation: seed against the checkout roots (`self.paths.repo_root, worktree`) and
+    the rels come back `app/_bmad-output/...`, which provisioning then lands at
+    `<worktree>/app/app/...`."""
+    from conftest import nested_repo_root_paths
+
+    paths = nested_repo_root_paths(project)
+    repo, app = paths.repo_root, paths.project
+    impl_rel = paths.implementation_artifacts.relative_to(app).as_posix()
+    # untracked in main, so a fresh checkout cannot deliver any of the three
+    paths.deferred_work.write_text("# ledger\n", encoding="utf-8")
+    paths.sprint_status.write_text("development_status:\n  1-1-a: ready-for-dev\n")
+    accepted = paths.implementation_artifacts / "spec-1-1-a.md"
+    accepted.write_text("---\nstatus: ready-for-dev\n---\n", encoding="utf-8")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    flow = _make_flow(tmp_path, paths=paths)
+    task = StoryTask("1-1-a", 1, spec_file=f"{impl_rel}/spec-1-1-a.md")
+
+    seeds = [
+        *flow._ledger_seed(wt),
+        *flow._board_seed(wt),
+        *flow._accepted_spec_seed(task, wt, project_relative_only=True),
+    ]
+
+    assert seeds == [
+        f"{impl_rel}/deferred-work.md",
+        f"{impl_rel}/sprint-status.yaml",
+        f"{impl_rel}/spec-1-1-a.md",
+    ]
+    ends = flow._accepted_spec_pair(task, wt, project_relative_only=True)
+    assert ends.destination == (wt / "app" / impl_rel / "spec-1-1-a.md").resolve()
+
+    assert provision_worktree(wt, [], repo, seed_files=seeds, project=app) == []
+    for rel in seeds:
+        assert (wt / "app" / rel).is_file(), rel
+        assert not (wt / rel).exists(), rel

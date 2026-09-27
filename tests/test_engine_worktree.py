@@ -33,6 +33,7 @@ from conftest import (
     git,
     ignore_before_commit,
     install_build_auto_skill,
+    nested_repo_root_paths,
     refuse_to_resolve,
     set_sprint,
     write_gated_ledger,
@@ -10178,3 +10179,348 @@ def test_adopt_of_a_task_with_operator_actions_parks_it(project):
     assert verify.status_of(verify.read_frontmatter(main_spec)) == "awaiting-operator"
     assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
     assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+
+
+# ------------------------------------------- nested repo_root (DW-379)
+
+
+def test_worktree_nested_repo_root_runs_and_merges_back(project):
+    """DW-379 end to end: the BMAD project nested at `<repo>/app`, `repo_root` the
+    checkout, `isolation = "worktree"`. The unit mount mirrors the main checkout, so
+    the session runs from the mount ROOT (as it runs from `repo_root` in place) while
+    its workspace paths — and the spec it writes — sit under `<mount>/app`; the
+    persisted spec spelling is project-relative; the unit merges back and leaves the
+    main tree clean.
+
+    Ablation: restore `project=new_root` in `ProjectPaths.rebased` and the workspace
+    assertion reddens on `<mount>` — the session would look for its artifacts in the
+    OUTER tree's `_bmad-output`."""
+    paths = nested_repo_root_paths(project)
+    repo, app = paths.repo_root, paths.project
+    commit_sprint(paths, {"1-1-a": "ready-for-dev"})
+    head_before = rev_parse_head(repo)
+    seen: dict[str, object] = {}
+    base = wt_dev_effect(paths, "1-1-a", followup_review=False)
+    holder: dict[str, Engine] = {}
+
+    def dev(spec):
+        seen["cwd"] = spec.cwd.resolve()
+        seen["project"] = holder["engine"].workspace.paths.project
+        result = base(spec)
+        seen["spec"] = Path(result.result_json["spec_file"])
+        return result
+
+    engine, adapter = make_engine(paths, [dev])
+    # a real profile, so the module-skill copy and its delivery probe actually run
+    attach_profile(adapter)
+    engine.state.repo_root = str(repo)  # as runsetup stamps it at run start
+    holder["engine"] = engine
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused, journal_kinds(engine)
+    mount = seen["cwd"]
+    assert isinstance(mount, Path) and mount != repo.resolve()
+    assert seen["project"] == mount / "app"
+    impl = mount / "app" / "_bmad-output" / "implementation-artifacts"
+    assert seen["spec"] == impl / "spec-1-1-a.md"
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE
+    assert rev_parse_head(repo) != head_before
+    assert "change for 1-1-a" in (repo / "src.txt").read_text()
+    # the spec merged back to the main project, not to the checkout root
+    assert (app / "_bmad-output" / "implementation-artifacts" / "spec-1-1-a.md").is_file()
+    assert not (repo / "_bmad-output" / "implementation-artifacts" / "spec-1-1-a.md").exists()
+    assert sprintstatus.story_status(paths.sprint_status, "1-1-a") == "done"
+    assert [p.resolve() for p in worktree_list(repo)] == [repo.resolve()]
+    assert worktree_clean(repo, project=app)
+    kinds = journal_kinds(engine)
+    assert "unit-merged" in kinds
+    assert "worktree-seed-dropped" not in kinds
+    assert "worktree-module-skills-dropped" not in kinds
+
+
+def _nested_unit(project):
+    """Nested roots, a committed board, an engine, and one mounted unit."""
+    from bmad_loop.workspace import open_unit_workspace
+
+    paths = nested_repo_root_paths(project)
+    commit_sprint(paths, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(paths, [])
+    engine.state.repo_root = str(paths.repo_root)
+    unit = open_unit_workspace(
+        paths.repo_root, paths, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    return paths, engine, unit
+
+
+def test_nested_reopen_reanchors_on_the_mount_project(project):
+    """`reopen_unit` re-absolutizes the persisted (project-relative) spellings onto the
+    reopened mount's PROJECT, `<mount>/app` — never the mount root, where the same
+    relative spelling names the outer tree.
+
+    Ablation: re-anchor on `wt` in `reopen_unit` and both assertions land at
+    `<mount>/_bmad-output/...`."""
+    _paths, engine, unit = _nested_unit(project)
+    task = StoryTask("1-1-a", 1, phase=Phase.DEV_VERIFY)
+    task.worktree_path = str(unit.path)
+    task.branch = unit.branch
+    task.spec_file = "_bmad-output/accepted.md"
+    task.dispatched_spec_file = "_bmad-output/dispatched.md"
+
+    reopened = engine._reopen_unit(task)
+
+    assert reopened.workspace.paths.project == unit.path.resolve() / "app"
+    assert task.spec_file == str(unit.path / "app" / "_bmad-output/accepted.md")
+    assert task.dispatched_spec_file == str(unit.path / "app" / "_bmad-output/dispatched.md")
+
+
+def test_nested_finish_inflight_reanchors_on_the_mount_project(project, monkeypatch):
+    """`_finish_inflight`'s pre-discard re-anchor uses the mount PROJECT too.
+
+    Ablation: re-anchor on `Path(task.worktree_path)` in `_finish_inflight` and both
+    assertions land at `<mount>/_bmad-output/...`."""
+    _paths, engine, unit = _nested_unit(project)
+    task = StoryTask("1-1-a", 1, phase=Phase.DEV_RUNNING)
+    task.worktree_path = str(unit.path)
+    task.branch = unit.branch
+    task.spec_file = "_bmad-output/accepted.md"
+    task.dispatched_spec_file = "_bmad-output/dispatched.md"
+    engine.state.tasks["1-1-a"] = task
+    seen: dict[str, str | None] = {}
+
+    class _StopAtDiscard(Exception):
+        pass
+
+    def _spy(*_args, **_kwargs):
+        seen["spec_file"] = task.spec_file
+        seen["dispatched_spec_file"] = task.dispatched_spec_file
+        raise _StopAtDiscard
+
+    monkeypatch.setattr("bmad_loop.engine.discard_worktree", _spy)
+
+    with pytest.raises(_StopAtDiscard):
+        engine._finish_inflight()
+
+    assert seen["spec_file"] == str(unit.path / "app" / "_bmad-output/accepted.md")
+    assert seen["dispatched_spec_file"] == str(unit.path / "app" / "_bmad-output/dispatched.md")
+
+
+def test_nested_restart_release_keeps_the_project_relative_spelling(project):
+    """`_discard_unit_for_restart` releases the mount's spec ownership relative to the
+    mount PROJECT, so the durable spelling is the project-relative one a replacement
+    mount (or the main checkout) re-resolves against its own project — not
+    `app/_bmad-output/...`, which would then double the offset.
+
+    Ablation: release without the mount project (`release_mount_owned_state()`) and
+    this reddens on `app/_bmad-output/...`."""
+    _paths, engine, unit = _nested_unit(project)
+    rel = "_bmad-output/implementation-artifacts/spec-1-1-a.md"
+    task = StoryTask("1-1-a", 1, phase=Phase.DEV_RUNNING)
+    task.worktree_path = str(unit.path)
+    task.branch = unit.branch
+    task.spec_file = str(unit.path / "app" / rel)
+    task.dispatched_spec_file = str(unit.path / "app" / rel)
+    engine.state.tasks["1-1-a"] = task
+
+    engine._discard_unit_for_restart(task)
+
+    assert task.worktree_path == ""
+    assert task.spec_file == rel
+    assert task.dispatched_spec_file is None
+
+
+def test_nested_orphaned_mount_release_keeps_the_project_relative_spelling(project):
+    """`_release_orphaned_mount` (a restart that will run in main after an isolation
+    flip) releases relative to the mount PROJECT, for the reason the row above gives.
+
+    Ablation: release without the mount project and this reddens on `app/...`."""
+    _paths, engine, unit = _nested_unit(project)
+    rel = "_bmad-output/implementation-artifacts/spec-1-1-a.md"
+    task = StoryTask("1-1-a", 1, phase=Phase.DEV_RUNNING)
+    task.worktree_path = str(unit.path)
+    task.branch = unit.branch
+    task.spec_file = str(unit.path / "app" / rel)
+    engine.state.tasks["1-1-a"] = task
+
+    engine._release_orphaned_mount(task)
+
+    assert task.worktree_path == ""
+    assert task.spec_file == rel
+
+
+def test_nested_missing_upstream_skill_escalates_before_dispatch(project, tmp_path):
+    """DW-379: the completeness gate reads the MOUNT PROJECT under nested roots. A dev
+    primitive linked to a shared install outside the repo passes the main checkout's
+    through-link resolution under `app/.claude/skills` but cannot be copied into
+    `<mount>/app/...`, so the unit escalates before any session — rather than probing
+    the checkout root, where no source exists and the gate would go inert (the #414
+    silent stall).
+
+    Ablation: make `base_skills_seed_incomplete` ignore `project=` and the run
+    dispatches instead of escalating."""
+    paths = nested_repo_root_paths(project)
+    tree = ".claude/skills"
+    ignore_before_commit(paths, ".claude/")
+    commit_sprint(paths, {"1-1-a": "ready-for-dev"})
+    shared_skills = install_build_auto_skill(tmp_path / "shared", tree)
+    linked_skill = paths.project / tree / DEV_PRIMITIVE_NEW
+    linked_skill.parent.mkdir(parents=True)
+    linked_skill.symlink_to(shared_skills / DEV_PRIMITIVE_NEW, target_is_directory=True)
+
+    engine, adapter = make_engine(
+        paths,
+        [wt_dev_effect(paths, "1-1-a"), wt_review_effect(paths, "1-1-a", clean=True)],
+    )
+    attach_profile(adapter)
+    engine.state.repo_root = str(paths.repo_root)
+
+    summary = engine.run()
+
+    assert summary.paused and adapter.sessions == []
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED
+    assert f"{tree}/{DEV_PRIMITIVE_NEW}" in (engine.state.paused_reason or "")
+
+
+def test_nested_missing_stories_support_probes_the_mount_project(project, tmp_path):
+    """The stories-support probe `run_isolated` runs is handed the mount project
+    (`_mount_roots(...)[1]`), `<mount>/app` under nested roots — where provisioning
+    lands the skill tree. Probed at the checkout root it would find no tree at all.
+
+    A direct probe, not a `run_isolated` drive: it grades the root `_mount_roots`
+    hands the call site, and that the mount root is the wrong one to probe.
+
+    Ablation: make `provision_roots` answer the checkout roots and the first assertion
+    reddens. Green-ablation: swapping `run_isolated`'s call site back to `unit.path`
+    does NOT redden this row — nothing here drives that call."""
+    from bmad_loop.install import missing_stories_support
+
+    paths = nested_repo_root_paths(project)
+    tree = ".claude/skills"
+    wt = tmp_path / "wt"
+    install_build_auto_skill(wt / "app", tree, folder_id=True)
+    flow = make_engine(paths, [])[0]._worktree_flow
+
+    mount_project = flow._mount_roots(wt)[1]
+
+    assert mount_project == wt / "app"
+    assert missing_stories_support(mount_project, [tree]) == []
+    assert missing_stories_support(wt, [tree]) != []
+
+
+def test_nested_redrive_delivers_an_accepted_project_relative_spec(project):
+    """A re-drive carrying an accepted, project-relative spec the checkout cannot
+    deliver (gitignored under `app/`) into a replacement mount: the seed lands at the
+    mount PROJECT, the delivery probe finds it there, and the unit dispatches with no
+    escalation and no `accepted-spec-delivery-unreachable` record.
+
+    Ablation: anchor the locator's destination (or the undelivered probe) on the mount
+    root and the record fires / the session reads nothing."""
+    paths = nested_repo_root_paths(project)
+    rel = "_bmad-output/implementation-artifacts/accepted-ignored.md"
+    ignore_before_commit(paths, rel)
+    commit_sprint(paths, {"1-1-a": "ready-for-dev"})
+    (paths.project / rel).write_bytes(b"accepted operator bytes\n")
+
+    engine, _ = make_engine(paths, [], policy=wt_policy(keep_failed=False))
+    engine.state.repo_root = str(paths.repo_root)
+    engine.state.target_branch = "main"
+    task = StoryTask("1-1-a", 1, spec_file=rel)
+    engine.state.tasks[task.story_key] = task
+    seen: list[bytes] = []
+
+    def drive(current):
+        seen.append((engine.workspace.paths.project / rel).read_bytes())
+        current.phase = Phase.DEFERRED
+        current.defer_reason = "test complete"
+
+    engine._run_isolated(task, drive)
+
+    assert seen == [b"accepted operator bytes\n"]
+    assert task.phase != Phase.ESCALATED
+    assert _undelivered_records(engine) == []
+    assert "story-escalated" not in journal_kinds(engine)
+
+
+def test_nested_stories_mode_unit_dispatches_with_its_primitive_under_the_project(project):
+    """A stories-mode unit under nested roots, driven through `run_isolated`: the dev
+    primitive lives at `app/.claude/skills`, provisioning lands it at `<mount>/app/...`,
+    and the stories-support gate probes that mount project, so the unit dispatches
+    with no escalation. The drive-level twin of
+    `test_nested_missing_stories_support_probes_the_mount_project`, which grades the
+    root but not the call site.
+
+    Ablation: hand `missing_stories_support` `unit.path` in `run_isolated` and the
+    gate finds no tree at the checkout root — the unit escalates before the drive."""
+    paths = nested_repo_root_paths(project)
+    tree = ".claude/skills"
+    ignore_before_commit(paths, ".claude/")
+    commit_sprint(paths, {"1-1-a": "ready-for-dev"})
+    install_build_auto_skill(paths.project, tree, folder_id=True)
+
+    engine, adapter = make_engine(paths, [], policy=wt_policy(keep_failed=False))
+    attach_profile(adapter)
+    engine.state.repo_root = str(paths.repo_root)
+    engine.state.target_branch = "main"
+    engine.state.source = "stories"
+    task = StoryTask("1-1-a", 1)
+    engine.state.tasks[task.story_key] = task
+    seen: list[Path] = []
+
+    def drive(current):
+        seen.append(engine.workspace.paths.project)
+        current.phase = Phase.DEFERRED
+        current.defer_reason = "test complete"
+
+    engine._run_isolated(task, drive)
+
+    assert len(seen) == 1 and seen[0].name == "app", journal_kinds(engine)
+    assert task.phase != Phase.ESCALATED
+    assert "story-escalated" not in journal_kinds(engine)
+
+
+def test_nested_relocated_accepted_spec_is_found_at_the_mount_project(project):
+    """A none-to-worktree re-drive under nested roots whose accepted spec is an
+    ABSOLUTE path in the main project: it is relativized project-relative, seeded at
+    `<mount>/app/<rel>`, and the relocated-spec delivery probe looks there — so the
+    unit dispatches reading the accepted bytes instead of escalating with "accepted
+    spec ... disappeared". The nested twin of
+    `test_prior_dispatch_does_not_block_fresh_mounted_spec_binding`.
+
+    Ablation: anchor `run_isolated`'s `accepted_probe` on `unit.path` and the probe
+    checks `<mount>/<rel>`, finds nothing, and the unit escalates."""
+    paths = nested_repo_root_paths(project)
+    rel = "_bmad-output/implementation-artifacts/accepted-rearm.md"
+    ignore_before_commit(paths, rel)
+    commit_sprint(paths, {"1-1-a": "ready-for-dev"})
+    accepted = paths.project / rel
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    accepted.write_bytes(b"ignored accepted bytes\n")
+
+    engine, _ = make_engine(paths, [], policy=wt_policy(keep_failed=False))
+    engine.state.repo_root = str(paths.repo_root)
+    engine.state.target_branch = "main"
+    task = StoryTask("1-1-a", 1, spec_file=str(accepted))
+    engine.state.tasks[task.story_key] = task
+    observed: dict[str, object] = {}
+
+    def bind_then_defer(current):
+        engine._bind_dispatched_spec_for_attempt(current)
+        observed["accepted"] = current.spec_file
+        observed["bound"] = current.dispatched_spec_file
+        observed["snapshot"] = current.dispatched_spec_snapshot
+        observed["project"] = engine.workspace.paths.project
+        current.phase = Phase.DEFERRED
+        current.defer_reason = "test complete"
+
+    engine._run_isolated(task, bind_then_defer)
+
+    mount_project = observed.get("project")
+    assert isinstance(mount_project, Path), journal_kinds(engine)
+    assert mount_project.name == "app"
+    assert observed["accepted"] == rel
+    assert observed["bound"] == str(mount_project / rel)
+    assert observed["snapshot"] == b"ignored accepted bytes\n"
+    assert task.phase != Phase.ESCALATED
+    assert "story-escalated" not in journal_kinds(engine)

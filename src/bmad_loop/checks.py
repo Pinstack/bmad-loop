@@ -49,6 +49,8 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "policy.model-qualified",
         "policy.effort-unsupported",
         "policy.bypass-dropped",
+        # worktree isolation beside a project that is NOT inside repo_root (a
+        # disjoint layout, #414); a nested project is supported since DW-379
         "policy.isolation-repo-root",
         "adapter.profile",
         "adapter.binary",

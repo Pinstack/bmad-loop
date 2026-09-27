@@ -366,9 +366,10 @@ class _CapturingEngine:
 
 
 def _split_root_paths(project):
-    """`_fake_paths` with the one supported divergence: `repo_root` naming a code
-    tree that is not the BMAD project dir (`isolation = "none"` plus a `repo_root:`
-    key; `bmadconfig.worktree_isolation_conflict` refuses the other combination).
+    """`_fake_paths` with the divergence a `repo_root:` key configures: `repo_root`
+    naming a code tree that is not the BMAD project dir (supported beside
+    `isolation = "none"`; beside worktree isolation only when it contains the project,
+    `bmadconfig.worktree_isolation_conflict` refusing a disjoint one — DW-379).
 
     `_fake_paths` leaves the two roots identical — as does the `project` fixture
     everywhere else — so without this no composition test can tell a `repo_root`

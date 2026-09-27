@@ -74,6 +74,15 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- Support `isolation = "worktree"` beside a `repo_root:` override that contains the
+  project (a monorepo's `<repo>/app`): each unit worktree provisions `_bmad/`, skills,
+  hook configs and seeds at the project's offset (`<worktree>/app/…`), and relative
+  spec paths persist project-relative. The #414 refusal (`policy.isolation-repo-root`)
+  now fires only when the project is NOT inside `repo_root`. `validate` and the TUI
+  launch guard now probe `repo_root` for a clean tree under any `repo_root:` override
+  (either isolation), as `run` and `sweep` do, so dirt elsewhere in the monorepo now
+  fails them; `validate`, the TUI launch guard, `run`, `sweep` and auto-sweep all
+  ignore the project's own `policy.toml` at its offset there (DW-379).
 - Amend the AGENTS.md doctrine: an observation degrade must be journaled or counted, never
   folded silently into a healthy-looking empty value (DW-347).
 - Commit hooks in the exact-path candidate worktree now see a worktree holding only the
@@ -100,6 +109,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Resolve a relative stories-mode spec folder against the workspace's project, not
+  its code root (`_stories_folder` joins `workspace.paths.project`), so a nested
+  `repo_root:` override finds `stories.yaml` in place and in a mount (DW-379).
 - Pause at the escalation instead of recording the run `finished` when a resume
   drains the queue past a story still ESCALATED, so `resume`/`resolve` still accept
   the run and its kept worktree is not reclaimed; `bmad-loop resolve` (re-arm or

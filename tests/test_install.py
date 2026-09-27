@@ -21,6 +21,7 @@ from conftest import (
     git,
     install_build_auto_skill,
     install_dev_shim,
+    nested_repo_root_paths,
     refuse_to_resolve,
     windows_relay_builder,
 )
@@ -74,6 +75,7 @@ from bmad_loop.worktree_flow import (
     _seed_bmad_tree,
     base_skills_seed_incomplete,
     module_skills_seed_undelivered,
+    provision_roots,
     worktree_seed_undelivered,
 )
 
@@ -4350,6 +4352,154 @@ def test_provision_worktree_bmad_custom_shielded_in_local_exclude(project, tmp_p
     assert "/_bmad" in exclude.splitlines()
     assert "/_bmad/custom" not in exclude.splitlines()
     assert shared.read_bytes() == before
+
+
+def test_provision_worktree_nested_project_lands_under_its_offset(project, tmp_path):
+    """DW-379, nested monorepo: `repo_root` is the checkout, the BMAD project `app/`.
+    The mount mirrors the main checkout, so every project-local surface is read from
+    the main `app/` and lands under `<worktree>/app/` — `_bmad/`, the bundled and
+    upstream skill trees, the hook config, the seed files — with nothing at the
+    worktree root, and the shield patterns carry the `/app/` offset git reads them
+    at.
+
+    Ablation: drop `project=` from the call (the pre-DW-379 shape) and every
+    `wt/app/...` assertion fails — the surfaces are read from the checkout root,
+    which carries none of them."""
+    paths = nested_repo_root_paths(project)
+    repo, app = paths.repo_root, paths.project
+    assert app == repo / "app", "premise: nested roots"
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    # Project-local surfaces the checkout cannot deliver: left untracked in main.
+    _install_base_skills(app, tree)
+    custom = _write_override(app, _layer("house-style", "bmad-review-company"), user=True)
+    _write_worktree_renderer_surface(app)  # renderer unit + central config under app/_bmad
+    (app / ".mcp.json").write_text('{"mcpServers": {}}\n', encoding="utf-8")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    pins: list[tuple[str, str, str]] = []
+    # the probes see the gap at the mount project before provisioning fills it
+    assert _bmad_scripts_seed_incomplete(wt, repo, project=app)
+    assert _central_config_seed_incomplete(wt, repo, project=app)
+
+    skipped = provision_worktree(
+        wt,
+        [claude],
+        repo,
+        seed_files=[".mcp.json"],
+        project=app,
+        on_pinned=lambda *a: pins.append(a),
+    )
+
+    mount = wt / "app"
+    custom_rel = custom.relative_to(app)
+    assert (mount / custom_rel).is_file()
+    assert (mount / ".mcp.json").is_file()
+    for skill in MODULE_SKILLS:
+        assert (mount / tree / skill / "SKILL.md").is_file()
+    for skill in BASE_SKILLS:
+        assert (mount / tree / skill / "SKILL.md").is_file()
+    hook = json.loads((mount / claude.hooks.config_path).read_text(encoding="utf-8"))
+    assert hook["hooks"]["Stop"][0]["hooks"][0]["command"].endswith(_installed_relay_suffix("Stop"))
+    # nothing project-local at the checkout root
+    for rel in (BMAD_DIR, ".claude", ".mcp.json"):
+        assert not (wt / rel).exists(), rel
+    assert skipped == []
+    assert pins == []  # the hook config is untracked: shielded, not pinned
+    # the shield names the offset, never the root-anchored spelling
+    exclude = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert f"/app/{tree}" in exclude
+    assert f"/app/{claude.hooks.config_path}" in exclude
+    assert "/app/.mcp.json" in exclude
+    assert f"/app/{custom_rel.as_posix()}" in exclude
+    assert not any(line in exclude for line in (f"/{tree}", "/.mcp.json", f"/{BMAD_DIR}"))
+    # the renderer's generated dir is shielded at the offset (or subsumed by the root)
+    assert f"/app/{RENDER_DIR_REL}/" in exclude or f"/app/{BMAD_DIR}" in exclude
+    assert f"/{RENDER_DIR_REL}/" not in exclude
+    assert (mount / CENTRAL_CONFIG_REL).is_file()
+    # the unit's `git add -A` stages none of it
+    git(wt, "add", "-A")
+    assert git(wt, "diff", "--cached", "--name-only") == ""
+    # and the result-side probes agree, reading the same roots
+    assert base_skills_seed_incomplete(wt, repo, [tree], project=app) == []
+    assert worktree_seed_undelivered(wt, repo, seed_files=[".mcp.json"], project=app) == []
+    assert module_skills_seed_undelivered(wt, [tree], repo_root=repo, project=app) == []
+    assert not _bmad_scripts_seed_incomplete(wt, repo, project=app)
+    assert not _central_config_seed_incomplete(wt, repo, project=app)
+
+
+def test_nested_result_probes_report_what_the_mount_project_lacks(project, tmp_path):
+    """The other direction of the probes above: under the nested layout they look at
+    `<worktree>/app`, so a surface missing THERE is reported even though nothing is
+    at the checkout root either — and, read without `project=`, the same probes see
+    no source at the checkout root and report nothing (the #414 silent stall shape).
+
+    Ablation: make the probes ignore `project=` and the first assertions go empty."""
+    paths = nested_repo_root_paths(project)
+    repo, app = paths.repo_root, paths.project
+    tree = get_profile("claude").skill_tree
+    _install_base_skills(app, tree)
+    (app / ".mcp.json").write_text("{}\n", encoding="utf-8")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    assert base_skills_seed_incomplete(wt, repo, [tree], project=app)
+    assert worktree_seed_undelivered(wt, repo, seed_files=[".mcp.json"], project=app) == [
+        ".mcp.json"
+    ]
+    assert module_skills_seed_undelivered(wt, [tree], repo_root=repo, project=app)
+    # without the project, the checkout root has no source to measure
+    assert base_skills_seed_incomplete(wt, repo, [tree]) == []
+    assert worktree_seed_undelivered(wt, repo, seed_files=[".mcp.json"]) == []
+
+
+def test_provision_worktree_nested_tracked_hook_pin_is_worktree_relative(project, tmp_path):
+    """The skip-worktree pin runs git from the worktree root, so a nested project's
+    tracked hook config is pinned — and recorded for the DW-368 teardown check — at
+    `app/<config_path>`, the rel `_pinned_config_edits` reads back against the
+    worktree.
+
+    Ablation: pin `profile.hooks.config_path` unprefixed and the pin is refused by
+    `git update-index` (no such path at the worktree root)."""
+    paths = nested_repo_root_paths(project)
+    repo, app = paths.repo_root, paths.project
+    claude = get_profile("claude")
+    hook_rel = claude.hooks.config_path
+    (app / hook_rel).parent.mkdir(parents=True, exist_ok=True)
+    (app / hook_rel).write_text('{"hooks": {}}\n', encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "track the nested hook config")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    pins: list[tuple[str, str, str]] = []
+    degraded: list[str] = []
+
+    provision_worktree(
+        wt,
+        [claude],
+        repo,
+        project=app,
+        on_pinned=lambda *a: pins.append(a),
+        on_degraded=degraded.append,
+    )
+
+    written = (wt / "app" / hook_rel).read_text(encoding="utf-8")
+    assert pins == [(f"app/{hook_rel}", claude.hooks.dialect, written)]
+    assert degraded == []
+    git(wt, "add", "-A")
+    assert f"app/{hook_rel}" not in git(wt, "diff", "--cached", "--name-only").splitlines()
+
+
+def test_provision_roots_refuses_a_project_outside_repo_root(tmp_path):
+    """A disjoint layout never reaches provisioning — worktree isolation refuses it
+    (#414) — so reaching here with one fails LOUD rather than seeding from either
+    root. `project=None` keeps the checkout roots; the default config is identity."""
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    assert provision_roots(wt, repo, None) == (repo, wt)
+    assert provision_roots(wt, repo, repo) == (repo, wt)
+    assert provision_roots(wt, repo, repo / "app") == (repo / "app", wt / "app")
+    with pytest.raises(verify.GitError, match="outside repo_root"):
+        provision_roots(wt, repo, tmp_path / "elsewhere")
 
 
 def test_shield_tracked_hook_config_is_not_excluded(project, tmp_path):

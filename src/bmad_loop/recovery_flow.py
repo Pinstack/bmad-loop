@@ -324,7 +324,8 @@ class RecoveryFlow:
         resolves candidates under), threaded down rather than re-derived here:
         this is a staticmethod on purpose, and `_workspace_get` is a live getter
         precisely because a unit worktree swaps the root mid-run (``rebased``
-        makes ``paths.project`` the worktree root there). It must NOT be
+        makes ``paths.project`` the mount project there — the worktree root, or
+        ``<worktree>/<offset>`` for a project nested in ``repo_root``). It must NOT be
         ``workspace.root``: under the `repo_root` override that is the separate
         code repo, an in-project spec fails its `is_relative_to` test, and the
         chokepoint silently takes the plain arm — dropping the parent walk the

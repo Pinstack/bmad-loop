@@ -23,6 +23,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import json
+import posixpath
 import secrets
 from collections import Counter
 from collections.abc import Collection, Sequence
@@ -66,6 +67,7 @@ from .install import (
     strip_relay_hooks,
 )
 from .model import Phase
+from .mountpaths import rebased_project
 from .platform_util import atomic_write_text
 from .workspace import (
     UnitWorkspace,
@@ -113,7 +115,12 @@ def _artifact_seed(artifact: Path, repo: Path, worktree: Path) -> tuple[str, ...
     leaf too followed a symlinked artifact to its target's rel, so the copy landed
     where no reader looks (DW-377, was #462).
 
-    The fully resolved target rel has two uses. First, it keeps the out-of-repo
+    ``repo`` and ``worktree`` are the project-local roots :func:`provision_roots`
+    names — the main project and the mount project (the checkout roots themselves in
+    the default config, DW-379) — so the rel is project-relative, and "out-of-repo"
+    below means outside the PROJECT.
+
+    The fully resolved target rel has two uses. First, it keeps the out-of-project
     exclusion: the seed loop refuses such a source whatever rel it is handed, so
     an untracked leaf link to an outside target leaves the worktree's configured
     path absent (the worktree reads an outside target in place only when the
@@ -143,6 +150,49 @@ def _artifact_seed(artifact: Path, repo: Path, worktree: Path) -> tuple[str, ...
     if linked:
         return () if _occupied(worktree / target_rel) else (target_rel,)
     return (rel,)
+
+
+def provision_roots(worktree: Path, repo_root: Path, project: Path | None) -> tuple[Path, Path]:
+    """``(src_root, dst_root)``: where provisioning reads each project-local surface
+    in the main checkout, and where it lands it in the mount (DW-379).
+
+    The project lies inside ``repo_root`` (the default config included), so the
+    mount mirrors the main checkout: ``src_root`` is the main project and
+    ``dst_root`` the mount project, :func:`mountpaths.rebased_project`'s single
+    definition (``<worktree>/<offset>``; ``worktree`` itself when the offset is
+    ``.``). ``project=None`` keeps the checkout roots, ``(repo_root, worktree)``.
+
+    A project NOT inside ``repo_root`` (a disjoint layout) raises
+    :class:`verify.GitError`: the checkout carries no copy of it, so there is no
+    mirror to build, and `bmadconfig.worktree_isolation_conflict` refuses worktree
+    isolation for that layout before any mount is made (#414). Reaching here with
+    one is a bypassed refusal, and seeding from either root would bring back the
+    silent stall the refusal exists for, so it fails loud instead.
+
+    Lexical: the caller hands over the spellings it wants compared (provisioning
+    resolves all three first). Containment is NOT narrowed by this — every caller
+    keeps judging sources against ``repo_root`` and destinations against
+    ``worktree``, checkout-wide."""
+    if project is None:
+        return repo_root, worktree
+    if not project.is_relative_to(repo_root):
+        raise verify.GitError(
+            f"cannot provision a worktree for a project ({project}) outside repo_root "
+            f"({repo_root}): worktree isolation is refused for that layout (#414)"
+        )
+    return project, rebased_project(project, repo_root, worktree)
+
+
+def _shield_rel(worktree: Path, dst_root: Path, rel: str) -> str:
+    """A ``dst_root``-relative rel spelled worktree-relative, for the git-add shield.
+
+    Identity when ``dst_root`` is the worktree (the default config, byte-for-byte);
+    otherwise the project's offset is prefixed, so a pattern built as ``f"/{rel}"``
+    anchors at ``/<offset>/...`` where provisioning actually wrote."""
+    offset = dst_root.relative_to(worktree).as_posix()
+    if offset == ".":
+        return rel
+    return posixpath.normpath(f"{offset}/{rel}")
 
 
 def _normalized_ledger_lines(text: str) -> list[str]:
@@ -588,11 +638,21 @@ def _pinned_config_edits(worktree: Path, pins: dict[str, dict[str, str]]) -> lis
     return edits
 
 
-def _seed_bmad_tree(worktree: Path, repo_root: Path) -> tuple[list[str], list[str]]:
+def _seed_bmad_tree(
+    worktree: Path, repo_root: Path, *, project: Path | None = None
+) -> tuple[list[str], list[str]]:
     """Merge the repo's project-local BMAD surface into an isolated worktree.
 
-    Renderer-backed skills receive the worktree as their project root and do not
-    walk upward for ``_bmad``. Copy every usable file except generated render output,
+    Read from ``<src_root>/_bmad`` and landed at ``<dst_root>/_bmad``
+    (:func:`provision_roots`) — under a nested project that is the mount project,
+    never the checkout root. Both returned readings are WORKTREE-relative, because
+    both feed the git-add shield, which git reads from the worktree root.
+
+    Renderer-backed skills receive the mount PROJECT as their project root — the
+    worktree itself in the default config, ``<worktree>/<offset>`` for a project
+    nested in ``repo_root`` (DW-379), while the session cwd stays the checkout root,
+    the accepted parity with isolation none — and do not walk upward for ``_bmad``.
+    Copy every usable file except generated render output,
     per-file and without clobbering checkout content. The shared Traversable walk is
     intentional: unlike ``rglob``, it descends a symlinked child directory, allowing
     the result-side completeness predicates to see every file the copier considered.
@@ -612,10 +672,12 @@ def _seed_bmad_tree(worktree: Path, repo_root: Path) -> tuple[list[str], list[st
       their own, so the answer has to stay per-file even when ``shield_rels``
       collapsed.
     """
-    src_root = repo_root / BMAD_DIR
+    source_root, mount_root = provision_roots(worktree, repo_root, project)
+    bmad_rel = _shield_rel(worktree, mount_root, BMAD_DIR)
+    src_root = source_root / BMAD_DIR
     if not _is_dir(src_root):
         return [], []
-    dst_root = worktree / BMAD_DIR
+    dst_root = mount_root / BMAD_DIR
     had_bmad = _is_dir(dst_root)
     try:
         tops = sorted(src_root.iterdir(), key=lambda entry: entry.name)
@@ -637,10 +699,10 @@ def _seed_bmad_tree(worktree: Path, repo_root: Path) -> tuple[list[str], list[st
                 worktree=worktree,
                 repo_root=repo_root,
             ):
-                seeded.append(f"{BMAD_DIR}/{rel}")
+                seeded.append(f"{bmad_rel}/{rel}")
     if not seeded:
         return [], []
-    return ([BMAD_DIR] if not had_bmad else seeded), seeded
+    return ([bmad_rel] if not had_bmad else seeded), seeded
 
 
 def _record_seeded(
@@ -684,27 +746,40 @@ def _written_rels(worktree: Path, landed: Sequence[Path]) -> list[str]:
     return [p.relative_to(worktree).as_posix() for p in landed if _is_file(p)]
 
 
-def _bmad_scripts_seed_incomplete(worktree: Path, repo_root: Path) -> bool:
+def _bmad_scripts_seed_incomplete(
+    worktree: Path, repo_root: Path, *, project: Path | None = None
+) -> bool:
     """Whether a required repo renderer unit member missed the worktree.
 
     Match the renderer preflight's content-keyed required-file predicate. Arbitrary
     sibling scripts are still merge-seeded, but their absence cannot prove the
     renderer will HALT and therefore must not arm the CRITICAL escalation gate.
+    Probes the project-local roots :func:`provision_roots` names.
     """
+    src_root, dst_root = provision_roots(worktree, repo_root, project)
     return any(
-        _renderer_unit_required(repo_root, rel)
-        and _is_file(repo_root / rel)
-        and not _is_file(worktree / rel)
+        _renderer_unit_required(src_root, rel)
+        and _is_file(src_root / rel)
+        and not _is_file(dst_root / rel)
         for rel in RENDERER_SCRIPT_UNIT_REL
     )
 
 
-def _central_config_seed_incomplete(worktree: Path, repo_root: Path) -> bool:
+def _central_config_seed_incomplete(
+    worktree: Path, repo_root: Path, *, project: Path | None = None
+) -> bool:
     """Whether the repo's required renderer config failed to reach the worktree."""
-    return _is_file(repo_root / CENTRAL_CONFIG_REL) and not _is_file(worktree / CENTRAL_CONFIG_REL)
+    src_root, dst_root = provision_roots(worktree, repo_root, project)
+    return _is_file(src_root / CENTRAL_CONFIG_REL) and not _is_file(dst_root / CENTRAL_CONFIG_REL)
 
 
-def base_skills_seed_incomplete(worktree: Path, repo_root: Path, trees: Sequence[str]) -> list[str]:
+def base_skills_seed_incomplete(
+    worktree: Path,
+    repo_root: Path,
+    trees: Sequence[str],
+    *,
+    project: Path | None = None,
+) -> list[str]:
     """Required upstream skill rels present in the repo but absent in the worktree.
 
     ``BASE_SKILLS`` is a copy-if-present catalog, not a requirement set. Gate only
@@ -723,13 +798,16 @@ def base_skills_seed_incomplete(worktree: Path, repo_root: Path, trees: Sequence
     ``SKILL.md`` remains the run-start preflight's concern and cannot produce a false
     CRITICAL escalation here. Stories mode adds its content-keyed dispatch probe at
     the caller, where the run mode is available.
+
+    The skill trees are project-local: probed under :func:`provision_roots`.
     """
+    src_root, dst_root = provision_roots(worktree, repo_root, project)
     missing: list[str] = []
     for tree in dict.fromkeys(trees):
-        primitive = dev_primitive_or_default(repo_root, tree)
-        for skill in _required_worktree_skills(repo_root, tree):
-            repo_skill = repo_root / tree / skill
-            worktree_skill = worktree / tree / skill
+        primitive = dev_primitive_or_default(src_root, tree)
+        for skill in _required_worktree_skills(src_root, tree):
+            repo_skill = src_root / tree / skill
+            worktree_skill = dst_root / tree / skill
             if not _is_file(repo_skill / "SKILL.md"):
                 # Distinguish an unreadable directory from a skill the repo simply
                 # does not carry. The walk yields only the former as a directory leaf.
@@ -760,8 +838,14 @@ def worktree_seed_undelivered(
     seed_files: Sequence[str] = (),
     seed_globs: Sequence[str] = (),
     config_paths: Sequence[str] = (),
+    *,
+    project: Path | None = None,
 ) -> list[str]:
     """Seed rels the repo carries that never reached the worktree.
+
+    Rels are project-relative, read under and probed against the roots
+    :func:`provision_roots` names, exactly as provisioning copied them; the
+    containment arms below stay checkout-wide (``repo_root``/``worktree``).
 
     Source containment is deliberately *not* an eligibility requirement: a source
     symlink resolving outside the repo is the canonical entry the seed loop refuses
@@ -774,28 +858,30 @@ def worktree_seed_undelivered(
     source escape, a symlinked destination, or destination escape proves the seed was
     refused. This report is informational and is never an escalation gate.
     """
-    unresolved_repo_root = repo_root
+    unresolved_src_root, _ = provision_roots(worktree, repo_root, project)
     try:
         worktree = worktree.resolve()
         repo_root = repo_root.resolve()
+        project = project.resolve() if project is not None else None
     except (OSError, RuntimeError, ValueError):
         # Observation only: root uncertainty cannot prove delivery, but it must
         # not turn an informational journal probe into a run-wide failure.
         rels = [str(rel) for rel in seed_files]
         for pattern in seed_globs:
             try:
-                matches = sorted(unresolved_repo_root.glob(pattern))
+                matches = sorted(unresolved_src_root.glob(pattern))
             except (OSError, RuntimeError, ValueError):
                 continue
-            rels.extend(match.relative_to(unresolved_repo_root).as_posix() for match in matches)
+            rels.extend(match.relative_to(unresolved_src_root).as_posix() for match in matches)
         return list(dict.fromkeys(rels))
+    src_root, dst_root = provision_roots(worktree, repo_root, project)
     rels = [str(rel) for rel in seed_files]
     for pattern in seed_globs:
         try:
-            matches = sorted(repo_root.glob(pattern))
+            matches = sorted(src_root.glob(pattern))
         except (OSError, RuntimeError, ValueError):
             continue
-        rels.extend(match.relative_to(repo_root).as_posix() for match in matches)
+        rels.extend(match.relative_to(src_root).as_posix() for match in matches)
     hook_configs = {Path(rel) for rel in config_paths}
 
     def contained(path: Path, root: Path) -> bool:
@@ -843,10 +929,10 @@ def worktree_seed_undelivered(
 
     undelivered: list[str] = []
     for rel in dict.fromkeys(rels):
-        src = repo_root / rel
+        src = src_root / rel
         if not (_is_file(src) or _is_dir(src)):
             continue
-        dst = worktree / rel
+        dst = dst_root / rel
         if Path(rel) in hook_configs:
             try:
                 destination_is_link = dst.is_symlink()
@@ -865,8 +951,15 @@ def module_skills_seed_undelivered(
     worktree: Path,
     trees: Sequence[str],
     skills_root: Traversable | None = None,
+    *,
+    repo_root: Path | None = None,
+    project: Path | None = None,
 ) -> list[str]:
     """Wheel-bundled ``MODULE_SKILLS`` whose content never reached the worktree.
+
+    The skill trees sit under the mount project when ``repo_root`` and ``project``
+    are both given (:func:`provision_roots`), at the worktree root otherwise;
+    containment stays judged against the whole worktree.
 
     Re-probes DISK, never the copier's bookkeeping: a user-authored
     ``scm.worktree_seed`` entry that happens to spell a skill rel can therefore
@@ -893,6 +986,7 @@ def module_skills_seed_undelivered(
     """
     if skills_root is None:
         skills_root = resources.files("bmad_loop.data").joinpath("skills")
+    unresolved_worktree = worktree
     try:
         worktree = worktree.resolve()
     except (OSError, RuntimeError, ValueError):
@@ -927,13 +1021,16 @@ def module_skills_seed_undelivered(
             # such an entry either, so its absence is not a delivery failure.
         return True
 
+    dst_root = worktree
+    if repo_root is not None:
+        dst_root = provision_roots(unresolved_worktree, repo_root, project)[1]
     undelivered: list[str] = []
     for tree in dict.fromkeys(trees):
         for skill in MODULE_SKILLS:
             src = skills_root.joinpath(skill)
             if not (_is_file(src) or _is_dir(src)):
                 continue
-            if not delivered(src, worktree / tree / skill):
+            if not delivered(src, dst_root / tree / skill):
                 undelivered.append(f"{tree}/{skill}")
     return undelivered
 
@@ -947,6 +1044,7 @@ def provision_worktree(
     *,
     on_degraded: Callable[[str], None] | None = None,
     on_pinned: Callable[[str, str, str], None] | None = None,
+    project: Path | None = None,
 ) -> list[str]:
     """Make a freshly-created git worktree a self-sufficient bmad-loop project.
 
@@ -1028,22 +1126,43 @@ def provision_worktree(
     channel with ordinary no-op seeds so they are journaled, but the caller re-probes
     the skill result and content-gates the renderer sentinels before escalating.
 
+    `project` is the BMAD project (DW-379). Every project-local surface — the
+    `seed_files`/`seed_globs` entries, `_bmad/`, the skill trees, the hook configs —
+    is read under ``src_root`` and landed under ``dst_root``
+    (:func:`provision_roots`): the main project and the mount project at the same
+    offset inside `repo_root`, so the mount mirrors the main checkout; ``None``
+    keeps the checkout roots, and a project outside `repo_root` raises (that layout
+    is refused before any mount, #414). Containment stays checkout-wide (sources
+    inside `repo_root`, destinations inside `worktree`), and the shield patterns and
+    the pinned config rel handed to ``on_pinned`` are worktree-relative, offset
+    included. Returned entries keep the project-relative spelling they were given.
+
     Returns the `seed_files` entries that copied NOTHING because everything they
     name was already present, plus reserved completeness reports. A directory entry
     that seeded even one child is not a no-op and is not reported.
     """
-    if not profiles and not seed_files and not seed_globs and not _is_dir(repo_root / BMAD_DIR):
+    bmad_source = provision_roots(worktree, repo_root, project)[0] / BMAD_DIR
+    if not profiles and not seed_files and not seed_globs and not _is_dir(bmad_source):
         return []
     unresolved_worktree = worktree
     unresolved_repo_root = repo_root
+    unresolved_project = project
     try:
         worktree = worktree.resolve()
         repo_root = repo_root.resolve()
+        project = project.resolve() if project is not None else None
     except (OSError, RuntimeError, ValueError) as e:
         raise verify.GitError(
             "cannot resolve worktree provisioning roots safely "
-            f"(worktree={unresolved_worktree}, repo_root={unresolved_repo_root}): {e}"
+            f"(worktree={unresolved_worktree}, repo_root={unresolved_repo_root}"
+            + (f", project={unresolved_project}" if unresolved_project is not None else "")
+            + f"): {e}"
         ) from e
+    src_root, dst_root = provision_roots(worktree, repo_root, project)
+
+    def shield(rel: str) -> str:
+        return _shield_rel(worktree, dst_root, rel)
+
     skills_root = resources.files("bmad_loop.data").joinpath("skills")
 
     # project gitignored MCP/CLI configs: copy from the main repo when absent.
@@ -1074,9 +1193,9 @@ def provision_worktree(
     # misconfiguration, exactly like the glob-expanded matches below.
     skipped: list[str] = []
     for rel in seed_files:
-        raw = worktree / rel
+        raw = dst_root / rel
         try:
-            src = (repo_root / rel).resolve()
+            src = (src_root / rel).resolve()
             dst = raw.resolve()
         except (OSError, RuntimeError, ValueError):
             continue
@@ -1147,12 +1266,12 @@ def provision_worktree(
     # worktree path mirrors the repo layout; resolve only guards containment.
     for pattern in seed_globs:
         try:
-            matches = sorted(repo_root.glob(pattern))
+            matches = sorted(src_root.glob(pattern))
         except (OSError, RuntimeError, ValueError):
             continue
         for match in matches:
-            rel = match.relative_to(repo_root)
-            raw = worktree / rel
+            rel = match.relative_to(src_root)
+            raw = dst_root / rel
             try:
                 src = match.resolve()
                 dst = raw.resolve()
@@ -1179,21 +1298,23 @@ def provision_worktree(
             _record_seeded(seeded_from, landed, src, raw)
             written.update(_written_rels(worktree, landed))
 
-    # Renderer-backed skills are handed the worktree as their project root. Merge
+    # Renderer-backed skills are handed the mount project as their project root (the
+    # worktree, or `<worktree>/<offset>` under a nested `repo_root`; the session cwd
+    # stays the checkout root either way, DW-379). Merge
     # the repo's project-local BMAD surface after explicit seeds (operator intent wins
     # on collisions) and reserve the two renderer sentinels for result-side checks.
-    seeded_bmad, bmad_written = _seed_bmad_tree(worktree, repo_root)
+    seeded_bmad, bmad_written = _seed_bmad_tree(worktree, repo_root, project=project)
     written.update(bmad_written)
     skipped = [rel for rel in skipped if rel not in RENDERER_SEED_SENTINELS]
-    if _bmad_scripts_seed_incomplete(worktree, repo_root):
+    if _bmad_scripts_seed_incomplete(worktree, repo_root, project=project):
         skipped.append(BMAD_SCRIPTS_SEED_REL)
-    if _central_config_seed_incomplete(worktree, repo_root):
+    if _central_config_seed_incomplete(worktree, repo_root, project=project):
         skipped.append(CENTRAL_CONFIG_REL)
 
     # bundled skills into each CLI's skill tree (deduped: codex+gemini share one);
     # never clobber a skill the checkout already carries (tracked or pre-existing).
     for tree in dict.fromkeys(p.skill_tree for p in profiles):
-        tree_dir = worktree / tree
+        tree_dir = dst_root / tree
         for skill in MODULE_SKILLS:
             dst = tree_dir / skill
             # `copied_paths` is read only by the shield: when this tree turns out to
@@ -1238,10 +1359,10 @@ def provision_worktree(
         # Validating a skill here and then not copying it is how preflight passes in
         # the main checkout while the isolated review fails on a skill that was
         # never there.
-        for skill in _worktree_skill_copy_candidates(repo_root, tree):
+        for skill in _worktree_skill_copy_candidates(src_root, tree):
             dst = tree_dir / skill
             try:
-                src = (repo_root / tree / skill).resolve()
+                src = (src_root / tree / skill).resolve()
             except (OSError, RuntimeError, ValueError):
                 continue
             if not src.is_relative_to(repo_root) or not _is_dir(src):
@@ -1261,7 +1382,7 @@ def provision_worktree(
     # can happen to spell a skill rel, so only this disk predicate may arm the gate.
     skipped.extend(
         base_skills_seed_incomplete(
-            worktree, repo_root, [profile.skill_tree for profile in profiles]
+            worktree, repo_root, [profile.skill_tree for profile in profiles], project=project
         )
     )
 
@@ -1271,7 +1392,7 @@ def provision_worktree(
     for profile in profiles:
         if profile.hookless:
             continue
-        raw_config_path = worktree / profile.hooks.config_path
+        raw_config_path = dst_root / profile.hooks.config_path
         # Refuse before mkdir, read, or write: hook commands are worktree-specific
         # and must never mutate a shared dotfile through a live or dangling link.
         # Inspect every component: a non-strict resolve either leaves a symlink cycle
@@ -1362,7 +1483,7 @@ def provision_worktree(
                 ) from e
         try:
             registrations = {
-                native: _hook_command(repo_root, profile, canonical)
+                native: _hook_command(src_root, profile, canonical)
                 for native, canonical in profile.hooks.events.items()
             }
         except ProfileError as e:
@@ -1409,13 +1530,16 @@ def provision_worktree(
             # the `write_text` this replaced raised.
             written_text = json.dumps(config, indent=2) + "\n"
             atomic_write_text(config_path, written_text, require_writable_target=True)
-            pinned, pin_degrade = _pin_tracked_config_rewrite(worktree, profile.hooks.config_path)
+            # Worktree-relative, offset included: the pin runs git from the worktree
+            # root, and the recorded rel is read back against it (DW-368).
+            pinned_rel = shield(profile.hooks.config_path)
+            pinned, pin_degrade = _pin_tracked_config_rewrite(worktree, pinned_rel)
             if pin_degrade is not None and on_degraded is not None:
                 on_degraded(pin_degrade)
             if pinned and on_pinned is not None:
                 # Profiles may share a config_path: a later pass rewrites the same
                 # file, so its call supersedes the earlier one (last write wins).
-                on_pinned(profile.hooks.config_path, profile.hooks.dialect, written_text)
+                on_pinned(pinned_rel, profile.hooks.dialect, written_text)
 
     # Shield exactly the paths we wrote (skill trees + hook configs + seeded
     # configs) from the unit's `git add -A`, in case a project doesn't gitignore
@@ -1428,23 +1552,27 @@ def provision_worktree(
     # inert (#392), and over a tracked DIRECTORY swaps the entry for one pattern per
     # file `written` recorded under it (#484). `written` is therefore not an
     # alternative source of patterns but the substitution ledger that step reads.
-    patterns = {f"/{p.skill_tree}" for p in profiles}
+    #
+    # Every rel below is spelled worktree-relative through `shield`: git reads the
+    # exclude from the worktree root, and a nested project's surfaces sit under its
+    # offset there (DW-379). `written` and `seeded_bmad` already are.
+    patterns = {f"/{shield(p.skill_tree)}" for p in profiles}
     # hookless profiles have no config_path, so there is nothing to shield: their
     # empty string would render as a bare "/", which git strips to a zero-length
     # pattern (the trailing slash becomes MUSTBEDIR) that matches nothing — inert,
     # unlike "/*" or "*", which do blanket. A junk line in a generated file, then,
     # not a worktree-wide exclusion.
-    patterns |= {f"/{p.hooks.config_path}" for p in profiles if not p.hookless}
-    patterns |= {f"/{rel}" for rel in seeded}
+    patterns |= {f"/{shield(p.hooks.config_path)}" for p in profiles if not p.hookless}
+    patterns |= {f"/{shield(rel)}" for rel in seeded}
     patterns |= {f"/{rel}" for rel in seeded_bmad}
-    if f"/{BMAD_DIR}" not in patterns:
+    if f"/{shield(BMAD_DIR)}" not in patterns:
         # The renderer may create or rewrite this generated directory during the
         # session, after provisioning has finished. Give it a dedicated transient
         # shield unless the blanket root shield already subsumes it: `/_bmad` prunes
         # the directory before git descends, so `/_bmad/render/` would provably never
         # be consulted. Avoiding that inert sibling keeps the worktree-local exclude
         # precise; the file and its lines disappear with this worktree.
-        patterns.add(f"/{RENDER_DIR_REL}/")
+        patterns.add(f"/{shield(RENDER_DIR_REL)}/")
     patterns, tracked_degrade = _reconcile_tracked_patterns(worktree, patterns, written)
     if tracked_degrade is not None and on_degraded is not None:
         on_degraded(tracked_degrade)
@@ -1717,6 +1845,20 @@ class WorktreeFlow:
                 ids.append(agent)
         return ids
 
+    def _mount_roots(self, worktree: Path) -> tuple[Path, Path]:
+        """:func:`provision_roots` for this run's project in the mount at ``worktree``:
+        ``(src_root, dst_root)``, the project-local roots in the main checkout and in
+        the mount. Lexical, over the spellings ``self.paths`` and ``worktree`` carry."""
+        return provision_roots(worktree, self.paths.repo_root, self.paths.project)
+
+    def _mount_project(self, worktree: Path) -> Path:
+        """The mount project for the mount at ``worktree`` — the tree a relative spec
+        spelling is anchored on there. The lexical form of
+        ``self.paths.rebased(worktree).project`` (both go through
+        :func:`mountpaths.rebased_project`): ``worktree`` itself by default,
+        ``<worktree>/<offset>`` for a project nested inside ``repo_root`` (DW-379)."""
+        return rebased_project(self.paths.project, self.paths.repo_root, worktree)
+
     def _ledger_seed(self, worktree: Path) -> tuple[str, ...]:
         """The deferred-work ledger, when a worktree checkout cannot deliver it.
 
@@ -1763,7 +1905,7 @@ class WorktreeFlow:
 
         Deduped against ``scm.worktree_seed`` by the caller.
         """
-        return _artifact_seed(self.paths.deferred_work, self.paths.repo_root, worktree)
+        return _artifact_seed(self.paths.deferred_work, *self._mount_roots(worktree))
 
     def _board_seed(self, worktree: Path) -> tuple[str, ...]:
         """The sprint board, when a worktree checkout cannot deliver it (#350).
@@ -1823,7 +1965,7 @@ class WorktreeFlow:
 
         Deduped against ``scm.worktree_seed`` by the caller.
         """
-        return _artifact_seed(self.paths.sprint_status, self.paths.repo_root, worktree)
+        return _artifact_seed(self.paths.sprint_status, *self._mount_roots(worktree))
 
     def _accepted_spec_seed(
         self,
@@ -1954,7 +2096,9 @@ class WorktreeFlow:
             return _AcceptedSpecEnds(source=source)
         rel = relative.as_posix()
         try:
-            destination = (worktree / relative).resolve(strict=False)
+            # The mount project, not the mount root: `relative` is project-relative
+            # and the mount mirrors the main checkout (DW-379).
+            destination = (self._mount_project(worktree) / relative).resolve(strict=False)
             mounted_root = worktree.resolve(strict=True)
             destination.relative_to(mounted_root)
         except (OSError, RuntimeError, ValueError):
@@ -2121,7 +2265,7 @@ class WorktreeFlow:
         ends = self._accepted_spec_pair(task, worktree, project_relative_only=project_relative_only)
         if ends.relative is None and not ends.faulted:
             return
-        probe = worktree / (ends.relative or str(task.spec_file))
+        probe = self._mount_project(worktree) / (ends.relative or str(task.spec_file))
         # File-ness alone is not delivery, for the reason the escalating probe states:
         # a parent that is a real directory in the main checkout but a committed
         # OUTWARD symlink in the mounted commit lands the probe on an unrelated
@@ -2288,6 +2432,7 @@ class WorktreeFlow:
                 seed_globs=seed_globs,
                 on_degraded=lambda msg: self._exclude_degraded(task.story_key, msg),
                 on_pinned=_record_pin,
+                project=self.paths.project,
             )
         except verify.GitError as e:
             # Every provisioning refusal carries its own cause — an unresolvable
@@ -2332,6 +2477,7 @@ class WorktreeFlow:
             seed_files=seed_files,
             seed_globs=seed_globs,
             config_paths=[p.hooks.config_path for p in profiles if not p.hookless],
+            project=self.paths.project,
         )
         if undelivered_seeds:
             self.journal.append(
@@ -2356,7 +2502,8 @@ class WorktreeFlow:
         # unresolvable probe cannot prove delivery, so every filesystem fault
         # escalates rather than binding.
         if accepted_spec_relocated:
-            accepted_probe = unit.path / str(task.spec_file)
+            # Project-relative spelling, so anchored on the mount project (DW-379).
+            accepted_probe = self._mount_project(unit.path) / str(task.spec_file)
             try:
                 accepted_delivered = _is_file(accepted_probe) and accepted_probe.resolve(
                     strict=False
@@ -2375,7 +2522,9 @@ class WorktreeFlow:
         # under their own kind so a user seed that spells a skill rel can neither forge
         # nor mask an entry. No MODULE_SKILLS entry has a worktree-resident consumer,
         # so an absence here cannot prove a stall and must never escalate.
-        undelivered_module_skills = module_skills_seed_undelivered(unit.path, trees)
+        undelivered_module_skills = module_skills_seed_undelivered(
+            unit.path, trees, repo_root=self.paths.repo_root, project=self.paths.project
+        )
         if undelivered_module_skills:
             self.journal.append(
                 "worktree-module-skills-dropped",
@@ -2387,7 +2536,9 @@ class WorktreeFlow:
         # renderer-era primitives. Re-probe disk rather than trusting skipped_seeds,
         # which a user-authored seed rel could otherwise forge. Check this first so a
         # wholly absent primitive is not misdiagnosed as a renderer-surface problem.
-        absent_skills = base_skills_seed_incomplete(unit.path, self.paths.repo_root, trees)
+        absent_skills = base_skills_seed_incomplete(
+            unit.path, self.paths.repo_root, trees, project=self.paths.project
+        )
         if absent_skills:
             reason = (
                 "the worktree is missing required upstream skill contract files the repo has "
@@ -2406,7 +2557,9 @@ class WorktreeFlow:
         # while a tracked stale worktree copy proves that existence alone is not
         # enough. Either shape would HALT a folder+id dispatch before writing a spec.
         stories_support = (
-            missing_stories_support(unit.path, trees) if self.state.source == "stories" else []
+            missing_stories_support(self._mount_roots(unit.path)[1], trees)
+            if self.state.source == "stories"
+            else []
         )
         if stories_support:
             short_dispatch = []
@@ -4621,13 +4774,14 @@ class WorktreeFlow:
                 f"worktree for {task.story_key} is on {mounted_branch!r}, not recorded "
                 f"branch {task.branch!r}; cannot resume in place",
             )
-        # Spec paths are persisted relative to the worktree (model.to_dict) so
+        # Spec paths are persisted relative to the mount PROJECT (model.to_dict) so
         # state stays portable; re-absolutize both accepted/result ownership and
-        # the current/last attempt's dispatch ownership against the reopened tree.
+        # the current/last attempt's dispatch ownership against the reopened tree's
+        # project — the checkout root itself unless the project is nested (DW-379).
         # Absolute outside-worktree paths pass through unchanged. The rule itself
         # lives on the class that creates the relative spelling, so this and
         # `Engine._finish_inflight`'s pre-discard re-anchor cannot drift apart.
-        task.rebase_spec_paths_on(wt)
+        task.rebase_spec_paths_on(self._mount_project(wt))
         return UnitWorkspace(
             workspace=Workspace(root=wt, paths=self.paths.rebased(wt)),
             repo_root=self.paths.repo_root,

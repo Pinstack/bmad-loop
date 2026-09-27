@@ -362,8 +362,9 @@ def resolve_or_lexical(path: str | Path) -> Path:
     (pathlib folds ``//wsl.localhost/...`` to the backslash form on the way). It is
     *not* canonical, so this helper stays at the observation surface —
     ``cli._project``, which runs pre-dispatch where there is no handler to catch
-    anything, and ``bmadconfig.worktree_isolation_conflict``'s comparison, which must
-    not kill ``validate`` ahead of the platform preflight. ``bmadconfig.load_paths``
+    anything, and ``bmadconfig.worktree_isolation_conflict``'s containment test
+    (project inside ``repo_root``), which must not kill ``validate`` ahead of the
+    platform preflight. ``bmadconfig.load_paths``
     is the boundary and refuses instead — a typed ``BmadConfigError`` for the project
     root *and* every configured path: a spelling the OS cannot canonicalize has an
     unknowable location (it can sit lexically inside the project while an in-tree

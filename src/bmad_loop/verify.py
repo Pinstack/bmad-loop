@@ -45,6 +45,7 @@ from .frontmatter import (
     status_of,
 )
 from .model import StoryTask, VerifyOutcome, result_mapping
+from .mountpaths import project_offset
 from .platform_util import (
     AT_DIRECTORY,
     AT_NOFOLLOW,
@@ -4582,7 +4583,7 @@ def last_commit_for(repo: Path, path: Path) -> str:
     return out
 
 
-def worktree_clean(repo: Path) -> bool:
+def worktree_clean(repo: Path, *, project: Path | None = None) -> bool:
     """True when the tree holds no change git would report.
 
     The orchestrator's own config file (.bmad-loop/policy.toml) is excluded: the TUI
@@ -4590,6 +4591,12 @@ def worktree_clean(repo: Path) -> bool:
     tree" that blocks run/sweep/validate or forces a commit. Scope is policy.toml only
     — the deferred-work ledger also lives under .bmad-loop/ and is meant to be
     committed (see sweep._commit_ledger).
+
+    The file lives under the BMAD PROJECT, which a `repo_root:` override can nest
+    below `repo` (DW-379): pass ``project`` and the exclusion is spelled at the
+    project's offset inside `repo` (``app/.bmad-loop/policy.toml``), so probing the
+    code root still ignores a settings edit. Without it, or when the project is
+    `repo` itself or lies outside it, the exclusion is repo-relative as before.
 
     Reads `stdout` ALONE rather than `_git`'s stdout+stderr merge, for the reason
     :func:`path_tracked` spells out: `status` exits 0 while still writing to stderr (a
@@ -4609,7 +4616,7 @@ def worktree_clean(repo: Path) -> bool:
             "--porcelain",
             "--",
             ".",
-            f":(exclude){POLICY_FILE_REL}",
+            f":(exclude){_project_policy_rel(repo, project)}",
         ],
         repo,
     )
@@ -4617,6 +4624,18 @@ def worktree_clean(repo: Path) -> bool:
         merged = (proc.stdout + proc.stderr).strip()
         raise GitError(f"git status failed in {repo}: {merged}")
     return proc.stdout.strip() == ""
+
+
+def _project_policy_rel(repo: Path, project: Path | None) -> str:
+    """The project's policy.toml spelled relative to `repo`, for a pathspec: the
+    project's offset prefixed onto :data:`POLICY_FILE_REL` when the project is nested
+    below `repo`, :data:`POLICY_FILE_REL` itself otherwise (no project given, the
+    default `repo == project`, or a project outside `repo`, whose file no pathspec
+    rooted at `repo` can name). Lexical, over the spellings the caller hands in."""
+    offset = None if project is None else project_offset(project, repo)
+    if offset is None or offset == ".":
+        return POLICY_FILE_REL
+    return f"{offset}/{POLICY_FILE_REL}"
 
 
 def path_clean(repo: Path, rel: str, *, env: dict[str, str] | None = None) -> bool:
@@ -8340,17 +8359,17 @@ def _verify_shared_gates(
     # `paths.project`. Both baseline writers stamp `workspace.root`
     # (`Engine._dev_phase`, `SweepEngine`'s migration task) and re-arm now does the
     # same, and `Workspace.default` sets `root = paths.repo_root` while
-    # `ProjectPaths.rebased` sets both roots to the worktree — so `repo_root` is
+    # `ProjectPaths.rebased` sets `repo_root` to the worktree — so `repo_root` is
     # the one root that names the same repository as the recorded baseline in every
-    # configuration. Under the `repo_root` override (`isolation = "none"` plus a
-    # `repo_root:` config key, the only shape where the two differ —
-    # `bmadconfig.worktree_isolation_conflict` refuses the other) the session's cwd
-    # IS the code tree, so a `project`-anchored probe judged a tree the session never
-    # touched. WHICH probe burned the attempt depends on the layout, and the burn is
-    # not the proof-of-work probe in both: `_changes_since` answers `None` when git
-    # will not run, and the gate arm below accepts anything that is not a positive
-    # "nothing changed" (`is False`), so wherever `project` is not a checkout the
-    # failing git call PASSES that gate. Nested
+    # configuration. Under a `repo_root:` override (the only shape where the two
+    # differ — in place, or under worktree isolation with the project nested in
+    # `repo_root`, where the rebased project is the mount's `<worktree>/<offset>`,
+    # DW-379) the session's cwd IS the code tree, so a `project`-anchored probe
+    # judged a tree the session never touched. WHICH probe burned the attempt
+    # depends on the layout, and the burn is not the proof-of-work probe in both:
+    # `_changes_since` answers `None` when git will not run, and the gate arm below
+    # accepts anything that is not a positive "nothing changed" (`is False`), so
+    # wherever `project` is not a checkout the failing git call PASSES that gate. Nested
     # (`project` a subdirectory of the code tree) the call succeeds but is scoped to
     # that subdirectory, and the "no changes" forever-burn is real. Disjoint
     # (`project` beside the checkout) git fails and the burn moves to the probes that
@@ -9498,9 +9517,10 @@ def _verify_review_commands(
     at both of its call sites. The three review gates were the sole outlier
     (#695).
 
-    The two roots are the same path in the default layout and under worktree
-    isolation (``ProjectPaths.rebased`` sets both); they diverge only under an
-    explicit ``repo_root:`` with ``isolation = "none"``. One helper rather than
+    The two roots are the same path in the default layout, under either isolation
+    mode; they diverge only under an explicit ``repo_root:`` — in place, or under
+    worktree isolation, where ``ProjectPaths.rebased`` keeps the project's offset
+    (``<worktree>/<offset>`` against the worktree, DW-379). One helper rather than
     three edited lines so the three gates cannot drift apart on the split.
 
     On win32 the cwd carries one more thing with it, so the split is not purely a

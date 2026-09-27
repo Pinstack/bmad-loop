@@ -145,10 +145,12 @@ def test_scripted_verify_runner_refuses_the_wrong_canonical_cwd(tmp_path):
 
 
 def test_nested_repo_root_paths_round_trips_committed_config_and_conflict(project):
-    """The nested fixture is a production-loadable config, not a hand-built snapshot.
+    """The nested fixture is a production-loadable config, not a hand-built snapshot,
+    and it is the layout worktree isolation SUPPORTS (DW-379): the project lies inside
+    `repo_root`, so neither isolation mode is refused.
 
-    Ablation: short-circuit `worktree_isolation_conflict` for the worktree mode
-    and this row fails because the divergent loaded config is no longer refused.
+    Ablation: widen `worktree_isolation_conflict` back to "any `repo_root` override"
+    and this row fails because the nested loaded config is refused again.
     """
     paths = conftest.nested_repo_root_paths(project)
 
@@ -158,9 +160,9 @@ def test_nested_repo_root_paths_round_trips_committed_config_and_conflict(projec
     assert paths.project.parent == paths.repo_root
     config_rel = (paths.project / conftest.BMAD_CONFIG_REL).relative_to(paths.repo_root)
     assert conftest.git(paths.repo_root, "ls-files", "--error-unmatch", config_rel.as_posix())
+    assert paths.repo_root != paths.project, "premise: the roots really diverge"
     assert bmadconfig.worktree_isolation_conflict(paths, "none") is None
-    conflict = bmadconfig.worktree_isolation_conflict(paths, "worktree")
-    assert conflict is not None and "not supported" in conflict
+    assert bmadconfig.worktree_isolation_conflict(paths, "worktree") is None
 
 
 def test_nested_repo_root_paths_canonicalizes_a_dotdot_input(project):

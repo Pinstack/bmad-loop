@@ -2434,3 +2434,25 @@ def test_stories_retry_prompt_names_the_earlier_attempts_parked_work(project):
         f"preserved at `{parked['ref']}`."
     )
     assert f"`git diff {base} {parked['ref']}`" in second
+
+
+def test_relative_stories_folder_joins_the_project_under_a_nested_repo_root(project, tmp_path):
+    """DW-379: the spec folder is stored PROJECT-relative, so `_stories_folder` joins it
+    on `workspace.paths.project` — `<repo>/app` in place (where `workspace.root` is the
+    code root `<repo>`), and the mount project `<mount>/app` inside a unit worktree.
+
+    Ablation: join on `self.workspace.root` again and both assertions land one level
+    up, in the outer tree (`<repo>/<folder>`, `<mount>/<folder>`)."""
+    from bmad_loop.workspace import Workspace
+
+    paths = nested_repo_root_paths(project)
+    engine, _adapter = make_engine(paths, [])
+    assert not Path(engine._spec_folder_rel).is_absolute(), "premise: a relative folder"
+    assert engine.workspace.root == paths.repo_root, "premise: in place, root is the code root"
+
+    assert engine._stories_folder() == paths.project / engine._spec_folder_rel
+
+    wt = tmp_path / "mount"
+    wt.mkdir()
+    engine.workspace = Workspace(root=wt.resolve(), paths=paths.rebased(wt))
+    assert engine._stories_folder() == wt.resolve() / "app" / engine._spec_folder_rel

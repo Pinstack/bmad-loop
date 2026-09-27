@@ -1311,3 +1311,85 @@ def test_story_task_baseline_artifacts_mangled_shape_reads_as_no_snapshot(mangle
     d["baseline_artifacts"] = mangled
 
     assert StoryTask.from_dict(d).baseline_artifacts is None
+
+
+# ------------------------------------------- nested mount project (DW-379)
+
+
+def _nested_state() -> RunState:
+    """A run whose project `/r/app` is nested in its code root `/r`."""
+    return RunState(run_id="r1", project="/r/app", repo_root="/r", started_at="now")
+
+
+def test_mount_project_keeps_a_nested_projects_offset():
+    """`RunState.mount_project` is `ProjectPaths.rebased(<mount>).project` from what
+    state records: the mount itself by default, `<mount>/<offset>` when the project is
+    nested in the code root, None without a mount."""
+    task = StoryTask("1-1-a", 1)
+    assert _nested_state().mount_project(task) is None
+    task.worktree_path = "/r/app/.bmad-loop/runs/r1/worktrees/1"
+    assert _nested_state().mount_project(task) == Path(task.worktree_path) / "app"
+    assert _state().mount_project(task) == Path(task.worktree_path)
+
+
+def test_nested_spec_paths_round_trip_through_the_mount_project():
+    """DW-379: a relative spec spelling is always PROJECT-relative. In a nested mount
+    `to_dict` persists the spec relative to `<mount>/app`, reopening re-anchors it
+    there, and releasing the mount keeps the same project-relative spelling — the
+    one a replacement mount (or the main checkout) re-resolves against its own
+    project.
+
+    Ablation: drop the mount project from `RunState.to_dict`'s task call and the
+    persisted spelling reddens as `app/_bmad-output/...`, which the reopen then joins
+    onto `<mount>/app` a second time."""
+    state = _nested_state()
+    wt = "/r/app/.bmad-loop/runs/r1/worktrees/1"
+    task = StoryTask("1-1-a", 1)
+    task.worktree_path = wt
+    task.spec_file = f"{wt}/app/_bmad-output/impl/s.md"
+    task.dispatched_spec_file = f"{wt}/app/_bmad-output/impl/s.md"
+    state.tasks[task.story_key] = task
+
+    persisted = state.to_dict()["tasks"]["1-1-a"]
+    assert persisted["spec_file"] == "_bmad-output/impl/s.md"
+    assert persisted["dispatched_spec_file"] == "_bmad-output/impl/s.md"
+
+    reopened = RunState.from_dict(json.loads(json.dumps(state.to_dict())))
+    back = reopened.tasks["1-1-a"]
+    mount_project = reopened.mount_project(back)
+    assert mount_project is not None
+    back.rebase_spec_paths_on(mount_project)
+    assert back.spec_file == str(Path(wt) / "app" / "_bmad-output" / "impl" / "s.md")
+    assert back.dispatched_spec_file == back.spec_file
+
+    back.release_mount_owned_state(mount_project)
+    assert back.spec_file == "_bmad-output/impl/s.md"
+    assert back.dispatched_spec_file is None
+
+
+def test_default_config_spec_paths_keep_the_mount_relative_spelling():
+    """Byte-identical when `project == repo_root`: the mount project IS the mount, so
+    the persisted spelling is exactly today's mount-relative one, and a bare
+    `to_dict()` (no anchor) agrees with the state-level call."""
+    state = _state()
+    wt = "/p/.bmad-loop/runs/r1/worktrees/1"
+    task = StoryTask("1-1-a", 1)
+    task.worktree_path = wt
+    task.spec_file = f"{wt}/_bmad-output/impl/s.md"
+    state.tasks[task.story_key] = task
+
+    assert state.to_dict()["tasks"]["1-1-a"]["spec_file"] == "_bmad-output/impl/s.md"
+    assert task.to_dict()["spec_file"] == "_bmad-output/impl/s.md"
+
+
+def test_nested_spec_outside_the_mount_project_stays_verbatim():
+    """A spec inside the mount but OUTSIDE its project (the checkout's other tree) is
+    not project-relative, so it is persisted absolute — never spelled `../...`."""
+    state = _nested_state()
+    wt = "/r/app/.bmad-loop/runs/r1/worktrees/1"
+    task = StoryTask("1-1-a", 1)
+    task.worktree_path = wt
+    task.spec_file = f"{wt}/other/s.md"
+    state.tasks[task.story_key] = task
+
+    assert state.to_dict()["tasks"]["1-1-a"]["spec_file"] == f"{wt}/other/s.md"

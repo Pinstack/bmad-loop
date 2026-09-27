@@ -19,6 +19,7 @@ from conftest import (
     assert_run_state_lock_held,
     escalated_run,
     git,
+    nested_repo_root_paths,
     patch_publish_rename,
     real_publish_rename,
     refuse_to_resolve,
@@ -29,7 +30,7 @@ from bmad_loop.adapters import tmux_base
 from bmad_loop.adapters.multiplexer import MultiplexerError
 from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
 from bmad_loop.journal import load_state, save_state
-from bmad_loop.model import RunState
+from bmad_loop.model import RunState, StoryTask
 from bmad_loop.process_host import ProcessHost
 
 
@@ -7866,3 +7867,129 @@ def test_rearm_escalation_pins_every_later_write_to_the_mount(
     swapped_in = (mount.with_name(mount.name + "-aside") / "specs" / "6-4.md").read_bytes()
     assert outside_spec.read_bytes() == swapped_in
     assert not outside_changes(outside_spec.read_text(encoding="utf-8"))
+
+
+# ------------------------------------------- nested repo_root mounts (DW-379)
+
+
+def _nested_run(tmp_path, *, spec_file, worktree_path):
+    """An escalated run whose project `<repo>/app` is nested in its code root `<repo>`,
+    with the unit's mount recorded at `worktree_path`."""
+    app = tmp_path / "repo" / "app"
+    app.mkdir(parents=True)
+    run = escalated_run(app, "r1", spec_file=spec_file, worktree_path=worktree_path)
+    run.state.repo_root = str(tmp_path / "repo")
+    return run
+
+
+def test_nested_mount_spec_and_stories_roots_are_the_mount_project(tmp_path):
+    """DW-379: a relative spec spelling is project-relative, so under a nested
+    `repo_root` every mount-side resolver answers the MOUNT PROJECT, `<mount>/app`:
+    `task_spec_root` (relative and absolute-inside shapes), `task_spec_path`, and
+    `task_stories_root` (which mirrors `_stories_folder`'s join on
+    `workspace.paths.project`). A spec in the mount but outside its project cannot be
+    confined by it and answers the project.
+
+    Ablation: return the raw `worktree_path` from `task_spec_root` and the first
+    assertions land on `<mount>`, the outer tree."""
+    wt = tmp_path / "wt"
+    (wt / "app").mkdir(parents=True)
+    rel = "_bmad-output/specs/6-4.md"
+
+    run = _nested_run(tmp_path, spec_file=rel, worktree_path=str(wt))
+    assert runs.task_spec_root(run.task, run.state) == wt / "app"
+    assert runs.task_spec_path(run.task, run.state) == wt / "app" / rel
+    assert runs.task_stories_root(run.task, run.state) == wt / "app"
+    # the relative spec is mount-owned, so its writers get a pin (DW-423)
+    live_project = Path(run.state.project)
+    assert runs.live_spec_root_identity(run.task, run.state, live_project) is not None
+
+    inside = wt / "app" / rel
+    run.task.spec_file = str(inside)
+    assert runs.task_spec_root(run.task, run.state) == wt / "app"
+
+    outer = wt / "other" / "6-4.md"
+    run.task.spec_file = str(outer)
+    assert runs.task_spec_root(run.task, run.state) == Path(run.state.project)
+
+
+def test_redrive_spec_status_prefixes_the_nested_offset_onto_the_blob_path(project):
+    """The isolated arm reads the COMMITTED spec from the code root's tree, where the
+    blob path is repo-relative: under a nested `repo_root` the project-relative
+    `spec_file` must carry the `app/` offset or no blob is ever found and the status
+    is always `""` (DW-379).
+
+    Ablation: drop the offset prefix in `_redrive_spec_status` and this reddens on
+    `""`."""
+    paths = nested_repo_root_paths(project)
+    rel = "_bmad-output/implementation-artifacts/spec-1-1-a.md"
+    spec = paths.project / rel
+    spec.write_text("---\nstatus: done\n---\n", encoding="utf-8")
+    git(paths.repo_root, "add", "-A")
+    git(paths.repo_root, "commit", "-q", "-m", "spec")
+    state = RunState(
+        run_id="r1",
+        project=str(paths.project),
+        repo_root=str(paths.repo_root),
+        started_at="now",
+        target_branch="main",
+    )
+    task = StoryTask("1-1-a", 1, spec_file=rel)
+
+    assert runs._redrive_spec_status(state, task, isolated_redrive=True) == "done"
+    # the unprefixed spelling names nothing in the code root's tree: the ablated read
+    flat = RunState(run_id="r2", project=str(paths.repo_root), started_at="now")
+    flat.target_branch = "main"
+    assert runs._redrive_spec_status(flat, task, isolated_redrive=True) == ""
+
+
+def test_moved_default_config_project_keeps_the_pre_dw379_anchors(project, tmp_path):
+    """A DEFAULT-config project moved after launch keeps its launch-time
+    `state.project` while resume re-stamps `repo_root`, so the recorded pair LOOKS
+    disjoint. No mount is ever made for a disjoint layout, so `mount_project` answers
+    the recorded mount itself (the pre-DW-379 anchor) and `_redrive_spec_status` reads
+    the raw spelling — byte-identical to before.
+
+    Ablation: let `mount_project` return `rebased_project(...)` for the disjoint pair
+    (the unmoved main project) and the first assertion reddens; return "" from
+    `_redrive_spec_status` for it and the second does."""
+    repo = project.project  # the live, re-stamped code root (a real checkout)
+    rel = "_bmad-output/implementation-artifacts/spec-1-1-a.md"
+    (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+    (repo / rel).write_text("---\nstatus: done\n---\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "spec")
+    mount = repo / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    state = RunState(
+        run_id="r1",
+        project=str(tmp_path / "old-location" / "proj"),  # launch-time spelling
+        repo_root=str(repo),  # re-stamped by resume
+        started_at="now",
+        target_branch="main",
+    )
+    task = StoryTask("1-1-a", 1, spec_file=rel, worktree_path=str(mount))
+    assert not Path(state.project).is_relative_to(state.code_root), "premise: looks disjoint"
+
+    assert runs.task_spec_root(task, state) == mount
+    assert runs._redrive_spec_status(state, task, isolated_redrive=True) == "done"
+
+
+def test_nested_live_stories_root_follows_a_project_move_to_the_mount_project(tmp_path):
+    """After the whole checkout moved, `live_stories_root` rebases the recorded MOUNT
+    PROJECT (`<mount>/app` under a nested `repo_root`) onto the live project and
+    answers it — not the moved mount's root, the outer tree.
+
+    Ablation: probe `Path(task.worktree_path)` instead of `state.mount_project(task)`
+    in `live_stories_root` and this answers `<live mount>` without `/app`."""
+    old_app = tmp_path / "old" / "repo" / "app"
+    old_app.mkdir(parents=True)
+    recorded_mount = old_app / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    run = escalated_run(
+        old_app, "r1", spec_file="_bmad-output/specs/6-4.md", worktree_path=str(recorded_mount)
+    )
+    run.state.repo_root = str(tmp_path / "old" / "repo")
+    live_app = tmp_path / "new" / "repo" / "app"
+    live_mount_project = live_app / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1" / "app"
+    live_mount_project.mkdir(parents=True)
+
+    assert runs.live_stories_root(run.task, run.state, live_app) == live_mount_project

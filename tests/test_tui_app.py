@@ -24,6 +24,7 @@ from conftest import (
     git,
     install_bmad_config,
     make_validate_document,
+    nested_repo_root_paths,
     refuse_to_resolve,
     write_sprint,
 )
@@ -2454,29 +2455,43 @@ async def test_dirty_worktree_blocks_launch(project, monkeypatch):
         assert not calls
 
 
-def _split_root_tui_project(project):
-    """The #414 pair, written where the guard reads them. Deliberately left
-    UNCOMMITTED: the guard is ordered ahead of the clean-tree gate exactly as
-    `cmd_run` orders it, and a committed fixture could not tell the two orders
-    apart."""
+def _split_root_tui_project(project, shape="inside"):
+    """The #414 pair, written where the guard reads them: `isolation = "worktree"`
+    beside a DISJOINT `repo_root` — inside the project (``git-root``, created so the
+    clean-tree probe of it answers rather than raising) or a sibling git checkout.
+    Deliberately left UNCOMMITTED: the guard is ordered ahead of the clean-tree gate
+    exactly as `cmd_run` orders it, and a committed fixture could not tell the two
+    orders apart."""
     install_bmad_config(project)
+    if shape == "sibling":
+        code_root = project.project.parent / f"{project.project.name}-code"
+        code_root.mkdir()
+        git(code_root, "init", "-q")
+        spelled = code_root.as_posix()
+    else:
+        (project.project / "git-root").mkdir()
+        spelled = "{project-root}/git-root"
     cfg = project.project / "_bmad" / "bmm" / "config.yaml"
-    cfg.write_text(cfg.read_text() + "repo_root: '{project-root}/git-root'\n", encoding="utf-8")
+    cfg.write_text(cfg.read_text() + f"repo_root: '{spelled}'\n", encoding="utf-8")
     (project.project / ".bmad-loop").mkdir(parents=True, exist_ok=True)
     (project.project / ".bmad-loop" / "policy.toml").write_text(
         '[adapter]\nname = "claude"\n\n[scm]\nisolation = "worktree"\n', encoding="utf-8"
     )
 
 
-async def test_worktree_isolation_under_a_repo_root_override_blocks_launch(project, monkeypatch):
+@pytest.mark.parametrize("shape", ["inside", "sibling"])
+async def test_worktree_isolation_under_a_repo_root_override_blocks_launch(
+    project, monkeypatch, shape
+):
     """#414: the TUI launches a detached CLI, and that CLI refuses this combination
     itself — this guard exists so the operator gets a toast instead of a pane that
     dies immediately. Asserted against the sole producer of the text rather than a
-    literal, so a reworded message cannot drift this test away from the CLI's."""
+    literal, so a reworded message cannot drift this test away from the CLI's. Both
+    disjoint layouts refuse."""
     calls = []
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "start_run_detached", lambda *a, **kw: calls.append(a))
-    _split_root_tui_project(project)
+    _split_root_tui_project(project, shape)
     expected = bmadconfig.worktree_isolation_conflict(
         bmadconfig.load_paths(project.project), "worktree"
     )
@@ -2524,6 +2539,90 @@ async def test_unreadable_policy_falls_through_the_isolation_guard(project, monk
         await pilot.click(await ready(pilot, "#ok"))
         await until(pilot, lambda: calls)
         assert not any("isolation" in m for m in notifications(app))
+
+
+async def test_worktree_isolation_beside_a_nested_repo_root_launches(project, monkeypatch):
+    """DW-379: the nested layout (`<repo>/app`, `repo_root` the checkout) is supported,
+    so the guard lets the launch through — graded on the detached launch happening.
+
+    Ablation: widen `worktree_isolation_conflict` back to "any `repo_root` override"
+    and the guard toasts the refusal instead of launching."""
+    calls = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "start_run_detached", lambda *a, **kw: calls.append(a))
+    paths = nested_repo_root_paths(project)
+    (paths.project / ".bmad-loop").mkdir(parents=True, exist_ok=True)
+    (paths.project / ".bmad-loop" / "policy.toml").write_text(
+        '[adapter]\nname = "claude"\n\n[scm]\nisolation = "worktree"\n', encoding="utf-8"
+    )
+    assert verify.worktree_clean(paths.repo_root, project=paths.project), "premise: clean"
+
+    app = BmadLoopApp(paths.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("r")
+        await until(pilot, lambda: isinstance(app.screen, StartRunModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: calls)
+        assert not any("needs the project directory" in m for m in notifications(app))
+
+
+async def test_a_nested_projects_policy_edit_does_not_block_launch(project, monkeypatch):
+    """The launch guard's clean probe of `repo_root` excludes the PROJECT's policy.toml
+    at its offset (`app/.bmad-loop/policy.toml`), as run/sweep/validate do, so a
+    settings edit under nested roots still launches.
+
+    Ablation: drop `project=` from `_guarded`'s `worktree_clean` call and the guard
+    toasts "not clean" instead of launching."""
+    calls = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "start_run_detached", lambda *a, **kw: calls.append(a))
+    paths = nested_repo_root_paths(project)
+    policy_file = paths.project / ".bmad-loop" / "policy.toml"
+    policy_file.parent.mkdir(parents=True, exist_ok=True)
+    policy_file.write_text('[adapter]\nname = "claude"\n', encoding="utf-8")
+    git(paths.repo_root, "add", "-f", "app/.bmad-loop/policy.toml")
+    git(paths.repo_root, "commit", "-qm", "track the nested policy")
+    policy_file.write_text(policy_file.read_text() + "# edited\n", encoding="utf-8")
+    assert not verify.worktree_clean(paths.repo_root), "premise: the edit is a real change"
+
+    app = BmadLoopApp(paths.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("r")
+        await until(pilot, lambda: isinstance(app.screen, StartRunModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: calls)
+        assert not any("not clean" in m for m in notifications(app))
+
+
+async def test_a_dirty_code_root_blocks_launch_under_a_nested_project(project, monkeypatch):
+    """The launch guard probes the CODE root, as `cmd_run`/`cmd_sweep` do (DW-379): in
+    the nested monorepo layout the project `app/` is clean while a tracked file OUTSIDE
+    it — in the checkout the run's git work happens in — is dirty, and the guard must
+    refuse exactly as the detached CLI's `worktree_clean(paths.repo_root)` would.
+
+    Ablation: probe `self.project` in `_guarded` instead of the loaded `repo_root` and
+    this fails — `worktree_clean` is pathspec-scoped to its cwd, so `app/` reads clean
+    and the launch goes through."""
+    calls = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "start_run_detached", lambda *a, **kw: calls.append(a))
+    paths = nested_repo_root_paths(project)
+    outer = paths.repo_root / "src.txt"
+    assert git(paths.repo_root, "ls-files", "--error-unmatch", "src.txt"), "premise: tracked"
+    outer.write_text("dirty outside the project\n", encoding="utf-8")
+    assert verify.worktree_clean(paths.project), "premise: the project itself is clean"
+    assert not verify.worktree_clean(paths.repo_root)
+
+    app = BmadLoopApp(paths.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("r")
+        await until(pilot, lambda: isinstance(app.screen, StartRunModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: any("not clean" in m for m in notifications(app)))
+        assert not calls
 
 
 def _fake_tui_git_version(monkeypatch, reported=None, *, boom=None):
@@ -6521,8 +6620,9 @@ def test_escalation_rearm_reports_state_lock_failures(project, monkeypatch, fail
     assert notes == [(f"re-arm failed: {failure}", "error")]
 
 
+@pytest.mark.parametrize("shape", ["inside", "sibling"])
 async def test_escalation_rearm_refuses_the_isolation_conflict_before_it_mutates(
-    project, monkeypatch
+    project, monkeypatch, shape
 ):
     """Parity with `cli.cmd_resolve` on the hoisted refusal, and for the same reason this
     surface needed the re-stamp parity above: it re-arms and resumes in ONE click.
@@ -6560,7 +6660,7 @@ async def test_escalation_rearm_refuses_the_isolation_conflict_before_it_mutates
         "notify",
         lambda self, msg, **kw: notes.append(str(msg)) or orig_notify(self, msg, **kw),
     )
-    _split_root_tui_project(project)
+    _split_root_tui_project(project, shape)
     expected = bmadconfig.worktree_isolation_conflict(
         bmadconfig.load_paths(project.project), "worktree"
     )
@@ -6587,6 +6687,49 @@ async def test_escalation_rearm_refuses_the_isolation_conflict_before_it_mutates
 
     assert not calls  # the resume folded into this gesture never fired
     assert load_state(run_dir).repo_root == recorded  # the mirror was never re-pointed
+
+
+def test_escalation_rearm_proceeds_beside_a_nested_repo_root(project, monkeypatch):
+    """DW-379: the re-arm guard's copy of the refusal stays silent for a `repo_root`
+    that CONTAINS the project (here its parent), so the gesture re-arms — with
+    `isolated_redrive=True`, the live worktree mode — graded on the re-arm happening.
+
+    Ablation: widen `worktree_isolation_conflict` back to "any `repo_root` override"
+    and this reddens: the guard toasts the refusal and never re-arms."""
+    from conftest import write_repo_root_override
+
+    from bmad_loop import runs
+
+    install_bmad_config(project)
+    write_repo_root_override(project, project.project.parent)
+    (project.project / ".bmad-loop").mkdir(parents=True, exist_ok=True)
+    (project.project / ".bmad-loop" / "policy.toml").write_text(
+        '[adapter]\nname = "claude"\n\n[scm]\nisolation = "worktree"\n', encoding="utf-8"
+    )
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision.",
+    )
+    rearms: list[bool] = []
+    notes: list[str] = []
+    monkeypatch.setattr(BmadLoopApp, "_resolve_blocked_by_liveness", lambda *_a: False)
+
+    def recording_rearm(_rd, key, *, isolated_redrive=False, **_kwargs):
+        rearms.append(isolated_redrive)
+        return _rearm_outcome(key)
+
+    monkeypatch.setattr(runs, "rearm_escalation", recording_rearm)
+    app = BmadLoopApp(project.project)
+    monkeypatch.setattr(app, "notify", lambda message, **_k: notes.append(str(message)))
+    monkeypatch.setattr(app, "_do_resume", lambda _run_id: None)
+
+    app._do_rearm(run_dir.name, run_dir, "1")
+
+    assert rearms == [True]
+    assert not any("needs the project directory" in note for note in notes)
 
 
 async def test_escalation_rearm_surfaces_the_kinds_it_used_to_drop(project, monkeypatch):

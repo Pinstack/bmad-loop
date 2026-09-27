@@ -71,6 +71,7 @@ from .model import (
     VerifyOutcome,
     result_mapping,
 )
+from .mountpaths import rebased_project
 from .platform_util import (
     atomic_replace,
     atomic_write_text,
@@ -1683,10 +1684,10 @@ class Engine:
         `baseline_untracked` all name the mount or a measurement taken inside it, and
         each is wrong the moment it is gone.
 
-        Spec ownership is released through `task.release_spec_paths_from_mount()`,
-        which clears the attempt-owned pair and returns `spec_file` to the
-        mount-relative spelling. It runs BEFORE `worktree_path` is cleared, because
-        the relativization is measured against it.
+        Spec ownership is released through `task.release_mount_owned_state()`, which
+        clears the attempt-owned pair and returns `spec_file` to the spelling relative
+        to the mount project (`_mount_project`, DW-379). It runs BEFORE `worktree_path`
+        is cleared, because the relativization is measured against that mount.
 
         An earlier version left that pair alone, reasoning that
         `_bind_dispatched_spec_for_attempt` rebinds on the next attempt before any
@@ -1743,10 +1744,19 @@ class Engine:
         attempt's to remove", and the same one `sweep`'s migration refusal already uses.
         """
         discard_worktree(self.paths.repo_root, task.worktree_path, "", run_dir=self.run_dir)
-        # before the clears below: the relativization is measured against this field
-        task.release_mount_owned_state()
+        # before the clears below: the relativization is measured against this field's
+        # mount project (DW-379)
+        task.release_mount_owned_state(self._mount_project(task))
         task.worktree_path = ""
         task.branch = ""
+
+    def _mount_project(self, task: StoryTask) -> Path:
+        """The mount project of ``task``'s recorded mount — the anchor its relative
+        spec spellings are persisted against (``model.StoryTask.to_dict``) and read
+        back from. ``self.paths.rebased(<mount>).project`` without the resolve,
+        through the same :func:`mountpaths.rebased_project`: the mount itself unless
+        the project is nested inside ``repo_root`` (DW-379)."""
+        return rebased_project(self.paths.project, self.paths.repo_root, Path(task.worktree_path))
 
     def _release_orphaned_mount(self, task: StoryTask) -> None:
         """Release mount ownership for a restart that will run in main.
@@ -1761,8 +1771,9 @@ class Engine:
         if not task.worktree_path:
             return
         orphan = task.worktree_path
-        # before the clears: the relativization is measured against this field
-        task.release_mount_owned_state()
+        # before the clears: the relativization is measured against this field's
+        # mount project (DW-379)
+        task.release_mount_owned_state(self._mount_project(task))
         task.worktree_path = ""
         task.branch = ""
         self.journal.append(
@@ -2093,11 +2104,12 @@ class Engine:
             if task.terminal:
                 continue
             if task.worktree_path:
-                # Portable spec paths are persisted relative to their recorded mount.
-                # Re-anchor before dispatching recovery: accepted continuations reopen
-                # that mount regardless of live policy, while a restart must release
-                # ownership before it can begin in main or a replacement worktree.
-                task.rebase_spec_paths_on(Path(task.worktree_path))
+                # Portable spec paths are persisted relative to their recorded mount's
+                # project. Re-anchor before dispatching recovery: accepted continuations
+                # reopen that mount regardless of live policy, while a restart must
+                # release ownership before it can begin in main or a replacement
+                # worktree.
+                task.rebase_spec_paths_on(self._mount_project(task))
             mounted = bool(task.worktree_path)
             restart_isolated = self._isolated and mounted
             if mounted and task.defer_reason is not None:
@@ -9366,7 +9378,7 @@ class Engine:
             self.journal.append("sweep-auto-suppressed", trigger=trigger)
             return
         try:
-            clean = verify.worktree_clean(self.workspace.root)
+            clean = verify.worktree_clean(self.workspace.root, project=self.workspace.paths.project)
         except verify.GitError as e:
             # Fails closed — but ahead of the latch, because unlike the dirty-tree
             # arm this one is transient-reachable: `_run_git` reports a
