@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import difflib
 import json
 import posixpath
 import secrets
@@ -149,6 +150,45 @@ def _artifact_seed(artifact: Path, repo: Path, worktree: Path) -> tuple[str, ...
         return ()
     if linked:
         return () if _occupied(worktree / target_rel) else (target_rel,)
+    return (rel,)
+
+
+def _artifact_seed_dropped(artifact: Path, repo: Path, worktree: Path) -> tuple[str, ...]:
+    """The configured rel :func:`_artifact_seed` excluded as out-of-project, when the
+    worktree ends up without it — or ``()`` (DW-432).
+
+    Naming only: the out-of-project exclusion itself stands, and nothing here seeds or
+    copies. It exists because that exclusion was silent — an untracked leaf symlink
+    whose target resolves outside the PROJECT left the worktree's configured path
+    absent with no journal entry saying so. For a nested project a target that is
+    inside ``repo_root`` but outside the project is named too (and still not copied:
+    the copier's checkout-wide containment check would let it through, which would be
+    a behavior change).
+
+    ``(rel,)`` only when the configured rel (parent resolved, leaf not — the one
+    :func:`_artifact_seed` derives) lies inside ``repo``, the fully resolved target
+    does NOT, the main-checkout artifact reads as a file, and ``worktree / rel`` does
+    not (a checkout carrying the link as a tracked live entry delivers it). ``repo``
+    and ``worktree`` are the :func:`provision_roots` pair, so the rel is
+    project-relative like every other ``worktree-seed-dropped`` entry. Meant to run
+    after provisioning, on the post-provisioning worktree. Total: a resolve fault is
+    "not dropped".
+    """
+    try:
+        repo_resolved = repo.resolve()
+        rel = (artifact.parent.resolve() / artifact.name).relative_to(repo_resolved).as_posix()
+    except (OSError, RuntimeError, ValueError):
+        return ()
+    try:
+        artifact.resolve().relative_to(repo_resolved)
+    except ValueError:
+        pass  # the target escapes the project: the exclusion this names
+    except (OSError, RuntimeError):
+        return ()
+    else:
+        return ()  # an in-project target is _artifact_seed's to deliver
+    if not _is_file(artifact) or _is_file(worktree / rel):
+        return ()
     return (rel,)
 
 
@@ -636,6 +676,84 @@ def _pinned_config_edits(worktree: Path, pins: dict[str, dict[str, str]]) -> lis
         )
         edits.append(f"{rel}: changed outside the relay hooks (keys: {', '.join(changed)})")
     return edits
+
+
+_PINNED_FORENSICS_HEADER = (
+    "# bmad-loop (DW-479): edits to skip-worktree-pinned hook configs.\n"
+    "# `git diff` reads a skip-worktree path as clean, so the patch above (if any)\n"
+    "# omits these. Each diff's base is the rewrite provisioning wrote and pinned\n"
+    "# (bmad-loop relay hooks included), not the baseline commit, so this section is\n"
+    "# commented out and does NOT apply: `git apply` skips it; carry it by hand.\n"
+)
+
+
+def _unified_diff_text(before: str, after: str | None, rel: str) -> str:
+    """A unified diff of ``before`` -> ``after`` for ``rel`` (``after=None``: deleted,
+    diffed to ``/dev/null``), with git's no-newline marker where a side lacks one.
+    Every line is ``# ``-prefixed: its base is the relay-bearing rewrite, not the
+    baseline, so a live hunk would make an all-or-nothing ``git apply`` of the whole
+    patch fail; commented, ``git apply`` skips it as garbage."""
+    lines = difflib.unified_diff(
+        _lines_keepends(before),
+        _lines_keepends(after or ""),
+        fromfile=f"a/{rel}",
+        # patch-format spelling of "no file", on every platform (not os.devnull)
+        tofile=posixpath.devnull if after is None else f"b/{rel}",
+    )
+    out: list[str] = []
+    for line in lines:
+        out.append(f"# {line}")
+        if not line.endswith("\n"):
+            out.append("\n# \\ No newline at end of file\n")
+    return "".join(out)
+
+
+def _lines_keepends(text: str) -> list[str]:
+    """``text`` split on ``\n`` only, ends kept. ``str.splitlines`` also splits on
+    U+2028/U+2029/``\x85``/``\r`` and more, all legal raw inside a JSON string,
+    which would put a bogus line break mid-hunk."""
+    parts = [f"{piece}\n" for piece in text.split("\n")]
+    parts[-1] = parts[-1][:-1]  # the last piece had no newline after it
+    return parts if parts[-1] else parts[:-1]
+
+
+def _pinned_config_forensics(worktree: Path, pins: dict[str, dict[str, str]]) -> str:
+    """The forensic-patch section for story edits to pinned hook configs, or ``""``
+    when there is none (DW-479).
+
+    A DEFERRED unit's ``changes.patch`` is ``git diff <baseline>``, which reads a
+    skip-worktree-pinned config as clean, so a story's edit to one never reached the
+    patch and was lost silently when teardown removed the worktree. ``pins`` is
+    ``StoryTask.pinned_config_rewrites``; each rel is judged alone by
+    :func:`_pinned_config_edits`, so a relay-only change or a reformat adds nothing.
+    Each edited rel gets its description line(s) as ``#`` comments, then a
+    commented-out unified diff from the recorded rewrite to the on-disk text (to
+    ``/dev/null`` when the file is gone) — commented so ``git apply`` of the patch
+    above still works. No git call: the recorded rewrite is exactly what provisioning
+    wrote, so the diff isolates the story's own delta without the relay noise.
+
+    Total: a file that cannot be read or decoded keeps its description line and
+    gets no diff.
+    """
+    sections: list[str] = []
+    for rel in sorted(pins):
+        entry = pins[rel]
+        edits = _pinned_config_edits(worktree, {rel: entry})
+        if not edits:
+            continue
+        section = "".join(f"# {line}\n" for line in edits)
+        after: str | None
+        try:
+            after = (worktree / rel).read_bytes().decode("utf-8")
+        except FileNotFoundError:
+            after = None
+        except (OSError, UnicodeDecodeError):
+            sections.append(section)
+            continue
+        sections.append(section + _unified_diff_text(str(entry.get("text", "")), after, rel))
+    if not sections:
+        return ""
+    return _PINNED_FORENSICS_HEADER + "".join(sections)
 
 
 def _seed_bmad_tree(
@@ -1900,6 +2018,8 @@ class WorktreeFlow:
         a link, so the target is the one path it will write, and the checked-out
         link then reads the copy. An out-of-repo target stays excluded
         (``provision_worktree`` refuses that source whatever rel it is handed).
+        That drop is no longer silent: :meth:`_artifact_seed_drops` names the
+        configured rel in ``worktree-seed-dropped`` (DW-432).
         See :func:`_artifact_seed`; containment is re-checked against both roots
         at the copy site.
 
@@ -1949,7 +2069,8 @@ class WorktreeFlow:
         A board that is itself a symlink is placed exactly as ``_ledger_seed``
         places a symlinked ledger — at the configured path, or at the target only
         behind a tracked dangling link (DW-377, was #462); both delegate to
-        :func:`_artifact_seed`.
+        :func:`_artifact_seed`. An out-of-project target is excluded as for the
+        ledger, and :meth:`_artifact_seed_drops` names that drop (DW-432).
 
         INHERITED LIMITATION — parity, not a regression, and NOT fixed here: a
         non-fixable rollback does not restore a seeded board. Rollback resets
@@ -1966,6 +2087,18 @@ class WorktreeFlow:
         Deduped against ``scm.worktree_seed`` by the caller.
         """
         return _artifact_seed(self.paths.sprint_status, *self._mount_roots(worktree))
+
+    def _artifact_seed_drops(self, worktree: Path) -> list[str]:
+        """The ledger's and board's configured rels that :meth:`_ledger_seed` /
+        :meth:`_board_seed` excluded as out-of-project and the worktree still lacks
+        (DW-432) — project-relative, deduped, ledger first. Naming only; run after
+        provisioning. See :func:`_artifact_seed_dropped`."""
+        roots = self._mount_roots(worktree)
+        drops = [
+            *_artifact_seed_dropped(self.paths.deferred_work, *roots),
+            *_artifact_seed_dropped(self.paths.sprint_status, *roots),
+        ]
+        return list(dict.fromkeys(drops))
 
     def _accepted_spec_seed(
         self,
@@ -2490,6 +2623,11 @@ class WorktreeFlow:
             config_paths=[p.hooks.config_path for p in profiles if not p.hookless],
             project=self.paths.project,
         )
+        # A ledger/board the seed step excluded because its leaf link escapes the
+        # project is otherwise dropped without a word (DW-432): name it here.
+        for rel in self._artifact_seed_drops(unit.path):
+            if rel not in undelivered_seeds:
+                undelivered_seeds.append(rel)
         if undelivered_seeds:
             self.journal.append(
                 "worktree-seed-dropped", story_key=task.story_key, entries=undelivered_seeds
@@ -2712,6 +2850,20 @@ class WorktreeFlow:
             task.isolated_ledger_carried = True
             self._save()
         else:  # DEFERRED — capture the diff, keep or drop per keep_failed
+            # `git diff` reads a skip-worktree-pinned hook config as clean, so a
+            # story's edit to one would miss the patch and die with the worktree
+            # (DW-479). Built here, while the worktree is still mounted.
+            forensic_extra = ""
+            if task.pinned_config_rewrites:
+                try:
+                    mounted = unit.path.is_dir()
+                except OSError:
+                    # an unprovable mount: the per-file reads below name the fault
+                    mounted = True
+                if mounted:
+                    forensic_extra = _pinned_config_forensics(
+                        unit.path, task.pinned_config_rewrites
+                    )
             patch = close_unit_workspace(
                 unit,
                 success=False,
@@ -2724,6 +2876,7 @@ class WorktreeFlow:
                 on_teardown_degraded=lambda msg: self.journal.append(
                     "worktree-teardown-degraded", story_key=task.story_key, error=msg
                 ),
+                forensic_extra=forensic_extra,
             )
             self.journal.append(
                 "unit-closed",

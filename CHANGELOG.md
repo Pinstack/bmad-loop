@@ -154,6 +154,13 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Name an untracked ledger or board whose leaf symlink targets a file outside the project
+  in `worktree-seed-dropped` (DW-432). The file is still not seeded; only the silent drop
+  is gone.
+- Carry a DEFERRED unit's edits to skip-worktree-pinned hook configs in its
+  `changes.patch` (DW-479). `git diff` reads a pinned file as clean, so the edit was lost
+  on teardown with `keep_failed = false`; the patch now appends a diff of each edited
+  config against the rewrite provisioning pinned.
 - Reach more of a verify command's or declarative hook's process tree on a hard stop or
   timeout (DW-477). While the root runs, the runner re-scans its descendants every
   second and keeps them, so a job seen under the live root is killed after its shell

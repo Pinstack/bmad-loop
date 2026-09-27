@@ -1526,6 +1526,44 @@ def test_undelivered_arbitrary_seed_is_journaled_never_escalated(project, tmp_pa
     assert "story-escalated" not in journal_kinds(engine)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_out_of_project_leaf_linked_ledger_drop_is_journaled(project, tmp_path):
+    """DW-432: an untracked ledger that is a leaf symlink to a file outside the
+    project stays unseeded (the out-of-project exclusion), but the drop is named in
+    `worktree-seed-dropped` instead of passing silently — and the outside target is
+    left unchanged.
+
+    Ablation: drop the `_artifact_seed_drops` merge in `run_isolated` and no
+    `worktree-seed-dropped` entry is journaled."""
+    ignore_before_commit(project, "deferred-work.md")
+    outside = tmp_path / "outside-ledger.md"
+    outside.write_text("# Deferred Work\n", encoding="utf-8")
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.symlink_to(outside)
+    rel = project.deferred_work.relative_to(project.project).as_posix()
+    assert git(project.project, "check-ignore", rel).strip() == rel
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+
+    seen: list[bool] = []
+    inner = wt_dev_effect(project, "1-1-a", followup_review=False)
+
+    def effect(spec):
+        wt_ledger = project.rebased(spec.cwd).deferred_work
+        seen.append(wt_ledger.is_file() or wt_ledger.is_symlink())
+        return inner(spec)
+
+    engine, _ = make_engine(project, [effect])
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    assert seen == [False]  # still not seeded: naming only
+    dropped = [
+        entry for entry in engine.journal.entries() if entry["kind"] == "worktree-seed-dropped"
+    ]
+    assert len(dropped) == 1 and rel in dropped[0]["entries"]
+    assert outside.read_text(encoding="utf-8") == "# Deferred Work\n"
+
+
 def test_undelivered_module_skill_is_journaled_never_escalated(project):
     """#464 — a wheel-bundled MODULE_SKILL whose content never reached the unit
     worktree is journaled under its own kind, and the run still completes.
@@ -2187,6 +2225,56 @@ def test_worktree_defer_without_keep_drops_worktree_but_saves_patch(project):
     # in the run dir is the only surviving artifact.
     attention = (engine.run_dir / "ATTENTION").read_text()
     assert "story deferred: 1-1-a" in attention and "kept on branch" not in attention
+
+
+@pytest.mark.parametrize("keep_failed", [False, True], ids=["dropped", "kept"])
+def test_worktree_defer_patch_carries_a_pinned_hook_config_edit(project, keep_failed):
+    """DW-479: provisioning pins a TRACKED hook config skip-worktree after rewriting
+    its relay hooks, so `git diff <baseline>` reads the story's own edit to it as
+    clean. With keep_failed=false the worktree is torn down, and the forensic patch
+    is the only copy left — it must carry the edit; a kept unit's patch carries it too.
+
+    Ablation: drop `forensic_extra=` from the DEFERRED arm's `close_unit_workspace`
+    call and the patch lacks the key."""
+    settings = project.project / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(
+        json.dumps({"permissions": {"allow": ["Bash(ls)"]}}, indent=2) + "\n", encoding="utf-8"
+    )
+    git(project.project, "add", "-f", ".claude/settings.json")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    assert verify.path_tracked(project.project, ".claude/settings.json")
+
+    script = _defer_script(project, "1-1-a")
+    inner = script[0]
+
+    def dev(spec):
+        cfg_path = spec.cwd / ".claude" / "settings.json"
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg["storyAddedKey"] = "dw-479"
+        cfg_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+        return inner(spec)
+
+    script[0] = dev
+    engine, adapter = make_engine(
+        project, script, policy=wt_policy(keep_failed=keep_failed, limits=_NO_DAMP)
+    )
+    attach_profile(adapter)
+    summary = engine.run()
+
+    assert summary.deferred == 1
+    patch = engine.run_dir / "failed" / "1-1-a" / "changes.patch"
+    text = patch.read_text(encoding="utf-8")
+    git_part, _, pinned_part = text.partition("# bmad-loop (DW-479)")
+    assert "change for 1-1-a" in git_part
+    # the premise: the pin is real, so `git diff` alone never saw the edit
+    assert "storyAddedKey" not in git_part
+    assert "# .claude/settings.json: changed outside the relay hooks" in pinned_part
+    assert '# +  "storyAddedKey": "dw-479"' in pinned_part
+    # the commented section must not break an all-or-nothing `git apply` of the rest
+    git(project.project, "apply", "--check", str(patch))
+    # kept or dropped, the patch is the same record; only the mount's fate differs
+    assert (len(worktree_list(project.project)) == 2) is keep_failed
 
 
 _HARVEST_CARRY = {
@@ -7812,6 +7900,37 @@ def test_close_capture_failure_preserves_worktree_and_branch(project, monkeypatc
     assert unit.path.exists()  # preserved: the worktree holds the only copy
     assert branch_exists(project.project, unit.branch)
     assert len(reports) == 1 and "diff capture failed" in reports[0]
+
+
+@pytest.mark.parametrize("capture", ["empty", "failed"])
+def test_close_forensic_extra_writes_the_patch_without_a_git_diff(project, monkeypatch, capture):
+    """DW-479: a pinned-config edit can be a unit's only change — `git diff` is then
+    empty — and a failed capture must not swallow it either: a non-empty
+    `forensic_extra` writes the patch on its own. Ablation: append the extra after
+    the `if diff:` write and both rows return None."""
+    from bmad_loop.workspace import close_unit_workspace
+
+    unit, run_dir = _open_unit(project)
+
+    def capture_diff(*a, **k):
+        if capture == "failed":
+            raise verify.GitError("git diff timed out")
+        return ""
+
+    monkeypatch.setattr(verify, "capture_diff", capture_diff)
+    extra = "# bmad-loop (DW-479): pinned\n"
+
+    patch = close_unit_workspace(
+        unit,
+        success=False,
+        keep_failed=False,
+        run_dir=run_dir,
+        unit_key="1-1-a",
+        on_teardown_degraded=lambda _msg: None,
+        forensic_extra=extra,
+    )
+
+    assert patch is not None and patch.read_text(encoding="utf-8") == extra
 
 
 def test_close_capture_failure_frees_shared_branch(project, monkeypatch):

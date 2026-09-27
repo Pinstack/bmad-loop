@@ -526,6 +526,7 @@ def close_unit_workspace(
     detach_kept: bool = False,
     diff_max_file_bytes: int | None = None,
     on_teardown_degraded: Callable[[str], None] | None = None,
+    forensic_extra: str = "",
 ) -> Path | None:
     """Tear down (or preserve) a unit's worktree.
 
@@ -555,6 +556,11 @@ def close_unit_workspace(
 
     diff_max_file_bytes caps the per-untracked-file size in that forensic patch
     (None = no cap); see verify.capture_diff.
+
+    forensic_extra (failure only) is appended to the captured diff before it is
+    written — the caller's record of changes `git diff` cannot see, such as a
+    story's edit to a skip-worktree-pinned hook config (DW-479). A non-empty extra
+    writes the patch even when the git diff is empty or its capture failed.
     """
     patch: Path | None = None
     if not success:
@@ -568,6 +574,10 @@ def close_unit_workspace(
         except verify.GitError as e:
             capture_err = e
             diff = ""
+        if forensic_extra:
+            if diff and not diff.endswith("\n"):
+                diff += "\n"
+            diff += forensic_extra
         if diff:
             patch = run_dir / "failed" / safe_segment(unit_key) / "changes.patch"
             patch.parent.mkdir(parents=True, exist_ok=True)

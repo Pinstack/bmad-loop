@@ -31,7 +31,9 @@ from bmad_loop.workspace import (
 )
 from bmad_loop.worktree_flow import (
     WorktreeFlow,
+    _artifact_seed_dropped,
     _pinned_config_edits,
+    _pinned_config_forensics,
     _setup_mcp_agent_id,
     _uncarried_ledger_changes,
     provision_worktree,
@@ -608,6 +610,151 @@ def test_artifact_seed_skips_a_leaf_symlink_escaping_the_repo(tmp_path, method, 
     assert getattr(flow, method)(worktree) == ()
 
 
+# DW-432: the out-of-project exclusion above stays, but the drop is named. The rows
+# call the module probe and the flow method both, over each artifact.
+
+
+def _dropped(flow: WorktreeFlow, attr: str, worktree: Path) -> tuple[str, ...]:
+    """The module probe for one artifact, over the flow's own roots, cross-checked
+    against the flow method that merges both artifacts."""
+    configured: Path = getattr(flow.paths, attr)
+    probe = _artifact_seed_dropped(configured, *flow._mount_roots(worktree))
+    drops = flow._artifact_seed_drops(worktree)
+    try:
+        rel = (configured.parent.resolve() / configured.name).relative_to(
+            flow._mount_roots(worktree)[0].resolve()
+        )
+    except ValueError:  # an out-of-tree artifacts dir: no project rel to name
+        assert probe == () and drops == []
+        return probe
+    assert (rel.as_posix() in drops) == bool(probe)
+    return probe
+
+
+@pytest.mark.parametrize(("method", "attr"), _SEED_ARTIFACTS)
+def test_artifact_seed_dropped_names_a_leaf_symlink_escaping_the_repo(tmp_path, method, attr):
+    """The configured project-relative rel is named — and still not seeded.
+    Ablation: return `()` from the escape arm and this answers `()`."""
+    flow = _artifact_flow(tmp_path)
+    configured: Path = getattr(flow.paths, attr)
+    outside = tmp_path / "outside.md"
+    outside.write_text("# Deferred Work\n", encoding="utf-8")
+    configured.symlink_to(outside)
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    rel = configured.relative_to(flow.paths.repo_root).as_posix()
+    assert _dropped(flow, attr, worktree) == (rel,)
+    assert getattr(flow, method)(worktree) == ()
+    assert flow._artifact_seed_drops(worktree) == [rel]
+
+
+@pytest.mark.parametrize(("method", "attr"), _SEED_ARTIFACTS)
+def test_artifact_seed_dropped_names_a_nested_target_outside_the_project(tmp_path, method, attr):
+    """project = repo_root/app; the link targets repo_root/elsewhere — inside the
+    checkout, outside the project. Named project-relative; nothing is seeded (the
+    copier's checkout-wide containment would let it through)."""
+    repo = tmp_path / "repo"
+    app = repo / "app"
+    impl = app / "_bmad-output" / "implementation-artifacts"
+    impl.mkdir(parents=True)
+    paths = ProjectPaths(
+        project=app,
+        implementation_artifacts=impl,
+        planning_artifacts=app / "_bmad-output" / "planning-artifacts",
+        repo_root=repo,
+    )
+    flow = _make_flow(tmp_path, paths=paths, policy=_policy(isolation="worktree"))
+    configured: Path = getattr(flow.paths, attr)
+    target = repo / "elsewhere" / "x.md"
+    target.parent.mkdir()
+    target.write_text("# Deferred Work\n", encoding="utf-8")
+    configured.symlink_to(target)
+    worktree = tmp_path / "wt"
+    (worktree / "app").mkdir(parents=True)
+
+    rel = configured.relative_to(app).as_posix()
+    assert _dropped(flow, attr, worktree) == (rel,)
+    assert getattr(flow, method)(worktree) == ()
+
+
+@pytest.mark.parametrize(("method", "attr"), _SEED_ARTIFACTS)
+def test_artifact_seed_dropped_skips_a_link_the_checkout_carries(tmp_path, method, attr):
+    """A tracked live link reads a file at the worktree's configured path: delivered,
+    so not named. Ablation: drop the `_is_file(worktree / rel)` arm and it is."""
+    flow = _artifact_flow(tmp_path)
+    configured: Path = getattr(flow.paths, attr)
+    outside = tmp_path / "outside.md"
+    outside.write_text("# Deferred Work\n", encoding="utf-8")
+    configured.symlink_to(outside)
+    worktree = tmp_path / "wt"
+    rel = configured.relative_to(flow.paths.repo_root)
+    (worktree / rel).parent.mkdir(parents=True)
+    (worktree / rel).symlink_to(outside)
+
+    assert _dropped(flow, attr, worktree) == ()
+    assert flow._artifact_seed_drops(worktree) == []
+
+
+@pytest.mark.parametrize(("method", "attr"), _SEED_ARTIFACTS)
+@pytest.mark.parametrize("shape", ["in-project-link", "plain-file", "absent"])
+def test_artifact_seed_dropped_skips_what_the_seed_owns(tmp_path, method, attr, shape):
+    """An in-project target and a plain file are `_artifact_seed`'s to deliver, and
+    an absent artifact is dropped silently by design: none is named. Ablation: drop
+    the `else: return ()` arm and the in-project rows are named."""
+    flow = _artifact_flow(tmp_path)
+    repo = flow.paths.repo_root
+    configured: Path = getattr(flow.paths, attr)
+    if shape == "in-project-link":
+        target = repo / "other" / "target.md"
+        target.parent.mkdir()
+        target.write_text("# Deferred Work\n", encoding="utf-8")
+        configured.symlink_to(target)
+    elif shape == "plain-file":
+        configured.write_text("# Deferred Work\n", encoding="utf-8")
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    assert _dropped(flow, attr, worktree) == ()
+    if shape != "absent":
+        assert getattr(flow, method)(worktree) != ()
+
+
+@pytest.mark.parametrize(("method", "attr"), _SEED_ARTIFACTS)
+def test_artifact_seed_dropped_skips_an_out_of_tree_artifacts_dir(tmp_path, method, attr):
+    """An artifacts DIR outside the project is shared, not per-checkout: the rel
+    cannot derive, so there is nothing to name."""
+    shared = tmp_path / "shared-artifacts"
+    shared.mkdir()
+    flow = _artifact_flow(tmp_path, artifacts=shared)
+    configured: Path = getattr(flow.paths, attr)
+    configured.write_text("# Deferred Work\n", encoding="utf-8")
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    assert _dropped(flow, attr, worktree) == ()
+
+
+@pytest.mark.parametrize(("method", "attr"), _SEED_ARTIFACTS)
+def test_artifact_seed_dropped_is_total_over_resolve_faults(tmp_path, monkeypatch, method, attr):
+    flow = _artifact_flow(tmp_path)
+    configured: Path = getattr(flow.paths, attr)
+    outside = tmp_path / "outside.md"
+    outside.write_text("# Deferred Work\n", encoding="utf-8")
+    configured.symlink_to(outside)
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    real = Path.resolve
+
+    def resolve(self, *a, **kw):
+        if self == configured:
+            raise RuntimeError("symlink loop")
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    assert _dropped(flow, attr, worktree) == ()
+
+
 # ------------------------------------------------------ uncarried ledger changes
 #
 # `_uncarried_ledger_changes` (DW-375) diffs a seeded ledger against its worktree
@@ -977,6 +1124,104 @@ def test_pinned_config_unreadable_file_counts_as_an_edit(tmp_path, monkeypatch):
     (edit,) = _pinned_config_edits(wt, pins)
     assert edit.startswith(f"{rel}: unreadable while pinned")
     assert "denied" in edit
+
+
+# DW-479: a DEFERRED unit's forensic patch is `git diff <baseline>`, blind to a
+# skip-worktree pin, so the pinned edits are appended as their own section.
+
+
+def test_pinned_config_forensics_diffs_a_story_edit(tmp_path):
+    """Ablation: drop the diff and only the description line is left."""
+    wt, rel, pins = _write_pinned(tmp_path)
+    _edit_json(wt / rel, lambda cfg: cfg.update(storyKey="added-by-story"))
+
+    text = _pinned_config_forensics(wt, pins)
+
+    assert text.startswith("# bmad-loop (DW-479)")
+    assert f"# {rel}: changed outside the relay hooks (keys: storyKey)\n" in text
+    assert "commented out and does NOT apply" in text
+    assert f"# --- a/{rel}\n# +++ b/{rel}\n" in text
+    assert '# +  "storyKey": "added-by-story"' in text
+    assert all(line.startswith("#") for line in text.splitlines())
+
+
+@pytest.mark.parametrize("how", ["untouched", "reformatted", "relay-changed", "relay-removed"])
+def test_pinned_config_forensics_is_empty_without_an_edit(tmp_path, how):
+    wt, rel, pins = _write_pinned(tmp_path)
+    if how != "untouched":
+        _hook_only(wt / rel, how)
+    assert _pinned_config_forensics(wt, pins) == ""
+    assert _pinned_config_forensics(wt, {}) == ""
+
+
+def test_pinned_config_forensics_diffs_a_deleted_config_to_dev_null(tmp_path):
+    wt, rel, pins = _write_pinned(tmp_path)
+    (wt / rel).unlink()
+
+    text = _pinned_config_forensics(wt, pins)
+
+    assert f"# {rel}: deleted while pinned\n" in text
+    assert f"# --- a/{rel}\n# +++ /dev/null\n" in text
+    assert '# -  "permissions": {' in text
+
+
+def test_pinned_config_forensics_marks_a_missing_final_newline(tmp_path):
+    wt, rel, pins = _write_pinned(tmp_path)
+    _edit_json(wt / rel, lambda cfg: cfg.update(k=1))
+    (wt / rel).write_text((wt / rel).read_text(encoding="utf-8").rstrip("\n"), encoding="utf-8")
+
+    text = _pinned_config_forensics(wt, pins)
+
+    assert text.endswith("\n# \\ No newline at end of file\n")
+    assert text.count("No newline") == 1
+
+
+def test_pinned_config_forensics_splits_on_newline_only(tmp_path):
+    """U+2028 is legal raw inside a JSON string; `str.splitlines` would break the
+    line there and emit a bogus mid-hunk no-newline marker."""
+    wt, rel, pins = _write_pinned(tmp_path)
+    cfg = json.loads((wt / rel).read_text(encoding="utf-8"))
+    cfg["note"] = "a\u2028b"
+    (wt / rel).write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    text = _pinned_config_forensics(wt, pins)
+
+    assert '# +  "note": "a\u2028b",\n' in text or '# +  "note": "a\u2028b"\n' in text
+    assert "No newline" not in text
+
+
+@pytest.mark.parametrize("fault", ["undecodable", "unreadable"])
+def test_pinned_config_forensics_keeps_the_description_without_a_diff(tmp_path, monkeypatch, fault):
+    """A file that cannot be read or decoded is described, never diffed, and the
+    probe does not raise."""
+    wt, rel, pins = _write_pinned(tmp_path)
+    if fault == "undecodable":
+        (wt / rel).write_bytes(b'{"a": "\xff"}')
+    else:
+        real = Path.read_bytes
+
+        def read_bytes(self):
+            if self == wt / rel:
+                raise PermissionError(13, "denied")
+            return real(self)
+
+        monkeypatch.setattr(Path, "read_bytes", read_bytes)
+
+    text = _pinned_config_forensics(wt, pins)
+
+    assert f"# {rel}: " in text
+    assert "---" not in text and "@@" not in text
+
+
+def test_pinned_config_forensics_diffs_only_the_edited_rel(tmp_path):
+    wt, rel, pins = _write_pinned(tmp_path)
+    _other_wt, other_rel, other_pins = _write_pinned(tmp_path, "gemini")
+    pins.update(other_pins)
+    _edit_json(wt / other_rel, lambda cfg: cfg.update(storyKey=True))
+
+    text = _pinned_config_forensics(wt, pins)
+
+    assert f"a/{other_rel}" in text and f"a/{rel}" not in text
 
 
 def _pinned_flow(tmp_path, monkeypatch, *, story_edit: bool):
