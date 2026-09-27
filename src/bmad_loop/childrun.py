@@ -47,18 +47,28 @@ from .process_host import ProcessHost, ProcessHostError, get_process_host
 STOP_POLL_S = 0.25
 
 # Per-step grace in the tree kill: root wait after the first signal, root wait
-# after the force-kill, and the straggler reap. Three steps plus the drain below
-# plus one poll bound the hard-stop-to-return latency at ~4.25 s, well under
-# ``runs._STOP_WAIT_S`` (10 s) — the budget ``stop_run`` gives the engine before
-# it force-kills it.
+# after the force-kill, the survivors' own-descendant harvest, and the straggler
+# reap. Four steps plus the drain below plus one poll bound the hard-stop-to-return
+# latency at ~5.25 s (each step may overrun by the one scan in flight at its
+# deadline), well under ``runs._STOP_WAIT_S`` (10 s) — the budget ``stop_run``
+# gives the engine before it force-kills it.
 KILL_WAIT_S = 1.0
 
 # Bounded pipe drain after a kill. A straggler the reap could not confirm (an
 # unstamped identity) may still hold the pipes open; the drain must not wait on it.
 DRAIN_S = 1.0
 
-# Cadence of the straggler reap's liveness re-read.
+# Cadence of the straggler reap's liveness re-read, and of the descendant
+# re-harvest while :func:`kill_tree` waits out a root's grace.
 _REAP_POLL_S = 0.05
+
+# How often :func:`run_child` re-harvests the running root's descendants into the
+# known tree (DW-477). A process forked and reparented away from the root inside
+# one interval is never seen; one that lives across a harvest stays reachable after
+# the root exits.
+HARVEST_S = 1.0
+
+KnownTree = dict[int, float | None]
 
 StopProbe = Callable[[], bool]
 
@@ -169,7 +179,17 @@ def run_child(
 
     A child that exits on its own is not tree-killed: a completed command's
     leftover background processes are the command's business, exactly as they
-    were under ``subprocess.run``."""
+    were under ``subprocess.run``.
+
+    While the root is unreaped the loop re-harvests its descendants every
+    :data:`HARVEST_S` into a KNOWN tree (DW-477) that every :func:`kill_tree` call
+    here receives, the ``finally`` one included. A background job that lived
+    across a harvest therefore stays reachable after its shell exits — the case
+    one pre-signal harvest could never see, because a reparented process can no
+    longer be enumerated from the root. The tree stays bounded over a long run:
+    an entry a fresh harvest no longer lists is pruned once it is gone or reused
+    (or was never stamped). A host that cannot be resolved skips harvesting —
+    the kill then raises that fault loudly, as it always has."""
     if hard_stop_pending():
         return ChildRun(None, "", "", interrupted=True)
     settled = False
@@ -185,15 +205,25 @@ def run_child(
         text=True,
         errors="replace",
     )
+    known: KnownTree = {}
+    harvester: ProcessHost | None = None
     try:
         # Everything after the spawn sits inside the try, so an exception landing
         # anywhere past `Popen` (SIGTERM's RunStopped) still reaches the kill below.
+        with contextlib.suppress(ProcessHostError):
+            # Unresolvable host: no loop harvest. kill_tree re-resolves it and
+            # raises loudly there, exactly as before DW-477.
+            harvester = get_process_host()
         deadline = None if timeout is None else time.monotonic() + timeout
         interrupted = False
+        next_harvest = time.monotonic() + HARVEST_S
         while True:
             if hard_stop_pending():
                 interrupted = True
                 break
+            if harvester is not None and time.monotonic() >= next_harvest:
+                harvester = _loop_harvest(harvester, proc, known)
+                next_harvest = time.monotonic() + HARVEST_S
             wait = STOP_POLL_S
             if deadline is not None:
                 remaining = deadline - time.monotonic()
@@ -206,7 +236,7 @@ def run_child(
                 continue
             settled = True
             return ChildRun(proc.returncode, stdout or "", stderr or "")
-        kill_tree(proc)
+        kill_tree(proc, known=known)
         stdout, stderr = _drain(proc)
         settled = True
         return ChildRun(
@@ -219,10 +249,13 @@ def run_child(
     finally:
         if not settled:
             # An exception is unwinding through the loop, the kill, or the drain.
-            # Kill errors must not mask the original exception; a second
-            # kill_tree on an already-reaped root is a no-op.
+            # Kill errors must not mask the original exception. If a first
+            # kill_tree already ran, it merged everything it harvested into
+            # `known`, so this retry signals the root only if it is still
+            # unreaped and re-reaps every known member still alive_and_ours —
+            # the ones an unwind mid-grace or mid-reap left standing.
             with contextlib.suppress(Exception):
-                kill_tree(proc)
+                kill_tree(proc, known=known)
             _close_pipes(proc)
 
 
@@ -239,39 +272,128 @@ def _drain(proc: subprocess.Popen[str]) -> tuple[str, str]:
 
 
 def _close_pipes(proc: subprocess.Popen[str]) -> None:
-    for stream in (proc.stdout, proc.stderr):
-        if stream is not None:
-            with contextlib.suppress(Exception):
-                stream.close()
+    """Close the parent's ends of the pipes after a drain that gave up.
+
+    On win32 a stream whose CPython reader thread is still alive is left open
+    (DW-478). ``Popen._communicate`` there reads each pipe in a thread
+    (``proc.stdout_thread`` / ``proc.stderr_thread``) that sits in ``fh.read()``
+    holding the BufferedReader lock for as long as some unreachable process keeps
+    the pipe open, and ``close()`` needs that lock — so closing would block the
+    runner on the very holder the bounded drain exists to not wait on. The thread
+    closes the stream itself once its read returns. POSIX reads in this thread,
+    so nothing holds the lock there and every stream is closed."""
+    streams = ((proc.stdout, "stdout_thread"), (proc.stderr, "stderr_thread"))
+    for stream, reader_attr in streams:
+        if stream is None:
+            continue
+        if sys.platform == "win32":
+            reader = getattr(proc, reader_attr, None)
+            if reader is not None and reader.is_alive():
+                continue
+        with contextlib.suppress(Exception):
+            stream.close()
 
 
-def kill_tree(proc: subprocess.Popen[str], *, wait_s: float = KILL_WAIT_S) -> None:
+def _merge(tree: KnownTree, fresh: KnownTree) -> None:
+    """Fold a fresh harvest into ``tree``. A fresh stamp overwrites (it is the pid's
+    current generation, and the harvest just found it under a process we own); an
+    unstamped entry never overwrites a stamped one, because that would turn a
+    member the reap can confirm into one it must never touch.
+
+    The built-in hosts never produce that case — ``ProcessHost.descendants``
+    OMITS a member it cannot stamp, and returns ``None`` only on a platform that
+    never stamps at all. The rule defends against a host that does return
+    unstamped entries: an out-of-tree ``register_process_host`` host, or a
+    platform that never stamps."""
+    for pid, identity in fresh.items():
+        if identity is not None or pid not in tree:
+            tree[pid] = identity
+
+
+def _harvest_and_prune(host: ProcessHost, root_pid: int, tree: KnownTree) -> None:
+    """One poll-loop harvest: merge the root's current descendants into ``tree``,
+    then prune every entry the fresh harvest no longer lists that is unstamped or
+    no longer ``alive_and_ours`` — so a long run's short-lived descendants do not
+    pile up. An entry absent from the harvest but still ours stays: that is the
+    reparented job the known tree exists to keep in reach. The caller guarantees
+    the root is unreaped, which pins ``root_pid``."""
+    fresh = host.descendants(root_pid)
+    _merge(tree, fresh)
+    for pid in [pid for pid in tree if pid not in fresh]:
+        identity = tree[pid]
+        if identity is None or not host.alive_and_ours(pid, identity):
+            del tree[pid]
+
+
+def _loop_harvest(
+    host: ProcessHost, proc: subprocess.Popen[str], known: KnownTree
+) -> ProcessHost | None:
+    """The poll loop's periodic harvest. Returns the host to harvest with next
+    time, or ``None`` to stop: once the root is reaped nothing new is reachable
+    from its pid, and a host fault (``ProcessHostError`` from a liveness read) must
+    not escape the loop — the kill reports a broken host, the loop never does."""
+    if proc.poll() is not None:
+        return None
+    try:
+        _harvest_and_prune(host, proc.pid, known)
+    except ProcessHostError:
+        return None
+    return host
+
+
+def kill_tree(
+    proc: subprocess.Popen[str],
+    *,
+    wait_s: float = KILL_WAIT_S,
+    known: KnownTree | None = None,
+) -> None:
     """Kill ``proc`` and every descendant it had, per the gh-183 doctrine
     (template: ``adapters/opencode_http.py::_kill_process``).
 
-    The descendant tree is harvested BEFORE the first signal, while it is
-    intact: once the root dies its children reparent and can no longer be
-    enumerated from it. On win32 the root gets ``force_kill`` (``taskkill /F
-    /T``) first — ``shell=True`` roots the tree at ``cmd.exe``, and a polite
-    taskkill can reap ``cmd.exe`` alone, after which ``/T`` can never find the
-    command again. On POSIX the root gets ``terminate`` (SIGTERM). Then a
-    bounded wait, a ``force_kill`` if the root is still up, and a reap of the
-    harvested stragglers — only those whose recorded identity still matches
-    (``alive_and_ours``), so a reused pid is never signalled.
+    ``known`` is the tree :func:`run_child` accumulated while the root ran
+    (DW-477). Every harvest below merges into it IN PLACE, so a retry after this
+    call unwound (an exception landing mid-grace or mid-reap) still knows every
+    pid this one found. While the root is unreaped, a fresh
+    harvest is merged in BEFORE the first signal, while the tree is intact: once
+    the root dies its children reparent and can no longer be enumerated from it.
+    On win32 the root gets ``force_kill`` (``taskkill /F /T``) first —
+    ``shell=True`` roots the tree at ``cmd.exe``, and a polite taskkill can reap
+    ``cmd.exe`` alone, after which ``/T`` can never find the command again. On
+    POSIX the root gets ``terminate`` (SIGTERM). Then a bounded wait, a
+    ``force_kill`` if the root is still up, and a second bounded wait; both waits
+    re-harvest every :data:`_REAP_POLL_S` while the root is unreaped, so a process
+    it forks in its grace (a TERM trap) is known before the root's exit reparents
+    it. Finally the known stragglers are reaped — only those whose recorded
+    identity still matches (``alive_and_ours``), so a reused pid is never
+    signalled — after each survivor's own descendants are harvested into the tree.
+
+    A root that already exited is never signalled or harvested (its pid is
+    reaped and may belong to someone else), but the known tree is still reaped.
+    With no known tree an exited root makes no host calls at all.
 
     Never ``os.killpg`` or ``os.kill``: the child is not detached into its own
     group (that would change what a console Ctrl-C reaches), and every signal
-    goes through the ``ProcessHost`` seam. A root that already exited is left
-    alone — its pid is reaped, so nothing it had is reachable from it.
+    goes through the ``ProcessHost`` seam.
 
-    Known limit (deferred): the tree is whatever ONE pre-signal harvest can reach
-    from the root. A descendant already reparented away from the root is out of
-    reach — the case of a root that exited while a background job it started
-    still holds the pipes (the runner then returns within :data:`DRAIN_S` rather
-    than hanging, as ``subprocess.run`` did, but the job survives). So is a
-    process spawned after the harvest. Where ``ProcessHost.descendants``
-    degrades to ``{}`` (macOS without psutil), only the root is killed."""
-    if proc.poll() is not None:
+    Known limits: only a member still alive and identity-matching is signalled.
+    A process is known only if its parent chain was still under the live root
+    at one of the harvests, so one that forks and is reparented away inside one
+    interval is never seen — a double-fork whose intermediate lives less than
+    :data:`HARVEST_S`, or a root that exits right after backgrounding a job (the
+    runner then returns within :data:`DRAIN_S` rather than hanging, as
+    ``subprocess.run`` did, but the job survives). A TERM trap that forks and
+    exits at once is missed the same way: the grace re-harvest catches the fork
+    only if the root lives one :data:`_REAP_POLL_S` re-scan after it. The loop
+    harvests only while the ROOT runs; once it has exited, a surviving job's own
+    children are reached only by the one-shot survivor sub-harvest here, so a
+    descendant of that job that was already reparented away from it is missed,
+    as is one forked after the sub-harvest (during the reap's wait) or under a
+    survivor the sub-harvest's ``wait_s`` budget did not reach. Where
+    ``ProcessHost.descendants`` degrades to ``{}`` (macOS without psutil), only
+    the root is killed."""
+    tree: KnownTree = known if known is not None else {}
+    root_running = proc.poll() is None
+    if not root_running and not tree:
         return
     try:
         host = get_process_host()
@@ -280,36 +402,66 @@ def kill_tree(proc: subprocess.Popen[str], *, wait_s: float = KILL_WAIT_S) -> No
         # doctrine. The root must not be left alive behind the raise: one legacy
         # Popen strike (no host means no tree kill — an accepted degrade on a loud
         # config error), then re-raise.
-        with contextlib.suppress(OSError):
-            if sys.platform == "win32":
-                proc.kill()
-            else:
-                proc.terminate()
+        if root_running:
+            with contextlib.suppress(OSError):
+                if sys.platform == "win32":
+                    proc.kill()
+                else:
+                    proc.terminate()
         raise
-    tree = host.descendants(proc.pid)
-    # The live Popen handle pins the pid (win32 handle / unreaped POSIX child),
-    # so signalling the root cannot hit a reused pid.
-    if sys.platform == "win32":
-        with contextlib.suppress(Exception):
-            host.force_kill(proc.pid)
-    else:
-        with contextlib.suppress(OSError):
-            host.terminate(proc.pid)
-    try:
-        proc.wait(timeout=wait_s)
-    except subprocess.TimeoutExpired:
-        with contextlib.suppress(Exception):
-            host.force_kill(proc.pid)
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            proc.wait(timeout=wait_s)
+    if root_running:
+        _merge(tree, host.descendants(proc.pid))
+        # The live Popen handle pins the pid (win32 handle / unreaped POSIX child),
+        # so signalling the root cannot hit a reused pid.
+        if sys.platform == "win32":
+            with contextlib.suppress(Exception):
+                host.force_kill(proc.pid)
+        else:
+            with contextlib.suppress(OSError):
+                host.terminate(proc.pid)
+        if not _grace_wait(host, proc, tree, wait_s):
+            with contextlib.suppress(Exception):
+                host.force_kill(proc.pid)
+            _grace_wait(host, proc, tree, wait_s)
     _reap_descendants(host, tree, wait_s)
 
 
-def _reap_descendants(host: ProcessHost, tree: dict[int, float | None], wait_s: float) -> None:
-    """Reap harvested descendants the root signal missed: terminate, bounded
-    wait, force-kill. A ``None`` identity is unconfirmable (possible pid reuse),
-    so it is never signalled or polled. Already-gone races are swallowed; this
-    is best-effort, never a gate."""
+def _grace_wait(
+    host: ProcessHost, proc: subprocess.Popen[str], tree: KnownTree, wait_s: float
+) -> bool:
+    """Wait up to ``wait_s`` for the signalled root, merging a fresh harvest of its
+    descendants into ``tree`` every :data:`_REAP_POLL_S` while it is unreaped.
+    Merge only, never prune: a prune reads liveness, and a host fault must not
+    abort the kill before the force-kill and the reap. True once the root is
+    reaped."""
+    deadline = time.monotonic() + wait_s
+    while True:
+        if proc.poll() is not None:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        _merge(tree, host.descendants(proc.pid))
+        remaining = max(deadline - time.monotonic(), 0.0)
+        try:
+            proc.wait(timeout=min(_REAP_POLL_S, remaining))
+        except subprocess.TimeoutExpired:
+            continue
+        return True
+
+
+def _reap_descendants(host: ProcessHost, tree: KnownTree, wait_s: float) -> None:
+    """Reap known descendants the root signal missed: terminate, bounded wait,
+    force-kill. A ``None`` identity is unconfirmable (possible pid reuse), so it
+    is never signalled or polled. Already-gone races are swallowed; this is
+    best-effort, never a gate.
+
+    Each survivor's own descendants are harvested first (DW-477) — a reparented
+    job's children were never under the root, so no root harvest lists them. The
+    sub-harvest is merged only when the survivor is STILL ``alive_and_ours``
+    after it was taken: a pid reused before the harvest would have listed a
+    stranger's children, and the identity recheck that follows the harvest
+    catches exactly that."""
 
     def _survivors() -> list[int]:
         return [
@@ -321,6 +473,17 @@ def _reap_descendants(host: ProcessHost, tree: dict[int, float | None], wait_s: 
     survivors = _survivors()
     if not survivors:
         return
+    # One scan per survivor, so the sub-harvest gets its own wait_s budget: no
+    # scan starts past it, and the reap below runs either way.
+    sub_deadline = time.monotonic() + wait_s
+    for pid in survivors:
+        if time.monotonic() >= sub_deadline:
+            break
+        identity = tree[pid]
+        sub = host.descendants(pid)
+        if sub and identity is not None and host.alive_and_ours(pid, identity):
+            _merge(tree, sub)
+    survivors = _survivors()
     for pid in survivors:
         with contextlib.suppress(OSError):
             host.terminate(pid)

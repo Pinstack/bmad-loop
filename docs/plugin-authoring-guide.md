@@ -209,13 +209,20 @@ kills the hook's process tree, and the run stops: the bus journals
 `plugin-hook-interrupted` (`plugin`, `stage`) instead of `plugin-hook-error`, and
 `fail_closed` never turns that into a veto, because an interrupted hook has not
 failed. If the interrupted hook is on `post_run`, the run still finishes. A hook
-timeout kills the tree the same way. The kill reaches the processes the hook's
-root still has when the stop lands. A process that has already been reparented
-away from it cannot be reached, such as a background job whose parent shell
-exited, or a process started after the kill began. On macOS without `psutil`,
-only the root is killed. Hooks that run as part of the stop's own unwind —
-`pre_worktree_teardown`/`post_worktree_teardown`, `pre_rollback`/`post_rollback` —
-are not interrupted and still run to completion.
+timeout kills the tree the same way. The runner re-scans the tree under the
+hook's root once a second while that root runs, and again every 50 ms while the
+root winds down after its signal; at kill time it also takes in each surviving
+known process's current children. Only processes still alive with a matching
+recorded identity are signalled. A background job whose parent shell exited is
+killed if its parent chain was still under the live root at one of those scans,
+and a process forked in the root's TERM handler is killed if the root lived one
+50 ms re-scan after forking. These cannot be reached: a process that starts and
+is reparented away within one scan interval, a TERM handler that forks and exits
+at once, a descendant already reparented away from a surviving job once the root
+has exited, and a process that starts while the survivors are being reaped. On
+macOS without `psutil`, only the root is killed. Hooks that run as part of the
+stop's own unwind — `pre_worktree_teardown`/`post_worktree_teardown`,
+`pre_rollback`/`post_rollback` — are not interrupted and still run to completion.
 
 **Versioning.** Every manifest declares `api_version`. The framework supports a
 set of versions (`SUPPORTED_API`). A **builtin** with an unsupported version is a

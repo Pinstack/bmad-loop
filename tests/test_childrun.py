@@ -19,6 +19,7 @@ import sys
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -28,8 +29,9 @@ from bmad_loop.process_host import get_process_host
 POSIX_ONLY = pytest.mark.skipif(sys.platform == "win32", reason="drives a /bin/sh process tree")
 WIN32_ONLY = pytest.mark.skipif(sys.platform != "win32", reason="drives a cmd.exe process tree")
 
-# A hard-stop-to-return ceiling for the real rows: one poll + three kill steps +
-# the drain is ~4.25 s by construction; runs._STOP_WAIT_S (10 s) is the budget the
+# A hard-stop-to-return ceiling for the real rows: one poll + four kill steps
+# (two root waits, the survivor sub-harvest, the reap) + the drain is ~5.25 s by
+# construction; runs._STOP_WAIT_S (10 s) is the budget the
 # stop path actually has. Asserting under that budget, not the construction, keeps
 # the row about the contract rather than about a slow CI host.
 _RETURN_CEILING_S = runs._STOP_WAIT_S - 2.0
@@ -235,6 +237,91 @@ def test_exception_unwinding_kills_the_tree_and_reraises(tmp_path, monkeypatch, 
             get_process_host().force_kill(grandchild)
 
 
+@POSIX_ONLY
+def test_timeout_reaches_the_job_of_an_exited_root(tmp_path, monkeypatch, reap_leftovers):
+    """DW-477, exited root: the shell backgrounds a job, lives across a loop
+    harvest, then exits, leaving the job holding the pipes. The timeout finds the
+    root already reaped — nothing is enumerable from its pid any more — so only
+    the tree the loop accumulated while it ran can reach the job.
+
+    Ablation: drop the poll-loop harvest in `run_child` (or pass no `known` to
+    `kill_tree`) and the job survives the timeout."""
+    monkeypatch.setattr(childrun, "HARVEST_S", 0.1)
+    pid_file = tmp_path / "job.pid"
+    started = time.monotonic()
+    with stop_probe(lambda: False):
+        run = childrun.run_child(
+            f"sleep 60 & echo $! > '{pid_file}'; sleep 0.6", cwd=tmp_path, timeout=1.5
+        )
+    elapsed = time.monotonic() - started
+    job = _read_pid(pid_file)
+    assert job is not None
+    reap_leftovers.append(job)
+
+    assert run.timed_out is True and run.interrupted is False
+    # anti-vacuity: rc 0 means the root exited on its own before the timeout; a
+    # root still up there (-SIGTERM) lets the pre-signal harvest reach the job
+    assert run.returncode == 0, "the root was still running at the timeout"
+    assert _wait_gone(job), f"job {job} survived the timeout of its exited root"
+    assert elapsed < 1.5 + 4 * childrun.KILL_WAIT_S + childrun.DRAIN_S + 2.0
+
+
+@POSIX_ONLY
+def test_unwinding_kill_reaches_the_job_of_an_exited_root(tmp_path, monkeypatch, reap_leftovers):
+    """The common POSIX hard stop: the engine's SIGTERM handler raises
+    `RunStopped` through the poll loop, so the kill is the `finally` one. It must
+    get the known tree too — the root has already exited, so without it nothing
+    reaches the job it left holding the pipes.
+
+    Ablation: call `kill_tree(proc)` without `known` in `run_child`'s `finally`
+    and the job survives."""
+    monkeypatch.setattr(childrun, "HARVEST_S", 0.1)
+    pid_file = tmp_path / "job.pid"
+    started = time.monotonic()
+
+    def late_raise() -> bool:
+        if time.monotonic() - started >= 1.2:  # the root exited at ~0.6 s
+            raise RuntimeError("unwinding")
+        return False
+
+    with stop_probe(late_raise), pytest.raises(RuntimeError, match="unwinding"):
+        childrun.run_child(
+            f"sleep 60 & echo $! > '{pid_file}'; sleep 0.6", cwd=tmp_path, timeout=120
+        )
+    job = _read_pid(pid_file)
+    assert job is not None
+    reap_leftovers.append(job)
+
+    assert _wait_gone(job), f"job {job} survived the unwinding kill of its exited root"
+
+
+@POSIX_ONLY
+def test_hard_stop_reaches_a_process_forked_in_the_roots_grace(tmp_path, reap_leftovers):
+    """DW-477, fork during grace: the root traps TERM and, in the trap, forks a
+    job and then exits. The job did not exist at the pre-signal harvest; only the
+    re-harvest while the root waits out its grace sees it before the root's exit
+    reparents it.
+
+    Ablation: drop the re-harvest in `_grace_wait` and the job survives."""
+    ready = tmp_path / "ready"
+    pid_file = tmp_path / "job.pid"
+    command = (
+        f"trap 'sleep 60 & echo $! > \"{pid_file}\"; sleep 0.5; exit 0' TERM; "
+        f"echo up > '{ready}'; while :; do sleep 0.05; done"
+    )
+    started = time.monotonic()
+    with stop_probe(ready.exists):
+        run = childrun.run_child(command, cwd=tmp_path, timeout=120)
+    elapsed = time.monotonic() - started
+    job = _read_pid(pid_file)
+    assert job is not None, "the TERM trap never ran"
+    reap_leftovers.append(job)
+
+    assert run.interrupted is True
+    assert elapsed < _RETURN_CEILING_S
+    assert _wait_gone(job), f"job {job} forked in the grace survived the hard stop"
+
+
 # ---- real win32 tree --------------------------------------------------------------
 
 
@@ -267,6 +354,66 @@ def test_hard_stop_kills_a_cmd_rooted_tree(tmp_path, reap_leftovers):
     assert _wait_gone(grandchild), f"grandchild {grandchild} survived the hard stop"
 
 
+@WIN32_ONLY
+def test_drain_gives_up_on_a_holder_nothing_can_reach(tmp_path, monkeypatch):
+    """DW-478: the root exits at once, leaving an orphan holder with the pipes, and
+    the harvest never sees it (patched to `{}`), so no kill reaches it. CPython's
+    win32 `communicate` reads each pipe in a thread blocked inside `read()` with
+    the BufferedReader lock held; closing the stream then waits on that lock for
+    the holder's whole life. The runner must return well before the holder dies.
+
+    Ablation: close every stream in `_close_pipes` regardless of its reader
+    thread and, where close() blocks, the return waits out the holder's 30 s."""
+    pid_file = tmp_path / "holder.pid"
+    holder = tmp_path / "holder.py"
+    holder.write_text(
+        "import os, sys, time\n"
+        "with open(sys.argv[1], 'w') as fh:\n"
+        "    fh.write(str(os.getpid()))\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    parent = tmp_path / "parent.py"
+    parent.write_text(
+        "import subprocess, sys\n"
+        "subprocess.Popen([sys.executable, sys.argv[1], sys.argv[2]],\n"
+        "                 stdout=sys.stdout, stderr=sys.stderr)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(get_process_host(), "descendants", lambda pid: {})
+    started = time.monotonic()
+    holder_alive_after = False
+    try:
+        with stop_probe(lambda: False):
+            run = childrun.run_child(
+                f'"{sys.executable}" "{parent}" "{holder}" "{pid_file}"',
+                cwd=tmp_path,
+                timeout=1.0,
+            )
+        elapsed = time.monotonic() - started
+        deadline = time.monotonic() + 5.0
+        while _read_pid(pid_file) is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        early_pid = _read_pid(pid_file)
+        # read before the finally kills it
+        holder_alive_after = early_pid is not None and not _gone(early_pid)
+    finally:
+        deadline = time.monotonic() + 5.0
+        while _read_pid(pid_file) is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        holder_pid = _read_pid(pid_file)
+        if holder_pid is not None:
+            with contextlib.suppress(Exception):
+                get_process_host().force_kill(holder_pid)
+
+    assert holder_pid is not None, "the holder never started"
+    # anti-vacuity: a slow runner whose cmd.exe was still up at the timeout lets
+    # `taskkill /F /T` reach the holder, and the drain-timeout arm is never taken
+    assert holder_alive_after, "the kill reached the holder; the unreachable-holder arm never ran"
+    assert run.timed_out is True
+    assert elapsed < 1.0 + 4 * childrun.KILL_WAIT_S + childrun.DRAIN_S + 2.0
+
+
 # ---- kill ordering against a fake host ---------------------------------------------
 
 
@@ -284,6 +431,7 @@ class _FakeProc:
 
     def wait(self, timeout: float | None = None) -> int:
         if not self._host.root_dead:
+            time.sleep(timeout or 0)  # a real wait blocks; the grace loop must not spin
             raise subprocess.TimeoutExpired("fake", timeout or 0)
         return 0
 
@@ -300,14 +448,20 @@ class _FakeHost:
         # 5001: a straggler that ignores terminate and dies only to force_kill.
         # 5002: unstamped identity — unconfirmable, so never signalled or polled.
         self.alive = {5001}
+        # A root that ignores SIGTERM and dies only to force_kill.
+        self.root_ignores_terminate = False
+        # descendants() keyed by the pid asked about; a pid absent here has none.
+        self.trees: dict[int, dict[int, float | None]] = {
+            _FakeProc.pid: {5001: 1.0, 5002: None},
+        }
 
     def descendants(self, pid: int) -> dict[int, float | None]:
         self.calls.append(("descendants", pid))
-        return {5001: 1.0, 5002: None}
+        return dict(self.trees.get(pid, {}))
 
     def terminate(self, pid: int) -> None:
         self.calls.append(("terminate", pid))
-        if pid == _FakeProc.pid and sys.platform != "win32":
+        if pid == _FakeProc.pid and sys.platform != "win32" and not self.root_ignores_terminate:
             self.root_dead = True
 
     def force_kill(self, pid: int) -> None:
@@ -326,8 +480,10 @@ def test_kill_tree_ordering(monkeypatch, platform):
     """Harvest before the first signal; on win32 `force_kill(root)` (taskkill /F
     /T) comes before anything polite, because a polite taskkill can reap cmd.exe
     alone and strand the command where /T can no longer find it; on POSIX the
-    root gets SIGTERM. Then the harvested straggler is reaped (terminate, then
-    force_kill when it ignores that), and the unstamped member is never touched.
+    root gets SIGTERM. Then the harvested straggler's own descendants are
+    harvested (DW-477) and it is reaped (terminate, then force_kill when it
+    ignores that), and the unstamped member is never touched. The root dies on
+    its first signal, so its grace wait takes no re-harvest.
 
     Ablation: swap the win32 arm to `terminate` and the second-call assertion
     reddens; move the harvest after the root signal and the first does."""
@@ -343,9 +499,270 @@ def test_kill_tree_ordering(monkeypatch, platform):
     assert host.calls[1] == first_signal
     if platform == "win32":
         assert ("terminate", root) not in host.calls
-    assert host.calls[2:] == [("terminate", 5001), ("force_kill", 5001)]
+    assert host.calls[2:] == [
+        ("descendants", 5001),
+        ("terminate", 5001),
+        ("force_kill", 5001),
+    ]
     assert not any(pid == 5002 for _, pid in host.calls)
     assert host.alive == set()
+
+
+def test_kill_tree_force_kills_a_root_that_outlives_its_grace(monkeypatch):
+    """A root that ignores SIGTERM outlives its grace wait: the wait keeps
+    re-harvesting its descendants until the deadline, then the root is
+    force-killed, and only then are the known stragglers reaped.
+
+    Ablation: make `_grace_wait`'s deadline arm return True and `force_kill(root)`
+    never happens."""
+    host = _FakeHost()
+    host.root_ignores_terminate = True
+    monkeypatch.setattr(childrun, "get_process_host", lambda: host)
+    monkeypatch.setattr(childrun.sys, "platform", "linux")
+
+    childrun.kill_tree(_FakeProc(host), wait_s=0.05)  # pyright: ignore[reportArgumentType]
+
+    root = _FakeProc.pid
+    calls = host.calls
+    signalled = calls.index(("terminate", root))
+    forced = calls.index(("force_kill", root))
+    assert calls[0] == ("descendants", root) and signalled == 1
+    assert ("descendants", root) in calls[signalled + 1 : forced], "no grace re-harvest"
+    assert calls[forced + 1 :] == [
+        ("descendants", 5001),
+        ("terminate", 5001),
+        ("force_kill", 5001),
+    ]
+    assert host.alive == set()
+
+
+def test_kill_tree_reaps_a_survivors_own_descendants(monkeypatch):
+    """A known survivor (a reparented job) has children the root harvest never
+    listed — they were never under the root. They are harvested from the
+    survivor, identity-rechecked, and reaped with it.
+
+    Ablation: drop the survivor-descendant harvest in `_reap_descendants` and
+    6001 is never signalled."""
+    host = _FakeHost()
+    host.trees[5001] = {6001: 2.0}
+    host.alive = {5001, 6001}
+    monkeypatch.setattr(childrun, "get_process_host", lambda: host)
+    monkeypatch.setattr(childrun.sys, "platform", "linux")
+
+    childrun.kill_tree(_FakeProc(host), wait_s=0.05)  # pyright: ignore[reportArgumentType]
+
+    assert ("terminate", 6001) in host.calls
+    assert ("force_kill", 6001) in host.calls
+    assert host.alive == set()
+
+
+def test_kill_tree_drops_a_survivor_harvest_whose_pid_was_reused(monkeypatch):
+    """The survivor sub-harvest is merged only when the survivor is still ours
+    AFTER it was taken: a pid reused before the harvest lists a stranger's
+    children, and none of those may be signalled.
+
+    Ablation: merge the sub-harvest without the post-harvest `alive_and_ours`
+    recheck and 6001 is signalled."""
+    host = _FakeHost()
+    host.trees[5001] = {6001: 2.0}
+    host.alive = {5001, 6001}
+    real_descendants = host.descendants
+
+    def reusing_descendants(pid: int) -> dict[int, float | None]:
+        out = real_descendants(pid)
+        if pid == 5001:
+            host.alive.discard(5001)  # 5001 died and its pid went to a stranger
+        return out
+
+    host.descendants = reusing_descendants  # type: ignore[method-assign]
+    monkeypatch.setattr(childrun, "get_process_host", lambda: host)
+    monkeypatch.setattr(childrun.sys, "platform", "linux")
+
+    childrun.kill_tree(_FakeProc(host), wait_s=0.05)  # pyright: ignore[reportArgumentType]
+
+    assert not any(pid == 6001 for name, pid in host.calls if name != "descendants")
+    assert host.alive == {6001}
+
+
+def test_kill_tree_reaps_the_known_tree_of_an_exited_root(monkeypatch):
+    """A root that already exited is reaped — its pid may belong to someone else
+    — so it is never signalled or harvested. But the tree the poll loop
+    accumulated while it ran is still reaped: the background job that outlived
+    its shell (DW-477).
+
+    Ablation: keep the unconditional early return on an exited root and 5001
+    survives."""
+    host = _FakeHost()
+    host.root_dead = True
+    monkeypatch.setattr(childrun, "get_process_host", lambda: host)
+    monkeypatch.setattr(childrun.sys, "platform", "linux")
+
+    childrun.kill_tree(
+        _FakeProc(host),  # pyright: ignore[reportArgumentType]
+        wait_s=0.05,
+        known={5001: 1.0, 5002: None},
+    )
+
+    assert not any(pid == _FakeProc.pid for _, pid in host.calls)
+    assert ("terminate", 5001) in host.calls and ("force_kill", 5001) in host.calls
+    assert not any(pid == 5002 for _, pid in host.calls)
+    assert host.alive == set()
+
+
+def test_kill_tree_never_lets_an_unstamped_harvest_overwrite_a_stamp(monkeypatch):
+    """An unstamped entry must not erase the identity an earlier harvest
+    recorded: that would turn a member the reap can confirm into one it must
+    never touch. The built-in hosts OMIT a member they cannot stamp, so this
+    defends against a host that returns unstamped entries — an out-of-tree
+    `register_process_host` host, or a platform that never stamps.
+
+    Ablation: let `_merge` overwrite unconditionally and 5001 is never reaped."""
+    host = _FakeHost()
+    host.trees[_FakeProc.pid] = {5001: None}
+    monkeypatch.setattr(childrun, "get_process_host", lambda: host)
+    monkeypatch.setattr(childrun.sys, "platform", "linux")
+
+    childrun.kill_tree(
+        _FakeProc(host),  # pyright: ignore[reportArgumentType]
+        wait_s=0.05,
+        known={5001: 1.0},
+    )
+
+    assert ("force_kill", 5001) in host.calls
+    assert host.alive == set()
+
+
+def test_kill_tree_retry_after_an_unwound_kill_reaps_what_the_first_harvested(monkeypatch):
+    """The common POSIX hard stop: SIGTERM's `RunStopped` can land INSIDE the first
+    `kill_tree` — after its pre-signal harvest and root signal — and `run_child`'s
+    `finally` retries with the same `known`. The root is reaped by then, so the
+    retry harvests nothing; only what the first call merged into `known` in place
+    is left to reach.
+
+    Ablation: make `kill_tree` work on a copy of `known` (`dict(known)`) and the
+    retry finds an empty tree, so 5001 survives."""
+
+    class _UnwindingHost(_FakeHost):
+        def terminate(self, pid: int) -> None:
+            super().terminate(pid)
+            if pid == _FakeProc.pid:
+                raise RuntimeError("unwinding")
+
+    host = _UnwindingHost()
+    monkeypatch.setattr(childrun, "get_process_host", lambda: host)
+    monkeypatch.setattr(childrun.sys, "platform", "linux")
+    proc = _FakeProc(host)
+    known: childrun.KnownTree = {}
+
+    with pytest.raises(RuntimeError, match="unwinding"):
+        childrun.kill_tree(proc, wait_s=0.05, known=known)  # pyright: ignore[reportArgumentType]
+    assert 5001 in known, "the first call's harvest was not merged into the caller's tree"
+
+    host.calls.clear()
+    childrun.kill_tree(proc, wait_s=0.05, known=known)  # pyright: ignore[reportArgumentType]
+
+    assert not any(pid == _FakeProc.pid for _, pid in host.calls)
+    assert ("force_kill", 5001) in host.calls
+    assert host.alive == set()
+
+
+def test_kill_tree_bounds_the_survivor_sub_harvest_by_wait_s(monkeypatch):
+    """One scan per survivor, so the sub-harvest has its own `wait_s` budget: no
+    scan starts past it, and every survivor is still reaped. That keeps the kill's
+    fourth step inside the hard-stop-to-return bound on a slow host.
+
+    Ablation: drop the `sub_deadline` break in `_reap_descendants` and every
+    survivor is scanned."""
+    host = _FakeHost()
+    host.root_dead = True
+    host.alive = {5001, 5003, 5004}
+    real_descendants = host.descendants
+
+    def slow_descendants(pid: int) -> dict[int, float | None]:
+        time.sleep(0.1)  # one scan outruns the whole 0.05 s budget
+        return real_descendants(pid)
+
+    host.descendants = slow_descendants  # type: ignore[method-assign]
+    monkeypatch.setattr(childrun, "get_process_host", lambda: host)
+    monkeypatch.setattr(childrun.sys, "platform", "linux")
+
+    childrun.kill_tree(
+        _FakeProc(host),  # pyright: ignore[reportArgumentType]
+        wait_s=0.05,
+        known={5001: 1.0, 5003: 1.0, 5004: 1.0},
+    )
+
+    assert [pid for name, pid in host.calls if name == "descendants"] == [5001]
+    assert {pid for name, pid in host.calls if name == "force_kill"} == {5001, 5003, 5004}
+    assert host.alive == set()
+
+
+def test_unresolvable_host_leaves_a_completing_command_alone(tmp_path, monkeypatch):
+    """`run_child` resolves the host up front for the loop harvest. A host that
+    cannot be resolved (a bogus `BMAD_LOOP_PROCESS_HOST`) only disables the
+    harvest: a command that finishes on its own still returns its result, as it
+    did when only the kill resolved the host.
+
+    Ablation: drop the `ProcessHostError` suppression around the resolution in
+    `run_child` and the call raises right after spawn."""
+    from bmad_loop.process_host import ProcessHostError
+
+    def bogus_host():
+        raise ProcessHostError("bogus-host-name")
+
+    monkeypatch.setattr(childrun, "get_process_host", bogus_host)
+    with stop_probe(lambda: False):
+        run = childrun.run_child("exit 0", cwd=tmp_path, timeout=30)
+    assert run == childrun.ChildRun(0, "", "")
+
+
+def test_loop_harvest_prunes_what_is_gone_and_keeps_what_is_reparented():
+    """The loop's known tree stays bounded over a long run: an entry a fresh
+    harvest no longer lists is dropped once it is gone or reused, or when it was
+    never stamped. One still ours stays — that is the reparented job the tree
+    exists to keep in reach. A fresh stamp for a known pid replaces the old one.
+
+    Ablation: drop the prune in `_harvest_and_prune` and 7001/7002 remain."""
+    host = _FakeHost()
+    host.trees[_FakeProc.pid] = {5001: 3.0, 5003: None}
+    host.alive = {5001, 7003}
+    known: dict[int, float | None] = {
+        5001: 1.0,  # re-stamped by the fresh harvest (new generation)
+        7001: 1.0,  # absent and gone: pruned
+        7002: None,  # absent and unstamped: pruned
+        7003: 1.0,  # absent but still ours (reparented): kept
+    }
+
+    harvest: Any = childrun._harvest_and_prune  # pyright: ignore[reportPrivateUsage]
+    harvest(host, _FakeProc.pid, known)
+
+    assert known == {5001: 3.0, 5003: None, 7003: 1.0}
+
+
+def test_loop_harvest_stops_once_the_root_is_reaped_or_the_host_faults():
+    """The loop harvests only from an unreaped root (the Popen pins its pid) and
+    never lets a host fault escape: it stops harvesting instead, and the kill
+    reports a broken host loudly.
+
+    Ablation: drop the `poll()` gate and the reaped root's pid is harvested;
+    drop the `ProcessHostError` catch and the fault escapes."""
+    from bmad_loop.process_host import ProcessHostError
+
+    host = _FakeHost()
+    host.root_dead = True
+    known: dict[int, float | None] = {}
+    loop_harvest: Any = childrun._loop_harvest  # pyright: ignore[reportPrivateUsage]
+    got = loop_harvest(host, _FakeProc(host), known)
+    assert got is None and host.calls == [] and known == {}
+
+    class _FaultingHost(_FakeHost):
+        def alive_and_ours(self, pid: int, identity: float | None) -> bool:
+            raise ProcessHostError("no psutil")
+
+    faulting = _FaultingHost()
+    known = {7001: 1.0}  # absent from the fresh harvest, so the prune reads liveness
+    got = loop_harvest(faulting, _FakeProc(faulting), known)
+    assert got is None
 
 
 @pytest.mark.parametrize("platform", ["win32", "linux"])
@@ -392,8 +809,9 @@ def test_kill_tree_strikes_the_root_once_before_reraising_a_host_error(monkeypat
 
 
 def test_kill_tree_leaves_an_exited_root_alone(monkeypatch):
-    """A root already reaped has nothing reachable left: no harvest, no signal
-    (its pid may already belong to someone else)."""
+    """A root already reaped with no known tree has nothing reachable left: no
+    harvest, no signal (its pid may already belong to someone else). The
+    no-`known` call shape stays backward compatible."""
     host = _FakeHost()
     host.root_dead = True
     monkeypatch.setattr(childrun, "get_process_host", lambda: host)
@@ -401,6 +819,50 @@ def test_kill_tree_leaves_an_exited_root_alone(monkeypatch):
     childrun.kill_tree(_FakeProc(host), wait_s=0.05)  # pyright: ignore[reportArgumentType]
 
     assert host.calls == []
+
+
+class _Stream:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _Reader:
+    def __init__(self, alive: bool) -> None:
+        self._alive = alive
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+
+class _PipedProc:
+    """stdout's reader thread is still blocked in read(); stderr's has finished."""
+
+    def __init__(self) -> None:
+        self.stdout = _Stream()
+        self.stderr = _Stream()
+        self.stdout_thread = _Reader(alive=True)
+        self.stderr_thread = _Reader(alive=False)
+
+
+@pytest.mark.parametrize("platform", ["win32", "linux"])
+def test_close_pipes_skips_a_stream_its_win32_reader_still_holds(monkeypatch, platform):
+    """DW-478: on win32 a stream whose reader thread is still alive is left for
+    that thread to close — `close()` would block on the BufferedReader lock its
+    `read()` holds. A stream whose reader finished is closed. POSIX has no reader
+    threads to wait on, so it closes both whatever attribute is present.
+
+    Ablation: drop the reader-thread check in `_close_pipes` and the win32 arm
+    closes stdout; make it unconditional and the linux arm leaves stdout open."""
+    monkeypatch.setattr(childrun.sys, "platform", platform)
+    proc = _PipedProc()
+
+    childrun._close_pipes(proc)  # pyright: ignore[reportArgumentType, reportPrivateUsage]
+
+    assert proc.stderr.closed is True
+    assert proc.stdout.closed is (platform != "win32")
 
 
 def test_timeout_stream_normalises_bytes_like_text_mode():
@@ -417,8 +879,8 @@ def test_timeout_stream_normalises_bytes_like_text_mode():
 # cannot reach outlives `DRAIN_S` does the drain raise `TimeoutExpired`, handing
 # over the raw POSIX chunks for `timeout_stream` to decode. The holder here is the
 # documented `kill_tree` limit made concrete: a background job double-forked out of
-# a subshell, so it is reparented away from the root before the one pre-signal
-# harvest and keeps the pipes open.
+# a subshell that exits at once, so it is reparented away from the root before any
+# harvest (the loop's first one is `HARVEST_S` in) and keeps the pipes open.
 #
 # Driven inside an ASCII-locale child interpreter for the reason the #378 rows in
 # tests/test_verify.py give: every CI leg is UTF-8, where the locale codec and a

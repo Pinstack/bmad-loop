@@ -154,6 +154,15 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Reach more of a verify command's or declarative hook's process tree on a hard stop or
+  timeout (DW-477). While the root runs, the runner re-scans its descendants every
+  second and keeps them, so a job seen under the live root is killed after its shell
+  exits. The kill re-scans while the root winds down (a TERM-trap fork is caught if the
+  root outlives one re-scan) and reaps each survivor's current children. Only pids
+  still alive with a matching identity are signalled.
+- On Windows, stop the post-kill drain from blocking on a pipe an unreachable process
+  still holds: a stream whose reader thread is still reading is left for that thread to
+  close (DW-478).
 - Pin the run dir and each worktree mount to the identity recorded when the orchestrator
   minted it (DW-446, DW-486). `state.json` now persists `run_dir_identity` and each task's
   `worktree_identity`. The verify stream and every mount writer compare the root they open
