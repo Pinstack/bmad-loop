@@ -5129,3 +5129,64 @@ def test_retry_preserve_notice_refuses_a_ref_this_task_cannot_own(project, stale
             flow.state = SimpleNamespace(run_id="run-2")
 
     assert flow.retry_preserve_notice(task) == ""
+
+
+# ------------------------------------ untrusted fragments fold (DW-417)
+
+# A multi-line fault text carrying a control byte: its second line must never land
+# in ATTENTION as a loose, unprefixed line.
+_MULTILINE_FAULT = "fatal: x\x1b[31m\nhint: y"
+_FOLDED_FAULT = "fatal: x\\x1b[31m ⏎ hint: y"
+
+
+def _assert_fragment_folded(run_dir: Path) -> None:
+    lines = _attention_lines(run_dir)
+    assert lines and lines[0].startswith("[")
+    assert not any(line.lstrip().startswith("hint: y") for line in lines)
+    assert any(_FOLDED_FAULT in line for line in lines)
+    assert "\x1b" not in "\n".join(lines)
+
+
+def test_owned_spec_pause_folds_a_multiline_problem(project, tmp_path):
+    """`pause_for_owned_spec_recovery`'s `{problem}` is folded into one segment of
+    its notice line; the journal row keeps it raw.
+
+    Ablation: interpolate the raw `problem` in the notice and a loose `hint: y`
+    line lands in ATTENTION."""
+    repo = project.project
+    flow = _make_flow(workspace=Workspace.default(project), run_dir=tmp_path)
+    task = _task(repo)
+
+    with pytest.raises(_Pause):
+        flow.pause_for_owned_spec_recovery(task, str(repo / "spec.md"), _MULTILINE_FAULT)
+
+    _assert_fragment_folded(tmp_path)
+    assert flow.journal.fields("rollback-owned-spec-manual-required")["problem"] == (
+        _MULTILINE_FAULT
+    )
+
+
+def test_accept_current_baseline_git_fault_folds_a_multiline_error(project, tmp_path, monkeypatch):
+    """`accept_current_baseline`'s `({exc})` is folded into one segment of its
+    notice line; the `baseline-accept-failed` row keeps `str(exc)` raw.
+
+    Ablation: interpolate the raw `exc` in the notice and a loose `hint: y` line
+    lands in ATTENTION."""
+    repo = project.project
+    flow = _make_flow(
+        workspace=Workspace.default(project),
+        policy=_policy(rollback_on_failure=True),
+        run_dir=tmp_path,
+    )
+    task = _task(repo)
+
+    def boom(root):
+        raise GitError(_MULTILINE_FAULT)
+
+    monkeypatch.setattr(verify, "rev_parse_head", boom)
+
+    with pytest.raises(_Pause):
+        flow.accept_current_baseline(task)
+
+    _assert_fragment_folded(tmp_path)
+    assert flow.journal.fields("baseline-accept-failed")["error"] == _MULTILINE_FAULT

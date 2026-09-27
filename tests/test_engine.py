@@ -5013,6 +5013,63 @@ def test_park_notice_keeps_its_numbered_action_list_on_separate_lines(project):
     assert lines[header + len(ACTIONS) + 1].startswith("run `bmad-loop confirm 1-1-a`")
 
 
+# A multi-line, control-bearing untrusted fragment (DW-417): its second line must
+# never land in ATTENTION as a loose, unprefixed line.
+_MULTILINE_FRAGMENT = "fatal: x\x1b[31m\nhint: y"
+_FOLDED_FRAGMENT = "fatal: x\\x1b[31m ⏎ hint: y"
+
+
+def _assert_attention_folds_the_fragment(run_dir: Path) -> list[str]:
+    lines = (run_dir / "ATTENTION").read_text(encoding="utf-8").splitlines()
+    assert lines and lines[0].startswith("[")
+    assert not any(line.lstrip().startswith("hint: y") for line in lines)
+    assert any(_FOLDED_FRAGMENT in line for line in lines)
+    assert "\x1b" not in "\n".join(lines)
+    return lines
+
+
+def test_park_notice_folds_a_multiline_action_onto_its_numbered_line(project):
+    """An agent-authored operator action is untrusted text: `_notify_park` folds it
+    through `gates.notice_line`, so an embedded line break stays on the action's
+    own numbered line and every other action keeps its line (DW-417).
+
+    Ablation: interpolate the raw action in `_notify_park` and `hint: y` lands in
+    ATTENTION as a loose line after `  1. fatal: x…`."""
+    engine, _ = make_engine(project, [], policy=_park_policy())
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    actions = [_MULTILINE_FRAGMENT, ACTIONS[1]]
+    task = StoryTask(story_key="1-1-a", epic=1, operator_actions=list(actions))
+
+    engine._notify_park(task)
+
+    lines = _assert_attention_folds_the_fragment(engine.run_dir)
+    (header,) = [i for i, ln in enumerate(lines) if "story awaiting operator: 1-1-a" in ln]
+    assert lines[header + 1] == f"  1. {_FOLDED_FRAGMENT}"
+    assert lines[header + 2] == f"  2. {ACTIONS[1]}"
+    assert lines[header + 3].startswith("run `bmad-loop confirm 1-1-a`")
+    assert task.operator_actions == actions  # the task keeps the raw text
+
+
+def test_ledger_repair_pause_folds_a_multiline_error(project):
+    """`_pause_for_ledger_repair`'s `{error}` is folded into one segment of its
+    notice line; the `ledger-read-refused` row keeps it raw (DW-417).
+
+    Ablation: interpolate the raw `error` in the notice and a loose `hint: y` line
+    lands in ATTENTION."""
+    engine, _ = make_engine(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    task = StoryTask(story_key="1-1-a", epic=1)
+    engine.state.tasks[task.story_key] = task
+    error = f"{project.deferred_work}: {_MULTILINE_FRAGMENT}"
+
+    with pytest.raises(RunPaused):
+        engine._pause_for_ledger_repair(task, project.deferred_work, error, site="test-site")
+
+    _assert_attention_folds_the_fragment(engine.run_dir)
+    (refused,) = [e for e in engine.journal.entries() if e["kind"] == "ledger-read-refused"]
+    assert refused["error"] == error
+
+
 # ------------------------ review demotion -> park (DW-383, on_review_demotion)
 
 

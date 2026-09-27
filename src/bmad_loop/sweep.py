@@ -7874,7 +7874,9 @@ class SweepEngine(Engine):
         # `_pause_on_intent_refusal`: at the accepted-dev site the session's
         # uncommitted work sits beside the ledger, and a whole-tree commit by hand
         # would swallow it under the repair. The bundle's own commit carries a
-        # tracked ledger's repair once it lands.
+        # tracked ledger's repair once it lands. `error` is folded to one segment
+        # of its line in the notice only (DW-417): the row above keeps it raw, and
+        # the persisted RunPaused reason below is not an ATTENTION line.
         if inaccessible:
             headline = "deferred-work ledger inaccessible"
             verb = "read"
@@ -7910,7 +7912,7 @@ class SweepEngine(Engine):
             f"**ACTION REQUIRED — {headline}**\n"
             f"Bundle **{task.story_key}** was about to {attempted}, but the "
             f"orchestrator could not {verb} the deferred-work ledger to publish it: "
-            f"{error}.\n"
+            f"{gates.notice_line(error)}.\n"
             f"This write did not land and no work was discarded. {repair}"
         )
         gates.notify(

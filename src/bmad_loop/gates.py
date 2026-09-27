@@ -37,8 +37,11 @@ NOTICE_LINE_SEPARATOR = " ⏎ "
 
 def _escape_controls(text: str) -> str:
     """``text`` with every C0/C1 control character (and DEL) replaced by a visible
-    ``\\xNN`` escape, TAB by a single space. Line breaks must already be split
-    out: this runs per line."""
+    ``\\xNN`` escape, every lone surrogate (U+D800-U+DFFF, e.g. a
+    ``surrogateescape``'d path byte in ``str(e)``) by a visible ``\\uNNNN``
+    escape, and TAB by a single space. Line breaks must already be split out: this
+    runs per line. Escaping surrogates makes the result UTF-8 encodable, so neither
+    the ATTENTION write nor a desktop notifier's argv/env can choke on it (DW-419)."""
     if text.isprintable():
         return text
     out: list[str] = []
@@ -48,6 +51,8 @@ def _escape_controls(text: str) -> str:
             out.append(" ")
         elif code < 0x20 or 0x7F <= code <= 0x9F:
             out.append(f"\\x{code:02x}")
+        elif 0xD800 <= code <= 0xDFFF:
+            out.append(f"\\u{code:04x}")
         else:
             out.append(ch)
     return "".join(out)
@@ -56,16 +61,17 @@ def _escape_controls(text: str) -> str:
 def notice_line(text: str) -> str:
     """``text`` shaped as ONE ATTENTION/toast line.
 
-    Control characters are escaped visibly (``\\x1b``), TAB becomes a space. Line
-    breaks — the whole ``str.splitlines`` set (``\\r\\n``, lone ``\\r``, ``\\v``,
-    ``\\f``, ``\\x1c``-``\\x1e``, ``\\x85``, U+2028/2029) — FOLD the text: each
+    Control characters are escaped visibly (``\\x1b``), lone surrogates likewise
+    (``\\udcff``), TAB becomes a space. Line breaks — the whole ``str.splitlines``
+    set (``\\r\\n``, lone ``\\r``, ``\\v``, ``\\f``, ``\\x1c``-``\\x1e``, ``\\x85``,
+    U+2028/2029) — FOLD the text: each
     segment is stripped, blank segments are dropped, and the rest are joined by
     ``NOTICE_LINE_SEPARATOR``, so every line survives. A result longer than
     ``NOTICE_LINE_MAX`` is cut and ends in ``NOTICE_TRUNCATION_MARKER``, which names
     where the full text lives; the total never exceeds ``NOTICE_LINE_MAX``.
 
-    Text with no line break, no control character, and within the cap is returned
-    byte-for-byte unchanged.
+    Text with no line break, no control or surrogate character, and within the cap
+    is returned byte-for-byte unchanged.
     """
     lines = text.splitlines()
     if lines == [text]:
@@ -82,9 +88,13 @@ def notice_line(text: str) -> str:
 def notice_block(text: str) -> str:
     """``text`` shaped as a deliberately MULTI-line notice (``notify(...,
     multiline=True)``): line breaks are kept, normalized to ``\\n``, with trailing
-    blank lines dropped; control characters are escaped as in ``notice_line``;
-    indentation is kept; there is no length cap (these are operator action
-    lists, not captured output)."""
+    blank lines dropped; control and surrogate characters are escaped as in
+    ``notice_line``; indentation is kept; there is no length cap (these are
+    operator action lists, not captured output). Untrusted fragments interpolated
+    into such a notice (``{error}``, agent-authored actions) are folded through
+    ``notice_line`` by the caller, so they stay one segment of their line and
+    each is individually capped at ``NOTICE_LINE_MAX`` (the raw text stays in the
+    caller's journal row) (DW-417)."""
     lines = [_escape_controls(line) for line in text.splitlines()]
     while lines and not lines[-1].strip():
         lines.pop()
@@ -196,7 +206,12 @@ def notify(
     if policy.notify.file:
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
         try:
-            with (run_dir / ATTENTION_FILE).open("a", encoding="utf-8") as f:
+            # backslashreplace: a backstop behind the shaping above (which already
+            # escapes lone surrogates) — an unencodable character must never turn
+            # the write into a UnicodeEncodeError out of a never-raises notifier.
+            with (run_dir / ATTENTION_FILE).open(
+                "a", encoding="utf-8", errors="backslashreplace"
+            ) as f:
                 f.write(f"[{stamp}] {title}: {message}\n")
         except OSError:
             # observe-degrade: an unwritable ATTENTION file is observability,

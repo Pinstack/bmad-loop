@@ -154,6 +154,16 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Fold untrusted fragments (`{error}`, `{problem}`, `({exc})`, agent-authored operator
+  actions) into ACTION REQUIRED and park notices through `gates.notice_line`, so a
+  multi-line fault no longer lands in ATTENTION as loose, unprefixed lines; journal rows
+  keep the raw text (DW-417).
+- Shape the Unity dialog probe's ATTENTION line and notify-send argv with
+  `gates.notice_line`, and pass `--` before the notify-send positionals, so an untrusted
+  window title cannot forge ATTENTION lines (DW-418).
+- Escape lone surrogates in notice shaping and open ATTENTION with
+  `errors="backslashreplace"`, so `gates.notify` never raises `UnicodeEncodeError`
+  (DW-419).
 - Prove ledger ownership on every harvested-deferral carry replay, keyed on the latch
   being set before the pass: a replay after a crash between the latch save and the
   append now pauses (`harvest-carry-foreign-dirt`) over an operator ledger edit instead

@@ -871,10 +871,12 @@ class RecoveryFlow:
                 "resume cannot carry the kept edits into it; they can only be "
                 "re-applied afterwards (e.g. as a later correction)."
             )
+        # `problem` is folded to one segment of its line (DW-417); the journal
+        # row below keeps it raw.
         notice = (
             "**ACTION REQUIRED — attempt-owned spec needs manual recovery**\n"
             f"Story **{task.story_key}** cannot safely restore its pre-attempt spec "
-            f"at `{spec}`: {problem}. The working tree at `{root}` now requires "
+            f"at `{spec}`: {gates.notice_line(problem)}. The working tree at `{root}` now requires "
             "inspection because bmad-loop cannot safely distinguish operator "
             "intent, failed-session output, and any rollback already completed.\n"
             f"{contract}{steps}"
@@ -1913,11 +1915,13 @@ class RecoveryFlow:
             untracked = sorted(verify.untracked_files(root))
         except (verify.GitError, OSError) as exc:
             self.journal.append("baseline-accept-failed", story_key=task.story_key, error=str(exc))
+            # The fault text is folded to one segment of its line (DW-417); the
+            # row above keeps it raw.
             notice = (
                 "**ACTION REQUIRED — could not accept the current baseline**\n"
                 f"`--accept-baseline` was requested for story **{task.story_key}**, but "
                 f"reading the current HEAD / untracked files of `{root}` failed "
-                f"({exc}). The baseline was left unchanged and no rollback ran, so "
+                f"({gates.notice_line(str(exc))}). The baseline was left unchanged and no rollback ran, so "
                 "nothing was reset.\n"
                 "Fix the git fault, then run "
                 f"`bmad-loop resume {self.state.run_id} --accept-baseline` again. A "

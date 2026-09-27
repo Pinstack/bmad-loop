@@ -35976,3 +35976,34 @@ def test_retro_ingest_partially_seen_board_files_only_the_new_item(project, how)
     assert row["dw_ids"] == ["DW-2"]
     assert _INGEST_MESSAGE in _subjects(project)
     assert "### DW-2: Add Y" in _ledger_at_head(project)
+
+
+def test_bundle_close_repair_notice_folds_a_multiline_fault(project):
+    """DW-417: the bundle-close repair notice folds the attributed fault text into
+    one segment of its line, so a multi-line, control-bearing `OSError` message
+    cannot land in ATTENTION as loose lines. The `sweep-bundle-close-refused` row
+    keeps the raw text, and so does the persisted `RunPaused` reason (not an
+    ATTENTION line).
+
+    Ablation: interpolate the raw `error` in the notice and a loose `hint: y` line
+    lands in ATTENTION."""
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    task = StoryTask(story_key="dw-fix-things", epic=0, dw_ids=["DW-1"])
+    task.phase = Phase.DEV_VERIFY
+    engine.state.tasks[task.story_key] = task
+    fault = PermissionError(13, "fatal: x\x1b[31m\nhint: y")
+
+    with pytest.raises(RunPaused) as raised:
+        engine._pause_for_bundle_close_repair(
+            task, project.deferred_work, fault, site="bundle-close-locked", dw_ids=["DW-1"]
+        )
+
+    lines = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8").splitlines()
+    assert lines and lines[0].startswith("[")
+    assert not any(line.lstrip().startswith("hint: y") for line in lines)
+    assert any("fatal: x\\x1b[31m ⏎ hint: y)" in line for line in lines)
+    assert "\x1b" not in "\n".join(lines)
+    [refused] = _records(engine, "sweep-bundle-close-refused")
+    assert refused["error"].endswith("fatal: x\x1b[31m\nhint: y)")
+    assert "fatal: x\x1b[31m\nhint: y" in raised.value.reason  # persisted reason unfolded

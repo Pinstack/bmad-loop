@@ -4384,8 +4384,14 @@ class Engine:
         must not read as "the run stopped for you". The run has already moved on.
         The actions are enumerated in the body rather than counted because this
         notification is the one artifact that reaches someone who is not looking
-        at the repo."""
-        actions = "\n".join(f"  {i}. {a}" for i, a in enumerate(task.operator_actions, 1))
+        at the repo.
+
+        Each action is agent-authored text, so it is folded through
+        ``gates.notice_line`` (DW-417): an embedded line break stays on its own
+        numbered line as a `` ⏎ `` segment instead of landing loose in ATTENTION."""
+        actions = "\n".join(
+            f"  {i}. {gates.notice_line(a)}" for i, a in enumerate(task.operator_actions, 1)
+        )
         gates.notify(
             self.policy,
             self.run_dir,
@@ -6239,11 +6245,12 @@ class Engine:
         )
         # `error` is `_ledger_fault_text`'s attribution and already begins with
         # the ledger's path, so the notice does not name the path a second time.
+        # It is folded to one segment of its line (DW-417); the row above keeps it raw.
         notice = (
             "**ACTION REQUIRED — deferred-work ledger unreadable**\n"
             f"Story **{task.story_key}** has a ledger write to publish (findings to "
             "file, or a declared close to record), but the orchestrator could not "
-            f"read the deferred-work ledger to publish it: {error}.\n"
+            f"read the deferred-work ledger to publish it: {gates.notice_line(error)}.\n"
             "This write did not land and no work was discarded. Repair the ledger by hand "
             "(it must be valid UTF-8, and the path's permissions or storage must let "
             "it be read), then run "
@@ -8735,11 +8742,13 @@ class Engine:
         )
         resume = f"`bmad-loop resume {self.state.run_id}` to retry the carry commit."
         if error is not None:
+            # The fault text is folded to one segment of its line (DW-417); the
+            # row above keeps it raw.
             notice = (
                 "**ACTION REQUIRED — deferred-work ledger could not be verified**\n"
                 f"Story **{task.story_key}** has harvested findings to commit into "
                 f"`{ledger}`, but the carry could not verify the ledger holds only its "
-                f"own changes: {error}. Any rows this carry filed are on disk but "
+                f"own changes: {gates.notice_line(error)}. Any rows this carry filed are on disk but "
                 "uncommitted, and nothing was committed.\n"
                 f"Fix the fault, then run {resume}"
             )

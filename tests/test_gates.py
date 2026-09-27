@@ -241,6 +241,8 @@ _ONE_LINE_ROWS = [
     pytest.param("del\x7f", "del\\x7f", id="del"),
     pytest.param("csi\x9b", "csi\\x9b", id="c1-csi"),
     pytest.param("col\tumn", "col umn", id="tab-to-space"),
+    pytest.param("bad \udcff path", "bad \\udcff path", id="lone-low-surrogate"),
+    pytest.param("hi\ud800gh", "hi\\ud800gh", id="lone-high-surrogate"),
     pytest.param("", "", id="empty"),
     pytest.param(" \n ", "", id="blank"),
 ]
@@ -298,6 +300,7 @@ def test_notice_block_keeps_lines_and_escapes_controls():
     assert gates.notice_block("a\r\nb\rc\n\n\n") == "a\nb\nc"
     assert gates.notice_block("") == ""
     assert gates.notice_block(" \n ") == ""
+    assert gates.notice_block("head\n  1. bad \udcff path") == "head\n  1. bad \\udcff path"
     # no cap on the block path: operator action lists are carried whole
     long = "\n".join("q" * 100 for _ in range(60))
     assert gates.notice_block(long) == long
@@ -388,3 +391,39 @@ def test_notify_desktop_shapes_env_payloads(monkeypatch, tmp_path):
     ((_argv, kwargs),) = calls
     assert kwargs["env"][gates._TITLE_ENV] == "t\\x07"
     assert kwargs["env"][gates._MESSAGE_ENV] == "a ⏎ b\\x00"
+
+
+# ------------------------------------------------ lone surrogates (DW-419)
+
+
+def test_notify_survives_a_lone_surrogate_on_both_channels(monkeypatch, tmp_path):
+    """A lone surrogate (a ``surrogateescape``'d path byte in ``str(e)``) is not
+    UTF-8 encodable: it used to raise ``UnicodeEncodeError`` out of the ATTENTION
+    write, breaking the never-raises contract. Shaping now escapes it visibly, so
+    both channels carry the same ``\\udcff`` text and ``notify`` returns.
+
+    Ablation: drop the surrogate branch in ``_escape_controls`` and the argv keeps
+    the raw surrogate; drop it AND ``errors="backslashreplace"`` and ``notify``
+    raises ``UnicodeEncodeError``."""
+    for multiline in (False, True):
+        (tmp_path / gates.ATTENTION_FILE).unlink(missing_ok=True)
+        attention, summary, body = _attention_and_argv(
+            monkeypatch, tmp_path, "ti\udcfftle", "bad \udcff path", multiline=multiline
+        )
+        assert summary == "ti\\udcfftle"
+        assert body == "bad \\udcff path"
+        assert attention.count("\n") == 1
+        assert attention.rstrip("\n").endswith("] ti\\udcfftle: bad \\udcff path")
+
+
+def test_notify_attention_write_backstops_an_unencodable_payload(monkeypatch, tmp_path):
+    """``errors="backslashreplace"`` on the ATTENTION open is a backstop behind the
+    shaping: even text that reaches the write unshaped cannot raise.
+
+    Ablation: drop ``errors="backslashreplace"`` and this raises
+    ``UnicodeEncodeError``."""
+    monkeypatch.setattr(gates, "notice_line", lambda text: text)
+    monkeypatch.setattr(gates, "notice_block", lambda text: text)
+    gates.notify(_policy(desktop=False, file=True), tmp_path, "t", "bad \udcff path")
+    attention = (tmp_path / gates.ATTENTION_FILE).read_text(encoding="utf-8")
+    assert attention.rstrip("\n").endswith("] t: bad \\udcff path")

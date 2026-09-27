@@ -4107,6 +4107,33 @@ def test_harvest_carry_replay_pauses_when_the_ownership_probe_faults(project, mo
     assert load_state(engine.run_dir).tasks[task.story_key].harvest_carry_commit_pending
 
 
+def test_harvest_carry_foreign_dirt_pause_folds_a_multiline_probe_error(project):
+    """DW-417: the probe-fault notice folds `{error}` into one segment of its line,
+    so a multi-line, control-bearing fault text cannot land in ATTENTION as loose
+    lines; the `harvest-carry-foreign-dirt` row keeps it raw.
+
+    Ablation: interpolate the raw `error` in the notice and a loose `hint: y` line
+    lands in ATTENTION."""
+    from bmad_loop.engine import RunPaused
+
+    engine, _ = make_engine(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    task = StoryTask(story_key="1-1-a", epic=1)
+    engine.state.tasks[task.story_key] = task
+    error = "GitError: fatal: x\x1b[31m\nhint: y"
+
+    with pytest.raises(RunPaused):
+        engine._pause_for_harvest_carry_foreign_dirt(task, project.deferred_work, error=error)
+
+    lines = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8").splitlines()
+    assert lines and lines[0].startswith("[")
+    assert not any(line.lstrip().startswith("hint: y") for line in lines)
+    assert any("GitError: fatal: x\\x1b[31m ⏎ hint: y" in line for line in lines)
+    assert "\x1b" not in "\n".join(lines)
+    (dirt,) = _rows(engine, "harvest-carry-foreign-dirt")
+    assert dirt["error"] == error
+
+
 def test_harvest_carry_replay_commits_an_untracked_ledger_unproved(project):
     """DW-355's #460 boundary: a ledger HEAD does not carry has no baseline to prove
     against, so a latch-only replay commits it exactly as before — an extra line
