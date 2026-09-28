@@ -1635,14 +1635,17 @@ class BmadLoopApp(App[None]):
 
     @work(thread=True, group="lifecycle")
     def _delete_run_worker(self, run_id: str, run_dir: Path) -> None:
+        guard_notes: list[str] = []
         try:
-            runs.delete_run(self.project, run_dir)
+            runs.delete_run(self.project, run_dir, warn=guard_notes.append)
         except (OSError, runs.StateRootError, runs.LiveEngineError, runs.LiveSessionError) as e:
             # The modal's liveness sample is advisory. Surface authoritative
             # lifecycle refusals and lock/removal failures here rather than letting
             # them kill the worker thread or forgetting a run that still exists.
+            self._notify_guard_notes(guard_notes)
             self.call_from_thread(self.notify, f"delete failed: {e}", severity="error")
             return
+        self._notify_guard_notes(guard_notes)
         self.call_from_thread(self._dashboard.forget_run, run_id)
         self.call_from_thread(self.notify, f"run {run_id} deleted")
 
@@ -1674,15 +1677,28 @@ class BmadLoopApp(App[None]):
 
     @work(thread=True, group="lifecycle")
     def _archive_run_worker(self, run_id: str, run_dir: Path) -> None:
+        guard_notes: list[str] = []
         try:
-            dest = runs.archive_run(self.project, run_dir)
+            dest = runs.archive_run(self.project, run_dir, warn=guard_notes.append)
         except (OSError, runs.StateRootError, runs.LiveEngineError, runs.LiveSessionError) as e:
             # Same worker boundary as delete: report the authoritative transaction,
             # not the earlier modal sample.
+            self._notify_guard_notes(guard_notes)
             self.call_from_thread(self.notify, f"archive failed: {e}", severity="error")
             return
+        self._notify_guard_notes(guard_notes)
         self.call_from_thread(self._dashboard.forget_run, run_id)
         self.call_from_thread(self.notify, f"run {run_id} archived to {dest}")
+
+    def _notify_guard_notes(self, notes: list[str]) -> None:
+        # The #419 session guard's "could not ask the multiplexer" degrade
+        # (DW-466). Its default channel is stderr, which Textual captures for the
+        # app's whole run (see run_tui), so the workers hand delete_run /
+        # archive_run a sink and toast what it collected — after the call, never
+        # from inside it, which holds the run's state lock. Shown whether or not
+        # the removal then succeeded: the guard's verdict was unasked either way.
+        for note in notes:
+            self.call_from_thread(self.notify, note, severity="warning")
 
     def action_cleanup_sessions(self) -> None:
         if self._mux_missing():

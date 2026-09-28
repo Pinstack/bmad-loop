@@ -5313,7 +5313,9 @@ async def test_archive_run_archives_and_forgets(project, monkeypatch):
     forgotten: list[str] = []
     dest = project.project / ".bmad-loop" / "archive" / "20260611-100000-aaaa.tar.gz"
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
-    monkeypatch.setattr(runs, "archive_run", lambda proj, rd: archived.append((proj, rd)) or dest)
+    monkeypatch.setattr(
+        runs, "archive_run", lambda proj, rd, **_kw: archived.append((proj, rd)) or dest
+    )
     monkeypatch.setattr(DashboardScreen, "forget_run", lambda self, rid: forgotten.append(rid))
     make_run(project.project, "20260611-100000-aaaa", finished=True)
     app = BmadLoopApp(project.project)
@@ -5341,7 +5343,9 @@ async def test_archive_live_run_refused_without_calling(project, monkeypatch):
 
     archived: list[tuple[Path, Path]] = []
     monkeypatch.setattr(data, "liveness", lambda run_dir: "alive")
-    monkeypatch.setattr(runs, "archive_run", lambda proj, rd: archived.append((proj, rd)) or proj)
+    monkeypatch.setattr(
+        runs, "archive_run", lambda proj, rd, **_kw: archived.append((proj, rd)) or proj
+    )
     make_run(project.project, "20260611-100000-aaaa", alive=True)
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
@@ -5398,6 +5402,80 @@ async def test_lifecycle_workers_report_authoritative_failures_and_keep_the_run_
         assert dashboard(app).selected_run_id == run_dir.name
 
     assert run_dir.is_dir()
+
+
+class _UnaskableMux:
+    """A backend whose session listing raises — the out-of-tree seam shape the
+    removal guard's DW-466 arm exists for. Tmux-shaped otherwise."""
+
+    def session_name_key(self, name):
+        return name
+
+    def has_registry_namespace(self):
+        return False
+
+    def list_sessions(self):
+        raise MultiplexerError("simulated transport failure")
+
+
+def _unselectable_mux():
+    raise MultiplexerError("[mux] backend = 'ghost' matches no registered backend")
+
+
+@pytest.mark.parametrize(
+    "select, what",
+    [
+        (_unselectable_mux, "the multiplexer backend could not be selected"),
+        (_UnaskableMux, "the session listing raised"),
+    ],
+    ids=["unselectable", "listing-raised"],
+)
+@pytest.mark.parametrize(
+    "key, removed",
+    [("D", "run 20260611-100000-aaaa deleted"), ("A", "run 20260611-100000-aaaa archived")],
+    ids=["delete", "archive"],
+)
+async def test_lifecycle_workers_toast_an_unasked_session_guard(
+    project, monkeypatch, select, what, key, removed
+):
+    """The #419 guard could not ask the multiplexer, so the removal went ahead
+    as if no session were live (DW-466). The CLI says so on stderr, but Textual
+    captures stderr for the app's whole run, so under the TUI that print reached
+    nobody: the run dir vanished with nothing shown. The worker now hands
+    `delete_run`/`archive_run` a sink and toasts the note as a warning — and the
+    stderr print does not fire on top of it (one route per frontend).
+
+    Drives the real removal helpers; only the multiplexer seam is faked.
+
+    Ablation: drop `_notify_guard_notes` from either worker and its rows fail at
+    the toast wait (the removal toast arrives, the warning never does). Verified."""
+    monkeypatch.setattr(data, "liveness", lambda _run_dir: "dead")
+    monkeypatch.setattr(runs_mod, "get_multiplexer", select)
+    run_dir = make_run(project.project, "20260611-100000-aaaa", finished=True)
+    # Textual redirects stderr while the app runs, so capsys cannot see a print
+    # made under it; spy on the runs module's own `print` instead.
+    printed: list[str] = []
+    monkeypatch.setattr(
+        runs_mod, "print", lambda *a, **_kw: printed.append(" ".join(map(str, a))), raising=False
+    )
+    note = f"run 20260611-100000-aaaa: could not check for a live agent session — {what}: "
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: dashboard(app).selected_run_id == run_dir.name)
+        await pilot.press(key)
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: any(removed in m for m in notifications(app)))
+        await until(
+            pilot,
+            lambda: any(
+                m.startswith(note) and sev == "warning"
+                for m, sev in notifications_with_severity(app)
+            ),
+        )
+
+    assert not run_dir.exists()
+    assert not [p for p in printed if "could not check for a live agent session" in p]
 
 
 # ------------------------------------------------------------ graceful stop (S)

@@ -203,8 +203,9 @@ breaking changes may land in a minor release.
 - Read an `engine.pid` that exists but cannot be read as liveness `unknown`, not `dead`:
   `delete`/`archive`/`clean`/`cleanup` now give their unverifiable-pid warning for it
   and `resolve` wants `--force`. A missing file still reads as no pid (DW-465).
-- Warn on stderr when the removal guard's backend selection or session listing raises;
-  the run is still removed as if no session were live (DW-466).
+- Warn when the removal guard's backend selection or session listing raises: on stderr
+  from the CLI, and as a warning toast from the TUI's `D`/`A`, where stderr is not
+  shown. The run is still removed as if no session were live (DW-466).
 - Warn on `resume` when the run's out-of-tree config baseline exists but cannot be read
   (not a regular file, a link, an OS fault, non-UTF-8 bytes, an unnameable state root),
   naming the path and fault. It still falls back to `state.json`; a missing file stays

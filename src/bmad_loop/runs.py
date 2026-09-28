@@ -27,7 +27,7 @@ import stat
 import sys
 import tarfile
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -2420,7 +2420,9 @@ def _stop_run_once(run_dir: Path) -> bool | None:
     return True
 
 
-def live_session_may_be_ours(project: Path, run_id: str) -> bool:
+def live_session_may_be_ours(
+    project: Path, run_id: str, *, warn: Callable[[str], None] | None = None
+) -> bool:
     """True when a live ``bmad-loop-<id>`` session exists that this project cannot
     prove belongs to another one — the precondition of the removal guard below.
 
@@ -2551,22 +2553,31 @@ def live_session_may_be_ours(project: Path, run_id: str) -> bool:
     no live session rather than aborting every removal path.
 
     **Those two degrades are signalled (DW-466).** A selection or listing that
-    raises :class:`MultiplexerError` still answers False, but prints a
-    ``warning:`` on stderr naming the run and the error, since the removal it
-    licenses then went ahead without the multiplexer ever being asked. Stderr,
-    not the return value: the answer is a bool read by `clean` and by
+    raises :class:`MultiplexerError` still answers False, but reports a warning
+    naming the run and the error, since the removal it licenses then went ahead
+    without the multiplexer ever being asked. Through ``warn``, not the return
+    value: the answer is a bool read by `clean` and by
     :func:`_refuse_live_session` under every delete/archive path (CLI, TUI and
     ``runsetup``'s launch-failure cleanup), and widening it would move every one
-    of them for a warning. No double report: the bundled backends never raise here —
+    of them for a warning. ``warn`` receives the operator-facing line; left
+    ``None`` it is printed on stderr as a ``warning:``, which is the CLI's
+    channel. A frontend that owns stderr passes its own sink instead — the TUI,
+    where Textual captures stderr for the app's whole run and a print would
+    reach nobody — and then the print does not also fire: one route per
+    frontend. No double report: the bundled backends never raise here —
     ``BaseTmuxBackend.list_sessions`` folds its own faults into ``[]`` and warns
     for them itself (DW-458) — so the exception this arm catches comes only
     from an out-of-tree backend or from selection, and no layer below has said
-    anything about it. The ``ctl_session_for`` and tag-read arms stay silent on
+    anything about it. That DW-458 warning is stderr-only and ``warn`` does not
+    reach it: the seam hands back a bare list, so a bundled listing fault is
+    not visible to this function to forward, and under the TUI it stays unseen. The ``ctl_session_for`` and tag-read arms stay silent on
     purpose: both degrade toward refusal, the safe direction."""
     try:
         mux = get_multiplexer()
     except MultiplexerError as exc:
-        _warn_unasked_session_guard(run_id, "the multiplexer backend could not be selected", exc)
+        _warn_unasked_session_guard(
+            run_id, "the multiplexer backend could not be selected", exc, warn
+        )
         return False
     key = mux.session_name_key
     name = session_name(run_id)
@@ -2581,7 +2592,7 @@ def live_session_may_be_ours(project: Path, run_id: str) -> bool:
         if key(name) not in {key(s) for s in mux_sessions()}:
             return False
     except MultiplexerError as exc:
-        _warn_unasked_session_guard(run_id, "the session listing raised", exc)
+        _warn_unasked_session_guard(run_id, "the session listing raised", exc, warn)
         return False
     try:
         tags = session_project_tags()
@@ -2591,16 +2602,23 @@ def live_session_may_be_ours(project: Path, run_id: str) -> bool:
     return not tag or tag in accepted_tags(project)
 
 
-def _warn_unasked_session_guard(run_id: str, what: str, exc: MultiplexerError) -> None:
+def _warn_unasked_session_guard(
+    run_id: str, what: str, exc: MultiplexerError, warn: Callable[[str], None] | None
+) -> None:
     # The removal guard's one I/O edge (see live_session_may_be_ours, DW-466).
-    print(
-        f"warning: run {run_id}: could not check for a live agent session — {what}: "
-        f"{exc}; proceeding as if none is live",
-        file=sys.stderr,
+    note = (
+        f"run {run_id}: could not check for a live agent session — {what}: "
+        f"{exc}; proceeding as if none is live"
     )
+    if warn is None:
+        print(f"warning: {note}", file=sys.stderr)
+    else:
+        warn(note)
 
 
-def _refuse_live_session(project: Path, run_id: str, verb: str) -> None:
+def _refuse_live_session(
+    project: Path, run_id: str, verb: str, *, warn: Callable[[str], None] | None = None
+) -> None:
     """Backstop for #419: refuse to remove a run dir out from under a live session.
 
     Every caller's live guard is keyed on *engine pid* liveness, so an orphan —
@@ -2628,7 +2646,7 @@ def _refuse_live_session(project: Path, run_id: str, verb: str) -> None:
     Hence the message asks the operator to confirm first: nothing available here can
     prove the session ours, and minting a proof that outlives the run dir is #419
     direction (2), not this guard."""
-    if live_session_may_be_ours(project, run_id):
+    if live_session_may_be_ours(project, run_id, warn=warn):
         raise LiveSessionError(
             f"run {run_id}: refusing to {verb} its directory while its agent session is "
             f"still live — for an untagged session this directory is the only ownership "
@@ -2739,6 +2757,7 @@ def delete_run(
     *,
     force: bool = False,
     wait_for_lock: bool = True,
+    warn: Callable[[str], None] | None = None,
     _expected_composer_pid: int | None = None,
     _expected_composer_claim: os.stat_result | None = None,
 ) -> None:
@@ -2770,7 +2789,11 @@ def delete_run(
     a held lock already means what that caller reports anyway ("in use, left
     alone"), and because waiting is unbounded on POSIX where ``fcntl.flock`` never
     times out. The default waits, which is what a single-run operator command
-    wants: there, giving up would turn a brief overlap into a failed command."""
+    wants: there, giving up would turn a brief overlap into a failed command.
+
+    ``warn`` is where the session guard reports that it could not ask the
+    multiplexer and let the removal proceed anyway (DW-466); ``None`` prints it
+    on stderr. See :func:`live_session_may_be_ours`."""
     _refuse_uncontained_run_dir(project, run_dir, "delete")
     with state_lock(run_dir, blocking=wait_for_lock):
         if _expected_composer_claim is not None:
@@ -2798,7 +2821,7 @@ def delete_run(
                 f"run {run_dir.name} is still live — refusing to delete it; stop it first"
             )
         if not force:
-            _refuse_live_session(project, run_dir.name, "delete")
+            _refuse_live_session(project, run_dir.name, "delete", warn=warn)
         shutil.rmtree(run_dir)
         # after the run dir, never before: a raise above leaves the run whole, and a
         # whole run keeps its control plane (see _discard_state_dir).
@@ -2806,7 +2829,12 @@ def delete_run(
 
 
 def archive_run(
-    project: Path, run_dir: Path, *, force: bool = False, wait_for_lock: bool = True
+    project: Path,
+    run_dir: Path,
+    *,
+    force: bool = False,
+    wait_for_lock: bool = True,
+    warn: Callable[[str], None] | None = None,
 ) -> Path:
     """Compress a run dir into .bmad-loop/archive/<id>.tar.gz and remove the
     original. The tarball is written to a temp path then atomically replaced into
@@ -2830,7 +2858,8 @@ def archive_run(
     ``wait_for_lock`` carries the meaning it has on :func:`delete_run`: ``False``
     declines a contended run with :class:`platform_util.LockUnavailableError`
     rather than queueing behind its holder, and refuses before the tarball is
-    written, so a decline — like the guards above it — leaves nothing behind."""
+    written, so a decline — like the guards above it — leaves nothing behind.
+    ``warn`` carries the session guard's degrade as on :func:`delete_run`."""
     _refuse_uncontained_run_dir(project, run_dir, "archive")
     with state_lock(run_dir, blocking=wait_for_lock):
         if engine_liveness(run_dir) == "alive":
@@ -2838,7 +2867,7 @@ def archive_run(
                 f"run {run_dir.name} is still live — refusing to archive it; stop it first"
             )
         if not force:
-            _refuse_live_session(project, run_dir.name, "archive")
+            _refuse_live_session(project, run_dir.name, "archive", warn=warn)
         return _archive_run_locked(project, run_dir)
 
 

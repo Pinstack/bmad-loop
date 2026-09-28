@@ -424,7 +424,7 @@ def test_cmd_clean_survives_a_session_appearing_mid_clean(project, monkeypatch, 
         save_state(d, RunState(run_id=d.name, project=str(repo), started_at="x", finished=True))
     seen: list[str] = []
 
-    def racing(_project, run_id):
+    def racing(_project, run_id, **_kw):
         if run_id != racer.name:
             return False  # only one run races; the other must still be reclaimed
         seen.append(run_id)
@@ -460,7 +460,7 @@ def test_cmd_clean_reports_a_mid_clean_racer_by_what_it_actually_did(project, mo
     save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", finished=True))
     seen: list[str] = []
 
-    def racing(_project, run_id):
+    def racing(_project, run_id, **_kw):
         seen.append(run_id)
         return len(seen) > 1
 

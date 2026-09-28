@@ -2793,7 +2793,7 @@ def test_failed_composition_pid_bypasses_only_its_own_live_engine(tmp_path, monk
     runs.write_pid(run_dir)
     checked: list[str] = []
 
-    def session_guard(_project, run_id, _action):
+    def session_guard(_project, run_id, _action, **_kw):
         checked.append(run_id)
 
     monkeypatch.setattr(runs, "_refuse_live_session", session_guard)
@@ -2968,6 +2968,37 @@ def test_delete_run_proceeds_when_the_session_listing_raises(tmp_path, monkeypat
     monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux([], unanswerable=True))
     runs.delete_run(tmp_path, run_dir)
     assert not run_dir.exists()
+
+
+@pytest.mark.parametrize("helper", ["delete_run", "archive_run"])
+def test_removal_routes_the_unasked_guard_warning_to_one_channel(
+    tmp_path, monkeypatch, capsys, helper
+):
+    """DW-466's warning has one route per caller: stderr by default (the CLI),
+    or the caller's ``warn`` sink instead of stderr (the TUI, whose stderr
+    Textual captures). The sink gets the operator-facing line without the
+    ``warning:`` prefix; stderr stays empty when a sink is given.
+
+    Ablation: drop ``warn=warn`` from either helper's `_refuse_live_session`
+    call and its sink row fails (the note goes to stderr instead)."""
+    remove = getattr(runs, helper)
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux([], unanswerable=True))
+    note = (
+        "run r1: could not check for a live agent session — the session listing "
+        "raised: simulated transport failure; proceeding as if none is live"
+    )
+
+    run_dir = _make_state_run(tmp_path, "r1")
+    remove(tmp_path, run_dir)
+    assert not run_dir.exists()
+    assert capsys.readouterr().err == f"warning: {note}\n"
+
+    run_dir = _make_state_run(tmp_path, "r1")
+    notes: list[str] = []
+    remove(tmp_path, run_dir, warn=notes.append)
+    assert not run_dir.exists()
+    assert notes == [note]
+    assert capsys.readouterr().err == ""
 
 
 def test_delete_run_refuses_when_the_tag_read_raises(tmp_path, monkeypatch):
