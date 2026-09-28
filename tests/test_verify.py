@@ -9689,6 +9689,15 @@ def _commit_tree(repo, tree, *parents, message="bound fixture"):
     return _raw_git(repo, *args, "-m", message)
 
 
+def _rewrite_gitfile(gitfile, data):
+    """Replace a git-written `.git` gitfile's bytes in place. Git for Windows
+    marks it hidden, and Windows refuses to truncate-create (`"wb"`) over a
+    hidden file with ERROR_ACCESS_DENIED; opening the existing file does not."""
+    with open(gitfile, "r+b") as fh:
+        fh.truncate()
+        fh.write(data)
+
+
 def _intercept_candidate_checkout(monkeypatch, after_add):
     """Run `after_add(candidate_root)` right after the candidate `worktree add`
     returns — the window between checkout and the accepted-bytes write."""
@@ -10887,7 +10896,9 @@ def test_commit_path_bound_refuses_a_rewritten_candidate_gitfile(
     rewritten = []
 
     def rewrite(candidate_root):
-        (candidate_root / ".git").write_bytes(f"gitdir: {(outside / '.git').as_posix()}\n".encode())
+        _rewrite_gitfile(
+            candidate_root / ".git", f"gitdir: {(outside / '.git').as_posix()}\n".encode()
+        )
         rewritten.append(True)
 
     _at_candidate_point(monkeypatch, rewrite_point, rewrite)
@@ -11010,9 +11021,9 @@ def test_commit_path_bound_pin_refuses_a_gitfile_naming_no_candidate_admin_dir(
         elif forgery == "nul-byte":
             value = f"{worktrees.as_posix()}/cand\x00idate"
         else:
-            gitfile.write_bytes(f"GITDIR: {admin.as_posix()}\n".encode())
+            _rewrite_gitfile(gitfile, f"GITDIR: {admin.as_posix()}\n".encode())
             return
-        gitfile.write_bytes(f"gitdir: {value}\n".encode())
+        _rewrite_gitfile(gitfile, f"gitdir: {value}\n".encode())
 
     _intercept_candidate_checkout(monkeypatch, forge)
     if forgery == "foreign-commondir":
@@ -11197,8 +11208,8 @@ def test_commit_path_bound_refuses_a_candidate_admin_dir_changed_after_the_pin(
         def via_link(candidate_root):
             admin = _gitfile_target(candidate_root / ".git")
             link.symlink_to(admin.parent, target_is_directory=True)
-            (candidate_root / ".git").write_bytes(
-                f"gitdir: {(link / admin.name).as_posix()}\n".encode()
+            _rewrite_gitfile(
+                candidate_root / ".git", f"gitdir: {(link / admin.name).as_posix()}\n".encode()
             )
 
         _intercept_candidate_checkout(monkeypatch, via_link)
@@ -11272,8 +11283,8 @@ def test_commit_path_bound_publishes_through_an_intact_intermediate_admin_link(
     def via_link(candidate_root):
         admin = _gitfile_target(candidate_root / ".git")
         link.symlink_to(admin.parent, target_is_directory=True)
-        (candidate_root / ".git").write_bytes(
-            f"gitdir: {(link / admin.name).as_posix()}\n".encode()
+        _rewrite_gitfile(
+            candidate_root / ".git", f"gitdir: {(link / admin.name).as_posix()}\n".encode()
         )
         seen.append(True)
 

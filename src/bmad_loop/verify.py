@@ -11763,7 +11763,9 @@ def commit_path_bound(
                     # The confined writer creates at 0600; carry the captured
                     # target's exec bit onto the inode so a hook that re-adds
                     # the file stages the same mode `--chmod` pins below.
-                    if fd is None or not executable:
+                    # Windows has no exec bit (and no `os.fchmod` before
+                    # 3.13); its `core.fileMode=false` keeps the pinned mode.
+                    if fd is None or not executable or os.name != "posix":
                         return
                     os.fchmod(fd, (os.fstat(fd).st_mode & 0o777) | 0o100)
 

@@ -1182,7 +1182,9 @@ def test_pinned_config_forensics_splits_on_newline_only(tmp_path):
     wt, rel, pins = _write_pinned(tmp_path)
     cfg = json.loads((wt / rel).read_text(encoding="utf-8"))
     cfg["note"] = "a\u2028b"
-    (wt / rel).write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    (wt / rel).write_text(
+        json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n"
+    )
 
     text = _pinned_config_forensics(wt, pins)
 

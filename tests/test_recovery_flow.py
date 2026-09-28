@@ -5788,5 +5788,6 @@ def test_owned_spec_pause_folds_multiline_spec_and_root_paths(project, tmp_path,
     _assert_fragment_folded(tmp_path)
     text = "\n".join(_attention_lines(tmp_path))
     assert text.count(f"/spec/{_FOLDED_FAULT}.md") == 4
-    assert text.count(f"/checkout/{_FOLDED_FAULT}") == 4
+    # `root` reaches the notice through `Path`, so it carries the platform separator.
+    assert text.count(f"{os.sep}checkout{os.sep}{_FOLDED_FAULT}") == 4
     assert flow.journal.fields("rollback-owned-spec-manual-required")["spec"] == spec

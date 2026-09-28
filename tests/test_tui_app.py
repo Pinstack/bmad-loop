@@ -2287,6 +2287,7 @@ async def test_spec_review_path_keeps_its_file_name(project, cols, path):
 
     Ablation: make `_TailPath.render` return the whole path unconditionally and
     the cut row fails on the missing leading `…`."""
+    path = str(Path(path))  # the modal takes a `Path`: platform separators
     app = BmadLoopApp(project.project)
     async with app.run_test(size=(cols, 24)) as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
@@ -2300,7 +2301,7 @@ async def test_spec_review_path_keeps_its_file_name(project, cols, path):
         width = widget.content_size.width
         if len(path) > width:
             assert rendered.startswith("…"), rendered
-            assert rendered.endswith("/spec-epic-1-story-2.md"), rendered
+            assert rendered.endswith(f"{os.sep}spec-epic-1-story-2.md"), rendered
             assert len(rendered) == width, (rendered, width)
             assert path.endswith(rendered[1:])
         else:

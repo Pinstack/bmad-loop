@@ -1,6 +1,8 @@
 """Unit tests for the dev/review retry-budget decisions — specifically the
 resolved-escalation guard that re-escalates instead of silently deferring."""
 
+import os
+
 import pytest
 
 from bmad_loop import escalation
@@ -552,8 +554,10 @@ def test_display_pause_reason_shapes_the_recovery_trail():
     task = StoryTask(story_key="1-1-a", epic=1, spec_file="/p/spec\nx\x1b.md")
     state = _paused_state("CRITICAL escalation from dev session: d", PAUSE_ESCALATION, task)
 
+    # `task_spec_path` renders the trail with the platform separator.
+    trail = f"{os.sep}p{os.sep}spec ⏎ x\\x1b.md"
     assert display_pause_reason(state) == (
-        "CRITICAL escalation from dev session: d [recovery trail: /p/spec ⏎ x\\x1b.md]"
+        f"CRITICAL escalation from dev session: d [recovery trail: {trail}]"
     )
 
 

@@ -5134,7 +5134,8 @@ def test_harvest_carry_foreign_dirt_pause_folds_a_multiline_ledger_path(project,
         engine._pause_for_harvest_carry_foreign_dirt(task, ledger, error=error)
 
     lines = _assert_attention_folds_the_fragment(engine.run_dir)
-    assert any(f"`/ledger/{_FOLDED_FRAGMENT}.md`" in line for line in lines)
+    # `Path` renders the ledger with the platform separator.
+    assert any(f"`{os.sep}ledger{os.sep}{_FOLDED_FRAGMENT}.md`" in line for line in lines)
     (dirt,) = [e for e in engine.journal.entries() if e["kind"] == "harvest-carry-foreign-dirt"]
     assert dirt["ledger"] == str(ledger)
 
@@ -5516,8 +5517,8 @@ def test_red_verify_on_a_review_demotion_unwinds_before_the_repair(project, monk
     seen: list[tuple[str | None, list[str], str | None]] = []
 
     def run_verify(_policy, cwd):
-        ok = verify.CommandResult("check", 0, "", "", "")
-        bad = verify.CommandResult("check", 1, "boom\n", "boom\n", "")
+        ok = verify.CommandResult("pytest -q", 0, "", "", "")
+        bad = verify.CommandResult("pytest -q", 1, "boom\n", "boom\n", "")
         return [bad if red["on"] else ok]
 
     monkeypatch.setattr(verify, "run_verify_commands", run_verify)

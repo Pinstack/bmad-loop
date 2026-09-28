@@ -4202,11 +4202,23 @@ def test_harvest_carry_replay_accepts_a_crlf_ledger_the_operator_committed(proje
     `os.linesep` there would hash LF bytes against a CRLF blob and pause every resume
     over a pristine tree."""
     engine, task = _latched_own_carry(project)
-    git(project.project, "config", "core.autocrlf", "false")
     crlf = project.deferred_work.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
     project.deferred_work.write_bytes(crlf)
-    git(project.project, "add", "--", str(project.deferred_work))
-    git(project.project, "commit", "-q", "-m", "operator commits a CRLF ledger")
+    # `autocrlf=false` for this commit only: set on the repo, it would turn every
+    # file Git-for-Windows' system `autocrlf=true` checked out CRLF into a
+    # modification and fail the clean-tree assertion below. Git never
+    # re-normalizes a path whose index blob already holds CRLF, so the ledger
+    # itself stays clean under either setting.
+    git(project.project, "-c", "core.autocrlf=false", "add", "--", str(project.deferred_work))
+    git(
+        project.project,
+        "-c",
+        "core.autocrlf=false",
+        "commit",
+        "-q",
+        "-m",
+        "operator commits a CRLF ledger",
+    )
     rel = project.deferred_work.relative_to(project.project).as_posix()
     assert verify.file_bytes_at_revision(project.project, "HEAD", rel) == crlf
     head = rev_parse_head(project.project)

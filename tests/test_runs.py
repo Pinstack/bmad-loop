@@ -8573,11 +8573,16 @@ def test_mount_root_identity_of_an_intact_nested_project_is_its_own_fstat(tmp_pa
 
     identity = runs.mount_root_identity(nested, mount=mount, recorded=_rec(mount))
 
-    fd = os.open(nested, os.O_RDONLY)
-    try:
-        own = os.fstat(fd)
-    finally:
-        os.close(fd)
+    if sys.platform == "win32":
+        # `os.open` cannot open a directory on Windows; `stat` reads the same
+        # volume serial and file index.
+        own = os.stat(nested)
+    else:
+        fd = os.open(nested, os.O_RDONLY)
+        try:
+            own = os.fstat(fd)
+        finally:
+            os.close(fd)
     assert (identity.st_dev, identity.st_ino) == (own.st_dev, own.st_ino)
 
 
