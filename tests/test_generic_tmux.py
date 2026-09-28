@@ -1262,6 +1262,80 @@ def test_resultless_stop_breadcrumb_stories_not_terminal(tmp_path, monkeypatch):
     assert "'ready-for-dev'" in crumb["detail"]
 
 
+@pytest.mark.parametrize("wait", [True, False], ids=["stop-readback", "one-shot"])
+def test_stories_readback_stat_fault_is_not_stale_mtime(tmp_path, monkeypatch, wait):
+    """DW-457: a stat fault on the resolved story spec still reads as no result,
+    but is recorded as the fault it is — `stat-failed` with the error, never the
+    `stale-mtime` ("predates session launch") answer. The Stop read-back files it
+    as its give-up verdict; the one-shot wait=False read (`_final`, the dead-window
+    reconcile), silent before, writes `spec-readback-failed`.
+
+    Ablation: drop the `_note_spec_read_fault` call and both rows fail."""
+    adapter, _ = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    story = _write_story_spec(
+        tmp_path, "1", "foo", "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+
+    def stat_fault(spec_path, launched_ns):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(adapter, "_written_this_session", stat_fault)
+    assert adapter._result_json(_dev_handle(), _stories_spec(tmp_path), wait=wait) is None
+    error = "PermissionError: [Errno 13] Permission denied"
+    if wait:
+        (crumb,) = _breadcrumbs(adapter)
+        assert crumb["verdict"] == "stat-failed"
+        assert crumb["detail"] == f"{story}: {error}"
+        assert _lifecycle_events(adapter, "spec-readback-failed") == []
+    else:
+        assert _breadcrumbs(adapter) == []  # wait=False stays compare-only there
+        (crumb,) = _lifecycle_events(adapter, "spec-readback-failed")
+        assert (crumb["reason"], crumb["spec"], crumb["error"]) == (
+            "stat-failed",
+            str(story),
+            error,
+        )
+
+
+@pytest.mark.parametrize("wait", [True, False], ids=["stop-readback", "one-shot"])
+def test_stories_readback_undecodable_spec_is_not_not_terminal(tmp_path, monkeypatch, wait):
+    """DW-457: an undecodable story spec still reads as no result, but is recorded
+    as `unreadable-spec` with the decode error, not as a spec with "no terminal
+    status" — in the Stop read-back's give-up record, and (silent before) as
+    `spec-readback-failed` on the one-shot read. A genuinely non-terminal spec
+    keeps `not-terminal` (`test_resultless_stop_breadcrumb_stories_not_terminal`)
+    and writes no lifecycle crumb (the healthy row below).
+
+    Ablation: drop the `_spec_read_fault` re-read or the `_note_spec_read_fault`
+    call and the fault rows fail."""
+    adapter, _ = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    d = tmp_path / "epic" / "stories"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "1-slug.md").write_bytes(_BAD_UTF8)
+    assert adapter._result_json(_dev_handle(), _stories_spec(tmp_path), wait=wait) is None
+    if wait:
+        (crumb,) = _breadcrumbs(adapter)
+        assert crumb["verdict"] == "unreadable-spec"
+        assert crumb["detail"].startswith(f"{d / '1-slug.md'}: UnicodeDecodeError: ")
+    else:
+        (crumb,) = _lifecycle_events(adapter, "spec-readback-failed")
+        assert crumb["reason"] == "unreadable-spec"
+        assert crumb["error"].startswith("UnicodeDecodeError: ")
+
+    # healthy: a readable non-terminal spec is `not-terminal` and crumbs nothing
+    root = tmp_path / "healthy"
+    root.mkdir()
+    healthy, _ = make_dev_adapter(root)
+    _write_story_spec(root, "1", "foo", "---\nstatus: in-review\n---\n\nwip\n")
+    assert healthy._result_json(_dev_handle(), _stories_spec(root), wait=wait) is None
+    assert _lifecycle_events(healthy, "spec-readback-failed") == []
+    if wait:
+        (crumb,) = _breadcrumbs(healthy)
+        assert crumb["verdict"] == "not-terminal"
+
+
 def test_resultless_stop_breadcrumb_base_no_result_json(tmp_path):
     adapter = GenericTmuxAdapter(
         run_dir=tmp_path / "run",
@@ -2302,12 +2376,13 @@ def test_heartbeat_written_and_throttled(tmp_path, monkeypatch):
         "stall_armed": True,
         "stall_nudges_sent": 0,
         "transcript_idle_s": None,  # no hook event has named a transcript (#680)
-        # DW-447/DW-449: the running liveness-probe failure streak and the
-        # failed stall-nudge attempts. A deliberate divergence from
-        # test_opencode_http.py's twin: DW-447 scoped the opencode-http loop
-        # out, so its heartbeat carries neither key.
+        # DW-447/DW-449/DW-452: the running liveness-probe failure streak, the
+        # failed stall-nudge attempts and the usage-sample failure streak. A
+        # deliberate divergence from test_opencode_http.py's twin: those DWs
+        # scoped the opencode-http loop out, so its heartbeat carries none.
         "stall_nudges_failed": 0,
         "probe_failures": 0,
+        "usage_sample_failures": 0,
     }
     assert [w["remaining_s"] for w in writes] == [100.0, 59.0]  # tick 2 was throttled
     hb = json.loads((adapter.tasks_dir / "3-1-dev-1" / "heartbeat.json").read_text())
@@ -2871,7 +2946,10 @@ def test_budget_sampling_oserror_is_inert(tmp_path, monkeypatch):
         raise OSError("unreadable transcript")
 
     monkeypatch.setattr(generic, "tally_usage", boom)
-    assert adapter._sample_weighted_usage("/t.jsonl", _budget_spec(tmp_path)) is None
+    assert adapter._sample_weighted_usage("/t.jsonl", _budget_spec(tmp_path)) == (
+        None,
+        "OSError: unreadable transcript",
+    )
 
 
 def test_budget_sampling_survives_torn_transcript(tmp_path, monkeypatch):
@@ -2884,7 +2962,8 @@ def test_budget_sampling_survives_torn_transcript(tmp_path, monkeypatch):
     entry = json.dumps({"message": {"usage": {"input_tokens": 5000}}})
     # valid entry, then a truncated multibyte sequence at the flush boundary
     transcript.write_bytes(entry.encode("utf-8") + b"\n\xe2\x82")
-    assert adapter._sample_weighted_usage(str(transcript), _budget_spec(tmp_path)) is None
+    weighted, fault = adapter._sample_weighted_usage(str(transcript), _budget_spec(tmp_path))
+    assert weighted is None and fault is not None and fault.startswith("UnicodeDecodeError: ")
 
     (adapter.tasks_dir / "b-1" / "result.json").write_text('{"ok": true}')
     adapter.watcher = _ScriptedWatcher(
@@ -2897,6 +2976,52 @@ def test_budget_sampling_survives_torn_transcript(tmp_path, monkeypatch):
     assert result.budget_weighted is None  # every sample tick was inert
     assert sent == []
     assert not (adapter.run_dir / "ATTENTION").exists()
+
+
+@pytest.mark.parametrize("faults", [0, 3], ids=["healthy", "fault-streak"])
+def test_budget_sampling_fault_streak_crumbs_transitions_only(tmp_path, monkeypatch, faults):
+    """DW-452: a raising usage sample still reads as "no sample" (the session's
+    verdict is unchanged), but its streak is crumbed at the transitions only — one
+    `usage-sample-failed` (`error`) at failure 1 and one `usage-sample-recovered`
+    (`failures=N`) at the first clean sample — and heartbeat.json carries the
+    running count. A healthy session writes neither crumb.
+
+    Ablation: drop either crumb call and the fault-streak row fails; crumb every
+    failed sample and its single-crumb assertion does."""
+    adapter, clock, sent = _budget_adapter(tmp_path, monkeypatch)
+    heartbeats: list[dict] = []
+    adapter._write_heartbeat = lambda task_id, payload: heartbeats.append(payload)
+    samples = {"n": 0}
+
+    def sample(path, spec):
+        samples["n"] += 1
+        if samples["n"] <= faults:
+            return None, f"OSError: unreadable {samples['n']}"
+        return 10, None
+
+    adapter._sample_weighted_usage = sample
+    transcript = tmp_path / "t.jsonl"
+    (adapter.tasks_dir / "b-1" / "result.json").write_text('{"ok": true}')
+    adapter.watcher = _ScriptedWatcher(
+        [_start_event(transcript), *[None] * 6, _stop_event("b-1", "sess", str(transcript))],
+        on_call=_advance_31(clock),
+    )
+    result = adapter.wait_for_completion(_budget_handle(), _budget_spec(tmp_path, mode="enforce"))
+
+    assert result.status == "completed"  # verdict unchanged either way
+    assert samples["n"] > faults + 1  # the streak closed before the session ended
+    failed = _lifecycle_events(adapter, "usage-sample-failed", task_id="b-1")
+    recovered = _lifecycle_events(adapter, "usage-sample-recovered", task_id="b-1")
+    if not faults:
+        assert (failed, recovered) == ([], [])
+        assert {hb["usage_sample_failures"] for hb in heartbeats} == {0}
+        return
+    (crumb,) = failed
+    assert crumb["error"] == "OSError: unreadable 1"
+    (crumb,) = recovered
+    assert crumb["failures"] == faults
+    # heartbeat N reports the streak as of sample N-1 (sampling follows the write)
+    assert [hb["usage_sample_failures"] for hb in heartbeats][:6] == [0, 0, 1, 2, 3, 0]
 
 
 def test_budget_nudge_send_failure_still_arms_grace(tmp_path, monkeypatch):
@@ -5340,6 +5465,169 @@ def test_frontmatter_fallback_alias_path_recognized_as_same_spec(tmp_path, monke
     assert crumb["verdict"] == "unmodified-since-launch"
 
 
+@pytest.mark.parametrize("exc", [OSError, RuntimeError], ids=["oserror", "symlink-loop"])
+def test_same_spec_returns_resolve_faults(tmp_path, monkeypatch, exc):
+    """DW-456: `_same_spec` degrades an unresolvable path to "not the same file"
+    and hands the fault back for the caller to crumb. RuntimeError is caught too:
+    3.11 raises it from `resolve()` on a symlink loop, which used to escape."""
+    target = tmp_path / "spec.md"
+    target.write_text("x")
+    assert GenericDevAdapter._same_spec(target, str(target)) == (True, None)
+
+    def loop(self, *args, **kwargs):
+        raise exc("Symlink loop from 'spec.md'")
+
+    monkeypatch.setattr(Path, "resolve", loop)
+    assert GenericDevAdapter._same_spec(target, str(target)) == (
+        False,
+        f"{exc.__name__}: Symlink loop from 'spec.md'",
+    )
+
+
+def _fault_resolve_of(monkeypatch, victim: Path):
+    """Make `resolve()` of one path raise the 3.11 symlink-loop RuntimeError."""
+    real = Path.resolve
+
+    def resolve(self, *args, **kwargs):
+        if self == victim:
+            raise RuntimeError(f"Symlink loop from {str(self)!r}")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+
+
+@pytest.mark.parametrize("fault", [False, True], ids=["healthy", "identity-fault"])
+def test_frontmatter_fallback_identity_fault_is_crumbed(tmp_path, monkeypatch, fault):
+    """DW-456: an identity fault against the launch snapshot still reads NEUTRAL —
+    the M1 refuse gate goes inert, so a byte-identical spec is pending rather than
+    refused, exactly the old fold — but leaves `spec-identity-unreadable` (`spec`,
+    `snapshot`, `error`). The healthy row refuses and crumbs nothing.
+
+    Ablation: drop the crumb in `_snapshot_identity` and the fault row fails."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(_MARKERLESS_DONE)
+    spec = _snapshotted_spec(tmp_path, spec_file)
+    if fault:
+        _fault_resolve_of(monkeypatch, spec_file)
+
+    assert adapter._result_json(_dev_handle(), spec, wait=True) is None
+    (verdict,) = _breadcrumbs(adapter)
+    crumbs = _lifecycle_events(adapter, "spec-identity-unreadable")
+    if not fault:
+        assert verdict["verdict"] == "unmodified-since-launch"
+        assert crumbs == []
+        return
+    assert verdict["verdict"] == "terminal-frontmatter-pending"  # NEUTRAL, as before
+    (crumb,) = crumbs
+    assert (crumb["spec"], crumb["snapshot"]) == (str(spec_file), str(spec_file))
+    assert crumb["error"] == f"RuntimeError: Symlink loop from {str(spec_file)!r}"
+
+
+def test_stories_readback_identity_fault_crumbs_once_per_readback(tmp_path, monkeypatch):
+    """DW-456 on the stories read-back: the grace poll re-checks identity on every
+    pass, but a persistent fault is ONE `spec-identity-unreadable` per read-back
+    call. The verdict is the unchanged NEUTRAL one: a non-terminal spec polls out
+    to `not-terminal`.
+
+    Ablation: drop the per-call dedupe and the single-crumb assertion fails."""
+    adapter, _ = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.05)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    story = _write_story_spec(tmp_path, "1", "foo", "---\nstatus: in-review\n---\n\nwip\n")
+    spec = _snapshotted_stories_spec(tmp_path, story)
+    _fault_resolve_of(monkeypatch, story)
+    passes = {"n": 0}
+    real_written = generic.GenericDevAdapter._written_this_session
+
+    def counting(spec_path, launched_ns):
+        passes["n"] += 1
+        return real_written(spec_path, launched_ns)
+
+    monkeypatch.setattr(adapter, "_written_this_session", counting)
+    assert adapter._result_json(_dev_handle(), spec, wait=True) is None
+    assert passes["n"] > 1  # the grace really polled more than once
+    (crumb,) = _lifecycle_events(adapter, "spec-identity-unreadable")
+    assert crumb["error"].startswith("RuntimeError: Symlink loop")
+    (verdict,) = _breadcrumbs(adapter)
+    assert verdict["verdict"] == "not-terminal"
+
+
+@pytest.mark.parametrize("fault", [False, True], ids=["healthy", "digest-fault"])
+def test_stories_readback_digest_fault_is_crumbed(tmp_path, monkeypatch, fault):
+    """DW-456: a launch-digest read that raises still reads NEUTRAL — the refuse
+    gate goes inert and the byte-identical `done` spec synthesizes, the old fold's
+    verdict — but leaves `spec-digest-unreadable` (`spec`, `error`). The healthy
+    row refuses (`unmodified-since-launch`) and crumbs nothing.
+
+    Ablation: drop the crumb call and the fault row fails."""
+    adapter, _ = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    story = _write_story_spec(tmp_path, "1", "foo", _MARKERLESS_DONE)
+    spec = _snapshotted_stories_spec(tmp_path, story)
+    if fault:
+        real = Path.read_bytes
+
+        def read_bytes(self):
+            if self == story:
+                raise PermissionError(13, "Permission denied")
+            return real(self)
+
+        monkeypatch.setattr(Path, "read_bytes", read_bytes)
+
+    rj = adapter._result_json(_dev_handle(), spec, wait=True)
+    crumbs = _lifecycle_events(adapter, "spec-digest-unreadable")
+    if not fault:
+        assert rj is None
+        assert _breadcrumbs(adapter)[0]["verdict"] == "unmodified-since-launch"
+        assert crumbs == []
+        return
+    assert rj is not None and rj["status"] == "done"  # NEUTRAL, as before
+    (crumb,) = crumbs
+    assert (crumb["spec"], crumb["error"]) == (
+        str(story),
+        "PermissionError: [Errno 13] Permission denied",
+    )
+
+
+@pytest.mark.parametrize("mode", ["stop-readback", "one-shot", "dead-window"], ids=lambda m: m)
+def test_frontmatter_fallback_unreadable_candidate_is_not_no_artifact(tmp_path, monkeypatch, mode):
+    """DW-457: a marker-less candidate whose read faults still yields no result,
+    but is recorded as `unreadable-spec` with the error rather than as
+    `no-artifact` on the Stop read-back, and — silent before — as
+    `spec-readback-failed` on the one-shot and dead-window (post-kill reconcile)
+    reads.
+
+    Ablation: drop the `_note_spec_read_fault` call and every row fails."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(_MARKERLESS_DONE)
+
+    def denied(path):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(generic, "read_frontmatter", denied)
+    wait = mode == "stop-readback"
+    sr = adapter._synth_result(
+        _dev_handle(), _dev_spec(tmp_path), wait=wait, dead_window=mode == "dead-window"
+    )
+    assert sr is None
+    error = "PermissionError: [Errno 13] Permission denied"
+    if wait:
+        (crumb,) = _breadcrumbs(adapter)
+        assert (crumb["verdict"], crumb["detail"]) == ("unreadable-spec", f"{spec_file}: {error}")
+        return
+    assert _breadcrumbs(adapter) == []
+    (crumb,) = _lifecycle_events(adapter, "spec-readback-failed")
+    assert (crumb["reason"], crumb["spec"], crumb["error"]) == (
+        "unreadable-spec",
+        str(spec_file),
+        error,
+    )
+
+
 def test_wait_loop_heartbeat_drives_observe_tick(tmp_path, monkeypatch):
     """The wait loop invokes _observe_tick inside the heartbeat-throttled block:
     the first tick always fires (last_heartbeat is None) and each later tick a
@@ -7351,7 +7639,7 @@ def test_post_nudge_usage_sample_is_not_work(tmp_path, monkeypatch, send_fails):
     adapter._stall_nudges = 1
     sent: list[str] = []
     adapter.send_text = _attempt_recorder(sent, send_fails)
-    adapter._sample_weighted_usage = lambda path, spec: 100 if sent else 0
+    adapter._sample_weighted_usage = lambda path, spec: (100 if sent else 0, None)
     alive = {"v": True}
     adapter._window_alive = lambda handle: alive["v"]
 
@@ -7396,6 +7684,70 @@ def test_transcript_write_inside_the_first_heartbeat_interval_is_work(tmp_path, 
     spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
     result = adapter.wait_for_completion(_dev_handle(), spec)
     assert (result.status, result.produced_work) == ("timeout", True)
+
+
+def test_transcript_scan_raises_read_faults_to_its_caller(tmp_path, monkeypatch):
+    """DW-455: the staticmethod cannot crumb, so a read fault propagates instead of
+    folding into False ("no model activity"); the wait loop owns the crumb.
+
+    Ablation: restore the in-scan `except OSError: pass` and this fails."""
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_bytes(b'{"type":"assistant"}\n')
+
+    def denied(path, *args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "open", denied)
+    with pytest.raises(PermissionError):
+        generic.GenericAdapter._transcript_has_assistant_activity(str(transcript), 0)
+
+
+@pytest.mark.parametrize("faults", [0, 2], ids=["healthy", "fault-streak"])
+def test_transcript_scan_fault_streak_crumbs_transitions_only(tmp_path, monkeypatch, faults):
+    """DW-455: a transcript activity scan that raises `OSError` still reads as no
+    model-side evidence — the #727 verdict is unchanged — but no longer silently:
+    the streak is crumbed once at failure 1 (`transcript-scan-failed`, `error`) and
+    once at the first clean scan (`transcript-scan-recovered`, `failures=N`). A
+    healthy scan writes neither.
+
+    Ablation: drop either crumb call and the fault-streak row fails; crumb every
+    failed scan and its single-crumb assertion does."""
+    adapter, _, _log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch, journal=False)
+    adapter._stall_grace_s = 0.0
+    scans = {"n": 0}
+
+    def scan(path, since_size):
+        scans["n"] += 1
+        if scans["n"] <= faults:
+            raise PermissionError(13, "Permission denied")
+        return False
+
+    adapter._transcript_has_assistant_activity = scan
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+            _grow(transcript, b'{"type":"user"}\n')  # growth that is not model work
+        if call_n == 7:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+
+    assert (result.status, result.produced_work) == ("timeout", False)  # unchanged
+    assert scans["n"] > faults + 1  # the streak closed before the session ended
+    failed = _lifecycle_events(adapter, "transcript-scan-failed")
+    recovered = _lifecycle_events(adapter, "transcript-scan-recovered")
+    if not faults:
+        assert (failed, recovered) == ([], [])
+        return
+    (crumb,) = failed
+    assert crumb["error"] == "PermissionError: [Errno 13] Permission denied"
+    (crumb,) = recovered
+    assert crumb["failures"] == faults
 
 
 @pytest.mark.parametrize(

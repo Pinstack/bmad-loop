@@ -180,6 +180,20 @@ breaking changes may land in a minor release.
 - Tell a refused `result.json` from a missing one: the Stop read-back's give-up records
   `malformed-result-json` with the refusal, and the exit read-back writes
   `result-json-refused` (`error`). Still no result (DW-451).
+- Crumb a failing budget usage sample: `usage-sample-failed` (`error`) at a streak's
+  first failure, `usage-sample-recovered` (`failures`) at the next clean sample; the
+  streak rides `heartbeat.json` as `usage_sample_failures`. Still no sample (DW-452).
+- Crumb a transcript activity scan that raises: `transcript-scan-failed` (`error`) and
+  `transcript-scan-recovered` (`failures`) at the streak's transitions. Still no model
+  evidence (DW-455).
+- Crumb a launch-snapshot fault that leaves the #276 refuse gate inert:
+  `spec-identity-unreadable` (`spec`, `snapshot`, `error`) and `spec-digest-unreadable`
+  (`spec`, `error`), once per read-back. Catch the 3.11 symlink-loop `RuntimeError` in the
+  identity check instead of letting it escape (DW-456).
+- Name spec read faults as faults: a stat fault is `stat-failed` (not `stale-mtime`), an
+  unreadable or undecodable spec `unreadable-spec` (not `not-terminal` or `no-artifact`),
+  with the error; a one-shot or dead-window read-back writes `spec-readback-failed`
+  (`reason`, `spec`, `error`). Still no result (DW-457).
 - Warn on stderr when the tmux-family session listing fails for a reason other than no
   server running; it still reads as no sessions, so a `delete`/`archive`/`clean` past a
   live session is no longer unrecorded (DW-458).

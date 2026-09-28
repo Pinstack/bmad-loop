@@ -450,6 +450,12 @@ class _ResultFileMixin:
         only prove work when output or reasoning tokens are positive; input
         tokens alone can be a submitted prompt. Codex token counts are cumulative,
         so only an increase in output tokens proves new work.
+
+        A read fault is NOT folded into "no activity" here (DW-455): the
+        ``OSError`` propagates, because this staticmethod cannot crumb and the
+        caller has already moved the growth baseline past the bytes it could not
+        read. The wait loop's ``sample_transcript`` treats it as no evidence —
+        the verdict it would have reached — and crumbs the streak.
         """
         seen_messages: dict[str, dict] = {}
         codex_output_seen = 0
@@ -457,67 +463,64 @@ class _ResultFileMixin:
         # it for a JSONL scan would block the deterministic wait loop indefinitely.
         if not Path(transcript_path).is_file():
             return False
-        try:
-            with Path(transcript_path).open("rb") as stream:
-                while line := stream.readline():
-                    after_baseline = stream.tell() > since_size
-                    try:
-                        entry = json.loads(line)
-                    except (json.JSONDecodeError, UnicodeDecodeError):
+        with Path(transcript_path).open("rb") as stream:
+            while line := stream.readline():
+                after_baseline = stream.tell() > since_size
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                messages = [entry]
+                set_patch = entry.get("$set")
+                if isinstance(set_patch, dict):
+                    snapshot = set_patch.get("messages")
+                    if isinstance(snapshot, list):
+                        messages.extend(
+                            message for message in snapshot if isinstance(message, dict)
+                        )
+                for message in messages:
+                    if message.get("type") not in ("assistant", "gemini") and message.get(
+                        "role"
+                    ) not in ("assistant", "model"):
                         continue
-                    if not isinstance(entry, dict):
-                        continue
-                    messages = [entry]
-                    set_patch = entry.get("$set")
-                    if isinstance(set_patch, dict):
-                        snapshot = set_patch.get("messages")
-                        if isinstance(snapshot, list):
-                            messages.extend(
-                                message for message in snapshot if isinstance(message, dict)
-                            )
-                    for message in messages:
-                        if message.get("type") not in ("assistant", "gemini") and message.get(
-                            "role"
-                        ) not in ("assistant", "model"):
-                            continue
-                        message_id = message.get("id")
-                        if isinstance(message_id, str):
-                            previous = seen_messages.get(message_id)
-                            seen_messages[message_id] = message
-                            if after_baseline and message != previous:
-                                return True
-                        elif after_baseline:
+                    message_id = message.get("id")
+                    if isinstance(message_id, str):
+                        previous = seen_messages.get(message_id)
+                        seen_messages[message_id] = message
+                        if after_baseline and message != previous:
                             return True
-                    payload = entry.get("payload")
-                    if (
-                        after_baseline
-                        and isinstance(payload, dict)
-                        and payload.get("type") == "agent_message"
-                    ):
+                    elif after_baseline:
                         return True
-                    if isinstance(payload, dict) and payload.get("type") == "token_count":
-                        info = payload.get("info")
-                        if isinstance(info, dict):
-                            totals = info.get("total_token_usage")
-                            usage = totals if isinstance(totals, dict) else info
-                            output = usage.get("output_tokens")
-                            if type(output) is int:
-                                if after_baseline and output > codex_output_seen:
-                                    return True
-                                codex_output_seen = max(codex_output_seen, output)
-                    if after_baseline:
-                        data = entry.get("data")
-                        metrics = data.get("modelMetrics") if isinstance(data, dict) else None
-                        if isinstance(metrics, dict):
-                            for model in metrics.values():
-                                usage = model.get("usage") if isinstance(model, dict) else None
-                                if isinstance(usage, dict) and any(
-                                    type(usage.get(key)) is int and usage[key] > 0
-                                    for key in ("outputTokens", "reasoningTokens")
-                                ):
-                                    return True
-        except OSError:
-            pass
+                payload = entry.get("payload")
+                if (
+                    after_baseline
+                    and isinstance(payload, dict)
+                    and payload.get("type") == "agent_message"
+                ):
+                    return True
+                if isinstance(payload, dict) and payload.get("type") == "token_count":
+                    info = payload.get("info")
+                    if isinstance(info, dict):
+                        totals = info.get("total_token_usage")
+                        usage = totals if isinstance(totals, dict) else info
+                        output = usage.get("output_tokens")
+                        if type(output) is int:
+                            if after_baseline and output > codex_output_seen:
+                                return True
+                            codex_output_seen = max(codex_output_seen, output)
+                if after_baseline:
+                    data = entry.get("data")
+                    metrics = data.get("modelMetrics") if isinstance(data, dict) else None
+                    if isinstance(metrics, dict):
+                        for model in metrics.values():
+                            usage = model.get("usage") if isinstance(model, dict) else None
+                            if isinstance(usage, dict) and any(
+                                type(usage.get(key)) is int and usage[key] > 0
+                                for key in ("outputTokens", "reasoningTokens")
+                            ):
+                                return True
         return False
 
     def _session_vanished(self, task_id: str) -> bool:
@@ -961,6 +964,12 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # `liveness-probe-recovered` (with its length) at the first clean probe —
         # never once per failed tick, so a persistent hang cannot flood the file.
         probe_failures = 0
+        # the running streak of budget usage samples whose transcript read raised
+        # (DW-452) — the probe_failures model for the usage read: the guard skips
+        # the tick, heartbeat.json carries the count (as of the previous sample —
+        # sampling follows the heartbeat write), and only the streak's transitions
+        # are crumbed (`usage-sample-failed` / `usage-sample-recovered`).
+        usage_failures = 0
         # monotonic ts of the last heartbeat.json overwrite; None = not yet
         # written, so the first tick always stamps one.
         last_heartbeat: float | None = None
@@ -1022,9 +1031,16 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # evidence only while the pre-nudge window remains open.
         transcript_work_seen = False
         usage_seen = False
+        # The running streak of transcript activity scans that raised (DW-455).
+        # A raising scan is no evidence — what the old in-scan fold returned —
+        # but the baseline has already moved past the bytes it could not read,
+        # so the streak is crumbed at its transitions, as probe_failures is:
+        # `transcript-scan-failed` at failure 1, `transcript-scan-recovered` at
+        # the next clean scan.
+        scan_failures = 0
 
         def sample_transcript(path: str, now: float) -> None:
-            nonlocal transcript_work_seen
+            nonlocal transcript_work_seen, scan_failures
             same_path = idle.path == path
             prior_key = idle.last_key if same_path else None
             was_absent = idle.seen_absent if same_path else False
@@ -1039,7 +1055,22 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             )
             if grew and stall_nudges_sent + stall_nudges_failed == 0 and not transcript_work_seen:
                 start = prior_key[1] if prior_key is not None else 0
-                transcript_work_seen = self._transcript_has_assistant_activity(path, start)
+                try:
+                    transcript_work_seen = self._transcript_has_assistant_activity(path, start)
+                except OSError as e:
+                    scan_failures += 1
+                    if scan_failures == 1:
+                        self._note_lifecycle(
+                            handle.task_id,
+                            "transcript-scan-failed",
+                            error=f"{type(e).__name__}: {e}",
+                        )
+                    return
+                if scan_failures:
+                    self._note_lifecycle(
+                        handle.task_id, "transcript-scan-recovered", failures=scan_failures
+                    )
+                scan_failures = 0
 
         def produced_work() -> bool:
             # Read at call time, after a final frame sample, so every exit below
@@ -1136,6 +1167,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         "transcript_idle_s": idle.idle_s,
                         # the running liveness-probe failure streak (DW-447)
                         "probe_failures": probe_failures,
+                        # the running budget usage-sample failure streak (DW-452)
+                        "usage_sample_failures": usage_failures,
                     },
                 )
                 # Mid-session spec-status transition sampling (#276 M2) rides the
@@ -1151,7 +1184,23 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     and spec.token_budget_mode in ("warn", "enforce")
                     and transcript_path
                 ):
-                    weighted = self._sample_weighted_usage(transcript_path, spec)
+                    weighted, usage_fault = self._sample_weighted_usage(transcript_path, spec)
+                    # A raising read is still "no sample" this tick; its streak is
+                    # crumbed at the transitions only (DW-452), like the liveness
+                    # probe's — one torn mid-append read is a failed/recovered pair,
+                    # a persistent fault one open streak the heartbeat counts.
+                    if usage_fault is not None:
+                        usage_failures += 1
+                        if usage_failures == 1:
+                            self._note_lifecycle(
+                                handle.task_id, "usage-sample-failed", error=usage_fault
+                            )
+                    else:
+                        if usage_failures:
+                            self._note_lifecycle(
+                                handle.task_id, "usage-sample-recovered", failures=usage_failures
+                            )
+                        usage_failures = 0
                     if (
                         weighted is not None
                         and weighted > 0
@@ -1602,7 +1651,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         the #680 idle detector: the transcript is what the CLI appends to when it
         is actually doing something — a tool result, a model turn — where the pane
         log also grows for a spinner repaint. Deliberately never parsed:
-        `_sample_weighted_usage` returns None for `usage_parser = "none"`, and idle
+        `_sample_weighted_usage` yields no sample for `usage_parser = "none"`, and idle
         detection has to work for that profile too. None is "no sample", never
         "idle" — the caller skips the tick."""
         try:
@@ -1975,21 +2024,29 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             handle.task_id, "kill-outcome", reaped=True, forced=forced, unreaped=unreaped
         )
 
-    def _sample_weighted_usage(self, transcript_path: str, spec: SessionSpec) -> int | None:
-        """Cumulative weighted spend of the live session's transcript, or None
-        when the guard must stay inert this tick (parser "none", nothing
-        tallied yet, an unreadable file). Sampling must never break the wait
-        loop — the liveness-probe tolerance model, for the usage read. The
-        transcript is a LIVE file being appended mid-turn: a flush boundary
-        can split a multibyte UTF-8 character, so the torn read raises
-        UnicodeDecodeError (a ValueError) — as tolerated as an OSError."""
+    def _sample_weighted_usage(
+        self, transcript_path: str, spec: SessionSpec
+    ) -> tuple[int | None, str | None]:
+        """``(weighted, fault)``: the cumulative weighted spend of the live
+        session's transcript, or None when the guard must stay inert this tick
+        (parser "none", nothing tallied yet, an unreadable file); ``fault`` is
+        ``"<ExcType>: <message>"`` when the read raised, else None. Sampling must
+        never break the wait loop — the liveness-probe tolerance model, for the
+        usage read. The transcript is a LIVE file being appended mid-turn: a
+        flush boundary can split a multibyte UTF-8 character, so the torn read
+        raises UnicodeDecodeError (a ValueError) — as tolerated as an OSError.
+
+        A fault still reads as "no sample" (the budget block skips the tick), but
+        it is returned apart from a clean None (DW-452) so the wait loop can crumb
+        the streak: a persistent one leaves `token_budget_mode = "enforce"` off
+        for the rest of the session, which must not look like a quiet transcript."""
         try:
             usage = tally_usage(self.profile.usage_parser, Path(transcript_path))
-        except (OSError, ValueError):
-            return None
+        except (OSError, ValueError) as e:
+            return None, f"{type(e).__name__}: {e}"
         if usage is None:
-            return None
-        return usage.weighted_total(spec.cache_read_weight)
+            return None, None
+        return usage.weighted_total(spec.cache_read_weight), None
 
     def read_usage(self, result: SessionResult) -> TokenUsage | None:
         if not result.transcript_path:
@@ -2407,19 +2464,61 @@ class _DevSynthesisMixin(_ResultFileMixin):
             )
 
     @staticmethod
-    def _same_spec(candidate: Path, snap_path: str) -> bool:
-        """Whether ``candidate`` and the snapshot's recorded path are the SAME file
-        by filesystem identity (#276 M1), not raw string spelling. ``snap_path`` is
-        the engine's ``str(task.spec_file)``; a ``..`` segment, a symlinked artifacts
-        dir, or a case-variant alias makes an equivalent path compare unequal
-        lexically and would silently disable the hash/transition gate. ``resolve()``
-        (the repo's identity convention, non-strict) collapses those; an unresolvable
-        path degrades to "not the same file" — conservative, the gate stays inert
-        rather than ever falsely refusing."""
+    def _same_spec(candidate: Path, snap_path: str) -> tuple[bool, str | None]:
+        """``(same, fault)``: whether ``candidate`` and the snapshot's recorded path
+        are the SAME file by filesystem identity (#276 M1), not raw string spelling.
+        ``snap_path`` is the engine's ``str(task.spec_file)``; a ``..`` segment, a
+        symlinked artifacts dir, or a case-variant alias makes an equivalent path
+        compare unequal lexically and would silently disable the hash/transition
+        gate. ``resolve()`` (the repo's identity convention, non-strict) collapses
+        those; an unresolvable path degrades to "not the same file" — conservative,
+        the gate stays inert rather than ever falsely refusing.
+
+        That degrade disables the M1 refuse gate, so it is returned as ``fault``
+        (``"<ExcType>: <message>"``) for the caller to crumb
+        (``spec-identity-unreadable``, DW-456) — this staticmethod cannot.
+        ``RuntimeError`` is caught beside ``OSError`` like every other ``resolve()``
+        guard here: on the 3.11 floor a symlink loop raises it."""
         try:
-            return candidate.resolve() == Path(snap_path).resolve()
-        except OSError:
+            return candidate.resolve() == Path(snap_path).resolve(), None
+        except (OSError, RuntimeError) as e:
+            return False, f"{type(e).__name__}: {e}"
+
+    def _snapshot_identity(self, task_id: str, candidate: Path, snap: SpecSnapshot | None) -> bool:
+        """``_same_spec`` against the launch snapshot, crumbing an identity fault
+        (DW-456): ``spec-identity-unreadable`` (``spec``, ``snapshot``, ``error``).
+        No snapshot is no comparison and no crumb. The verdict is unchanged — a
+        fault is still "not the same file" (NEUTRAL)."""
+        if snap is None:
             return False
+        same, fault = self._same_spec(candidate, snap.path)
+        if fault is not None:
+            self._note_lifecycle(
+                task_id,
+                "spec-identity-unreadable",
+                spec=str(candidate),
+                snapshot=snap.path,
+                error=fault,
+            )
+        return same
+
+    def _note_spec_read_fault(
+        self, task_id: str, verdict: str, spec_path: Path, error: str, *, wait: bool
+    ) -> None:
+        """Record a spec read-back that gave up on a FAULT (DW-457) — ``stat-failed``
+        or ``unreadable-spec`` — apart from the genuine answers (``no-artifact``,
+        ``stale-mtime``, ``not-terminal``) it used to be filed under. A Stop
+        read-back (``wait=True``) writes it as its give-up resultless-stop verdict
+        (``<path>: <error>``); a one-shot ``wait=False`` read (`_final`, the
+        dead-window `_post_kill_reconcile`), which otherwise leaves no record,
+        writes ``spec-readback-failed`` (``reason`` = the verdict, ``spec``,
+        ``error``). The read-back's answer — no result — is unchanged."""
+        if wait:
+            self._note_resultless_stop(task_id, verdict, f"{spec_path}: {error}")
+        else:
+            self._note_lifecycle(
+                task_id, "spec-readback-failed", reason=verdict, spec=str(spec_path), error=error
+            )
 
     def _snapshot_verdict(
         self,
@@ -2492,12 +2591,16 @@ class _DevSynthesisMixin(_ResultFileMixin):
         case: a review that died with a NON-terminal frontmatter.
 
         Owns the give-up breadcrumb: exactly one of ``no-artifact``,
-        ``ambiguous-frontmatter``, ``unmodified-since-launch``, or
+        ``ambiguous-frontmatter``, ``unreadable-spec`` (the candidate's read
+        faulted, DW-457), ``unmodified-since-launch``, or
         ``terminal-frontmatter-pending`` per wait=True pass (none on a harvest).
         A plain wait=False read (the crash path) is compare-only — it may harvest
         an already-stable fingerprint but never records observations or
-        breadcrumbs; the hash gate is the one wait=False path that leaves a crumb,
-        and only under a dead window (``frontmatter-unmodified-refused``).
+        breadcrumbs; the wait=False paths that leave a crumb are the hash gate,
+        only under a dead window (``frontmatter-unmodified-refused``), and a
+        fault: an unreadable candidate (``spec-readback-failed``, DW-457). An
+        identity fault against the launch snapshot is crumbed in every mode
+        (``spec-identity-unreadable``, DW-456).
 
         On the FIRST ``terminal-frontmatter-pending`` observation (wait=True, one
         candidate, not the hash-gate refusal, transition not yet proven) it also
@@ -2561,7 +2664,7 @@ class _DevSynthesisMixin(_ResultFileMixin):
             return None
         path = candidates[0]
         snap = spec.spec_snapshot
-        same_file = snap is not None and self._same_spec(path, snap.path)
+        same_file = self._snapshot_identity(task_id, path, snap)
         try:
             mtime_ns = path.stat().st_mtime_ns
             fm_status = status_of(read_frontmatter(path))
@@ -2569,13 +2672,14 @@ class _DevSynthesisMixin(_ResultFileMixin):
             # by filesystem identity) — an unrelated marker-less spec under the same
             # artifacts dir shares no launch state, so hashing it is meaningless work.
             digest = hashlib.sha256(path.read_bytes()).hexdigest() if same_file else None
-        except OSError:
+        except OSError as e:
             # Torn mid-write read: not evidence of anything — same degrade as
-            # the read-back doctrine everywhere else on this path.
-            if wait:
-                self._note_resultless_stop(
-                    task_id, "no-artifact", f"unreadable marker-less candidate {path}"
-                )
+            # the read-back doctrine everywhere else on this path. Named as the
+            # fault it is (DW-457), not as `no-artifact`, and crumbed on the
+            # wait=False reads (`_final`, the dead-window reconcile) too.
+            self._note_spec_read_fault(
+                task_id, "unreadable-spec", path, f"{type(e).__name__}: {e}", wait=wait
+            )
             return None
         # Launch-snapshot verdict (#276 M1/M2), shared with the stories read-back.
         # REFUSE (M1) — bytes byte-identical to the review-launch snapshot with NO
@@ -2717,6 +2821,15 @@ class _DevSynthesisMixin(_ResultFileMixin):
         )
         plan_halt = bool(spec.env.get("BMAD_LOOP_PLAN_HALT"))
         deadline = time.monotonic() + RESULT_GRACE_S
+        # The launch-snapshot faults (DW-456) are crumbed once per read-back call,
+        # not once per grace poll: a persistent fault re-occurs every RESULT_POLL_S.
+        snapshot_faults_noted: set[str] = set()
+
+        def note_snapshot_fault(event: str, **fields: str) -> None:
+            if event not in snapshot_faults_noted:
+                snapshot_faults_noted.add(event)
+                self._note_lifecycle(handle.task_id, event, **fields)
+
         while True:
             state = stories.resolve_story_spec(base, story_key)
             if state.kind == stories.KIND_AMBIGUOUS:
@@ -2732,10 +2845,20 @@ class _DevSynthesisMixin(_ResultFileMixin):
                 return None
             # Classify this pass for the result-less breadcrumb; overwritten
             # below when the spec is present but not (yet) this session's
-            # terminal output.
+            # terminal output. `fault` is set instead when the pass gave up on a
+            # read FAULT (DW-457) — `stat-failed` / `unreadable-spec`, never filed
+            # as the genuine `stale-mtime` / `not-terminal` answers it used to be.
             verdict, detail = state.kind, str(state.path or base)
+            fault: tuple[Path, str] | None = None
             if state.kind in (stories.KIND_PRESENT, stories.KIND_SENTINEL) and state.path:
-                if not self._written_this_session(state.path, handle.launched_ns):
+                try:
+                    fresh = self._written_this_session(state.path, handle.launched_ns)
+                except OSError as e:
+                    fresh = False
+                    verdict, fault = "stat-failed", (state.path, f"{type(e).__name__}: {e}")
+                if fault is not None:
+                    pass
+                elif not fresh:
                     verdict = "stale-mtime"
                     detail = f"{state.path} predates session launch"
                 else:
@@ -2743,15 +2866,31 @@ class _DevSynthesisMixin(_ResultFileMixin):
                     # fallback so the stories read-back can't false-complete on an
                     # unmodified `done` spec. Only bites on a review session (the
                     # engine threads `spec_snapshot` there); a dev leg leaves it None
-                    # → NEUTRAL → the mtime-floor accept below.
+                    # → NEUTRAL → the mtime-floor accept below. Both of its faults
+                    # still read NEUTRAL, crumbed (DW-456).
                     snap = spec.spec_snapshot
-                    same_file = snap is not None and self._same_spec(state.path, snap.path)
+                    same_file = False
+                    if snap is not None:
+                        same_file, identity_fault = self._same_spec(state.path, snap.path)
+                        if identity_fault is not None:
+                            note_snapshot_fault(
+                                "spec-identity-unreadable",
+                                spec=str(state.path),
+                                snapshot=snap.path,
+                                error=identity_fault,
+                            )
                     digest = None
                     if same_file:
                         try:
                             digest = hashlib.sha256(state.path.read_bytes()).hexdigest()
-                        except OSError:
-                            digest = None  # torn read → NEUTRAL; synthesize keeps its degrade
+                        except OSError as e:
+                            # torn read → NEUTRAL; synthesize keeps its degrade
+                            digest = None
+                            note_snapshot_fault(
+                                "spec-digest-unreadable",
+                                spec=str(state.path),
+                                error=f"{type(e).__name__}: {e}",
+                            )
                     snap_verdict = self._snapshot_verdict(
                         same_file=same_file, snap=snap, task_id=handle.task_id, digest=digest
                     )
@@ -2768,11 +2907,13 @@ class _DevSynthesisMixin(_ResultFileMixin):
                             f"(snapshot mtime_ns={snap.mtime_ns}); refusing stories synthesis"
                         )
                     else:
+                        sr = None
+                        read_fault: str | None = None
                         try:
                             sr = devcontract.synthesize_result(
                                 state.path, story_key=story_key or None, plan_halt=plan_halt
                             )
-                        except UnicodeDecodeError:
+                        except UnicodeDecodeError as e:
                             # A non-UTF-8 read is either a torn glimpse of a spec still
                             # being written (keep polling — a later pass sees the finished
                             # write) or a genuinely corrupt file: then the grace expires
@@ -2780,30 +2921,54 @@ class _DevSynthesisMixin(_ResultFileMixin):
                             # wedge (resolve_story_spec degrades an undecodable PRESENT
                             # spec to status "" → pause for resolve), never a crash of
                             # the read-back poll.
-                            sr = None
+                            read_fault = f"{type(e).__name__}: {e}"
                         if sr is not None and sr.result_json is not None:
                             return sr
-                        verdict = "not-terminal"
-                        detail = (
-                            f"{state.path} has no terminal status (frontmatter {state.status!r})"
-                        )
+                        # `synthesize_result` folds its own read faults into "not
+                        # terminal yet"; re-read to tell the two apart (DW-457).
+                        read_fault = read_fault or self._spec_read_fault(state.path)
+                        if read_fault is not None:
+                            verdict, fault = "unreadable-spec", (state.path, read_fault)
+                        else:
+                            verdict = "not-terminal"
+                            detail = (
+                                f"{state.path} has no terminal status"
+                                f" (frontmatter {state.status!r})"
+                            )
             if not wait or time.monotonic() >= deadline:
-                if wait:
+                if fault is not None:
+                    self._note_spec_read_fault(handle.task_id, verdict, *fault, wait=wait)
+                elif wait:
                     self._note_resultless_stop(handle.task_id, verdict, detail)
                 return None
             time.sleep(RESULT_POLL_S)
+
+    @staticmethod
+    def _spec_read_fault(spec_path: Path) -> str | None:
+        """``"<ExcType>: <message>"`` when ``spec_path`` cannot be read as UTF-8
+        text right now, else None. Classification only (DW-457): the stories
+        read-back asks it after a synthesis that found nothing, because
+        ``synthesize_result`` folds an unreadable or undecodable spec into "not
+        terminal yet" — this tells that fault apart from a genuinely non-terminal
+        spec for the record, without changing the answer."""
+        try:
+            spec_path.read_bytes().decode("utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            return f"{type(e).__name__}: {e}"
+        return None
 
     @staticmethod
     def _written_this_session(spec_path: Path, launched_ns: int) -> bool:
         """Whether ``spec_path`` was (re)written at/after the session launched — the
         same launch-floor guard ``devcontract.find_result_artifact`` applies on the
         scan path, so a stale terminal spec from a prior step (a dev ``done`` a
-        follow-up review re-opens) is not mistaken for this session's output. A spec
-        that vanished between resolve and stat is treated as not-yet-written."""
-        try:
-            return spec_path.stat().st_mtime_ns >= launched_ns
-        except OSError:
-            return False
+        follow-up review re-opens) is not mistaken for this session's output.
+
+        A stat fault — a spec that vanished between resolve and stat included —
+        raises ``OSError`` (DW-457): the caller still reads it as not-yet-written,
+        but records it as ``stat-failed`` rather than as a spec that predates the
+        launch."""
+        return spec_path.stat().st_mtime_ns >= launched_ns
 
     def _post_kill_reconcile(
         self, handle: SessionHandle, spec: SessionSpec, result: SessionResult

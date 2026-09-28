@@ -279,16 +279,21 @@ One row per story (or sweep bundle/triage task) in the selected run:
   `session-vanished` (the mux no longer reported the session during the run, #489),
   mux transport faults `liveness-probe-failed` / `liveness-probe-recovered` /
   `nudge-send-failed`, observation faults `parked-probe-failed` /
-  `log-evidence-failed` / `result-json-refused`, an abandoned post-kill rescue
+  `log-evidence-failed` / `result-json-refused` / `usage-sample-failed` /
+  `usage-sample-recovered` / `transcript-scan-failed` / `transcript-scan-recovered` /
+  `spec-identity-unreadable` / `spec-digest-unreadable` / `spec-readback-failed`,
+  an abandoned post-kill rescue
   `post-kill-rescue-abandoned` (liveness unknown or an unreadable artifact), and the
   #276 missing-marker forensics `spec-status-transition-observed` /
   `frontmatter-unmodified-refused` / `contract-nudge-sent`),
   `heartbeat.json` (the wait loop's proof-of-life —
   stale under a live session means the orchestrator itself was frozen; on the
   generic adapter it also carries `probe_failures`, the running liveness-probe
-  failure streak, and `stall_nudges_failed`), and
+  failure streak, `stall_nudges_failed`, and `usage_sample_failures`, the running
+  budget usage-sample failure streak), and
   `resultless-stops.jsonl` (each give-up Stop with its verdict: `no-result-json` /
-  `malformed-result-json`, `no-artifact`,
+  `malformed-result-json`, `no-artifact`, `stat-failed` / `unreadable-spec` (a spec
+  read fault, with the error),
   `ambiguous-frontmatter`, `unmodified-since-launch` — the spec's bytes were
   unchanged since review launch, so it is a prior `done` re-opened, not this
   session's output (#276) — or `terminal-frontmatter-pending`).
