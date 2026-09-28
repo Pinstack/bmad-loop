@@ -156,6 +156,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Surface the auto retrospective's verdict: `retro-auto-finished` and the done notice
+  carry the retro doc's frontmatter `verdict` (`unknown` when absent or unreadable, never
+  folded into accepted), and a `rejected` epic adds an `ATTENTION` line. The run is not
+  paused (DW-487).
 - Notify (`ATTENTION`) when a resume restart's reset parks only uncommitted changes,
   naming the `refs/attempt-preserve-dirty/*` snapshot with a `git diff` and a
   `git restore --source=` hint (DW-480).

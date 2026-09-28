@@ -496,6 +496,16 @@ RETRO_SKILL = "bmad-retrospective"
 # How many leftover paths a retro dirty-tree pause names in its reason.
 _RETRO_DIRTY_REASON_PATHS = 10
 
+# The frontmatter `verdict:` vocabulary bmad-retrospective writes into its retro doc
+# (its `references/retro-document.md`; the skill's `sprint_status.py --verdict`
+# refuses any other spelling). The board key reads `done` whatever the verdict, so
+# the doc is the only place a rejection shows (DW-487). Anything else — no doc
+# frontmatter, no `verdict:`, an unknown spelling, an unreadable doc — is journaled
+# as `RETRO_VERDICT_UNKNOWN`, never folded into an acceptance.
+RETRO_VERDICTS = frozenset({"accepted", "accepted-with-open-items", "rejected"})
+RETRO_VERDICT_REJECTED = "rejected"
+RETRO_VERDICT_UNKNOWN = "unknown"
+
 
 def _retro_auto_prompt(epic: int) -> str:
     return RETRO_AUTO_PROMPT.format(epic=epic)
@@ -9781,6 +9791,32 @@ class Engine:
                 errors.append(f"no epic-{epic}-retro-*.md retrospective doc")
         return errors, docs
 
+    def _retro_verdict(self, docs: list[Path]) -> tuple[str, Path | None]:
+        """The acceptance verdict of the newest retro doc (DW-487), as ``(verdict,
+        doc)``: one of ``RETRO_VERDICTS`` or ``RETRO_VERDICT_UNKNOWN``, plus the doc
+        it was read from (``None`` when none could be picked).
+
+        The newest by ``lstat`` mtime (ties by name) is the one this session wrote:
+        a board already reading ``done`` never dispatches, so an older doc is a
+        leftover. Read through ``verify.read_frontmatter``, the spec-frontmatter
+        reader, which already degrades an undecodable or unparseable block to
+        ``{}``; the value is stripped and lowercased, then matched against the
+        skill's closed vocabulary. Every miss — including a doc that cannot be
+        stat'd or read — is ``unknown``, so the caller can never mistake an
+        unreadable verdict for an accepted one, and no raw doc text is returned."""
+        try:
+            doc = max(docs, key=lambda d: (d.lstat().st_mtime_ns, d.name), default=None)
+        except OSError:
+            return RETRO_VERDICT_UNKNOWN, None
+        if doc is None:
+            return RETRO_VERDICT_UNKNOWN, None
+        try:
+            raw = verify.read_frontmatter(doc).get("verdict")
+        except OSError:
+            return RETRO_VERDICT_UNKNOWN, doc
+        verdict = raw.strip().lower() if isinstance(raw, str) else ""
+        return (verdict if verdict in RETRO_VERDICTS else RETRO_VERDICT_UNKNOWN), doc
+
     def _repo_relpath(self, path: Path) -> str | None:
         """``path`` as the repo-relative posix spelling ``verify.dirty_paths``
         uses, or None when it lies outside the repo (a sibling artifacts tree)."""
@@ -9860,7 +9896,12 @@ class Engine:
         retro. A failed retro is not retried within one pass of the boundary; a
         resume after a ``retro-auto-dirty`` pause re-enters the boundary and
         re-dispatches unless the board already reads done. The tree is settled
-        afterwards either way (:meth:`_settle_retro_tree`)."""
+        afterwards either way (:meth:`_settle_retro_tree`).
+
+        A succeeded retro's acceptance verdict (:meth:`_retro_verdict`) rides
+        ``retro-auto-finished`` and the done notice; a ``rejected`` one also sends
+        an ATTENTION line. Neither pauses: the verdict is surfaced, not gated
+        (DW-487)."""
         if self.policy.gates.retrospective != "auto":
             return
         try:
@@ -9904,13 +9945,16 @@ class Engine:
         ok = not errors
         if ok:
             names = [d.name for d in docs]
-            self.journal.append("retro-auto-finished", epic=epic, docs=names)
+            verdict, verdict_doc = self._retro_verdict(docs)
+            self.journal.append("retro-auto-finished", epic=epic, docs=names, verdict=verdict)
             gates.notify(
                 self.policy,
                 self.run_dir,
                 f"epic {epic} retrospective done",
-                f"retrospective written: {', '.join(names)}",
+                f"retrospective written: {', '.join(names)}; verdict: {verdict}",
             )
+            if verdict == RETRO_VERDICT_REJECTED and verdict_doc is not None:
+                self._notify_retro_rejected(epic, verdict_doc)
         else:
             extra = {} if raised is None else {"error": str(raised)}
             self.journal.append("retro-auto-failed", epic=epic, errors=errors, **extra)
@@ -9922,6 +9966,23 @@ class Engine:
                 f"{epic} by hand",
             )
         self._settle_retro_tree(epic, ok, docs)
+
+    def _notify_retro_rejected(self, epic: int, doc: Path) -> None:
+        """The ATTENTION line for a retrospective that REJECTED its epic (DW-487).
+
+        Notify-only by decision: the run is not paused, it goes on to the next
+        epic, so the line says so and points at the doc that holds the evidence.
+        The doc name is a session-written filename, so it is folded through
+        ``gates.notice_line`` (DW-417/419) to stay one segment of the line."""
+        gates.notify(
+            self.policy,
+            self.run_dir,
+            f"epic {epic} retrospective rejected",
+            f"the auto retrospective's verdict for epic {epic} is rejected (see "
+            f"{gates.notice_line(doc.name)}); the run continues with the next epic — "
+            f"review its Acceptance verdict and Action items before relying on epic "
+            f"{epic}'s work",
+        )
 
     def _epic_boundary(self, finished_epic: int, next_epic: int) -> None:
         self.journal.append("epic-boundary", finished=finished_epic, next=next_epic)

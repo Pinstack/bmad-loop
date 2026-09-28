@@ -446,6 +446,11 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     # DW-446: the `st_dev` a locked resume/re-arm re-bound (`old_dev` -> `dev`) under
     # a still-matching `ino` — integers only, kept for the same comparison.
     "root-identity-rebound": frozenset({"old_dev", "dev", "ino"}),
+    # DW-487: the retro doc's acceptance verdict, normalized by
+    # `Engine._retro_verdict` into a closed four-value token (`accepted` /
+    # `accepted-with-open-items` / `rejected` / `unknown`) — never the doc's raw
+    # text. Kind-scoped because `verdict` is generic.
+    "retro-auto-finished": frozenset({"verdict"}),
 }
 
 # Every OTHER field name journalled today: a declared inventory, not a per-name

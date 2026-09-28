@@ -21641,17 +21641,21 @@ def retro_effect(
     status: str = "completed",
     rj_status: str | None = "done",
     stray: str | None = None,
+    doc_body: str | bytes = "# retro\n",
 ):
-    """Simulate a `bmad-retrospective -H` session: it writes the retro doc, flips
+    """Simulate a `bmad-retrospective -H` session: it writes the retro doc (body
+    `doc_body`; the default carries no frontmatter, so no verdict), flips
     `epic-N-retrospective: done` on the board (the SKILL writes the board, never
     the engine), optionally touches a foreign file, and returns a result whose
     result.json carries `rj_status`."""
 
     def effect(spec: SessionSpec) -> SessionResult:
         if doc:
-            (project.implementation_artifacts / f"epic-{epic}-retro-2026-09-26.md").write_text(
-                "# retro\n"
-            )
+            path = project.implementation_artifacts / f"epic-{epic}-retro-2026-09-26.md"
+            if isinstance(doc_body, bytes):
+                path.write_bytes(doc_body)
+            else:
+                path.write_text(doc_body)
         if board:
             set_sprint(project, f"epic-{epic}-retrospective", "done")
         if stray is not None:
@@ -22191,6 +22195,121 @@ def test_auto_retro_runs_before_the_per_epic_sweep(project):
     kinds = _kinds(engine)
     assert kinds.index("retro-auto-finished") < kinds.index("sweep-auto-trigger")
     assert "sweep-auto-skipped-dirty" not in kinds
+
+
+# DW-487: bmad-retrospective marks the board `done` whatever the verdict, so the
+# verdict is read from the retro doc's frontmatter and surfaced, never gated.
+
+
+def _retro_doc_with(verdict_line: str) -> str:
+    return f"---\nepic: 1\ndate: 2026-09-26\n{verdict_line}headless: true\n---\n\n# retro\n"
+
+
+_REJECTED_TITLE = "epic 1 retrospective rejected"
+
+
+@pytest.mark.parametrize(
+    ("doc_body", "verdict"),
+    [
+        (_retro_doc_with("verdict: accepted\n"), "accepted"),
+        (_retro_doc_with("verdict: accepted-with-open-items\n"), "accepted-with-open-items"),
+        (_retro_doc_with("verdict: Rejected \n"), "rejected"),
+        ("# retro\n", "unknown"),
+        (_retro_doc_with(""), "unknown"),
+        (_retro_doc_with("verdict: maybe\n"), "unknown"),
+        (_retro_doc_with("verdict: [rejected]\n"), "unknown"),
+        (b"---\nverdict: rejected\n---\n\xff\xfe\n", "unknown"),
+    ],
+    ids=[
+        "accepted",
+        "accepted-with-open-items",
+        "rejected",
+        "no-frontmatter",
+        "no-verdict-key",
+        "unknown-spelling",
+        "not-a-string",
+        "undecodable",
+    ],
+)
+def test_auto_retro_surfaces_the_doc_verdict_and_the_run_continues(project, doc_body, verdict):
+    """The retro doc's frontmatter `verdict:` rides `retro-auto-finished` and the
+    done notice. Only a `rejected` verdict adds the ATTENTION line, and it names
+    the doc and says the run goes on. An absent, unknown or unreadable verdict is
+    `unknown`, never folded into an acceptance. No verdict pauses the run: epic 2
+    runs every time.
+
+    Ablation: delete the `_notify_retro_rejected` call in `_maybe_auto_retro` and
+    the `rejected` row reddens on the missing ATTENTION line."""
+    _two_epic_sprint(project)
+    retro = MockAdapter([retro_effect(project, doc_body=doc_body)])
+    engine, _ = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=True),
+            dev_effect(project, "2-1-b"),
+            review_effect(project, "2-1-b", clean=True),
+        ],
+        policy=AUTO_RETRO,
+        retro_adapter=retro,
+    )
+    summary = engine.run()
+
+    assert summary.done == 2 and not summary.paused
+    assert load_state(engine.run_dir).current_epic == 2
+    assert _only(engine, "retro-auto-finished")["verdict"] == verdict
+
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8").splitlines()
+    done = [line for line in attention if "epic 1 retrospective done: " in line]
+    assert len(done) == 1 and done[0].endswith(f"; verdict: {verdict}")
+    rejected = [line for line in attention if f"] {_REJECTED_TITLE}: " in line]
+    if verdict == "rejected":
+        assert len(rejected) == 1
+        assert RETRO_DOC in rejected[0] and "the run continues" in rejected[0]
+    else:
+        assert rejected == []
+
+
+def test_auto_retro_verdict_is_read_from_the_newest_doc(project):
+    """A leftover retro doc from an earlier attempt does not decide the verdict: the
+    newest doc (the one this session wrote) does."""
+    _two_epic_sprint(project)
+    old = project.implementation_artifacts / "epic-1-retro-2026-09-30.md"
+    old.write_text(_retro_doc_with("verdict: accepted\n"))
+    os.utime(old, ns=(1_000_000_000, 1_000_000_000))
+    _commit_all(project)
+    engine, _ = make_engine(
+        project,
+        [],
+        policy=AUTO_RETRO,
+        retro_adapter=MockAdapter(
+            [retro_effect(project, doc_body=_retro_doc_with("verdict: rejected\n"))]
+        ),
+    )
+
+    engine._maybe_auto_retro(1)
+
+    assert _only(engine, "retro-auto-finished")["verdict"] == "rejected"
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert f"] {_REJECTED_TITLE}: " in attention and RETRO_DOC in attention
+
+
+def test_auto_retro_unreadable_verdict_doc_is_unknown(project, monkeypatch):
+    """A doc that cannot be read when the verdict is parsed reads as `unknown` —
+    journaled, with no ATTENTION line — and the run still continues."""
+    engine, _ = _boundary_engine(
+        project, [retro_effect(project, doc_body=_retro_doc_with("verdict: rejected\n"))]
+    )
+
+    def unreadable(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(verify, "read_frontmatter", unreadable)
+
+    engine._maybe_auto_retro(1)
+
+    assert _only(engine, "retro-auto-finished")["verdict"] == "unknown"
+    assert _REJECTED_TITLE not in (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
 
 
 # ------------------------------------------ engine worktree-mount writer pin (DW-445)

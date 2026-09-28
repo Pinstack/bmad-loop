@@ -1101,6 +1101,31 @@ def test_auto_retro_path_lists_reduce_to_counts(kind, field, values):
     assert all(value not in json.dumps(scrubbed) for value in values)
 
 
+@pytest.mark.parametrize("verdict", ["accepted", "accepted-with-open-items", "rejected", "unknown"])
+def test_auto_retro_verdict_ships_as_its_closed_token(verdict):
+    """DW-487: `retro-auto-finished`'s `verdict` is a closed token the engine
+    normalizes (never doc text), declared benign on that kind, so a dump keeps it
+    verbatim beside the doc count — the value a maintainer reads the record for."""
+    scrubbed = diagnostics._scrub_entry(
+        {
+            "kind": "retro-auto-finished",
+            "epic": 1,
+            "docs": ["epic-1-retro-2026-09-26.md"],
+            "verdict": verdict,
+        },
+        sanitize.Pseudonymizer(salt=b"fixed"),
+        {},
+        None,
+    )
+
+    assert scrubbed == {
+        "kind": "retro-auto-finished",
+        "epic": 1,
+        "docs_count": 1,
+        "verdict": verdict,
+    }
+
+
 @pytest.mark.parametrize(
     ("kind", "field", "value"),
     [
