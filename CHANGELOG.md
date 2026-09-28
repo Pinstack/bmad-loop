@@ -136,6 +136,8 @@ breaking changes may land in a minor release.
   where an operator or durable record can see it (journal, `heartbeat.json`,
   `SessionResult`, CLI/TUI output), never folded silently into a healthy-looking empty
   value (DW-347, DW-476).
+- Narrow that doctrine's `SessionResult` item to "a `SessionResult` field the engine
+  journals": a count held only in memory no longer satisfies the rule (DW-504).
 - Commit hooks in the exact-path candidate worktree now see a worktree holding only the
   target: a hook that reads other tracked files (whole-tree lint or tests) sees them missing
   and may fail the publication, and one that stages the rest of the tree is refused by scope
