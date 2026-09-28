@@ -13,10 +13,11 @@ from bmad_loop.escalation import (
     decide_dev,
     decide_review_session,
     display_critical_reason,
+    display_pause_reason,
     preference_escalations,
     review_retry_or_exhaust,
 )
-from bmad_loop.model import StoryTask
+from bmad_loop.model import PAUSE_ESCALATION, PAUSE_STORY_GATE, RunState, StoryTask
 from bmad_loop.policy import LimitsPolicy, NotifyPolicy, Policy, ReviewPolicy
 from bmad_loop.verify import VerifyOutcome
 
@@ -509,3 +510,54 @@ def test_review_retry_or_exhaust_helper_matches_budget_semantics():
     assert review_retry_or_exhaust(_task(review_cycle=2), POLICY, "r").action == Action.DEFER
     latched = review_retry_or_exhaust(_task(review_cycle=2, resolved_redrive=True), POLICY, "r")
     assert latched.action == Action.PAUSE
+
+
+# ------------------------------------------ pause reasons shaped at display (DW-491)
+
+# A multi-line reason carrying an ESC byte, e.g. a `({error})` a RunPaused builder
+# interpolated raw: displayed, its second line must not land as a loose line.
+_MULTILINE_REASON = "ledger refused (fatal: x\x1b[31m\nhint: y)"
+_SHAPED_REASON = "ledger refused (fatal: x\\x1b[31m ⏎ hint: y)"
+
+
+def _paused_state(reason: str, stage: str, task: StoryTask | None = None) -> RunState:
+    state = RunState(run_id="r1", project="/p", started_at="now")
+    state.paused_reason = reason
+    state.paused_stage = stage
+    if task is not None:
+        state.tasks[task.story_key] = task
+        state.paused_story_key = task.story_key
+    return state
+
+
+@pytest.mark.parametrize("stage", [PAUSE_STORY_GATE, PAUSE_ESCALATION])
+def test_display_pause_reason_shapes_an_esc_and_newline_reason(stage):
+    """`display_pause_reason` folds a reason's line breaks into `` ⏎ `` segments and
+    escapes its control characters, so `status` and the TUI print one line; the
+    persisted reason stays raw (DW-491).
+
+    Ablation: drop the `notice_line` around the reason and the raw ESC and line
+    break come back."""
+    state = _paused_state(_MULTILINE_REASON, stage)
+
+    assert display_pause_reason(state) == _SHAPED_REASON
+    assert state.paused_reason == _MULTILINE_REASON
+
+
+def test_display_pause_reason_shapes_the_recovery_trail():
+    """The escalation recovery trail is a path, shaped like the reason (DW-491).
+
+    Ablation: drop the `notice_line` around the source and the raw line break
+    lands in the trail."""
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file="/p/spec\nx\x1b.md")
+    state = _paused_state("CRITICAL escalation from dev session: d", PAUSE_ESCALATION, task)
+
+    assert display_pause_reason(state) == (
+        "CRITICAL escalation from dev session: d [recovery trail: /p/spec ⏎ x\\x1b.md]"
+    )
+
+
+@pytest.mark.parametrize("stage", [PAUSE_STORY_GATE, PAUSE_ESCALATION])
+def test_display_pause_reason_keeps_a_plain_reason_unchanged(stage):
+    reason = "CRITICAL escalation from dev session: needs a human — resolve it"
+    assert display_pause_reason(_paused_state(reason, stage)) == reason

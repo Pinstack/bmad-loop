@@ -12,7 +12,7 @@ from enum import StrEnum
 from typing import Any
 
 from .adapters.base import SessionResult
-from .gates import NOTICE_FULL_DETAIL_SOURCE, NOTICE_TRUNCATION_MARKER
+from .gates import NOTICE_FULL_DETAIL_SOURCE, NOTICE_TRUNCATION_MARKER, notice_line
 from .model import PAUSE_ESCALATION, RunState, StoryTask, VerifyOutcome
 from .policy import Policy
 
@@ -149,9 +149,19 @@ def display_pause_reason(state: RunState) -> str:
     Missing task/source metadata is total and falls back to ``journal.jsonl``.
     A persisted worktree-local spec is relative by design, so anchor it through
     ``runs.task_spec_path`` before presenting it to an operator (#734).
+
+    The result is shaped for a terminal (DW-491): every caller (`status`, the TUI
+    header and resume modal, `RunSummary`) prints it inline on one line, and a
+    reason routinely interpolates untrusted fault text, so it goes through
+    ``gates.notice_line`` — control/ESC and surrogate characters escaped visibly,
+    line breaks folded into `` ⏎ `` segments so every line survives on one. The
+    reason and recovery trail are each shaped before the CRITICAL display budget
+    applies, so escapes count against it and the trail is never dropped. Shaping is
+    display-only: ``state.paused_reason`` and ``status --json`` stay raw, and a
+    plain one-line reason is returned unchanged.
     """
     raw_reason = state.paused_reason
-    reason = (
+    reason = notice_line(
         raw_reason if isinstance(raw_reason, str) else "" if raw_reason is None else str(raw_reason)
     )
     if state.paused_stage != PAUSE_ESCALATION:
@@ -164,7 +174,7 @@ def display_pause_reason(state: RunState) -> str:
         # module-initialization cycle. Display calls happen only after startup.
         from .runs import task_spec_path
 
-        source = str(task_spec_path(task, state))
+        source = notice_line(str(task_spec_path(task, state)))
     return display_critical_reason(reason, source)
 
 

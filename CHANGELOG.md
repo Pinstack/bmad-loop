@@ -160,6 +160,13 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Shape pause reasons for terminal display through `gates.notice_line`: `status`, the TUI
+  header and resume modal, and the run summary now print a multi-line or ESC-bearing
+  reason on one line, escaped and folded. `state.json` and `status --json` keep the raw
+  reason (DW-491).
+- Fold the spec, checkout-root and ledger paths in the attempt-owned-spec recovery and
+  harvested-carry foreign-dirt ACTION REQUIRED notices through `gates.notice_line`;
+  journal rows keep the raw paths (DW-492).
 - Refuse a lying managed relay in any antigravity top-level hook group, not only
   `bmad-loop`: agy runs every group, so a hand-added `relay Stop` under e.g. `PreToolUse`
   in a user group completes sessions early. `validate`/`probe-adapter` flag

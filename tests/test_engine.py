@@ -5116,6 +5116,29 @@ def test_ledger_repair_pause_folds_a_multiline_error(project):
     assert refused["error"] == error
 
 
+@pytest.mark.parametrize("error", [None, "probe fault"])
+def test_harvest_carry_foreign_dirt_pause_folds_a_multiline_ledger_path(project, error):
+    """`_pause_for_harvest_carry_foreign_dirt` folds `{ledger}` into one segment of
+    its notice line, on both the foreign-dirt and the probe-fault arms; the
+    `harvest-carry-foreign-dirt` row keeps it raw (DW-492).
+
+    Ablation: interpolate the raw `ledger` in the notice and a loose `hint: y` line
+    lands in ATTENTION."""
+    engine, _ = make_engine(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    task = StoryTask(story_key="1-1-a", epic=1)
+    engine.state.tasks[task.story_key] = task
+    ledger = Path(f"/ledger/{_MULTILINE_FRAGMENT}.md")
+
+    with pytest.raises(RunPaused):
+        engine._pause_for_harvest_carry_foreign_dirt(task, ledger, error=error)
+
+    lines = _assert_attention_folds_the_fragment(engine.run_dir)
+    assert any(f"`/ledger/{_FOLDED_FRAGMENT}.md`" in line for line in lines)
+    (dirt,) = [e for e in engine.journal.entries() if e["kind"] == "harvest-carry-foreign-dirt"]
+    assert dirt["ledger"] == str(ledger)
+
+
 # ------------------------ review demotion -> park (DW-383, on_review_demotion)
 
 

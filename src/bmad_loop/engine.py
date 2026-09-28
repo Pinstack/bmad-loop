@@ -8829,13 +8829,16 @@ class Engine:
             **extra,
         )
         resume = f"`bmad-loop resume {self.state.run_id}` to retry the carry commit."
+        # The ledger path is folded to one segment of its line (DW-492), like
+        # `error` below (DW-417); the row above keeps it raw.
+        shown_ledger = gates.notice_line(str(ledger))
         if error is not None:
             # The fault text is folded to one segment of its line (DW-417); the
             # row above keeps it raw.
             notice = (
                 "**ACTION REQUIRED — deferred-work ledger could not be verified**\n"
                 f"Story **{task.story_key}** has harvested findings to commit into "
-                f"`{ledger}`, but the carry could not verify the ledger holds only its "
+                f"`{shown_ledger}`, but the carry could not verify the ledger holds only its "
                 f"own changes: {gates.notice_line(error)}. Any rows this carry filed are on disk but "
                 "uncommitted, and nothing was committed.\n"
                 f"Fix the fault, then run {resume}"
@@ -8845,7 +8848,7 @@ class Engine:
                 "**ACTION REQUIRED — deferred-work ledger holds changes the carry cannot "
                 "prove are its own**\n"
                 f"Story **{task.story_key}** has harvested findings to commit into "
-                f"`{ledger}`, but the ledger holds changes beyond HEAD plus those findings, "
+                f"`{shown_ledger}`, but the ledger holds changes beyond HEAD plus those findings, "
                 "in the working tree or the index (an operator edit, or a pre-commit hook "
                 "that rewrote the ledger when it rejected the commit). Any rows this carry filed are on disk "
                 "but uncommitted, and nothing was committed: committing now would have "

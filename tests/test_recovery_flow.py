@@ -5765,3 +5765,28 @@ def test_owned_spec_restore_sites_pause_on_a_swapped_mount(project, tmp_path, mo
     else:
         expected = _EDITED_SPEC
     assert outside_spec.read_bytes() == expected
+
+
+def test_owned_spec_pause_folds_multiline_spec_and_root_paths(project, tmp_path, monkeypatch):
+    """`pause_for_owned_spec_recovery` folds `{spec}` and `{root}` wherever its notice
+    shows them — headline, contract and steps — into one segment of their line; the
+    journal row keeps `spec` raw (DW-492).
+
+    Ablation: interpolate the raw `spec` (or `root`) in the notice and a loose
+    `hint: y` line lands in ATTENTION."""
+    repo = project.project
+    workspace = Workspace.default(project)
+    flow = _make_flow(workspace=workspace, run_dir=tmp_path)
+    task = _task(repo)
+    root = f"/checkout/{_MULTILINE_FAULT}"
+    monkeypatch.setattr(flow, "_workspace_get", lambda: SimpleNamespace(root=Path(root)))
+    spec = f"/spec/{_MULTILINE_FAULT}.md"
+
+    with pytest.raises(_Pause):
+        flow.pause_for_owned_spec_recovery(task, spec, "problem")
+
+    _assert_fragment_folded(tmp_path)
+    text = "\n".join(_attention_lines(tmp_path))
+    assert text.count(f"/spec/{_FOLDED_FAULT}.md") == 4
+    assert text.count(f"/checkout/{_FOLDED_FAULT}") == 4
+    assert flow.journal.fields("rollback-owned-spec-manual-required")["spec"] == spec

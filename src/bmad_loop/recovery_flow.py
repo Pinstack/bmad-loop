@@ -900,16 +900,21 @@ class RecoveryFlow:
         task.dispatched_spec_file = None
         task.dispatched_spec_snapshot = None
         root = self._workspace_get().root
+        # The paths are folded to one segment of their line wherever the notice
+        # shows them (DW-492), like `problem` below (DW-417); the journal row keeps
+        # `spec` raw, and the recovery logic reads the raw values.
+        shown_spec = gates.notice_line(spec)
+        shown_root = gates.notice_line(str(root))
         short = (task.baseline_commit or "")[:12]
         if short:
             baseline_name = f"the attempt baseline `{short}`"
-            reset_step = f'`git -C "{root}" reset --hard {short}`'
+            reset_step = f'`git -C "{shown_root}" reset --hard {short}`'
         else:
             baseline_name = "the commit the attempt started from (not recorded)"
             reset_step = "reset tracked files to that commit"
         save_step = (
             "  1. Save any failed-session work you may want to inspect — commits "
-            f'too, e.g. `git -C "{root}" branch my-rescue HEAD`'
+            f'too, e.g. `git -C "{shown_root}" branch my-rescue HEAD`'
         )
         spec_rel = ""
         if Path(spec).is_absolute():
@@ -923,32 +928,32 @@ class RecoveryFlow:
         if redrive_keeps_spec:
             contract = (
                 f"Resume re-checks this checkout against {baseline_name}, and the "
-                f"cleared binding no longer protects `{spec}`. On this re-drive, "
+                f"cleared binding no longer protects `{shown_spec}`. On this re-drive, "
                 "resume rolls the checkout back automatically, and an approved spec "
                 "kept under the BMAD artifact folders survives resume's reset.\n"
             )
             steps = (
                 f"{save_step}.\n"
-                f"  2. Keep the approved contents of `{spec}` in place and return the "
-                f"other residue in `{root}` to {baseline_name}, then review/remove "
+                f"  2. Keep the approved contents of `{shown_spec}` in place and return the "
+                f"other residue in `{shown_root}` to {baseline_name}, then review/remove "
                 "leftover untracked files.\n"
                 f"  3. Run `bmad-loop resume {self.state.run_id}`."
             )
         else:
             contract = (
                 f"Resume re-checks this checkout against {baseline_name}, and the "
-                f"cleared binding no longer protects `{spec}`: if it is Git-tracked, "
+                f"cleared binding no longer protects `{shown_spec}`: if it is Git-tracked, "
                 "edits that differ from its baseline version — uncommitted or "
                 "committed on top of the baseline — count as attempt residue "
                 "(automatic rollback parks and resets them; with it off the run "
                 "pauses again). **Resume will not adopt them.**\n"
             )
             steps = (
-                f"{save_step} — and keep a copy of any approved edits to `{spec}` "
+                f"{save_step} — and keep a copy of any approved edits to `{shown_spec}` "
                 "that differ from its baseline version.\n"
-                f"  2. Return `{root}` to {baseline_name}: {reset_step}, then "
+                f"  2. Return `{shown_root}` to {baseline_name}: {reset_step}, then "
                 "review/remove leftover untracked files.\n"
-                f"  3. Run `bmad-loop resume {self.state.run_id}`. If `{spec}` is "
+                f"  3. Run `bmad-loop resume {self.state.run_id}`. If `{shown_spec}` is "
                 "Git-tracked, the next attempt starts from its baseline version: "
                 "resume cannot carry the kept edits into it; they can only be "
                 "re-applied afterwards (e.g. as a later correction)."
@@ -958,7 +963,7 @@ class RecoveryFlow:
         notice = (
             "**ACTION REQUIRED — attempt-owned spec needs manual recovery**\n"
             f"Story **{task.story_key}** cannot safely restore its pre-attempt spec "
-            f"at `{spec}`: {gates.notice_line(problem)}. The working tree at `{root}` now requires "
+            f"at `{shown_spec}`: {gates.notice_line(problem)}. The working tree at `{shown_root}` now requires "
             "inspection because bmad-loop cannot safely distinguish operator "
             "intent, failed-session output, and any rollback already completed.\n"
             f"{contract}{steps}"
