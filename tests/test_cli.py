@@ -7585,7 +7585,7 @@ def test_sweep_resume_refuses_a_broken_sweep_skill_before_any_write(
     assert "run `bmad-loop validate` for details" in err
     assert armed == []
     assert _resume_entries(run_dir) == []
-    assert runs.read_trusted_config_digest(project.project, run_dir.name) == "OLDPIN"
+    assert runs.read_trusted_config_digest(project.project, run_dir.name)[0] == "OLDPIN"
 
 
 def test_story_resume_is_not_gated_on_the_sweep_skill(project, monkeypatch):
@@ -7809,7 +7809,7 @@ def test_resume_leaves_the_owed_root_and_marker_intact_when_the_discharge_fails(
     with pytest.raises(OSError):
         cli._resume_paused_run(project.project, run_dir)
 
-    assert runs.read_trusted_config_digest(project.project, run_dir.name) == "OLDPIN"
+    assert runs.read_trusted_config_digest(project.project, run_dir.name)[0] == "OLDPIN"
     persisted = load_state(run_dir)
     assert persisted.repo_root == str(owed)
     assert persisted.code_root_restamp_pending is True
@@ -8087,7 +8087,7 @@ def test_resume_warns_when_the_pinned_host_exec_config_changed(project, monkeypa
     # First resume stamps the pin (the run predates the field, so it has none).
     assert cli._resume_paused_run(project.project, run_dir) == 0
     assert _resume_entry(run_dir)["security_config_changed"] is False
-    pinned = runs.read_trusted_config_digest(project.project, run_dir.name)
+    pinned = runs.read_trusted_config_digest(project.project, run_dir.name)[0]
     assert pinned  # the launch/resume baseline is persisted, not just in memory
     capsys.readouterr()
 
@@ -8101,7 +8101,7 @@ def test_resume_warns_when_the_pinned_host_exec_config_changed(project, monkeypa
     assert "verify commands" in err and "plugin allowlist" in err
     assert "touch pwned" not in err
     # ...and the resume re-blesses it, so the next one is quiet again.
-    assert runs.read_trusted_config_digest(project.project, run_dir.name) != pinned
+    assert runs.read_trusted_config_digest(project.project, run_dir.name)[0] != pinned
 
 
 def test_resume_still_warns_when_a_session_rewrote_the_digest_in_state_json(
@@ -8127,7 +8127,7 @@ def test_resume_still_warns_when_a_session_rewrote_the_digest_in_state_json(
     run_dir = _paused_run_for_resume(project, monkeypatch)
     monkeypatch.setattr(cli, "Engine", _StubEngine)
     assert cli._resume_paused_run(project.project, run_dir) == 0
-    assert runs.read_trusted_config_digest(project.project, run_dir.name)
+    assert runs.read_trusted_config_digest(project.project, run_dir.name)[0]
     capsys.readouterr()
 
     # The session rewrites the verify commands...
@@ -8162,16 +8162,51 @@ def test_resume_migrates_a_pre_498_baseline_out_of_state_json(project, monkeypat
     # A run persisted by the old code: a pin in state.json, nothing out of tree.
     run_dir = _paused_run_for_resume(project, monkeypatch, trusted_config_digest="stale-pin")
     monkeypatch.setattr(cli, "Engine", _StubEngine)
-    assert runs.read_trusted_config_digest(project.project, run_dir.name) is None
+    assert runs.read_trusted_config_digest(project.project, run_dir.name) == (None, None)
 
     assert cli._resume_paused_run(project.project, run_dir) == 0
 
     # It compared against the legacy field, so the change is caught on this resume.
     assert _resume_entries(run_dir)[-1]["security_config_changed"] is True
-    assert "host-exec config pinned at launch has changed" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "host-exec config pinned at launch has changed" in err
+    # Genuine absence is the legacy case, not a fault: no DW-467 warning for it.
+    assert "baseline could not be read" not in err
     # ...and migrated: the baseline now lives out of tree, and is the fresh one.
-    migrated = runs.read_trusted_config_digest(project.project, run_dir.name)
+    migrated = runs.read_trusted_config_digest(project.project, run_dir.name)[0]
     assert migrated and migrated != "stale-pin"
+
+
+def test_resume_warns_when_the_trusted_baseline_is_unreadable(project, monkeypatch, capsys):
+    """DW-467. A FAULT at the out-of-tree path — here undecodable bytes, the
+    portable stand-in for a planted FIFO or a link — takes the same fallback to
+    `state.json` that genuine absence does, and that copy is session-writable. It
+    used to take it silently, so the operator could not tell "compared against the
+    trusted baseline" from "compared against whatever the session left in the
+    tree". The fallback itself is unchanged (this run's legacy field still decides
+    the verdict); the warning names the path and the fault.
+
+    ABLATION: drop the `digest_fault` print in `_resume_paused_run` and the first
+    assert fails; make the reader return `(None, None)` from its decode arm and
+    it fails the same way."""
+    from bmad_loop import runs
+
+    run_dir = _paused_run_for_resume(project, monkeypatch, trusted_config_digest="stale-pin")
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+    path = runs.config_digest_path_for(project.project, run_dir.name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"\xff\xfe garbage")
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    err = capsys.readouterr().err
+    assert (
+        f"warning: run {run_dir.name}: the trusted host-exec config baseline could not be"
+        f" read ({path}: not UTF-8 text); falling back to the copy in state.json"
+    ) in err
+    # The decision is the unchanged fallback: the legacy field was compared.
+    assert _resume_entries(run_dir)[-1]["security_config_changed"] is True
+    assert "host-exec config pinned at launch has changed" in err
 
 
 def test_resume_still_warns_after_the_project_is_renamed(project, monkeypatch, capsys):
@@ -8198,7 +8233,7 @@ def test_resume_still_warns_after_the_project_is_renamed(project, monkeypatch, c
     run_dir = _paused_run_for_resume(project, monkeypatch)
     monkeypatch.setattr(cli, "Engine", _StubEngine)
     assert cli._resume_paused_run(project.project, run_dir) == 0
-    assert runs.read_trusted_config_digest(project.project, run_dir.name)
+    assert runs.read_trusted_config_digest(project.project, run_dir.name)[0]
     capsys.readouterr()
 
     # The operator renames the project directory; the run dir goes with it.
@@ -8210,7 +8245,7 @@ def test_resume_still_warns_after_the_project_is_renamed(project, monkeypatch, c
     # Precondition, or this test would pass for the wrong reason: the rename really
     # did put the out-of-tree baseline out of reach.
     assert runs.project_tag(dst) != runs.project_tag(src)
-    assert runs.read_trusted_config_digest(dst, run_dir.name) is None
+    assert runs.read_trusted_config_digest(dst, run_dir.name) == (None, None)
 
     # ...and the host-exec config changes, exactly as in the no-move case.
     _write_policy(dst, RESUME_POLICY.replace('["true"]', '["touch pwned"]'))
@@ -8219,7 +8254,7 @@ def test_resume_still_warns_after_the_project_is_renamed(project, monkeypatch, c
     assert _resume_entries(moved)[-1]["security_config_changed"] is True
     assert "host-exec config pinned at launch has changed" in capsys.readouterr().err
     # The resume re-keys the run: from here the baseline is out of tree again.
-    assert runs.read_trusted_config_digest(dst, run_dir.name)
+    assert runs.read_trusted_config_digest(dst, run_dir.name)[0]
 
 
 def test_resume_under_an_unchanged_host_exec_config_reports_no_security_change(
@@ -8352,7 +8387,7 @@ def test_refused_resume_leaves_the_pin_and_the_journal_untouched(project, monkey
 
     assert cli._resume_paused_run(project.project, run_dir) == 1
     assert "could not be discarded" in capsys.readouterr().err
-    assert runs.read_trusted_config_digest(project.project, run_dir.name) == "OLDPIN"
+    assert runs.read_trusted_config_digest(project.project, run_dir.name)[0] == "OLDPIN"
     assert _resume_entries(run_dir) == []
 
 
@@ -16018,7 +16053,7 @@ def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monke
     assert captured["only_ids"] is None and captured["min_severity"] is None
     assert signalled == ["started"]  # #501: the child composed, so the parent may latch
     run_id = captured["state"].run_id
-    assert runs.read_trusted_config_digest(project.project, run_id) == pin
+    assert runs.read_trusted_config_digest(project.project, run_id)[0] == pin
     # Both copies, and the same validated bytes in each: the in-tree secondary is
     # what survives a project rename (the state root is keyed by resolved path), so
     # a launch that stamped only out of tree loses the pin on the first move.
@@ -16193,7 +16228,7 @@ def test_run_pins_the_profile_bytes_it_launches(project, monkeypatch):
     ), "the swap must actually have landed on disk, or this test proves nothing"
     assert captured["adapter"].profile.binary == "mycli"
     run_id = captured["state"].run_id
-    assert runs.read_trusted_config_digest(project.project, run_id) == pin
+    assert runs.read_trusted_config_digest(project.project, run_id)[0] == pin
     # As in the sweep twin: the launch stamps both copies, out-of-tree (trusted) and
     # in-tree (travels with the run dir when the project is renamed).
     assert captured["state"].trusted_config_digest == pin
@@ -16252,7 +16287,7 @@ def test_resume_pins_the_profile_bytes_it_launches(project, monkeypatch):
         profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
     ), "the swap must actually have landed on disk, or this test proves nothing"
     assert captured["adapter"].profile.binary == "mycli"
-    assert runs.read_trusted_config_digest(project.project, run_dir.name) == pin
+    assert runs.read_trusted_config_digest(project.project, run_dir.name)[0] == pin
 
 
 @pytest.mark.parametrize("shape", ["inside", "sibling"])

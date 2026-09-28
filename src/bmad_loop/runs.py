@@ -108,6 +108,13 @@ CONFIG_DIGEST_FILE = "config-digest"
 # see `read_trusted_config_digest` on why a bound, not a bigger buffer.
 _MAX_DIGEST_BYTES = 256
 _INVALID_PID_IDENTITY = -1.0  # impossible process start/create time; forces "not ours"
+# The identity half of ``(None, _PID_FILE_UNREADABLE)``: a pid file that could not
+# be proved absent but could not be read either (DW-465). Paired with a ``None``
+# pid, so every caller that gates on ``pid is None`` first keeps its "no pid to act
+# on" behaviour; only `engine_liveness`, which must tell the fault from absence,
+# looks at it. Deliberately a finite float, never NaN: `stop_run` compares pid-file
+# tuples for equality, and an unreadable file read twice must compare equal.
+_PID_FILE_UNREADABLE = -2.0
 
 
 class StopRunError(Exception):
@@ -761,9 +768,10 @@ def config_digest_path_for(project: Path, run_id: str) -> Path:
     return state_dir_for(project, run_id) / CONFIG_DIGEST_FILE
 
 
-def read_trusted_config_digest(project: Path, run_id: str) -> str | None:
-    """This run's persisted host-exec baseline, or ``None`` when the state root
-    holds none for it.
+def read_trusted_config_digest(project: Path, run_id: str) -> tuple[str | None, str | None]:
+    """``(digest, fault)``: this run's persisted host-exec baseline, or ``None``
+    when the state root holds none for it — paired with ``None``, or with an
+    operator-facing description of why the baseline could not be read.
 
     ``None`` is "ask the in-tree copy", not "no pin" — the two are different
     answers and the caller acts on the difference (see
@@ -787,7 +795,17 @@ def read_trusted_config_digest(project: Path, run_id: str) -> str | None:
 
     Pure observation, so it degrades rather than raising: a state root this host
     cannot name, or a file it cannot read, both answer ``None`` and hand the
-    decision to the in-tree copy. The write half raises — see
+    decision to the in-tree copy. **Only genuine absence is silent** (DW-467):
+    every other ``None`` comes with a ``fault`` naming the path and what went
+    wrong, which the resume prints. Without it a planted FIFO, a link, an
+    unreadable file or undecodable bytes each read as "paused before #498" and
+    fell back to the session-writable ``state.json`` copy with nothing said — the
+    very silencing #498 closed, reopened through the error arms. The decision is
+    unchanged (the caller still falls back); what changed is that the operator
+    is told the trusted baseline was not read. Absence is ``FileNotFoundError``
+    alone: ``NotADirectoryError`` there means a file stands where a state-dir
+    component belongs, which is a tampered path, not an unstamped one. The write
+    half raises — see
     :func:`write_trusted_config_digest` — and the split is the standard one
     (``platform_util.resolve_or_lexical`` states the doctrine). Degrading here
     costs at most one advisory warning; a resume that *aborts* because an
@@ -825,26 +843,28 @@ def read_trusted_config_digest(project: Path, run_id: str) -> str | None:
     exhausting the orchestrator, which is a different and fixable harm."""
     try:
         path = config_digest_path_for(project, run_id)
-    except (StateRootError, OSError, RuntimeError):
-        return None
+    except (StateRootError, OSError, RuntimeError) as exc:
+        return None, f"cannot name its path in the state root: {type(exc).__name__}: {exc}"
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     flags |= getattr(os, "O_BINARY", 0)  # win32: no CRLF translation on the raw fd
     try:
         fd = os.open(path, flags)
-    except OSError:
-        return None
+    except FileNotFoundError:
+        return None, None  # never stamped: the legacy case, and the only silent one
+    except OSError as exc:
+        return None, f"{path}: cannot open: {type(exc).__name__}: {exc}"
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return None
+            return None, f"{path}: not a regular file"
         data = os.read(fd, _MAX_DIGEST_BYTES)
-    except OSError:
-        return None
+    except OSError as exc:
+        return None, f"{path}: cannot read: {type(exc).__name__}: {exc}"
     finally:
         os.close(fd)
     try:
-        return data.decode("utf-8").strip()
+        return data.decode("utf-8").strip(), None
     except UnicodeDecodeError:
-        return None
+        return None, f"{path}: not UTF-8 text"
 
 
 def write_trusted_config_digest(project: Path, run_id: str, digest: str) -> None:
@@ -996,11 +1016,24 @@ def read_named_pid_identity(pidfile: Path) -> tuple[int | None, float | None]:
     when the file is missing or the pid is unparseable; identity ``None`` for a legacy
     pid-only file (callers then degrade to a bare existence check). A malformed
     second token is not legacy: it returns an impossible identity so reuse guards
-    fail closed. First token is the pid, an optional second token the identity float."""
+    fail closed. First token is the pid, an optional second token the identity float.
+
+    A read fault other than absence answers ``(None, _PID_FILE_UNREADABLE)`` (DW-465).
+    It used to answer ``(None, None)``, so an EACCES/EIO/EISDIR read looked exactly
+    like "no pid file" and :func:`engine_liveness` called a possibly-live engine
+    ``'dead'`` — `clean` and `cleanup` then reclaimed past it without the
+    unverifiable-pid warning they owe. The pid stays ``None``, so a caller that only
+    asks "is there a pid to act on" (the Unity dialog-probe reaps, :func:`read_pid`)
+    is unchanged; :func:`engine_liveness` routes the sentinel to ``'unknown'``.
+    Absence is ``FileNotFoundError`` and ``NotADirectoryError`` — the latter when a
+    path component above the file is not a directory (a stray file where a run dir
+    would be), which holds no pid file just as surely."""
     try:
         tokens = pidfile.read_text(encoding="utf-8").split()
-    except OSError:
+    except (FileNotFoundError, NotADirectoryError):
         return None, None
+    except OSError:
+        return None, _PID_FILE_UNREADABLE
     if not tokens:
         return None, None
     try:
@@ -1023,7 +1056,10 @@ def engine_alive(run_dir: Path) -> bool:
     """True only when a local engine pid is provably alive **and still our engine**
     (identity-checked, so a reused pid reads as dead). Mirrors :func:`liveness`
     minus the tmux fallback — callers here want a definite 'is something running'
-    answer, and 'unknown' must not block stop/delete."""
+    answer, and 'unknown' must not block stop/delete. That includes an unreadable pid
+    file (DW-465): False here, but the frontends that report liveness read
+    :func:`engine_liveness`, which answers ``'unknown'`` for it rather than
+    ``'dead'``."""
     pid, identity = read_pid_identity(run_dir)
     if pid is None:
         return False
@@ -1034,10 +1070,13 @@ def engine_liveness(run_dir: Path) -> str:
     """Tri-state read of the local engine: ``'alive'`` | ``'dead'`` | ``'unknown'``.
     Wraps :meth:`ProcessHost.liveness_of` so a live-but-unreadable pid (win32
     ``ERROR_ACCESS_DENIED``) reads ``'unknown'``, not a false ``'dead'``. No pid →
-    ``'dead'`` (the session fallback lives in the TUI layer)."""
+    ``'dead'`` (the session fallback lives in the TUI layer). A pid file that exists
+    but cannot be read → ``'unknown'`` as well (DW-465): the pid in it cannot be
+    probed, which is the same verdict as a pid whose identity cannot be, and every
+    frontend already reports ``'unknown'`` as an unverifiable pid."""
     pid, identity = read_pid_identity(run_dir)
     if pid is None:
-        return "dead"
+        return "unknown" if identity == _PID_FILE_UNREADABLE else "dead"
     return probe_liveness(pid, identity)
 
 
@@ -2509,10 +2548,25 @@ def live_session_may_be_ours(project: Path, run_id: str) -> bool:
     listing read — :func:`mux_sessions` selects inside the caught call — so it
     degrades the listing's way: a transport that cannot even be chosen (a
     persisted `[mux] backend` naming a backend no longer registered) reports
-    no live session rather than aborting every removal path."""
+    no live session rather than aborting every removal path.
+
+    **Those two degrades are signalled (DW-466).** A selection or listing that
+    raises :class:`MultiplexerError` still answers False, but prints a
+    ``warning:`` on stderr naming the run and the error, since the removal it
+    licenses then went ahead without the multiplexer ever being asked. Stderr,
+    not the return value: the answer is a bool read by `clean` and by
+    :func:`_refuse_live_session` under every delete/archive path (CLI, TUI and
+    ``runsetup``'s launch-failure cleanup), and widening it would move every one
+    of them for a warning. No double report: the bundled backends never raise here —
+    ``BaseTmuxBackend.list_sessions`` folds its own faults into ``[]`` and warns
+    for them itself (DW-458) — so the exception this arm catches comes only
+    from an out-of-tree backend or from selection, and no layer below has said
+    anything about it. The ``ctl_session_for`` and tag-read arms stay silent on
+    purpose: both degrade toward refusal, the safe direction."""
     try:
         mux = get_multiplexer()
-    except MultiplexerError:
+    except MultiplexerError as exc:
+        _warn_unasked_session_guard(run_id, "the multiplexer backend could not be selected", exc)
         return False
     key = mux.session_name_key
     name = session_name(run_id)
@@ -2526,7 +2580,8 @@ def live_session_may_be_ours(project: Path, run_id: str) -> bool:
     try:
         if key(name) not in {key(s) for s in mux_sessions()}:
             return False
-    except MultiplexerError:
+    except MultiplexerError as exc:
+        _warn_unasked_session_guard(run_id, "the session listing raised", exc)
         return False
     try:
         tags = session_project_tags()
@@ -2534,6 +2589,15 @@ def live_session_may_be_ours(project: Path, run_id: str) -> bool:
         tags = {}  # unread is not proof of foreign
     tag = next((v for s, v in tags.items() if key(s) == key(name)), "")
     return not tag or tag in accepted_tags(project)
+
+
+def _warn_unasked_session_guard(run_id: str, what: str, exc: MultiplexerError) -> None:
+    # The removal guard's one I/O edge (see live_session_may_be_ours, DW-466).
+    print(
+        f"warning: run {run_id}: could not check for a live agent session — {what}: "
+        f"{exc}; proceeding as if none is live",
+        file=sys.stderr,
+    )
 
 
 def _refuse_live_session(project: Path, run_id: str, verb: str) -> None:

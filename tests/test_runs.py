@@ -419,6 +419,31 @@ def test_read_pid_identity_forms(tmp_path):
     assert runs.read_pid_identity(run_dir) == (None, None)
 
 
+def test_read_pid_identity_tells_an_unreadable_file_from_a_missing_one(tmp_path):
+    """DW-465. A pid file that exists but cannot be read used to answer
+    `(None, None)`, exactly like no file, so a possibly-live engine read as dead.
+    The pid stays `None` (callers that only ask "is there a pid to act on" keep
+    their answer) and the identity carries the fault. A directory at the name is
+    the portable unreadable file: IsADirectoryError on POSIX, PermissionError on
+    Windows — neither is absence.
+
+    Absence stays absence: a missing file, and a path whose parent is a FILE
+    (NotADirectoryError on POSIX), both hold no pid file.
+
+    ABLATION: fold the generic `OSError` arm back into `(None, None)` and the
+    unreadable row fails; drop `NotADirectoryError` from the absence arm and the
+    stray-file row fails."""
+    run_dir = _make_run(tmp_path, "r1")
+    (run_dir / "engine.pid").mkdir()
+    assert runs.read_pid_identity(run_dir) == (None, runs._PID_FILE_UNREADABLE)
+    assert runs.read_pid(run_dir) is None
+
+    stray = tmp_path / "stray"
+    stray.write_text("not a run dir")
+    assert runs.read_named_pid_identity(stray / "engine.pid") == (None, None)
+    assert runs.read_named_pid_identity(tmp_path / "absent" / "engine.pid") == (None, None)
+
+
 def test_engine_liveness(tmp_path, monkeypatch):
     run_dir = _make_run(tmp_path, "r1")
     assert runs.engine_liveness(run_dir) == "dead"  # no pid file → nothing to gate on
@@ -455,6 +480,31 @@ def test_engine_liveness(tmp_path, monkeypatch):
     monkeypatch.setattr(runs, "get_process_host", _boom_host)
     with pytest.raises(ProcessHostError):
         runs.engine_liveness(run_dir)
+
+
+def test_engine_liveness_reads_an_unreadable_pid_file_as_unknown(tmp_path, monkeypatch):
+    """DW-465: the pid in a file that cannot be read cannot be probed, which is the
+    tri-state's 'unknown' — never 'dead', which licensed every removal path to
+    proceed without the unverifiable-pid warning. `engine_alive` keeps answering
+    False (unknown must not block stop/delete); the frontends report liveness
+    through `engine_liveness`, where the fault is now distinguishable.
+
+    No host is consulted: there is no pid to hand it.
+
+    ABLATION: map the unreadable sentinel back to 'dead' in `engine_liveness` and
+    this fails."""
+    run_dir = _make_run(tmp_path, "r1")
+    (run_dir / "engine.pid").mkdir()
+
+    def _no_host():
+        raise AssertionError("an unreadable pid file has no pid to probe")
+
+    monkeypatch.setattr(runs, "get_process_host", _no_host)
+    assert runs.engine_liveness(run_dir) == "unknown"
+    assert runs.engine_alive(run_dir) is False
+    # the absent file stays 'dead' — the control that makes 'unknown' an answer
+    (run_dir / "engine.pid").rmdir()
+    assert runs.engine_liveness(run_dir) == "dead"
 
 
 @pytest.mark.parametrize("identity_token", ["garbage", "nan", "inf", "-inf"])
@@ -2123,7 +2173,7 @@ def test_config_digest_is_stamped_under_the_state_root_not_in_the_project(tmp_pa
 
     path = runs.config_digest_path_for(project, "r1")
     assert path == runs.state_dir_for(project, "r1") / "config-digest"
-    assert runs.read_trusted_config_digest(project, "r1") == "abc123"
+    assert runs.read_trusted_config_digest(project, "r1") == ("abc123", None)
     assert not any(p.is_file() for p in (project / ".bmad-loop").rglob("*"))
 
 
@@ -2135,15 +2185,20 @@ def test_read_trusted_config_digest_separates_an_absent_file_from_an_empty_one(t
     fallback; collapsing them to `None` would let a session that truncates the
     out-of-tree file fall back into the tree it controls.
 
+    Both are answers, not faults, so neither carries one (DW-467): genuine absence
+    is the one `None` that stays silent.
+
     ABLATION: return `""` instead of `None` from the reader's except arm, or drop
-    the `.strip()`-of-an-empty-file distinction, and one of these two fails."""
+    the `.strip()`-of-an-empty-file distinction, and one of these two fails. Fold
+    `FileNotFoundError` into the generic open-fault arm and the first fails on its
+    fault."""
     project = tmp_path / "proj"
     project.mkdir()
 
-    assert runs.read_trusted_config_digest(project, "r1") is None
+    assert runs.read_trusted_config_digest(project, "r1") == (None, None)
 
     runs.write_trusted_config_digest(project, "r1", "")
-    assert runs.read_trusted_config_digest(project, "r1") == ""
+    assert runs.read_trusted_config_digest(project, "r1") == ("", None)
 
 
 @pytest.mark.parametrize(
@@ -2170,12 +2225,18 @@ def test_trusted_config_digest_read_degrades_where_the_write_raises(
     The `RuntimeError` row is live below 3.13, where `Path.resolve` reports a
     symlink loop that way — same reason `_discard_state_dir` holds it.
 
-    ABLATION: widen the write to swallow these and the second half passes."""
+    The degrade is not silent (DW-467): the read names the fault, which the
+    resume prints, since its fallback is the session-writable copy.
+
+    ABLATION: widen the write to swallow these and the second half passes. Drop
+    the fault from the read's path arm and the first half fails."""
     project = tmp_path / "proj"
     project.mkdir()
     monkeypatch.setattr(runs, attr, _raising(exc))
 
-    assert runs.read_trusted_config_digest(project, "r1") is None
+    digest, fault = runs.read_trusted_config_digest(project, "r1")
+    assert digest is None
+    assert fault is not None and "state root" in fault and str(exc) in fault
     with pytest.raises(type(exc)):
         runs.write_trusted_config_digest(project, "r1", "abc123")
 
@@ -2203,7 +2264,8 @@ def test_read_trusted_config_digest_refuses_a_planted_fifo_instead_of_hanging(tm
     the alarm fires. Dropping the `S_ISREG` check instead fails the assert rather
     than the alarm — with no writer the FIFO reads EOF, so the reader answers `""`
     where it owes `None`. Both are graded; the twin below covers the case where a
-    writer makes those bytes attacker-chosen instead of empty."""
+    writer makes those bytes attacker-chosen instead of empty. The refusal is a
+    fault, not absence, so it is named (DW-467)."""
     import signal
 
     project = tmp_path / "proj"
@@ -2218,7 +2280,10 @@ def test_read_trusted_config_digest_refuses_a_planted_fifo_instead_of_hanging(tm
     previous = signal.signal(signal.SIGALRM, _blew_up)
     signal.alarm(20)
     try:
-        assert runs.read_trusted_config_digest(project, "r1") is None
+        assert runs.read_trusted_config_digest(project, "r1") == (
+            None,
+            f"{path}: not a regular file",
+        )
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, previous)
@@ -2249,7 +2314,10 @@ def test_read_trusted_config_digest_refuses_a_fed_fifo_instead_of_reading_it(tmp
     holder = os.open(path, os.O_RDWR | os.O_NONBLOCK)
     try:
         os.write(holder, b"ff" * 32 + b"\n")  # a plausible-looking sha256 hex digest
-        assert runs.read_trusted_config_digest(project, "r1") is None
+        assert runs.read_trusted_config_digest(project, "r1") == (
+            None,
+            f"{path}: not a regular file",
+        )
     finally:
         os.close(holder)
 
@@ -2289,8 +2357,9 @@ def test_read_trusted_config_digest_is_bounded(tmp_path):
         return real_read(fd, n)
 
     with mock.patch.object(runs.os, "read", _spy):
-        got = runs.read_trusted_config_digest(project, "r1")
+        got, fault = runs.read_trusted_config_digest(project, "r1")
 
+    assert fault is None
     assert got is not None
     assert len(got) == runs._MAX_DIGEST_BYTES
     # The read never asks for more than the cap, however many calls it makes.
@@ -2305,7 +2374,8 @@ def test_read_trusted_config_digest_does_not_follow_a_planted_symlink(tmp_path):
     "digest" it comes back with is that file's contents.
 
     ABLATION: drop `O_NOFOLLOW` from the flags and the read returns the target's
-    contents instead of `None`."""
+    contents instead of `None`. The refused open is a fault (ELOOP), named with the
+    path (DW-467)."""
     project = tmp_path / "proj"
     project.mkdir()
     secret = tmp_path / "elsewhere.txt"
@@ -2314,7 +2384,56 @@ def test_read_trusted_config_digest_does_not_follow_a_planted_symlink(tmp_path):
     path.parent.mkdir(parents=True)
     path.symlink_to(secret)
 
-    assert runs.read_trusted_config_digest(project, "r1") is None
+    digest, fault = runs.read_trusted_config_digest(project, "r1")
+    assert digest is None
+    assert fault is not None and fault.startswith(f"{path}: cannot open: ")
+
+
+def test_read_trusted_config_digest_names_undecodable_bytes(tmp_path):
+    """Garbage bytes at the out-of-tree path used to read as the legacy no-file
+    case and hand the comparison to `state.json` without a word (DW-467). The
+    answer stays `None`; the fault names the path, never the bytes (they are
+    session-chosen, and headed for an operator's terminal).
+
+    ABLATION: return `(None, None)` from the decode arm and this fails."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    path = runs.config_digest_path_for(project, "r1")
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"\xff\xfe\x00garbage")
+
+    assert runs.read_trusted_config_digest(project, "r1") == (None, f"{path}: not UTF-8 text")
+
+
+@pytest.mark.parametrize(
+    "target, exc, prefix",
+    [
+        ("open", PermissionError(errno.EACCES, "Permission denied"), "cannot open"),
+        ("open", NotADirectoryError(errno.ENOTDIR, "Not a directory"), "cannot open"),
+        ("read", OSError(errno.EIO, "Input/output error"), "cannot read"),
+    ],
+    ids=["open-eacces", "open-enotdir", "read-eio"],
+)
+def test_read_trusted_config_digest_names_an_os_fault(tmp_path, target, exc, prefix):
+    """Every OS fault on the way to the bytes is named, with the path (DW-467).
+    `NotADirectoryError` is deliberately a fault, not absence: it means a FILE
+    stands where a state-dir component belongs — a tampered path, not a run that
+    was never stamped — so it must not take the legacy fallback silently.
+
+    ABLATION: fold the open arm back into `(None, None)`, or catch
+    `NotADirectoryError` beside `FileNotFoundError`, or drop the read arm's
+    fault, and the matching row fails."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    runs.write_trusted_config_digest(project, "r1", "abc123")
+    path = runs.config_digest_path_for(project, "r1")
+
+    with mock.patch.object(runs.os, target, _raising(exc)):
+        digest, fault = runs.read_trusted_config_digest(project, "r1")
+
+    assert digest is None
+    assert fault is not None
+    assert fault.startswith(f"{path}: {prefix}: {type(exc).__name__}: ")
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
@@ -2341,7 +2460,7 @@ def test_write_trusted_config_digest_replaces_a_planted_symlink(tmp_path):
 
     assert target.read_text() == "untouched"
     assert not path.is_symlink()
-    assert runs.read_trusted_config_digest(project, "r1") == "abc123"
+    assert runs.read_trusted_config_digest(project, "r1") == ("abc123", None)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
@@ -2424,7 +2543,7 @@ def test_write_trusted_config_digest_lands_under_a_clean_state_root(tmp_path, mo
     runs.write_trusted_config_digest(project, "r1", "abc123")
 
     assert seen == [root]  # the state root itself, not the run dir
-    assert runs.read_trusted_config_digest(project, "r1") == "abc123"
+    assert runs.read_trusted_config_digest(project, "r1") == ("abc123", None)
 
 
 def test_the_state_dir_gc_reclaims_the_config_digest(tmp_path):
@@ -2534,6 +2653,24 @@ def test_prunable_sessions_flags_unknown(tmp_path, monkeypatch):
     monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-odd-1"])
     monkeypatch.setattr(runs, "session_project_tags", lambda: {"bmad-loop-odd-1": mine})
     monkeypatch.setattr(runs, "get_process_host", lambda: _FakeHost(alive=True, identity=None))
+    prunable, live, unknown = runs.prunable_sessions(tmp_path)
+    assert prunable == ["odd-1"]
+    assert live == []
+    assert unknown == {"odd-1"}
+
+
+def test_prunable_sessions_flags_an_unreadable_pid_file_as_unknown(tmp_path, monkeypatch):
+    """DW-465 at the prune seam: an unreadable engine.pid takes the existing
+    unverifiable-pid path — prunable, but in the `unknown` set every frontend warns
+    for — rather than reading as a dead engine and pruning without a word.
+
+    ABLATION: fold the unreadable read back into `(None, None)` and `unknown` is
+    empty."""
+    mine = runs.project_tag(tmp_path)
+    odd = _make_state_run(tmp_path, "odd-1")
+    (odd / "engine.pid").mkdir()
+    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-odd-1"])
+    monkeypatch.setattr(runs, "session_project_tags", lambda: {"bmad-loop-odd-1": mine})
     prunable, live, unknown = runs.prunable_sessions(tmp_path)
     assert prunable == ["odd-1"]
     assert live == []
@@ -6795,22 +6932,38 @@ def test_live_session_may_be_ours_compares_names_the_transports_way(tmp_path, mo
     assert runs.live_session_may_be_ours(tmp_path, "ctl-0123456789abcdef")
 
 
-def test_live_session_may_be_ours_degrades_an_unanswerable_listing_to_absent(tmp_path, monkeypatch):
+def test_live_session_may_be_ours_degrades_an_unanswerable_listing_to_absent(
+    tmp_path, monkeypatch, capsys
+):
     """Observation degrades — the guard's documented contract, restored over
     this branch's withdrawn raise-propagation: a listing that cannot answer
     reads as "no session", the same answer the bundled backend gives for a
     missing multiplexer or a dead server. The control-name discount still
     answers before any probe at all, so the recovery `bmad-loop delete ctl`
-    needs no transport."""
+    needs no transport.
+
+    The degrade is signalled (DW-466): the removal it licenses goes ahead
+    without the multiplexer having answered, so the guard says so on stderr,
+    naming the run and the error. The discount asks no transport, so it is
+    silent. Ablation: drop the warning from the listing arm and the first
+    assert block fails."""
     monkeypatch.setattr(
         runs, "get_multiplexer", lambda: _LivenessMux([], fold=False, unanswerable=True)
     )
     monkeypatch.setattr(runs, "ctl_session_for", lambda project, mux=None: runs.CTL_SESSION)
     assert not runs.live_session_may_be_ours(tmp_path, "20260826-000000-run1")
+    err = capsys.readouterr().err
+    assert err.startswith(
+        "warning: run 20260826-000000-run1: could not check for a live agent session"
+        " — the session listing raised: simulated transport failure;"
+    )
     assert not runs.live_session_may_be_ours(tmp_path, "ctl")
+    assert capsys.readouterr().err == ""
 
 
-def test_live_session_may_be_ours_degrades_an_unselectable_backend_to_absent(tmp_path, monkeypatch):
+def test_live_session_may_be_ours_degrades_an_unselectable_backend_to_absent(
+    tmp_path, monkeypatch, capsys
+):
     """Selection is part of the listing read, so it degrades the listing's way.
 
     `mux_sessions()` selects the backend *inside* the call the guard catches, so
@@ -6821,19 +6974,27 @@ def test_live_session_may_be_ours_degrades_an_unselectable_backend_to_absent(tmp
     `--force`.
 
     Ablation: hoist the selection back above the `try` and this fails with the
-    `MultiplexerError` the misconfiguration raises."""
+    `MultiplexerError` the misconfiguration raises. Drop the selection arm's
+    warning (DW-466) and the stderr asserts fail: the answer is still False, but
+    no longer silently."""
 
     def unselectable():
         raise MultiplexerError("[mux] backend = 'ghost' matches no registered backend")
 
     monkeypatch.setattr(runs, "get_multiplexer", unselectable)
     assert not runs.live_session_may_be_ours(tmp_path, "20260826-000000-run1")
+    assert capsys.readouterr().err == (
+        "warning: run 20260826-000000-run1: could not check for a live agent session"
+        " — the multiplexer backend could not be selected: [mux] backend = 'ghost'"
+        " matches no registered backend; proceeding as if none is live\n"
+    )
     # ...and the control-name discount needs the transport too, so it degrades alike
     assert not runs.live_session_may_be_ours(tmp_path, "ctl")
+    assert "run ctl: could not check for a live agent session" in capsys.readouterr().err
 
 
 def test_live_session_may_be_ours_reads_a_successful_listing_as_the_whole_truth(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, capsys
 ):
     """The accepted ceiling of #732, pinned so it cannot be closed by accident.
 
@@ -6865,6 +7026,9 @@ def test_live_session_may_be_ours_reads_a_successful_listing_as_the_whole_truth(
 
     monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux([name]))
     assert runs.live_session_may_be_ours(tmp_path, "20260826-000000-run1")
+    # A listing that answered — however wrongly — is not a fault: DW-466's warning
+    # is for the arms where the multiplexer was never asked, and must stay off here.
+    assert capsys.readouterr().err == ""
 
 
 def test_prune_sessions_claims_a_historical_ctl_prefixed_session(tmp_path, monkeypatch):

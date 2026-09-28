@@ -306,6 +306,24 @@ def test_cmd_clean_warns_unknown_liveness(project, monkeypatch, capsys):
     assert "run 20260101-000000-aaaa: engine may still be live (unverifiable pid)" in err
 
 
+def test_cmd_clean_warns_for_an_unreadable_pid_file(project, capsys):
+    """DW-465, end to end through the real liveness read: an engine.pid that
+    exists but cannot be read (a directory at the name) used to read as a dead
+    engine, so `clean` reclaimed the run without its unverifiable-pid warning.
+
+    ABLATION: fold `read_named_pid_identity`'s read fault back into `(None, None)`
+    and the warning is gone."""
+    install_bmad_config(project)
+    repo = project.project
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", stopped=True))
+    (run_dir / runs.PID_FILE).mkdir()
+
+    assert cli.cmd_clean(_clean_args(repo)) == 0
+    err = capsys.readouterr().err
+    assert "run 20260101-000000-aaaa: engine may still be live (unverifiable pid)" in err
+
+
 def test_cmd_clean_reclaims_and_keeps_protected(project, capsys):
     install_bmad_config(project)
     repo = project.project

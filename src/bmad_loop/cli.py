@@ -3406,7 +3406,22 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     # so the fallback fires only for those runs, and the re-stamp below migrates
     # them on this very resume. Empty either way keeps its meaning: no prior pin,
     # no warning.
-    pinned = runs.read_trusted_config_digest(project, run_dir.name)
+    #
+    # A `None` that is a read FAULT rather than absence (DW-467) takes the same
+    # fallback — the decision is unchanged — but not silently: the fallback is the
+    # session-writable copy, so a planted FIFO or garbage bytes at the out-of-tree
+    # path would otherwise quietly hand the comparison back to the tree it polices.
+    # Printed ahead of the fallback's own verdict, so an operator who sees no
+    # config-change warning below knows what that silence was measured against.
+    pinned, digest_fault = runs.read_trusted_config_digest(project, run_dir.name)
+    if digest_fault is not None:
+        print(
+            f"warning: run {run_dir.name}: the trusted host-exec config baseline could"
+            f" not be read ({digest_fault}); falling back to the copy in state.json,"
+            " which the driven session can rewrite — a changed-config warning may be"
+            " missing below",
+            file=sys.stderr,
+        )
     if pinned is None:
         pinned = state.trusted_config_digest
     security_config_changed = bool(pinned) and new_digest != pinned
