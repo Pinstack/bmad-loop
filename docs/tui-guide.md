@@ -219,8 +219,10 @@ session is open it falls back to the run's configured adapters, rebuilt from the
 run's policy snapshot — `agents <name·model>` when dev and review resolve alike,
 else `agents dev <name·model> review <name·model>`, plus a `triage <name·model>`
 on sweep runs. A run that predates adapter stamping (no rebuildable snapshot)
-shows no agent line at all rather than a fabricated default. Below that,
-situational banners:
+shows no agent line at all rather than a fabricated default. An open session whose
+identity cannot be derived from a malformed journal entry reads a yellow
+`agent unreadable — <fault>` rather than no line, which would look like no session
+at all (DW-474). Below that, situational banners:
 
 - `⏸ paused (<stage>) — <reason> · press e to resume` — gate or escalation
   pause; stages are `spec-approval`, `epic-boundary`, `escalation`,
@@ -241,6 +243,17 @@ situational banners:
 - `⧗ starting… waiting for the engine to write state.json` — just launched;
   if nothing appears within 10 seconds the TUI raises a "launch may have
   failed" error toast.
+- `⚠ state stale — state.json unreadable (<fault>); showing the last good read`
+  (DW-472) — the header keeps the last `state.json` that parsed, and this line says
+  it is no longer current: the file stopped parsing, went away, or cannot be
+  stat'd. It appears only once the same unchanged file has failed on two
+  consecutive polls, so a read torn by a write in progress never flashes it, and it
+  clears on the next good parse. A run whose `state.json` never parsed reads
+  `state unavailable — <fault>`.
+- `⚠ journal.jsonl …` / `⚠ ATTENTION …` (dim, DW-475) — the poll could not stat or
+  read that file this tick; the Journal / Attention tab holds what was read before.
+  The journal tail keeps its position across the fault, so nothing is re-listed or
+  skipped when it clears.
 
 ### Task table (middle right)
 
@@ -302,7 +315,10 @@ One row per story (or sweep bundle/triage task) in the selected run:
   active task is the last `session-start` without a matching `session-end`
   (falling back to the newest log file); the tab switches automatically when
   the engine moves to the next session. Only the last 64 KB of a large log is
-  read on first open.
+  read on first open. If the scan of the skipped head for a fullscreen
+  (alt-screen) switch cannot read the file, a yellow `⚠ could not scan this log's
+head for a fullscreen switch` note says the pane may show only the final frame
+  (DW-475).
 - **Attention** — the run's `ATTENTION` file (escalations, gate
   notifications). New lines after the first poll also fire a warning toast.
 
@@ -600,7 +616,10 @@ attended sweeps.
 The flow above is for a decision a _live_ attended sweep is blocked on. For
 decisions an **unattended** sweep skipped — or an attended one you walked away
 from — press `d`. The Deferred Work pane title shows the outstanding count
-(`Deferred Work — N to answer (d)`), and `d` walks them one modal at a time
+(`Deferred Work — N to answer (d)`), or `Deferred Work — decisions unreadable (d)`
+when they could not be read (no loadable BMAD config, an unreadable ledger, a read
+that raised — DW-473); `d` then toasts the fault as an error instead of claiming
+nothing is pending. Otherwise `d` walks them one modal at a time
 (question, context, and each option with its effect and the triage
 recommendation). Each answer is durable: a `close` is applied immediately, and
 a `build`/`keep-open` is saved to `.bmad-loop/decisions.json`, so the next sweep
@@ -768,6 +787,7 @@ if the operator has marked `policy.toml` read-only (#593, #597).
 | `another run is live: <ids>`                                                        | a second engine on the same project may conflict — confirm only if you know they won't touch the same stories                        |
 | `launch may have failed — attach to control session <name>`                         | no `state.json` within 10 s of launch; attach to the named ctl session to read the error (the window stays open with the exit code)  |
 | `no run selected`                                                                   | `e` / `a` need a selected run — the project has no runs yet                                                                          |
+| `could not read past sweeps' decisions: <fault>`                                    | `d` could not read the missed decisions (DW-473) — fix the named config or ledger fault; `bmad-loop decisions` reports the same      |
 | `state for run <id> is unreadable`                                                  | corrupt/missing `state.json`; inspect the run dir                                                                                    |
 | `run <id> already finished`                                                         | finished runs can't be resumed                                                                                                       |
 | `nothing to attach: no live agent session … runs started outside the TUI have none` | between sessions there is no agent window, and shell-started runs have no ctl window; wait for the next session or attach manually   |

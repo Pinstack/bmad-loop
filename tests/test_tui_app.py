@@ -1437,6 +1437,29 @@ async def test_answer_decisions_none_notifies(project):
         await until(pilot, lambda: any("no unanswered decisions" in m for m in notifications(app)))
 
 
+async def test_answer_decisions_read_fault_toasts_the_fault_not_none(project):
+    """DW-473: with no loadable BMAD config nothing could be read, so `d` toasts the
+    fault as an error and never claims "no unanswered decisions"; the Deferred Work
+    badge says unreadable rather than showing no count.
+
+    Ablation: treat `missed.fault` as an empty answer in `action_answer_decisions`
+    and the "could not read" wait times out."""
+    app = BmadLoopApp(project.project)  # no install_bmad_config: config not found
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        deferred = dashboard(app).query_one("#deferred", OptionList)
+        await until(pilot, lambda: "decisions unreadable" in str(deferred.border_title))
+        await pilot.press("d")
+        await until(
+            pilot,
+            lambda: any(
+                "could not read past sweeps' decisions" in m and sev == "error"
+                for m, sev in notifications_with_severity(app)
+            ),
+        )
+        assert not any("no unanswered decisions" in m for m in notifications(app))
+
+
 # ------------------------------------- #275 modal bodies scroll, buttons stay
 
 
@@ -5755,6 +5778,65 @@ async def test_header_agent_line_shows_open_idle_stretch(project, monkeypatch):
         assert "idle" not in str(header.content)
         header.show_run("r1", data.RUNNING, state, agent=None)  # session-end
         assert "idle" not in str(header.content)
+
+
+async def test_header_marks_stale_state_unreadable_agent_and_read_faults(project):
+    """DW-472/474/475 at the header: a stale last-good state gets its own warning
+    line, a state never parsed names why, an unreadable agent says so instead of
+    falling back to the configured-agents line, and each read fault is listed.
+
+    Ablation: drop any one branch in `show_run` and its assertion reddens."""
+    state = RunState(
+        run_id="r1",
+        project=str(project.project),
+        started_at="now",
+        policy_snapshot={"adapter": {"name": "claude", "model": "opus"}},
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test():
+        header = dashboard(app).query_one("#runheader", RunHeader)
+
+        header.show_run("r1", data.RUNNING, state)
+        content = str(header.content)
+        assert "stale" not in content and "unreadable" not in content and "⚠" not in content
+
+        header.show_run("r1", data.RUNNING, state, state_fault="state.json unreadable (X: y)")
+        assert "⚠ state stale — state.json unreadable (X: y); showing the last good read" in str(
+            header.content
+        )
+
+        header.show_run("r1", data.UNKNOWN, None, state_fault="state.json unreadable (X: y)")
+        assert "state unavailable — state.json unreadable (X: y)" in str(header.content)
+
+        header.show_run("r1", data.RUNNING, state, agent=data.UnreadableAgent("bad entry"))
+        content = str(header.content)
+        assert "agent unreadable — bad entry" in content
+        assert "agents claude" not in content  # not the no-session fallback
+
+        header.show_run(
+            "r1",
+            data.RUNNING,
+            state,
+            read_faults=("journal.jsonl cannot be stat'd (E)", "ATTENTION unreadable (F)"),
+        )
+        content = str(header.content)
+        assert "⚠ journal.jsonl cannot be stat'd (E)" in content
+        assert "⚠ ATTENTION unreadable (F)" in content
+
+
+async def test_stale_state_reaches_the_dashboard_header(project):
+    # End to end (DW-472): a state.json that stops parsing flows RunWatcher ->
+    # snapshot -> header as a stale marker, while the last good read stays shown.
+    run_dir = make_run(project.project, "20260611-100000-aaaa", finished=True)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        screen = dashboard(app)
+        await until(pilot, lambda: screen.selected_run_id == "20260611-100000-aaaa")
+        header = screen.query_one("#runheader", RunHeader)
+        await until(pilot, lambda: "started 2026-06-11T10:00:00" in str(header.content))
+        (run_dir / "state.json").write_text("{ broken", encoding="utf-8")
+        await until(pilot, lambda: "⚠ state stale" in str(header.content))
+        assert "started 2026-06-11T10:00:00" in str(header.content)
 
 
 async def test_idle_run_shows_configured_agents_and_cell_falls_back(project, monkeypatch):

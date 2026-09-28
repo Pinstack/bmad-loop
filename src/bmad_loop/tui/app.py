@@ -391,11 +391,19 @@ class BmadLoopApp(App[None]):
         modal at a time. Each answer is recorded so the next sweep acts on it
         (build -> bundle, close -> closed, keep-open -> recorded) without asking
         again. No tmux/engine needed — this only edits the ledger and store."""
-        pending = data.pending_missed_decisions(self.project)
-        if not pending:
+        missed = data.pending_missed_decisions(self.project)
+        if missed.fault is not None:
+            # DW-473: nothing could be read, which is not "nothing is pending".
+            self.notify(
+                f"could not read past sweeps' decisions: {missed.fault}",
+                severity="error",
+                markup=False,
+            )
+            return
+        if not missed.items:
             self.notify("no unanswered decisions from past sweeps")
             return
-        self._walk_decisions(list(pending), 0, 0)
+        self._walk_decisions(list(missed.items), 0, 0)
 
     def _walk_decisions(self, pending: list, idx: int, answered: int) -> None:
         if idx >= len(pending):

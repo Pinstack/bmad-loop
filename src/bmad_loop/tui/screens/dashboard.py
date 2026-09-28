@@ -125,14 +125,17 @@ class _Snapshot:
     runs: list[data.RunInfo] | None = None  # None: no rescan this tick
     project_refreshed: bool = False  # sprint + deferred rescanned this tick
     missed_decisions: int = 0  # decisions past sweeps left unanswered
+    missed_decisions_fault: str | None = None  # why that count could not be read (DW-473)
     sprint: sprintstatus.SprintStatus | None = None
     deferred: list[data.DeferredItem] | None = None
     has_run: bool = False
     run_id: str = ""
     status: str = data.UNKNOWN
     stopping: bool = False  # selected run has a stop request pending, either mode (RUNNING only)
-    agent: data.ActiveAgent | None = None  # agent driving the selected run, live only
+    agent: data.ActiveAgent | data.UnreadableAgent | None = None  # live only
     state: RunState | None = None
+    state_fault: str | None = None  # the state shown is a stale last-good read (DW-472)
+    read_faults: tuple[str, ...] = ()  # run-dir files unreadable this tick (DW-475)
     stories_mode: bool = False  # selected run is stories mode (source == "stories")
     stories: list[stories.StoryRow] | None = None  # stories board rows, when stories_mode
     new_entries: list[dict[str, Any]] = field(default_factory=list)
@@ -143,6 +146,7 @@ class _Snapshot:
     log_pinned: bool = False
     log_altscreen: bool = False  # the capture entered a fullscreen (alt-screen) TUI
     log_transcript: str | None = None  # agent JSONL transcript, when an altscreen log has one
+    log_scan_fault: str | None = None  # the altscreen prefix scan could not read the log
     attention_reset: bool = False
     new_attention: str = ""
     toast_attention: bool = False
@@ -761,11 +765,14 @@ class DashboardScreen(Screen[None]):
                 snap.project_refreshed = True
                 snap.sprint = data.sprint_overview(self.project)
                 snap.deferred = data.deferred_entries(self.project)
-                snap.missed_decisions = len(data.pending_missed_decisions(self.project))
+                missed = data.pending_missed_decisions(self.project)
+                snap.missed_decisions = len(missed.items)
+                snap.missed_decisions_fault = missed.fault
             if ctx is not None:
                 snap.has_run = True
                 snap.run_id = ctx.run_dir.name
                 snap.state = ctx.watcher.state()
+                snap.state_fault = ctx.watcher.state_fault
                 snap.status = ctx.watcher.status()
                 # A pending stop is the control file's presence in either mode,
                 # meaningful while an engine is still around to consume it — RUNNING
@@ -808,7 +815,14 @@ class DashboardScreen(Screen[None]):
                     snap.log_altscreen = True
                     if snap.state is not None and task:
                         snap.log_transcript = _transcript_for_task(snap.state, task)
+                elif ctx.log is not None:
+                    snap.log_scan_fault = ctx.log.altscreen_scan_fault
                 attention = ctx.watcher.attention()
+                snap.read_faults = tuple(
+                    fault
+                    for fault in (ctx.journal.fault, ctx.watcher.attention_fault)
+                    if fault is not None
+                )
                 if len(attention) < ctx.attention_seen:
                     snap.attention_reset = True
                     snap.new_attention = attention
@@ -837,7 +851,7 @@ class DashboardScreen(Screen[None]):
         if snap.project_refreshed:
             self._apply_sprint_tree(snap.sprint)
             self._apply_deferred(snap.deferred)
-            self._apply_missed_decisions(snap.missed_decisions)
+            self._apply_missed_decisions(snap.missed_decisions, snap.missed_decisions_fault)
         if not snap.has_run or snap.generation != self._generation:
             return  # selection changed mid-poll: per-run parts are stale
 
@@ -855,10 +869,13 @@ class DashboardScreen(Screen[None]):
                 snap.decision,
                 stopping=snap.stopping,
                 agent=snap.agent,
+                state_fault=snap.state_fault,
+                read_faults=snap.read_faults,
             )
         self._apply_board(snap)
         if snap.state is not None:
-            self._apply_tasks(snap.state, snap.agent)
+            live = snap.agent if isinstance(snap.agent, data.ActiveAgent) else None
+            self._apply_tasks(snap.state, live)
         if snap.toast_decision and snap.decision is not None:
             self.notify(
                 snap.decision[1] or snap.decision[0],
@@ -905,6 +922,14 @@ class DashboardScreen(Screen[None]):
                 note = "⚠ fullscreen (alt-screen) session — this pane shows only the final frame"
                 if snap.log_transcript:
                     note += f"; full transcript: {snap.log_transcript}"
+                log.write(Text(note, style="yellow"), scroll_end=False)
+            elif snap.log_scan_fault:
+                # DW-475: the cold-open scan for a fullscreen switch could not read
+                # the log head, so "no warning above" is not "not fullscreen".
+                note = (
+                    "⚠ could not scan this log's head for a fullscreen switch"
+                    f" ({snap.log_scan_fault}) — this pane may show only the final frame"
+                )
                 log.write(Text(note, style="yellow"), scroll_end=False)
             if snap.log_lines is not None and snap.log_lines.plain:
                 log.write(snap.log_lines, scroll_end=at_end)
@@ -1064,8 +1089,12 @@ class DashboardScreen(Screen[None]):
             except OptionDoesNotExist:
                 pass
 
-    def _apply_missed_decisions(self, count: int) -> None:
+    def _apply_missed_decisions(self, count: int, fault: str | None = None) -> None:
         deferred = self.query_one("#deferred", OptionList)
+        if fault is not None:
+            # DW-473: a read that failed is not "0 to answer"; `d` names the fault.
+            deferred.border_title = "Deferred Work — decisions unreadable (d)"
+            return
         deferred.border_title = (
             f"Deferred Work — {count} to answer (d)" if count else "Deferred Work"
         )

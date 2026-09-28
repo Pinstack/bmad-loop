@@ -94,7 +94,8 @@ def test_pending_missed_decisions_reads_and_caches(project, monkeypatch):
     _write_triage_decision(run_dir)
 
     pending = data.pending_missed_decisions(project.project)
-    assert [d.id for d in pending] == ["DW-1"]
+    assert pending.fault is None
+    assert [d.id for d in pending.items] == ["DW-1"]
     # cached: same object back while ledger/store/run-set are unchanged
     assert data.pending_missed_decisions(project.project) is pending
 
@@ -119,7 +120,7 @@ def test_pending_missed_decisions_uses_loaded_project_root(project, monkeypatch)
 
     pending = data.pending_missed_decisions(original_spelling)
 
-    assert [decision.id for decision in pending] == ["DW-1"]
+    assert [decision.id for decision in pending.items] == ["DW-1"]
     assert data.pending_missed_decisions(original_spelling) is pending
     assert paths.project in data._missed_cache
     assert original_spelling not in data._missed_cache
@@ -142,7 +143,7 @@ def test_pending_missed_decisions_survives_an_undecodable_triage(project):
     bad = make_run(project.project, "20260102-000000-bbbb")
     (bad / "triage.json").write_bytes(b'{"workflow": "deferred-sweep-triage", "x": "\xff"}')
 
-    assert [d.id for d in data.pending_missed_decisions(project.project)] == ["DW-1"]
+    assert [d.id for d in data.pending_missed_decisions(project.project).items] == ["DW-1"]
 
 
 def test_pending_missed_decisions_survives_a_nested_null_triage(project):
@@ -181,11 +182,18 @@ def test_pending_missed_decisions_survives_a_nested_null_triage(project):
         encoding="utf-8",
     )
 
-    assert [d.id for d in data.pending_missed_decisions(project.project)] == ["DW-1"]
+    assert [d.id for d in data.pending_missed_decisions(project.project).items] == ["DW-1"]
 
 
-def test_pending_missed_decisions_empty_for_uninitialized(tmp_path):
-    assert data.pending_missed_decisions(tmp_path) == []
+def test_pending_missed_decisions_faults_for_uninitialized(tmp_path):
+    """DW-473: a project whose BMAD config cannot be loaded has no answer to give,
+    so the reader says so instead of answering "none pending".
+
+    Ablation: return `MissedDecisions([])` on the `_project_paths is None` arm and
+    this reddens on the fault assertion."""
+    missed = data.pending_missed_decisions(tmp_path)
+    assert missed.items == []
+    assert missed.fault is not None and "BMAD config not found" in missed.fault
 
 
 # ------------------------------------------------------------ no textual dep
@@ -1114,7 +1122,9 @@ def test_project_paths_degrades_and_recovers_from_root_resolve_refusal(project, 
         assert data._project_paths(root) is None
         assert data.sprint_overview(root) is None
         assert data.deferred_entries(root) is None
-        assert data.pending_missed_decisions(root) == []
+        missed = data.pending_missed_decisions(root)
+        assert missed.items == [] and missed.fault is not None
+        assert "cannot canonicalize" in missed.fault
         assert root not in data._paths_cache
 
     paths = data._project_paths(root)
@@ -1517,3 +1527,310 @@ def test_project_paths_invalidates_when_a_dangling_link_appears_at_an_absent_lay
     layer.symlink_to("missing.toml")
 
     assert data._project_paths(root) is None
+
+
+# ------------------------------------------- folded read faults (DW-472..475)
+
+
+def _refuse_stat(monkeypatch, target: Path) -> None:
+    """`target.stat()` raises EACCES; every other path stats normally."""
+    real = Path.stat
+
+    def fake(self, *args, **kwargs):
+        if self == target:
+            raise PermissionError(13, "stubbed: permission denied", str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", fake)
+
+
+def test_classified_sig_tells_absence_from_a_stat_fault(tmp_path, monkeypatch):
+    present = tmp_path / "f"
+    present.write_text("x")
+    assert data._classified_sig(present)[0] is not None
+    assert data._classified_sig(present)[1] is None
+    assert data._classified_sig(tmp_path / "missing") == (None, None)
+    assert data._classified_sig(present / "under-a-file") == (None, None)  # ENOTDIR
+    _refuse_stat(monkeypatch, present)
+    sig, fault = data._classified_sig(present)
+    assert sig is None and fault is not None and "PermissionError" in fault
+
+
+def test_watcher_flags_a_persisting_state_parse_fault(tmp_path):
+    """DW-472: the last good state survives a bad state.json, but once the SAME
+    signature has failed twice the watcher says the shown state is stale — and the
+    next good parse clears it. One failed look is forgiven (a torn read the next
+    write heals).
+
+    Ablation: drop `self.state_fault = why` in `_note_state_fault` and the second
+    look's assertion reddens."""
+    run_dir = make_run(tmp_path, "20260611-100000-aaaa", current_epic=1)
+    watcher = data.RunWatcher(run_dir)
+    assert watcher.state().current_epic == 1 and watcher.state_fault is None
+
+    (run_dir / "state.json").write_text("{ broken for good")
+    assert watcher.state().current_epic == 1
+    assert watcher.state_fault is None  # first failed look: maybe torn, not flagged
+    assert watcher.state().current_epic == 1  # still the last good...
+    assert watcher.state_fault is not None  # ...but now marked stale
+    assert "state.json unreadable" in watcher.state_fault
+    assert "JSONDecodeError" in watcher.state_fault
+
+    save_state(
+        run_dir,
+        RunState(run_id=run_dir.name, project=str(tmp_path), started_at="t", current_epic=2),
+    )
+    assert watcher.state().current_epic == 2
+    assert watcher.state_fault is None
+
+
+def test_watcher_forgives_a_torn_state_read_the_next_write_heals(tmp_path):
+    """A failure at one signature followed by a good write at a new one never flags:
+    the two-look rule compares signatures, not failure counts."""
+    run_dir = make_run(tmp_path, "20260611-100000-aaaa", current_epic=1)
+    watcher = data.RunWatcher(run_dir)
+    watcher.state()
+    (run_dir / "state.json").write_text("{ torn")
+    watcher.state()
+    save_state(
+        run_dir,
+        RunState(run_id=run_dir.name, project=str(tmp_path), started_at="t", current_epic=3),
+    )
+    assert watcher.state().current_epic == 3
+    assert watcher.state_fault is None
+
+
+def test_watcher_flags_state_json_gone_after_a_good_read(tmp_path):
+    run_dir = make_run(tmp_path, "20260611-100000-aaaa", current_epic=1)
+    watcher = data.RunWatcher(run_dir)
+    watcher.state()
+    (run_dir / "state.json").unlink()
+    watcher.state()
+    assert watcher.state().current_epic == 1
+    assert watcher.state_fault == "state.json is gone"
+
+
+def test_watcher_state_never_written_is_not_stale(tmp_path):
+    watcher = data.RunWatcher(tmp_path / "nope")
+    for _ in range(3):
+        assert watcher.state() is None
+    assert watcher.state_fault is None
+
+
+def test_watcher_state_fault_names_a_never_parsed_state(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "state.json").write_text("not json")
+    watcher = data.RunWatcher(run_dir)
+    watcher.state()
+    assert watcher.state() is None
+    assert watcher.state_fault is not None and "state.json unreadable" in watcher.state_fault
+
+
+def test_watcher_attention_flags_an_unreadable_file(tmp_path):
+    """DW-475: a read fault keeps the last text but is named in
+    `attention_fault`, cleared by the next good read; absence is no fault.
+
+    Ablation: drop the `attention_fault` assignment in the read arm and the
+    directory-case assertion reddens."""
+    run_dir = make_run(tmp_path, "20260611-100000-aaaa")
+    watcher = data.RunWatcher(run_dir)
+    assert watcher.attention() == "" and watcher.attention_fault is None
+
+    (run_dir / "ATTENTION").mkdir()  # stats fine, cannot be read as a file
+    assert watcher.attention() == ""
+    assert watcher.attention_fault is not None
+    assert "ATTENTION unreadable" in watcher.attention_fault
+
+    (run_dir / "ATTENTION").rmdir()
+    (run_dir / "ATTENTION").write_text("[ts] gate: epic boundary\n", encoding="utf-8")
+    assert watcher.attention() == "[ts] gate: epic boundary\n"
+    assert watcher.attention_fault is None
+
+
+def test_watcher_attention_undecodable_bytes_are_a_fault_not_a_crash(tmp_path):
+    run_dir = make_run(tmp_path, "20260611-100000-aaaa")
+    (run_dir / "ATTENTION").write_bytes(b"\xff\xfe not utf-8\n")
+    watcher = data.RunWatcher(run_dir)
+    assert watcher.attention() == ""
+    assert watcher.attention_fault is not None
+    assert "UnicodeDecodeError" in watcher.attention_fault
+
+
+def test_watcher_attention_stat_fault_keeps_text_and_flags(tmp_path, monkeypatch):
+    run_dir = make_run(tmp_path, "20260611-100000-aaaa")
+    (run_dir / "ATTENTION").write_text("[ts] one\n", encoding="utf-8")
+    watcher = data.RunWatcher(run_dir)
+    assert watcher.attention() == "[ts] one\n"
+    _refuse_stat(monkeypatch, run_dir / "ATTENTION")
+    assert watcher.attention() == "[ts] one\n"
+    assert watcher.attention_fault is not None and "cannot be stat'd" in watcher.attention_fault
+
+
+def test_journal_tail_stat_fault_keeps_the_offset(tmp_path, monkeypatch):
+    """DW-475: a stat FAULT is not absence — the offset survives it, so recovery
+    reads only what is new, and the fault is named until then.
+
+    Ablation: reset `_offset` on the fault arm and the post-recovery read returns
+    all three entries (re-delivering two), reddening the last assertion."""
+    journal = Journal(tmp_path)
+    journal.append("run-start")
+    journal.append("story-start", story="1-1-a")
+    tail = data.JournalTail(tmp_path)
+    assert len(tail.read_new()) == 2
+
+    with monkeypatch.context() as m:
+        _refuse_stat(m, tmp_path / "journal.jsonl")
+        assert tail.read_new() == []
+        assert tail.fault is not None and "journal.jsonl cannot be stat'd" in tail.fault
+
+    journal.append("story-done", story="1-1-a")
+    assert [e["kind"] for e in tail.read_new()] == ["story-done"]
+    assert tail.fault is None
+
+
+def test_journal_tail_open_fault_keeps_the_offset(tmp_path, monkeypatch):
+    journal = Journal(tmp_path)
+    journal.append("run-start")
+    tail = data.JournalTail(tmp_path)
+    assert len(tail.read_new()) == 1
+    journal.append("story-start", story="1-1-a")
+
+    real_open = Path.open
+
+    def refuse(self, *args, **kwargs):
+        if self == tmp_path / "journal.jsonl":
+            raise PermissionError(13, "stubbed: permission denied", str(self))
+        return real_open(self, *args, **kwargs)
+
+    with monkeypatch.context() as m:
+        m.setattr(Path, "open", refuse)
+        assert tail.read_new() == []
+        assert tail.fault is not None and "journal.jsonl unreadable" in tail.fault
+
+    assert [e["kind"] for e in tail.read_new()] == ["story-start"]
+    assert tail.fault is None
+
+
+def test_journal_tail_absence_still_resets_without_a_fault(tmp_path):
+    journal = Journal(tmp_path)
+    journal.append("run-start")
+    journal.append("story-start")
+    tail = data.JournalTail(tmp_path)
+    assert len(tail.read_new()) == 2
+    (tmp_path / "journal.jsonl").unlink()
+    assert tail.read_new() == []
+    assert tail.fault is None
+    Journal(tmp_path).append("run-resume")
+    assert [e["kind"] for e in tail.read_new()] == ["run-resume"]
+
+
+def test_log_view_prefix_scan_fault_is_flagged(tmp_path, monkeypatch):
+    """DW-475: a cold-open prefix scan that cannot read leaves `altscreen_seen`
+    False — which then means "not looked", so the fault is recorded for the pane.
+
+    Ablation: drop the `altscreen_scan_fault` assignment and this reddens."""
+    path = tmp_path / "task.log"
+    path.write_bytes(b"\x1b[?1049h" + b"filler\r\n" * 2000 + b"THE-END\r\n")
+    real_open = Path.open
+    calls = {"n": 0}
+
+    def fail_first(self, *args, **kwargs):
+        if self == path:
+            calls["n"] += 1
+            if calls["n"] == 1:  # the prefix scan opens first
+                raise PermissionError(13, "stubbed: permission denied", str(self))
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_first)
+    view = data.LogView(path, max_bytes=1024)
+    assert view.read_new() is True
+    assert view.altscreen_seen is False
+    assert view.altscreen_scan_fault is not None
+    assert "PermissionError" in view.altscreen_scan_fault
+
+
+def test_log_view_clean_scan_records_no_fault(tmp_path):
+    path = tmp_path / "task.log"
+    path.write_bytes(b"filler\r\n" * 2000)
+    view = data.LogView(path, max_bytes=1024)
+    assert view.read_new() is True
+    assert view.altscreen_scan_fault is None
+
+
+def test_active_agent_malformed_entry_is_unreadable_not_absent():
+    """DW-474: a malformed entry answers `UnreadableAgent` with the fault, never
+    `None` (which means no session is open).
+
+    Ablation: return None from the narrowed except arm and this reddens."""
+    agent = data.active_agent([_stamped_start(), None], None)  # type: ignore[list-item]
+    assert isinstance(agent, data.UnreadableAgent)
+    assert "AttributeError" in agent.error
+
+
+def test_active_agent_does_not_swallow_an_unexpected_exception(monkeypatch):
+    """DW-474: only the malformed-data faults are caught; a bug propagates.
+
+    Ablation: widen the except back to `Exception` and this reddens."""
+
+    def bug(*_args, **_kwargs):
+        raise RuntimeError("programming error")
+
+    monkeypatch.setattr(data, "_idle_since", bug)
+    with pytest.raises(RuntimeError, match="programming error"):
+        data.active_agent([_stamped_start()], None)
+
+
+def test_pending_missed_decisions_read_fault_is_named_and_not_cached(project, monkeypatch):
+    """DW-473: a raising read answers a fault, not an empty list, and is not
+    cached — the next call, with nothing on disk changed, reads for real.
+
+    Ablation: cache the fault result (or return it without `fault`) and one of the
+    two assertions reddens."""
+    from conftest import write_ledger
+
+    from bmad_loop import decisions
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _write_triage_decision(make_run(project.project, "20260101-000000-aaaa"))
+
+    with monkeypatch.context() as m:
+
+        def boom(_project):
+            raise PermissionError(13, "stubbed: permission denied")
+
+        m.setattr(decisions, "pending_missed_decisions", boom)
+        missed = data.pending_missed_decisions(project.project)
+        assert missed.items == []
+        assert missed.fault is not None and "PermissionError" in missed.fault
+
+    missed = data.pending_missed_decisions(project.project)
+    assert missed.fault is None
+    assert [d.id for d in missed.items] == ["DW-1"]
+
+
+def test_pending_missed_decisions_unreadable_ledger_is_a_fault(project):
+    """DW-473: `decisions.pending_missed_decisions` reads an undecodable ledger as
+    "no open ids" and answers []; the TUI reader probes the ledger the way
+    `cmd_decisions` does and names the fault instead.
+
+    Ablation: drop the `read_for_observation` probe and `fault` is None."""
+    from conftest import UNDECODABLE_LEDGER
+
+    install_bmad_config(project)
+    project.deferred_work.write_bytes(UNDECODABLE_LEDGER)
+    _write_triage_decision(make_run(project.project, "20260101-000000-aaaa"))
+    missed = data.pending_missed_decisions(project.project)
+    assert missed.items == []
+    assert missed.fault is not None and "deferred-work ledger unreadable" in missed.fault
+    assert "UnicodeDecodeError" in missed.fault
+
+
+def test_pending_missed_decisions_none_pending_is_an_answer(project):
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "done 2026-06-01"})
+    missed = data.pending_missed_decisions(project.project)
+    assert missed == data.MissedDecisions([])

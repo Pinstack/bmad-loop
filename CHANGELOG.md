@@ -209,6 +209,18 @@ breaking changes may land in a minor release.
   (not a regular file, a link, an OS fault, non-UTF-8 bytes, an unnameable state root),
   naming the path and fault. It still falls back to `state.json`; a missing file stays
   silent (DW-467).
+- Mark a stale run header in the TUI: once the same `state.json` fails to parse on two
+  polls (or goes away), `⚠ state stale — <fault>` shows under the last good read until
+  a good parse clears it (DW-472).
+- Tell unreadable missed decisions from none in the TUI: the Deferred Work badge reads
+  `decisions unreadable` and `d` toasts the fault (config, ledger, or read) instead of
+  "no unanswered decisions". Faults are no longer cached (DW-473).
+- Catch only malformed-data faults when deriving the TUI's live agent and show
+  `agent unreadable — <fault>` for them; other exceptions propagate (DW-474).
+- Flag the TUI's minor read folds: an unreadable `ATTENTION` or `journal.jsonl` gets a
+  header note, a journal stat/read fault keeps the tail offset, an undecodable
+  `ATTENTION` no longer escapes the poll, and a failed fullscreen prefix scan notes the
+  Log pane (DW-475).
 - Name an untracked ledger or board whose leaf symlink targets a file outside the project
   in `worktree-seed-dropped` (DW-432). The file is still not seeded; only the silent drop
   is gone.
