@@ -1182,6 +1182,11 @@ def cmd_mux(args: argparse.Namespace) -> int:
             # — nothing here sizes a column, and the diagnostic IS the payload.
             detail = " ".join(r.version_error.split())
             print(f"warning: {r.name} version probe failed: {detail}", file=sys.stderr)
+        # Same blindness one column over (DW-464): a PLATFORM or AVAILABLE of
+        # `no` that a raising probe forced, not the host's answer.
+        if r.probe_error:
+            detail = " ".join(r.probe_error.split())
+            print(f"warning: {r.name} backend probe failed: {detail}", file=sys.stderr)
     # A failed external package is invisible in the table (it never registered),
     # so name it here — the one place an operator looks when a backend is missing.
     for ep_name, reason in sorted(external_backend_errors().items()):

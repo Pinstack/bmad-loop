@@ -77,6 +77,9 @@ def fresh_registry(monkeypatch):
     m._EXTERNALS_LOADED = True
     m._EXTERNAL_ERRORS.clear()
     m.get_multiplexer.cache_clear()
+    # _usable's once-per-process probe-fault warnings (DW-464): a fresh set per
+    # test, so one test's warning never silences another's.
+    monkeypatch.setattr(m, "_PROBE_FAULTS_WARNED", set())
     yield m
     m._BACKENDS[:] = saved_backends
     m._BUILTINS_LOADED = saved_loaded
@@ -277,6 +280,37 @@ def test_raising_available_probe_reads_as_unavailable(fresh_registry):
     assert backend is ok and name == "ok"
 
 
+def test_raising_available_probe_warns_once_on_stderr(fresh_registry, capsys):
+    """The skip above is a fold, not the host's answer, so it says so (DW-464):
+    one stderr line naming the backend and the raise — and only once per
+    distinct fault, since the TUI's observers re-probe through `_usable` on every
+    poll. ABLATION: drop the print and the first assert fails; drop the
+    once-per-fault gate and the second does."""
+    fresh_registry._BUILTINS_LOADED = True
+    fresh_registry.register_multiplexer(
+        "broken", lambda p: p == sys.platform, lambda: _Stub(avail=RuntimeError("boom"))
+    )
+    fresh_registry.register_multiplexer("ok", lambda p: p == sys.platform, lambda: _Stub())
+    fresh_registry._select()
+    assert capsys.readouterr().err == (
+        "warning: multiplexer backend _Stub available() raised RuntimeError: boom; "
+        "reading it as unavailable\n"
+    )
+    fresh_registry._select()
+    assert fresh_registry._usable(_Stub(avail=RuntimeError("boom"))) is False
+    assert capsys.readouterr().err == ""
+    # a different fault on the same backend type is news, and is told
+    assert fresh_registry._usable(_Stub(avail=OSError("gone"))) is False
+    assert "available() raised OSError: gone" in capsys.readouterr().err
+
+
+def test_answering_available_probes_stay_silent(fresh_registry, capsys):
+    """The healthy half: True and False are both answers, and warn nothing."""
+    assert fresh_registry._usable(_Stub(avail=True)) is True
+    assert fresh_registry._usable(_Stub(avail=False)) is False
+    assert capsys.readouterr().err == ""
+
+
 def test_configure_multiplexer_clears_cache_only_on_change(fresh_registry):
     """Re-configuring the same value must keep the cached singleton identity;
     an actual change must invalidate it (mirrors register_multiplexer)."""
@@ -344,6 +378,62 @@ def test_detect_multiplexers_guards_broken_probes(fresh_registry):
     rows = {r.name: r for r in fresh_registry.detect_multiplexers()}
     assert rows["bare"].available is False and rows["bare"].version is None
     assert rows["raiser"].available is False
+    # ...but no longer an ordinary unavailable row (DW-464): the fault is named.
+    assert rows["raiser"].probe_error == "available() raised RuntimeError: boom"
+    assert rows["bare"].probe_error is not None
+    assert rows["bare"].probe_error.startswith("available() raised AttributeError: ")
+
+
+def test_detect_multiplexers_rows_carry_each_raising_probe(fresh_registry, capsys):
+    """Every probe the row loop folds keeps its identity (DW-464): a raising
+    platform predicate, factory or available() fills `probe_error` (joined when
+    several raise), and a raising version() fills `version_error`, whose "why is
+    there no version" question it answers. The loop's own probes read quietly —
+    the row IS the report. Only `_select`'s pass may warn, and a forced choice
+    keeps these backends off its path, so stderr stays empty.
+    ABLATION: drop any one `faults.append` (or the version_error assignment) and
+    its row assertion fails."""
+    fresh_registry._BUILTINS_LOADED = True
+
+    def bad_predicate(p):
+        raise ValueError("no such platform")
+
+    def bad_factory():
+        raise ImportError("half-installed")
+
+    fresh_registry.register_multiplexer("predicate", bad_predicate, lambda: _Stub(avail=True))
+    fresh_registry.register_multiplexer("factory", lambda p: False, bad_factory)
+    fresh_registry.register_multiplexer(
+        "both", bad_predicate, lambda: _Stub(avail=RuntimeError("boom"))
+    )
+    fresh_registry.register_multiplexer(
+        "verless", lambda p: False, lambda: _Stub(avail=True, version=RuntimeError("crash"))
+    )
+    fresh_registry.register_multiplexer("healthy", lambda p: False, lambda: _Stub(version="1"))
+    # _select runs every platform predicate; a raising one propagates from it
+    # (documented on detect_multiplexers), so force a selection that skips them.
+    fresh_registry.configure_multiplexer("healthy")
+    rows = {r.name: r for r in fresh_registry.detect_multiplexers()}
+    assert rows["predicate"].matches_platform is False
+    assert rows["predicate"].probe_error == "platform predicate raised ValueError: no such platform"
+    assert rows["factory"].available is False
+    assert rows["factory"].probe_error == "factory raised ImportError: half-installed"
+    assert rows["both"].probe_error == (
+        "platform predicate raised ValueError: no such platform; "
+        "available() raised RuntimeError: boom"
+    )
+    assert rows["verless"].available is True and rows["verless"].probe_error is None
+    assert rows["verless"].version is None
+    assert rows["verless"].version_error == "version() raised RuntimeError: crash"
+    assert rows["healthy"].probe_error is None and rows["healthy"].version_error is None
+    assert capsys.readouterr().err == ""
+
+
+def test_mux_backend_info_stays_positionally_constructible():
+    """probe_error is appended with a default, like version_error, so a
+    positional construction of the original six fields keeps working."""
+    row = m.MuxBackendInfo("tmux", True, True, "tmux 3.4", True, "platform-default")
+    assert row.version_error is None and row.probe_error is None
 
 
 def test_detect_multiplexers_version_crash_keeps_availability(fresh_registry):

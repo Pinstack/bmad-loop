@@ -3645,14 +3645,34 @@ def test_classify_env_fault_no_match_leaves_verdict(tmp_path):
     assert _lifecycle_lines(adapter, _ENV_FAULT_TASK) == []
 
 
-def test_classify_env_fault_missing_log_degrades_silently(tmp_path):
-    """No pane log at all (an OSError on read) → no classification, no crash,
-    no breadcrumb — the best-effort doctrine."""
+def test_classify_env_fault_missing_log_declines_with_a_crumb(tmp_path):
+    """No pane log at all (an OSError on read) → no classification, no crash —
+    the best-effort doctrine — but no longer silently (DW-460): the scan never
+    looked, so an outage in that log would read as an ordinary failure. An
+    `env-fault-scan-failed` crumb names the stage, the log and the error.
+    ABLATION: drop the crumb in the OSError arm and the event list is empty."""
     adapter = make_adapter(tmp_path)  # no log file written
     result = _classify(adapter, "timeout")
     assert result.env_fault is False
     assert result.env_fault_evidence is None
-    assert _lifecycle_lines(adapter, _ENV_FAULT_TASK) == []
+    events = _lifecycle_lines(adapter, _ENV_FAULT_TASK)
+    assert [e["event"] for e in events] == ["env-fault-scan-failed"]
+    assert events[0]["stage"] == "read"
+    assert events[0]["log"] == str(adapter.logs_dir / f"{_ENV_FAULT_TASK}.log")
+    assert events[0]["error"].startswith("FileNotFoundError: ")
+
+
+def test_classify_env_fault_unreadable_log_declines_with_a_crumb(tmp_path):
+    """Not only absence: any OSError on the tail read (here the log path is a
+    directory) declines the same way and crumbs its own error (DW-460)."""
+    adapter = make_adapter(tmp_path)
+    (adapter.logs_dir / f"{_ENV_FAULT_TASK}.log").mkdir()
+    result = _classify(adapter, "timeout")
+    assert result.env_fault is False and result.env_fault_evidence is None
+    events = _lifecycle_lines(adapter, _ENV_FAULT_TASK)
+    assert [e["event"] for e in events] == ["env-fault-scan-failed"]
+    assert events[0]["stage"] == "read"
+    assert events[0]["error"].split(":")[0] in {"IsADirectoryError", "PermissionError"}
 
 
 def test_classify_env_fault_last_match_wins_and_truncates(tmp_path):
@@ -4154,7 +4174,10 @@ def test_classify_env_fault_bounds_pathological_pattern(tmp_path, monkeypatch):
       passed with the timeout gate deleted outright. Here, any scan that is not cut
       short reaches ``!$``, matches, and reddens every assertion below — which is
       also what catches the patch being repointed at a non-authoritative module,
-      since the 2.0s default lets the backtracker run to completion."""
+      since the 2.0s default lets the backtracker run to completion.
+
+    The decline is crumbed (DW-460) with the pattern that ran away, so a
+    classification that never happened does not read as "no provider error"."""
     adapter = make_adapter(tmp_path)
     adapter._env_fault_patterns = (
         regex.compile(r"(a+)+$"),  # catastrophic backtracker, never matches
@@ -4166,7 +4189,11 @@ def test_classify_env_fault_bounds_pathological_pattern(tmp_path, monkeypatch):
     result = _classify(adapter, "timeout")
     assert time.monotonic() - start < 5  # bounded; did not hang on the runaway match
     assert result.env_fault is False and result.env_fault_evidence is None
-    assert _lifecycle_lines(adapter, _ENV_FAULT_TASK) == []
+    events = _lifecycle_lines(adapter, _ENV_FAULT_TASK)
+    assert [e["event"] for e in events] == ["env-fault-scan-failed"]
+    assert events[0]["stage"] == "match"
+    assert events[0]["pattern"] == r"(a+)+$"
+    assert events[0]["error"].startswith("TimeoutError: ")
 
 
 def test_wait_for_completion_tolerates_transient_liveness_probe_failure(tmp_path, monkeypatch):

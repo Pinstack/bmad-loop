@@ -12116,6 +12116,31 @@ def test_validate_json_mux_detail_keeps_the_rows_the_text_flattens(mux_registry,
     assert rows["beta"]["matches_platform"] is False and rows["beta"]["available"] is False
 
 
+def test_platform_preflight_names_a_raising_backend_probe(mux_registry):
+    """A lone backend whose available() raises gets no inventory (the listing is
+    gated on >1 backend), so the fault has its own warning finding, ungated
+    (DW-464) — and a healthy backend gets none. A warning, so the verdict holds.
+    ABLATION: drop the mux.backend-probe loop in platform_preflight and the
+    assertion fails."""
+    import sys as _sys
+
+    mux_registry.register_multiplexer("alpha", lambda p: p == _sys.platform, _RaisingAvailableMux)
+    found = cli._platform_preflight(Path("C:/p"))
+    probes = [f for f in found if f.check == "mux.backend-probe"]
+    assert [(f.severity, f.detail) for f in probes] == [
+        (
+            "warning",
+            {"backend": "alpha", "error": "available() raised RuntimeError: probe exploded"},
+        )
+    ]
+    assert "alpha probe failed: available() raised RuntimeError" in probes[0].message
+
+    mux_registry._BACKENDS.clear()
+    mux_registry.get_multiplexer.cache_clear()
+    mux_registry.register_multiplexer("alpha", lambda p: p == _sys.platform, _MuxStub)
+    assert not [f for f in cli._platform_preflight(Path("C:/p")) if f.check == "mux.backend-probe"]
+
+
 def test_platform_preflight_selection_detail_keeps_the_raw_reason(mux_registry, monkeypatch):
     """mux.selection's message renders _mux_reason_label's prose; the detail keeps the
     enum MuxBackendInfo.reason actually carries, which is the matchable value."""
@@ -12536,6 +12561,7 @@ def mux_registry(monkeypatch):
     m._BUILTINS_LOADED = True  # suppress the real tmux builtin
     m._CONFIGURED = None
     m.get_multiplexer.cache_clear()
+    monkeypatch.setattr(m, "_PROBE_FAULTS_WARNED", set())  # DW-464 warn-once state
     yield m
     m._BACKENDS[:] = saved_backends
     m._BUILTINS_LOADED = saved_loaded
@@ -12720,6 +12746,29 @@ def test_mux_warns_for_an_unavailable_backend_too(mux_registry, tmp_path, capsys
     assert cli.main(["mux", "--project", str(tmp_path)]) == 0
 
     assert "warning: alpha version probe failed: psmux -V failed" in capsys.readouterr().err
+
+
+class _RaisingAvailableMux(_MuxStub):
+    def available(self):
+        raise RuntimeError("probe exploded")
+
+
+def test_mux_names_a_raising_availability_probe(mux_registry, tmp_path, capsys):
+    """An AVAILABLE of `no` that a raising probe forced is a fold, not the host's
+    answer (DW-464): the row carries the fault and `mux` names it on stderr,
+    beside the version-probe diagnostic. ABLATION: drop the probe_error loop in
+    cmd_mux and the assertion fails."""
+    import sys as _sys
+
+    mux_registry.register_multiplexer("alpha", lambda p: p == _sys.platform, _RaisingAvailableMux)
+    mux_registry.register_multiplexer("beta", lambda p: p == _sys.platform, _MuxStub)
+    assert cli.main(["mux", "--project", str(tmp_path)]) == 0
+    err = capsys.readouterr().err
+    assert (
+        "warning: alpha backend probe failed: available() raised RuntimeError: probe exploded"
+        in err.splitlines()
+    )
+    assert "beta backend probe failed" not in err
 
 
 def test_mux_stays_silent_when_a_backend_simply_reports_no_version(mux_registry, tmp_path, capsys):

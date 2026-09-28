@@ -698,6 +698,20 @@ def platform_preflight(project: Path) -> list[Finding]:
                 },
             )
         )
+    # Not gated on the backend count like the listing above: an "(unavailable)"
+    # that a raising probe forced is a fold, not the host's answer, and a lone
+    # backend is the one an operator most needs told about (DW-464). A warning —
+    # selection already degraded past it, as for a failed external.
+    for i in infos:
+        if i.probe_error:
+            found.append(
+                Finding(
+                    "mux.backend-probe",
+                    "warning",
+                    f"mux backend {i.name} probe failed: {i.probe_error}",
+                    {"backend": i.name, "error": i.probe_error},
+                )
+            )
     chosen = next((i for i in infos if i.selected), None)
     if chosen:
         # Emitted for EVERY reason, not just the forced ones (#332): the reason that

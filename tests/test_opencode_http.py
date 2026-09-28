@@ -3898,11 +3898,28 @@ def test_opencode_env_fault_skips_completed_and_result_bearing(tmp_path):
     assert not (adapter.tasks_dir / _EF_TASK / "session-lifecycle.jsonl").exists()
 
 
-def test_opencode_env_fault_missing_log_degrades_silently(tmp_path):
-    """Best-effort doctrine: an unreadable log leaves the verdict untouched."""
+def test_opencode_env_fault_missing_log_declines_with_a_crumb(tmp_path):
+    """Best-effort doctrine: an unreadable log leaves the verdict untouched — and
+    says so (DW-460). This host reaches the crumb through the same
+    `_note_lifecycle` it inherits from `_ResultFileMixin`, and names the file it
+    actually scans (`.server.out`), not the transcript."""
     adapter = make_adapter(tmp_path)
     result = _ef_classify(adapter, "timeout", task_id="never-ran")
     assert result.env_fault is False
+    events = _lifecycle_lines(adapter, "never-ran")
+    assert [e["event"] for e in events] == ["env-fault-scan-failed"]
+    assert events[0]["stage"] == "read"
+    assert events[0]["log"] == str(adapter.logs_dir / "never-ran.server.out")
+    assert events[0]["error"].startswith("FileNotFoundError: ")
+
+
+def test_opencode_env_fault_clean_scan_leaves_no_crumb(tmp_path):
+    """The healthy half of DW-460: a readable log with no match is an answer, and
+    writes nothing."""
+    adapter = make_adapter(tmp_path)
+    _write_ef_log(adapter, "cleanup prune=7.days\n")
+    assert _ef_classify(adapter, "timeout").env_fault is False
+    assert _lifecycle_lines(adapter, _EF_TASK) == []
 
 
 def test_e2e_env_fault_classified_through_run(tmp_path, fake_opencode):

@@ -194,6 +194,15 @@ breaking changes may land in a minor release.
   unreadable or undecodable spec `unreadable-spec` (not `not-terminal` or `no-artifact`),
   with the error; a one-shot or dead-window read-back writes `spec-readback-failed`
   (`reason`, `spec`, `error`). Still no result (DW-457).
+- Crumb `env-fault-scan-failed` (`stage` `read`/`match`, `log`, `error`, and `pattern`
+  on a match timeout) when env-fault classification cannot read the session log or a
+  pattern times out. The verdict is still unclassified, but it no longer reads as a
+  scan that found no provider error (DW-460).
+- Name a multiplexer backend probe that raised instead of reading it as an ordinary
+  unavailable row. A raising `available()` warns once on stderr during selection. A
+  raising platform predicate, factory or `available()` fills the new
+  `MuxBackendInfo.probe_error`, which `mux` prints as a `warning:` and `validate` reports
+  as `mux.backend-probe`. A raising `version()` fills `version_error` (DW-464).
 - Warn when the tmux-family session listing fails for a reason other than no server
   running: on stderr, or as a warning toast from the TUI's `D`/`A` instead. It still
   reads as no sessions, so a `delete`/`archive`/`clean` past a live session is no

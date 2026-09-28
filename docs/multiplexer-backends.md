@@ -308,6 +308,12 @@ Two operational notes that apply to any external backend:
   import, selection proceeds without it; `bmad-loop mux` prints a
   `warning: external backend '<name>' failed to load: <reason>` line and `validate` notes
   the same. The fix is usually reinstalling or upgrading the adapter.
+- **A raising probe reads as unavailable, but says so.** When a backend's platform
+  predicate, factory or `available()` raises, selection skips it with a one-time
+  `warning:` on stderr, `bmad-loop mux` prints `warning: <name> backend probe failed:
+<error>`, and `validate` adds a `mux.backend-probe` warning. A `version()` that raises
+  is reported as a failed version probe. None of these reads the same as an
+  ordinary unavailable row (DW-464).
 - **`mux set --force` covers late registrations.** A backend that only registers on some
   other machine (where the package IS installed) can still be persisted in a shared
   workflow with `bmad-loop mux set <name> --force`.

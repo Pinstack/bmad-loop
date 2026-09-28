@@ -760,13 +760,40 @@ def _factory_by_name(name: str) -> Callable[[], TerminalMultiplexer] | None:
     return None
 
 
+def _raised(what: str, exc: BaseException) -> str:
+    # One wording for every probe fault this module folds, stderr and row alike.
+    return f"{what} raised {type(exc).__name__}: {exc}"
+
+
+def _probe_available(backend: TerminalMultiplexer) -> tuple[bool, str | None]:
+    """``available()`` read through a guard, keeping the fault it folds: the
+    verdict, and ``None`` or the raise that forced it to False."""
+    try:
+        return bool(backend.available()), None
+    except Exception as exc:
+        return False, _raised("available()", exc)
+
+
+_PROBE_FAULTS_WARNED: set[tuple[str, str]] = set()
+
+
 def _usable(backend: TerminalMultiplexer) -> bool:
     """``available()`` read through a guard: selection must never crash on a
-    backend's host probe, so a missing or raising probe reads as unavailable."""
-    try:
-        return bool(backend.available())
-    except Exception:
-        return False
+    backend's host probe, so a missing or raising probe reads as unavailable.
+
+    That False is a fold, not an answer, so it says so on stderr (DW-464) —
+    once per process per distinct fault, like :func:`mux_usable`'s warning:
+    the TUI's observers re-probe through here on every poll."""
+    usable, fault = _probe_available(backend)
+    if fault is not None:
+        key = (type(backend).__name__, fault)
+        if key not in _PROBE_FAULTS_WARNED:
+            _PROBE_FAULTS_WARNED.add(key)
+            print(
+                f"warning: multiplexer backend {key[0]} {fault}; reading it as unavailable",
+                file=sys.stderr,
+            )
+    return usable
 
 
 def backend_forced() -> bool:
@@ -909,6 +936,11 @@ class MuxBackendInfo:
     # present (TerminalMultiplexer.version_error). Defaulted so it is additive
     # for anyone constructing this row positionally.
     version_error: str | None = None
+    # Why ``matches_platform`` or ``available`` reads False when it is a fold,
+    # not an answer: the platform predicate, the factory or ``available()``
+    # raised (DW-464). ``"; "``-joined when more than one did. Appended with a
+    # default for the same reason as version_error.
+    probe_error: str | None = None
 
 
 def detect_multiplexers() -> list[MuxBackendInfo]:
@@ -918,7 +950,8 @@ def detect_multiplexers() -> list[MuxBackendInfo]:
     Every per-backend probe in the row loop is guarded — this feeds diagnostics,
     which must work on a misconfigured host: a forced unknown name yields rows
     with no selected mark, and a backend whose factory or probes blow up there
-    reads as unavailable. Two steps ahead of that loop are NOT fully guarded, so
+    reads as unavailable, naming the raise in ``probe_error`` (or, for
+    ``version()``, ``version_error``). Two steps ahead of that loop are NOT fully guarded, so
     this function can raise: the registry loads (a broken third-party entry point
     is recorded, not raised — :func:`_load_external_backends` — but a failed
     import of a bundled backend, i.e. a broken install, propagates), and the
@@ -938,26 +971,38 @@ def detect_multiplexers() -> list[MuxBackendInfo]:
         if name in seen:  # duplicate registrations: only the selectable (first) one is shown
             continue
         seen.add(name)
+        # A raising probe still reads False/None as before, but the row keeps
+        # its identity (DW-464) — the #428 blindness version_error fixed for
+        # version(), here for the probes that decide the other two columns.
+        faults: list[str] = []
         try:
             matches_platform = bool(matches(sys.platform))
-        except Exception:
+        except Exception as exc:
             matches_platform = False
+            faults.append(_raised("platform predicate", exc))
         version: str | None = None
         version_error: str | None = None
         try:
             backend = factory()
-            available = _usable(backend)
-        except Exception:
+        except Exception as exc:
             available = False
+            faults.append(_raised("factory", exc))
         else:
+            # The row carries this fault, so it takes the quiet probe, not
+            # _usable's stderr warning.
+            available, fault = _probe_available(backend)
+            if fault is not None:
+                faults.append(fault)
             # version() is cosmetic: its failure must not overwrite the
             # already-computed availability (a selected backend would
-            # otherwise show a contradictory available=False row).
+            # otherwise show a contradictory available=False row). It is
+            # named in version_error, whose question — why is there no
+            # version — a raise answers too.
             try:
                 version = fold_version(backend.version())
-            except Exception:
-                version = None
-            if version is None:
+            except Exception as exc:
+                version, version_error = None, _raised("version()", exc)
+            if version is None and version_error is None:
                 # Read only after version(), which is what it describes, and
                 # only when there is a None to explain. Guarded like every other
                 # probe in this loop — none of them may raise out of it.
@@ -975,6 +1020,7 @@ def detect_multiplexers() -> list[MuxBackendInfo]:
                 selected=selected,
                 reason=reason if selected else "",
                 version_error=version_error,
+                probe_error="; ".join(faults) or None,
             )
         )
     return rows

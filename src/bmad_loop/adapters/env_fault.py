@@ -187,9 +187,19 @@ class EnvFaultMixin:
         bound. Returns the ANSI-stripped matching line (last match winning, windowed
         to ``ENV_FAULT_EVIDENCE_MAX`` around the match), or None when nothing matches,
         the log can't be read (any ``OSError``), or a pattern exceeds the match timeout
-        (``TimeoutError``) — no classification, the best-effort doctrine."""
+        (``TimeoutError``) — no classification, the best-effort doctrine.
+
+        The last two Nones are folds, not answers: the scan never looked, so an
+        outage in that log reads as an ordinary failure and spends a dev attempt.
+        Each drops an ``env-fault-scan-failed`` lifecycle crumb (``stage`` =
+        ``read`` or ``match``, ``log``, ``error``; ``match`` adds ``pattern``) so
+        the post-mortem can tell "no provider error" from "never checked" (DW-460).
+        A MISSING log is a read fault too, not an answer: both hosts create it
+        before the session starts (the pane tee pre-touched, ``.server.out`` at
+        spawn), so its absence here means it went away."""
+        log_path = self._env_fault_log_path(task_id)
         try:
-            with self._env_fault_log_path(task_id).open("rb") as fh:
+            with log_path.open("rb") as fh:
                 fh.seek(0, 2)  # SEEK_END
                 size = fh.tell()
                 offset = max(0, size - ENV_FAULT_TAIL_BYTES)
@@ -205,7 +215,8 @@ class EnvFaultMixin:
                     fh.seek(0)
                     boundary = b"\n"  # not truncated: the window is the whole file
                 raw = fh.read()
-        except OSError:
+        except OSError as exc:
+            self._note_scan_failed(task_id, "read", log_path, exc)
             return None
         straddles = boundary not in (b"\n", b"\r")
         text = _ANSI_RE.sub("", raw.decode("utf-8", errors="replace").replace("\r", "\n"))
@@ -234,18 +245,37 @@ class EnvFaultMixin:
             lines = lines[1:]
         match_line: str | None = None
         match_pos = 0
-        try:
-            for line in lines:
-                for pat in self._env_fault_patterns:
+        for line in lines:
+            for pat in self._env_fault_patterns:
+                try:
                     hit = pat.search(line, timeout=ENV_FAULT_MATCH_TIMEOUT_S)
-                    if hit is not None:
-                        match_line, match_pos = line, hit.start()  # last match wins
-                        break
-        except TimeoutError:
-            return None  # runaway pattern → decline to classify (best-effort, like OSError)
+                except TimeoutError as exc:
+                    # runaway pattern → decline to classify (best-effort, like OSError)
+                    self._note_scan_failed(task_id, "match", log_path, exc, pattern=pat.pattern)
+                    return None
+                if hit is not None:
+                    match_line, match_pos = line, hit.start()  # last match wins
+                    break
         if match_line is None:
             return None
         return _excerpt(match_line, match_pos)
+
+    def _note_scan_failed(
+        self, task_id: str, stage: str, log_path: Path, exc: BaseException, **fields: object
+    ) -> None:
+        # Through the host's _note_lifecycle, the channel env-fault-classified
+        # already takes — every in-tree host (GenericAdapter, OpencodeHttpAdapter
+        # and their Dev subclasses) gets it from _ResultFileMixin, whose writer
+        # swallows its own I/O faults, so the crumb cannot turn a declined
+        # classification into a raise out of run() teardown.
+        self._note_lifecycle(
+            task_id,
+            "env-fault-scan-failed",
+            stage=stage,
+            log=str(log_path),
+            error=f"{type(exc).__name__}: {exc}",
+            **fields,
+        )
 
 
 def _excerpt(line: str, match_pos: int) -> str:

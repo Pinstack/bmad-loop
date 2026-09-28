@@ -81,6 +81,8 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "mux.backends-detected",
         "mux.selection",
         "mux.external-backend",
+        # a registered backend whose platform predicate, factory or available() raised (DW-464)
+        "mux.backend-probe",
         "host.process",
         "host.win32-on-wsl-path",
         "notify.desktop-unavailable",
