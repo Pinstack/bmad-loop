@@ -7,6 +7,8 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-09-28
+
 ### Added
 
 - Implement `[gates] retrospective = "auto"`: at each epic boundary, and at run end for
@@ -55,8 +57,8 @@ breaking changes may land in a minor release.
   `post_rollback` now fires once for every `pre_rollback`, also on a paused or failed
   rollback (DW-317, DW-322).
 - Add a free-form `effort` key to `[adapter]` and `[adapter.<stage>]`; `opencode-http`
-  sends it as the per-prompt `variant`, and `validate` warns
-  (`policy.effort-unsupported`) for tmux stages (#643).
+  sends it as the per-prompt `variant` (shown on the `run --dry-run` launch line), and
+  `validate` warns (`policy.effort-unsupported`) for tmux stages (#643).
 - Journal a session's idle stretches as `session-idle` / `session-active` (threshold
   `limits.dev_stall_grace_s`), with `transcript_idle_s` on `heartbeat.json` and the TUI
   agent line (#680).
@@ -104,8 +106,9 @@ breaking changes may land in a minor release.
 - Stop charging an attempt for a session that times out having consumed zero tokens (a
   provider quota stall): it is now an environment fault that pauses, and usage with no
   signal is journaled as untracked (`null`), not 0 (DW-364).
-- Count Copilot shutdown metrics and increased Codex output-token totals as work when a
-  dev session exits before the next transcript heartbeat (#822).
+- Count Copilot shutdown metrics, increased Codex output-token totals and new or changed
+  Gemini model messages as work when a dev session exits before the next transcript
+  heartbeat (#822).
 - Honor a hard `bmad-loop stop` inside verify commands and declarative plugin hooks, and
   kill the whole process tree (including descendants that outlive their shell) on stop or
   timeout; on Windows the post-kill drain no longer blocks on a held pipe (DW-353,
@@ -6372,7 +6375,8 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/bmad-code-org/bmad-loop/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/bmad-code-org/bmad-loop/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.13.0
 [0.12.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.12.0
 [0.11.1]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.11.1
 [0.11.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.11.0
