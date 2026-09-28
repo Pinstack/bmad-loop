@@ -98,8 +98,9 @@ def test_advance_never_regresses_done_into_awaiting_operator(tmp_path):
     board back to `awaiting-operator`. This is a real hardening, not a restatement
     — before the token joined STATUS_ORDER it was unordered, so the never-regress
     guard's `target in STATUS_ORDER` arm short-circuited and this write went
-    through. (Demoting a done story is Phase 4's `operator.on_review_demotion`
-    question, and it will need its own deliberate, allowlisted writer.)"""
+    through. (Demoting a done story is `operator.on_review_demotion`'s question,
+    DW-383: the same writer performs it only on explicit `allow_regression=True`
+    opt-in — see the allowlist tests below. Without the flag this stays refused.)"""
     p = _write(tmp_path)
     before = p.read_text()
 
@@ -107,6 +108,106 @@ def test_advance_never_regresses_done_into_awaiting_operator(tmp_path):
 
     assert out == "done"
     assert p.read_text() == before
+
+
+# ---------------------------------------------------------------------------
+# allow_regression — the one allowlisted never-regress exception (DW-383)
+
+
+def test_allowed_regression_demotes_done_to_awaiting_operator(tmp_path):
+    """The opt-in exception: `done -> awaiting-operator` is the one pair in
+    `statemachine.BOARD_REGRESSIONS`, so the sole writer performs it when asked.
+    Only the story's row changes — no epic touch, no `last_updated` without `now`.
+
+    Ablation: let the advisory probe short-circuit a regression the flag asked for
+    and this reddens (the call echoes `done` and writes nothing)."""
+    p = _write(tmp_path)
+    before = p.read_text()
+
+    out = sprintstatus.advance(p, "3-1-login", "awaiting-operator", allow_regression=True)
+
+    assert out == "awaiting-operator"
+    assert sprintstatus.story_status(p, "3-1-login") == "awaiting-operator"
+    assert p.read_text() == before.replace("3-1-login: done", "3-1-login: awaiting-operator")
+
+
+def test_allowed_regression_then_forward_restore_round_trips(tmp_path):
+    """The engine's failed-demotion unwind: re-advancing the demoted row to `done`
+    is an ordinary forward move and leaves the board byte-identical."""
+    p = _write(tmp_path)
+    before = p.read_text()
+    sprintstatus.advance(p, "3-1-login", "awaiting-operator", allow_regression=True)
+
+    assert sprintstatus.advance(p, "3-1-login", "done") == "done"
+    assert p.read_text() == before
+
+
+@pytest.mark.parametrize(
+    ("current", "target"),
+    [
+        (current, target)
+        for i, current in enumerate(sprintstatus.STATUS_ORDER)
+        for target in sprintstatus.STATUS_ORDER[:i]
+        if (current, target) != ("done", "awaiting-operator")
+    ],
+)
+def test_every_other_regression_raises_and_writes_nothing(tmp_path, current, target):
+    """Any regressing pair outside the allowlist is refused LOUDLY under the flag —
+    an `IllegalTransition`, not a silent never-regress echo — and nothing reaches
+    the disk. The raise must come from under the lock: the advisory probe swallows
+    every exception, so a check placed only there would decide nothing.
+
+    Ablation: widen `BOARD_REGRESSIONS` (or drop `check_board_regression`) and
+    these redden."""
+    from bmad_loop.statemachine import IllegalTransition
+
+    p = tmp_path / "sprint-status.yaml"
+    p.write_text(f"development_status:\n  epic-1: in-progress\n  1-1-a: {current}\n")
+    before = p.read_bytes()
+
+    with pytest.raises(IllegalTransition):
+        sprintstatus.advance(p, "1-1-a", target, allow_regression=True, now="02-06-2026 10:00")
+
+    assert p.read_bytes() == before
+
+
+def test_flag_on_forward_move_is_identical_to_flag_off(tmp_path):
+    flagged, plain = tmp_path / "a", tmp_path / "b"
+    flagged.mkdir()
+    plain.mkdir()
+    pf, pp = _write(flagged), _write(plain)
+
+    out_f = sprintstatus.advance(pf, "3-2-digest-delivery", "in-progress", allow_regression=True)
+    out_p = sprintstatus.advance(pp, "3-2-digest-delivery", "in-progress")
+
+    assert out_f == out_p == "in-progress"
+    assert pf.read_bytes() == pp.read_bytes()
+    assert sprintstatus.load(pf).epics[3] == "in-progress"  # epic lift still fires
+
+
+def test_flag_on_no_op_at_target_writes_nothing(tmp_path, monkeypatch):
+    """A row already AT the target is not a regression: the flag changes nothing,
+    and — like the flag-off call — the probe answers it without taking the lock."""
+    p = _write(tmp_path)
+    before = p.read_bytes()
+
+    def no_lock(path):  # pragma: no cover - reaching it is the failure
+        raise AssertionError("a no-op must not take the board lock")
+
+    monkeypatch.setattr(sprintstatus, "_board_lock", no_lock)
+
+    assert sprintstatus.advance(p, "3-1-login", "done", allow_regression=True) == "done"
+    assert p.read_bytes() == before
+
+
+def test_flag_off_still_refuses_the_allowlisted_pair_silently(tmp_path):
+    """The allowlist is opt-in per call: without the flag `done -> awaiting-operator`
+    is the ordinary never-regress echo — the current status back, no write, no raise."""
+    p = _write(tmp_path)
+    before = p.read_bytes()
+
+    assert sprintstatus.advance(p, "3-1-login", "awaiting-operator") == "done"
+    assert p.read_bytes() == before
 
 
 def test_advance_returns_current_when_line_not_rewritable(tmp_path):

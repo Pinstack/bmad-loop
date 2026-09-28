@@ -14,7 +14,15 @@ import os
 import sys
 
 import pytest
-from conftest import git, install_bmad_config, spec_path, write_spec, write_sprint
+from conftest import (
+    git,
+    install_bmad_config,
+    patch_publish_rename,
+    real_publish_rename,
+    spec_path,
+    write_spec,
+    write_sprint,
+)
 
 from bmad_loop import devcontract, operatoractions, platform_util, verify
 
@@ -178,19 +186,21 @@ def test_a_failed_record_write_leaves_no_tmp_residue(project, monkeypatch):
     `os.replace`, not `platform_util.atomic_replace`: the confined writer's
     anchored arm publishes with a bare dir_fd-relative `os.replace` and never
     reaches `atomic_replace` at all, so the old injection point would no longer
-    fire and this test would pass having faulted nothing. Filtered to the record's
-    own name so an unrelated replace during the test is not collateral.
+    fire and this test would pass having faulted nothing. Through
+    `patch_publish_rename`, which also covers the Windows anchored arm's
+    `win32_at.replace_at` for the same reason. Filtered to the record's own name
+    so an unrelated replace during the test is not collateral.
 
     Ablation: drop the `os.unlink(tmp, dir_fd=dir_fd)` in
     `platform_util._atomic_write_at`'s except arm and this fails."""
-    real_replace = os.replace
+    real_replace = real_publish_rename
 
     def boom(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
         if str(dst).endswith(".json"):
             raise OSError(28, "No space left on device")
         return real_replace(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
 
-    monkeypatch.setattr(os, "replace", boom)
+    patch_publish_rename(monkeypatch, boom)
     with pytest.raises(OSError):
         operatoractions.record_park(
             project.project,
@@ -332,7 +342,7 @@ def test_a_failed_legacy_prune_leaves_no_tmp_residue(project, monkeypatch):
 
     Ablation: drop the `os.unlink(tmp, dir_fd=dir_fd)` in
     `platform_util._atomic_write_at`'s except arm and this fails."""
-    real_replace = os.replace
+    real_replace = real_publish_rename
 
     def boom(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
         if str(dst).endswith(".json"):
@@ -345,7 +355,7 @@ def test_a_failed_legacy_prune_leaves_no_tmp_residue(project, monkeypatch):
     before = sorted(p.name for p in store.parent.iterdir())
     assert before == ["operator-actions.json"]  # a snapshot with something IN it
 
-    monkeypatch.setattr(os, "replace", boom)
+    patch_publish_rename(monkeypatch, boom)
     with pytest.raises(OSError):
         operatoractions.drop(project.project, "1-1-a")
 
@@ -761,16 +771,15 @@ def test_the_record_write_refuses_a_symlinked_bmad_loop(project, tmp_path):
     The assertions after the raise are the load-bearing half: refusing loudly is
     worth nothing if the write already landed outside the project, and
     `pytest.raises` alone passes just as happily on a raise that came AFTER the
-    escape. They are stated as "no record CONTENT escaped" rather than
-    "`outside/` is empty", because an empty `operator/` DOES land there — the
-    `mkdir` runs before the writer and is precisely the step #593 says a planted
-    parent survives. The confinement is what stops the bytes, and the bytes are
-    what a record is; an empty directory names no obligation and `load` reads it
-    as nothing.
+    escape. Until DW-497 an empty `operator/` still landed there — the by-path
+    `mkdir` ran before the writer — so `outside/` staying EMPTY is what pins the
+    confined `mkdir` (`platform_util.make_dirs_confined`).
 
     Ablation: revert `record_park` to
     `atomic_write_text(path, ..., follow_symlinks=False)` and this fails
-    `DID NOT RAISE`, with `1-1-a.json` sitting in `outside/operator/`."""
+    `DID NOT RAISE`, with `1-1-a.json` sitting in `outside/operator/`; revert only
+    the `make_dirs_confined` call to `path.parent.mkdir(parents=True,
+    exist_ok=True)` and `outside/operator/` reappears."""
     outside = tmp_path / "outside"
     outside.mkdir()
     (project.project / ".bmad-loop").symlink_to(outside, target_is_directory=True)
@@ -778,7 +787,7 @@ def test_the_record_write_refuses_a_symlinked_bmad_loop(project, tmp_path):
     with pytest.raises(platform_util.UnconfinedWriteError):
         _record_only(project)
 
-    assert [p.name for p in outside.iterdir()] == ["operator"]  # the mkdir, nothing more
+    assert list(outside.iterdir()) == []  # nothing — not even a directory — escaped
     assert list(outside.rglob("*.json")) == []  # no record escaped the project
     assert not list(outside.rglob("*.tmp"))  # nor a temp it was staged through
     assert operatoractions.load(project.project) == {}
@@ -927,3 +936,134 @@ def test_the_legacy_prune_refuses_a_readonly_store(project):
     assert store.read_bytes() == before  # the prune never landed
     assert sorted(operatoractions.load(project.project)) == ["1-1-a", "2-2-b"]
     assert [p.name for p in store.parent.iterdir()] == [store.name]  # no temp residue
+
+
+# --------------------------------------------- worktree-mount pin (DW-445)
+#
+# Under worktree isolation the engine's `record_park` project IS the unit mount and
+# passes its identity. The swap: the mount renamed aside and a link planted at its
+# name to an outside directory.
+
+requires_symlinked_mount_swap = pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES or sys.platform == "win32",
+    reason="dir-fd anchoring and POSIX symlinks",
+)
+
+
+def _swapped_mount(tmp_path):
+    """(mount, outside, the mount's accepted identity), the swap already made."""
+    mount = tmp_path / "project" / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    mount.mkdir(parents=True)
+    identity = os.lstat(mount)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    mount.rename(mount.with_name("1-aside"))
+    mount.symlink_to(outside, target_is_directory=True)
+    return mount, outside, identity
+
+
+def _park_into(project, **kw):
+    return operatoractions.record_park(
+        project,
+        "1-1-a",
+        actions=ACTIONS,
+        spec_file="spec.md",
+        run_id="run-1",
+        parked_at="2026-07-28",
+        **kw,
+    )
+
+
+@requires_symlinked_mount_swap
+def test_record_park_pinned_mount_refuses_a_mount_swapped_for_a_link(tmp_path):
+    """A pinned park write through a swapped mount refuses BEFORE its `mkdir`: no
+    record and no directories land under the link target. The unpinned control shows
+    the same swap really creates both outside.
+
+    Ablation: drop the `require_root_pinned` pre-check and the `.bmad-loop/` tree is
+    created outside before the (still pinned) write refuses with a different message
+    — the message match and the no-dirs assertion redden; drop both it and the
+    forward and the record lands outside."""
+    mount, outside, identity = _swapped_mount(tmp_path)
+
+    with pytest.raises(
+        platform_util.UnconfinedWriteError, match="no longer the directory it was pinned to"
+    ):
+        _park_into(mount, root_identity=identity)
+    assert list(outside.iterdir()) == []
+
+    _park_into(mount)  # control
+    assert operatoractions.record_path(outside, "1-1-a").is_file()
+
+
+@requires_symlinked_mount_swap
+def test_record_park_pinned_write_refuses_even_past_the_precheck(tmp_path, monkeypatch):
+    """The identity is also forwarded to the confined writer, so a swap landing
+    after the pre-check and the confined `mkdir` still refuses at the write.
+    Modelled by pre-creating the records dir outside and disarming both.
+
+    Ablation: drop the `root_identity=` forward to `atomic_write_text_confined` and
+    the record lands outside."""
+    mount, outside, identity = _swapped_mount(tmp_path)
+    operatoractions.record_path(outside, "1-1-a").parent.mkdir(parents=True)
+    monkeypatch.setattr(operatoractions, "require_root_pinned", lambda *a: None)
+    monkeypatch.setattr(operatoractions, "make_dirs_confined", lambda *a, **kw: None)
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        _park_into(mount, root_identity=identity)
+    assert not operatoractions.record_path(outside, "1-1-a").exists()
+
+
+@requires_symlinked_mount_swap
+def test_record_park_pinned_mkdir_refuses_a_mount_swapped_past_the_precheck(tmp_path, monkeypatch):
+    """The identity is forwarded to the confined `mkdir` too (DW-497): with the
+    pre-check disarmed, a swapped mount still gets no directory created outside.
+
+    Ablation: drop the `root_identity=` forward to `make_dirs_confined` and
+    `outside/.bmad-loop/operator/` is created before the write refuses."""
+    mount, outside, identity = _swapped_mount(tmp_path)
+    monkeypatch.setattr(operatoractions, "require_root_pinned", lambda *a: None)
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        _park_into(mount, root_identity=identity)
+    assert list(outside.iterdir()) == []
+
+
+@requires_symlinked_mount_swap
+@pytest.mark.parametrize("link_at", [".bmad-loop", ".bmad-loop/operator"])
+@pytest.mark.parametrize("pinned", [True, False], ids=["pinned", "unpinned"])
+def test_record_park_refuses_a_link_below_the_mount(tmp_path, link_at, pinned):
+    """DW-497: a link planted BELOW an intact mount — at `.bmad-loop/` or
+    `.bmad-loop/operator/` — refuses the park, pinned or not, and leaves the link's
+    target exactly as it was: no directory created, no record written, the
+    same-named record already there untouched. The root pin cannot see this — the
+    mount itself is intact — so the refusal is the confined walk's.
+
+    Ablation: revert `record_park`'s `make_dirs_confined` call to
+    `path.parent.mkdir(parents=True, exist_ok=True)` and the `.bmad-loop` rows grow
+    an `operator/` directory outside (the `.bmad-loop/operator` rows already refuse
+    at the write, whose confinement is #593's)."""
+    mount = tmp_path / "mount"
+    (mount / link_at).parent.mkdir(parents=True, exist_ok=True)
+    identity = os.lstat(mount)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "elsewhere.json"
+    victim.write_text("not the park's", encoding="utf-8")
+    (mount / link_at).symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        _park_into(mount, root_identity=identity if pinned else None)
+
+    assert sorted(p.name for p in outside.iterdir()) == ["elsewhere.json"]
+    assert victim.read_text(encoding="utf-8") == "not the park's"
+
+
+def test_record_park_pinned_intact_mount_writes(tmp_path):
+    """An intact mount's own identity binds nothing extra: the record lands."""
+    mount = tmp_path / "mount"
+    mount.mkdir()
+
+    path = _park_into(mount, root_identity=os.lstat(mount))
+
+    assert json.loads(path.read_text(encoding="utf-8"))["story_key"] == "1-1-a"

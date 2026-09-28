@@ -67,9 +67,8 @@ class ProcessHost(ABC):
     def hook_interpreter(self) -> str:
         """The command prefix that runs a bmad-loop python hook script on this
         host, interpolated into the hook registrations `install`/`probe` write
-        (the script path + canonical event are appended by the caller). POSIX runs
-        the ``python3`` on PATH; a Windows host overrides it (no ``python3`` there)
-        so hook registration never branches on ``sys.platform`` at the call site."""
+        (the script path + canonical event are appended by the caller). The
+        prefix is an absolute interpreter path, quoted for the host shell."""
 
     def alive_and_ours(self, pid: int, identity: float | None) -> bool:
         """Identity-aware liveness: True only when ``pid`` is alive **and** still the
@@ -134,6 +133,17 @@ class ProcessHost(ABC):
         (POSIX quoting mangles ``C:\\Program Files\\...`` paths)."""
         return shlex.quote(arg)
 
+    def unsafe_shell_chars(self, path: str) -> tuple[str, ...]:
+        """Shell metacharacters in ``path`` that :meth:`shell_quote` leaves exposed
+        to the hook shell — sorted and deduplicated, ``()`` when the quoted path is
+        safe. Advisory only (DW-346): ``init`` and ``validate`` warn on a non-empty
+        result; nothing refuses. Not abstract: the default is ``()`` because
+        ``shlex.quote`` single-quotes any argument containing an sh metacharacter,
+        and nothing expands inside POSIX single quotes. A Windows host overrides it,
+        since its double-quoting is conditional and leaves expanders live."""
+        del path
+        return ()
+
 
 class PosixProcessHost(ProcessHost):
     """Linux/macOS/WSL: ``os.kill`` for signalling and the read-only existence
@@ -184,7 +194,27 @@ class PosixProcessHost(ProcessHost):
         return super().descendants(pid)  # macOS: psutil, guarded by the seam's never-raise
 
     def hook_interpreter(self) -> str:
-        return "python3"
+        return self.shell_quote(str(Path(sys.executable).absolute()))
+
+
+# DW-346: characters a Windows hook shell may act on in a registered path. The
+# three shells a hook runner may use are cmd.exe, Git Bash (sh) and PowerShell;
+# which one a given coding CLI actually uses was never measured, so the sets are
+# the union. Inside list2cmdline's double quotes only expanders stay live:
+#   %  cmd.exe variable expansion (%VAR%)
+#   !  cmd.exe delayed expansion (!VAR!, when enabled)
+#   $  sh and PowerShell variable/subexpression expansion
+#   `  sh command substitution; PowerShell escape character
+_WINDOWS_IN_QUOTE_EXPANDERS = frozenset("%!$`")
+# Unquoted (no whitespace in the path, so list2cmdline adds no quotes) the
+# separators and redirections are live too:
+#   & | < >  cmd.exe/sh command separators and redirection (& and | in PowerShell)
+#   ^        cmd.exe escape character
+#   ( )      sh subshell / PowerShell grouping; cmd.exe inside a block
+#   ;        sh and PowerShell statement separator
+#   '        sh and PowerShell quoting
+#   { } ,    sh brace expansion (`a{b,c}` becomes two words); PowerShell script block
+_WINDOWS_BARE_METACHARS = _WINDOWS_IN_QUOTE_EXPANDERS | frozenset("&|<>^();'{},")
 
 
 class WindowsProcessHost(ProcessHost):
@@ -221,14 +251,35 @@ class WindowsProcessHost(ProcessHost):
             return None
 
     def hook_interpreter(self) -> str:
-        # Windows ships no `python3` launcher; `uv run --no-project python` resolves
-        # an interpreter without activating a project venv (hooks fire detached).
-        return "uv run --no-project python"
+        return self.shell_quote(str(Path(sys.executable).absolute()))
 
     def shell_quote(self, arg: str) -> str:
-        # POSIX single-quoting breaks Windows paths; list2cmdline is the stdlib's
-        # Windows argument quoter (the inverse of how CreateProcess parses argv).
-        return subprocess.list2cmdline([arg])
+        # Hook runners hand these commands to a shell, not CreateProcess: Claude
+        # Code uses Git Bash on Windows (PowerShell without it), and Git Bash eats
+        # an unquoted backslash — `C:\Users\me\bmad-loop.exe` runs as
+        # `C:Usersmebmad-loop.exe` and every session stalls to timeout (#773). So
+        # separators become forward slashes, which Windows and Python accept and
+        # sh, PowerShell and cmd.exe pass through unchanged; list2cmdline then
+        # double-quotes a path with spaces as before. Every caller passes a path
+        # (interpreter, relay executable, hook script), so no backslash here is an
+        # escape. Known gap: on the PowerShell fallback a double-quoted executable
+        # followed by arguments is a parse error without `&` (which would break
+        # sh), so paths WITH spaces stay unsupported there. Claude's exec-form
+        # `args` would avoid shells entirely but is Claude-only and changes the
+        # registered JSON shape older versions mis-run. A second known gap (DW-346):
+        # list2cmdline double-quotes only on whitespace, so a metacharacter in an
+        # unspaced path stays bare and one inside quotes may still expand —
+        # `unsafe_shell_chars` below names them, and `init`/`validate` warn
+        # (`hooks.relay-path-unsafe`) instead of changing what gets registered.
+        return subprocess.list2cmdline([arg.replace("\\", "/")])
+
+    def unsafe_shell_chars(self, path: str) -> tuple[str, ...]:
+        quoted = self.shell_quote(path)
+        if len(quoted) >= 2 and quoted.startswith('"') and quoted.endswith('"'):
+            live = _WINDOWS_IN_QUOTE_EXPANDERS
+        else:
+            live = _WINDOWS_BARE_METACHARS
+        return tuple(sorted({ch for ch in quoted if ch in live}))
 
 
 def _proc_starttime(pid: int) -> float | None:

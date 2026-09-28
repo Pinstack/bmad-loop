@@ -170,7 +170,7 @@ def _fake_script(scripts_dir, name, rc):
     (scripts_dir / name).write_text(f"import sys\nsys.exit({rc})\n", encoding="utf-8")
 
 
-def _ctx(stage, scripts_dir, *, agents=()):
+def _ctx(stage, scripts_dir, *, agents=(), **fields):
     return HookContext(
         stage,
         run_id="r",
@@ -179,6 +179,7 @@ def _ctx(stage, scripts_dir, *, agents=()):
         run_dir=str(scripts_dir),
         worktree=str(scripts_dir),
         agents=tuple(agents),
+        **fields,
     )
 
 
@@ -253,6 +254,25 @@ def test_rollback_hooks_run_quiesce_with_phase_and_timeout(tmp_path, monkeypatch
     ]
 
 
+@pytest.mark.parametrize("outcome", ["paused", "failed"])
+def test_post_rollback_quiesces_after_an_unfinished_rollback(tmp_path, monkeypatch, outcome):
+    """DW-322: post_rollback also fires after a paused/failed rollback; the Unity
+    hook tolerates that context and still runs the post quiesce (re-import)."""
+    inst = _make_unity({}, tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        inst,
+        "_run_script",
+        lambda name, ctx, *, timeout, extra_env=None: (
+            calls.append((name, ctx.rollback_outcome, extra_env)) or (0, "")
+        ),
+    )
+    ctx = _ctx("post_rollback", tmp_path, rollback_outcome=outcome)
+    inst.on_post_rollback(ctx)
+    assert calls == [("unity_quiesce.py", outcome, {"BMAD_LOOP_QUIESCE_PHASE": "post"})]
+    assert not ctx.vetoed
+
+
 def test_rollback_hooks_skipped_when_disabled(tmp_path, monkeypatch):
     inst = _make_unity({"quiesce_on_rollback": False}, tmp_path)
     calls = []
@@ -301,6 +321,19 @@ def test_run_script_merges_extra_env(tmp_path):
     assert rc == 0 and out == "pre"
     # base engine_env is unchanged: without extra_env the var is absent
     assert "BMAD_LOOP_QUIESCE_PHASE" not in inst.engine_env(_ctx("pre_rollback", tmp_path))
+
+
+def test_run_script_helper_output_round_trips_non_ascii(tmp_path, monkeypatch):
+    """The helper's stdio is pinned to utf-8 to match the parent's decode, so its
+    non-ASCII diagnostics survive even when the inherited env names a legacy
+    codepage (cp932 stands in for a Japanese Windows locale)."""
+    monkeypatch.setenv("PYTHONIOENCODING", "cp932")
+    (tmp_path / "echo_jp.py").write_text(
+        "import sys\nsys.stderr.write('エディタ準備完了')\n", encoding="utf-8"
+    )
+    inst = _make_unity({}, tmp_path)
+    rc, out = inst._run_script("echo_jp.py", _ctx("pre_rollback", tmp_path), timeout=30)
+    assert rc == 0 and out == "エディタ準備完了"
 
 
 # ------------------------------------------------------ UnityPlugin env contract
@@ -942,6 +975,20 @@ def test_unity_ready_not_ready_when_tool_never_answers(tmp_path, monkeypatch):
     assert mod._ready_ivanmurzak(time.monotonic() + 0.2) == 1
 
 
+def test_unity_ready_tolerates_undecodable_cli_output(tmp_path, monkeypatch):
+    """A CLI emitting bytes that are not valid UTF-8 (cp932-encoded text, as on a
+    Japanese Windows locale) degrades to U+FFFD instead of raising
+    UnicodeDecodeError out of the strict decode."""
+    mod = _load_unity_ready()
+    payload = "エディタ準備完了".encode("cp932")  # 0x83 lead bytes: invalid UTF-8
+    body = f"import sys\nsys.stdout.buffer.write({payload!r})\nsys.stdout.flush()\n"
+    script = write_script_launcher(tmp_path, "fake-unity-mcp-cli", body)
+    monkeypatch.setenv("BMAD_LOOP_WORKTREE", str(tmp_path))
+    rc, out = mod._wait_for_ready(str(script), 10.0)
+    assert rc == 0
+    assert "\ufffd" in out
+
+
 # ------------------------------------------ unity_setup custom/local-mode launch
 
 
@@ -992,6 +1039,15 @@ def test_unity_setup_local_url_missing_returns_none(tmp_path, monkeypatch):
     mod = _load_unity_setup()
     _clear_setup_knobs(monkeypatch)
     assert mod._local_url(tmp_path) is None  # no .mcp.json, no override
+
+
+def test_unity_setup_setup_mcp_unlaunchable_cli_returns_nonzero(tmp_path, capsys):
+    """An unlaunchable CLI fails setup-mcp with a non-zero rc and a stderr line,
+    not an OSError traceback out of the hook."""
+    mod = _load_unity_setup()
+    missing = str(tmp_path / "no-such-unity-mcp-cli")
+    assert mod._run_setup_mcp(missing, "claude-code", tmp_path) == 1
+    assert "setup-mcp claude-code could not run" in capsys.readouterr().err
 
 
 def test_unity_setup_open_command_local_defaults(tmp_path, monkeypatch):

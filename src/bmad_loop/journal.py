@@ -13,13 +13,19 @@ from typing import Any
 
 from .model import RunState
 from .platform_util import (
+    AT_DIRECTORY,
+    AT_NOFOLLOW,
     DIR_FD_ANCHORED_WRITES,
+    RootIdentityRecord,
     atomic_replace,
     atomic_write_text,
     atomic_write_text_at,
     file_lock,
     is_link_like,
+    open_at,
     open_dir_confined,
+    recorded_root_identity,
+    require_root_pinned,
 )
 
 STATE_FILE = "state.json"
@@ -81,6 +87,48 @@ TASK_CYCLE_ARTIFACTS: tuple[str, ...] = ("result.json", "escalation.json")
 # name; neither restates the pair.
 SELF_MINTED_FIELDS: frozenset[str] = frozenset({"log_task", "log_pos"})
 
+# The one kind in this file NO producer writes: both journal readers mint it in place
+# of a line they could not JSON-decode, so a lost record is counted and rendered
+# instead of vanishing under a bare ``continue``.
+#
+# Spelled here, next to ``SELF_MINTED_FIELDS`` and for the same reason: two readers
+# (``Journal.entries`` and ``tui.data.JournalTail.read_new``) need exactly one shape,
+# and a second copy is how they drift. ``tui.widgets.journal_line`` imports the constant
+# too and matches it by EQUALITY, so the styling rule cannot outlive a rename and cannot
+# leak red onto a producer kind that merely contains this spelling.
+#
+# NOT a ``tests/test_portability_guard.py`` ``JOURNAL_KINDS`` row, deliberately: that
+# inventory is scanned from the literal kinds passed to ``Journal.append``, so a
+# reader-minted kind would sit there as a row nothing writes and redden
+# ``test_journal_kind_inventory_is_complete``'s staleness arm.
+UNREADABLE_LINE_KIND = "journal-line-unreadable"
+
+
+def unreadable_line_entry(byte_len: int) -> dict[str, Any]:
+    """One unreadable journal line, reported in the stream position it occupied.
+
+    Deliberately one line, not one record: a marker stands for a LINE the reader could
+    not decode, and how many records that line cost is unknowable from the line alone.
+    A torn record that its own next append healed costs one; a line written before this
+    heal existed — or one a rival appender tore inside :meth:`Journal.append`'s
+    probe-to-write window — can be two records concatenated into a single unparseable
+    line. The ``bytes`` count is what is actually known.
+
+    Deliberately minimal. No ``ts``: ``diagnostics.summarize_journal`` derives
+    ``first_ts``/``last_ts``/``duration_s`` from entry timestamps, so a fabricated one
+    would corrupt them, and the true write time of an unparseable line is unknowable
+    (a ``ts``-less entry is simply skipped for those). No content from the offending
+    line, which can carry session text — a bounded byte count only. No line number:
+    ``entries()`` counts from the file and ``JournalTail`` from its chunk, so the same
+    field would mean two different things; the list position already carries it.
+
+    A plain ``dict``, so it survives ``runs.journal_entries_or_none``'s
+    ``isinstance(e, dict)`` filter and keeps that reader's ``len(before)`` watermark
+    exact across two reads of an unchanged file.
+    """
+    return {"kind": UNREADABLE_LINE_KIND, "bytes": byte_len}
+
+
 _STATE_LOCK_LOCAL = threading.local()
 
 
@@ -100,7 +148,78 @@ class Journal:
         self._log_task = task_id
         self._log_path = self.run_dir / LOGS_DIR / f"{task_id}.log"
 
+    def _tail_is_terminated(self) -> bool:
+        """Whether the journal's last byte is a newline — an absent or zero-length
+        file counts as terminated (there is no fragment to close).
+
+        Read in ``"rb"`` and closed before the append opens the file, mirroring
+        ``install.py``'s read-then-write: ``"ab+"`` would put a read and a write on
+        one handle, which CPython only defines with an intervening seek/flush.
+
+        The two error directions are deliberately NOT the same, because their costs
+        are not symmetric. ``FileNotFoundError`` is the only one that justifies
+        ``True``: no file means no fragment, and healing it would put a leading blank
+        line in every fresh journal. Every OTHER ``OSError`` — a transient EACCES or
+        EMFILE, or the Windows sharing violation ``atomic_replace`` already retries
+        for — leaves a file that EXISTS and whose tail is unknown. Answering "already
+        terminated" there skips the heal, and if that tail is a fragment the next
+        append concatenates onto it: the exact two-record loss this method exists to
+        prevent, reintroduced on the unlucky path. Answering "unterminated" costs at
+        worst one blank line, which both readers skip. So the unknown case fails
+        toward the heal. Neither arm raises: a writer that is only trying to record
+        must not be taken down by a probe.
+        """
+        try:
+            with self.path.open("rb") as f:
+                f.seek(0, os.SEEK_END)
+                if f.tell() == 0:
+                    return True
+                f.seek(-1, os.SEEK_END)
+                return f.read(1) == b"\n"
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+
     def append(self, kind: str, **fields: Any) -> None:
+        """Append one record, healing an unterminated tail first.
+
+        The fault this closes (DW-97) costs TWO records, not one. This is the only
+        writer in this module without a durable path — ``save_state`` uses
+        ``atomic_replace``, ``write_verify_stream`` uses ``atomic_write_text`` — so a
+        partially flushed write leaves a fragment with no trailing newline. Without
+        the heal the NEXT append concatenates its own record onto that fragment, and
+        both readers then drop the combined line: one fault, two lost records, and one
+        of them may be an ``unit-merged`` that
+        ``engine._replay_unlatched_ledger_carries`` needs to avoid re-driving merged
+        work. Prepending the newline keeps the damage to the one record that was
+        actually torn.
+
+        Not routed through ``atomic_write_text``/``atomic_replace``: those rewrite the
+        whole target, and this journal is append-only and grows for a whole run, so an
+        "atomic append" would re-copy the entire file per record. The heal is the
+        in-repo precedent at ``install.py``'s exclude-file writer
+        (``existing if not existing or existing.endswith(b"\\n") else existing + b"\\n"``)
+        applied at O(1) cost.
+
+        Text mode stays, deliberately. Windows translates the ``"\\n"`` to ``"\\r\\n"``
+        on the way out, which both readers already tolerate (``splitlines`` +
+        ``strip``) and which leaves the file's LAST byte a newline either way, so the
+        probe above stays correct without a mode change no other line here needs.
+
+        The read-then-append window is racy, and the heal BOUNDS the loss rather than
+        eliminating it — do not read it as a guarantee. POSIX ``O_APPEND`` (and
+        Windows' append mode) places every write at the current end, so a rival
+        appender cannot interleave INTO this record; but it can tear its own write
+        inside the window, after the probe has already answered "terminated". That
+        leaves a fresh fragment this append then concatenates onto, and the two-record
+        loss recurs for that one pair. A rival that completes its line in the window
+        is harmless: the tail stays terminated and the prepended newline, if any, is a
+        blank line both readers skip. Closing the race needs a lock, which is
+        deliberately out of scope here (as is fsync): this defect is the SEQUENTIAL
+        concatenation — one writer's own torn record absorbing its own next one —
+        which the probe closes completely.
+        """
         entry = {"ts": time.time(), "kind": kind, **fields}
         if self._log_path is not None:
             try:
@@ -109,10 +228,15 @@ class Journal:
                 size = 0  # pipe-pane has not created the file yet
             entry.setdefault("log_task", self._log_task)
             entry.setdefault("log_pos", size)
+        text = json.dumps(entry, default=str) + "\n"
+        if not self._tail_is_terminated():
+            text = "\n" + text
         with self.path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, default=str) + "\n")
+            f.write(text)
 
-    def write_verify_stream(self, name: str, content: str) -> str:
+    def write_verify_stream(
+        self, name: str, content: str, *, run_dir_identity: RootIdentityRecord | None
+    ) -> str:
         """Atomically retain one verifier subprocess stream under ``verify/`` and
         return its run-relative pointer.  The journal records the pointer and byte
         counts, never unbounded subprocess output inline.
@@ -169,9 +293,9 @@ class Journal:
         never names a path again.  A path check would be answered *about a path*
         and stale the moment it returned — the session can re-plant the link
         between check and write — so this closes the window rather than narrowing
-        it.  The ``mkdir`` above may still be fooled; that is harmless, because the
-        confinement walk that follows is not, and refusal is what the fooled case
-        produces.
+        it.  ``verify/`` is created relative to the pinned run-dir descriptor, so a
+        planted link there makes the ``mkdir`` answer ``FileExistsError`` and the
+        ``O_NOFOLLOW`` open that follows refuses it.
 
         win32 has no ``*at()`` family to anchor against, so it keeps a
         check-then-write, and the check is :func:`is_link_like` rather than
@@ -185,41 +309,97 @@ class Journal:
         as this writer and the names here are engine-minted, so the exposure is a
         redirected diagnostic rather than a foothold.
 
+        The run dir itself is PINNED to its MINT-TIME identity (DW-338, DW-446):
+        ``run_dir_identity`` is ``RunState.run_dir_identity``, the ``(st_dev,
+        st_ino)`` the composer recorded when it claimed the directory. A fresh
+        ``lstat`` would refuse a link only at the run dir itself; ``runs/`` (or
+        the run dir) swapped for a link to a tree holding a real ``<id>/`` would
+        answer the outside directory, and every record would land there. On the
+        dir-fd arm the run dir is OPENED first and its ``fstat`` compared against
+        the record, before ``verify/`` is created — relative to that descriptor —
+        so a swapped run dir gets no ``verify/`` in its target, and ``verify/``
+        is then walked ``O_NOFOLLOW`` from the same descriptor. The win32 arm
+        re-``lstat``s the run dir against the record before its ``mkdir`` and
+        again before the write (check-then-write, beside its
+        :func:`is_link_like` checks). A missing record (``None``: a pre-upgrade
+        state not yet backfilled, a zero-inode claim) refuses outright — it never
+        degrades to an unpinned open. That is no change on the dir-fd arm (a zero
+        inode never matched), but the win32 arm, which before DW-446 wrote through
+        a zero-inode run dir, now REFUSES it (accepted 2026-09-27): a refusal, not a
+        degrade, surfaced by the caller as the verify record's ``capture_error``.
+        Trust-on-first-use: the record is what sat at the run dir when it was
+        minted; only a locked resume/re-arm (``runs.reconcile_root_identities``)
+        backfills a missing one or re-binds an ``st_dev`` a reboot renumbered.
+
         Raises ``OSError`` — including when confinement cannot be established, so
         an unconfined ``verify/`` REFUSES rather than writing through the link.
         The caller degrades (this is observation), it does not swallow it here:
         the record still lands, with a null pointer and ``capture_error``.
         """
         verify_dir = self.run_dir / VERIFY_DIR
-        verify_dir.mkdir(parents=True, exist_ok=True)
+        root_identity = recorded_root_identity(run_dir_identity)
+        # Pin (or refuse) the run dir BEFORE the mkdir: a swapped run dir must not
+        # get a `verify/` created in its target ahead of the refusal.
         if DIR_FD_ANCHORED_WRITES:
-            dir_fd = open_dir_confined(self.run_dir, verify_dir)
-            if dir_fd is None:
+            run_fd = open_dir_confined(self.run_dir, self.run_dir, root_identity=root_identity)
+            if run_fd is None:
                 raise OSError(
                     f"refusing to write into an unconfined verify directory: {verify_dir}"
                 )
+            try:
+                try:
+                    os.mkdir(VERIFY_DIR, 0o777, dir_fd=run_fd)
+                except FileExistsError:
+                    pass  # an existing entry — the O_NOFOLLOW open below vets it
+                try:
+                    dir_fd = open_at(run_fd, VERIFY_DIR, os.O_RDONLY | AT_DIRECTORY | AT_NOFOLLOW)
+                except OSError as e:
+                    raise OSError(
+                        f"refusing to write into an unconfined verify directory: {verify_dir}"
+                    ) from e
+            finally:
+                os.close(run_fd)
             try:
                 atomic_write_text_at(dir_fd, name, content)
             finally:
                 os.close(dir_fd)
         else:
-            if is_link_like(verify_dir):
+            require_root_pinned(self.run_dir, root_identity)
+            if is_link_like(self.run_dir):
+                raise OSError(f"refusing to write into a redirected verify directory: {verify_dir}")
+            verify_dir.mkdir(parents=True, exist_ok=True)
+            require_root_pinned(self.run_dir, root_identity)
+            if is_link_like(self.run_dir) or is_link_like(verify_dir):
                 raise OSError(f"refusing to write into a redirected verify directory: {verify_dir}")
             atomic_write_text(verify_dir / name, content, follow_symlinks=False)
         return (verify_dir / name).relative_to(self.run_dir).as_posix()
 
     def entries(self) -> list[dict[str, Any]]:
+        """Every record in the journal, with an unparseable line reported rather than
+        skipped: :func:`unreadable_line_entry` takes its place at the same stream
+        position, so a lost record is counted on the surfaces that read this list
+        instead of vanishing silently.
+
+        Blank lines are still skipped — a blank line lost no record, and the heal in
+        :meth:`append` can introduce one. Invalid UTF-8 still raises out of
+        ``read_text``: ``runs.journal_entries_or_none`` catches ``UnicodeDecodeError``
+        deliberately, so widening this to swallow it would take away a caller's ability
+        to tell a corrupt journal from an empty one. Only ``JSONDecodeError`` becomes a
+        marker.
+        """
         if not self.path.is_file():
             return []
-        out = []
-        for line in self.path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
+        out: list[dict[str, Any]] = []
+        for raw_line in self.path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
             if not line:
                 continue
             try:
                 out.append(json.loads(line))
             except json.JSONDecodeError:
-                continue
+                # The raw line's own byte length, not the stripped spelling's: the
+                # count reports what sits in the file.
+                out.append(unreadable_line_entry(len(raw_line.encode("utf-8"))))
         return out
 
 

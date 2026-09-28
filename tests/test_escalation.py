@@ -1,16 +1,25 @@
 """Unit tests for the dev/review retry-budget decisions — specifically the
 resolved-escalation guard that re-escalates instead of silently deferring."""
 
+import os
+
+import pytest
+
+from bmad_loop import escalation
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.escalation import (
+    CRITICAL_DISPLAY_MAX,
     Action,
     critical_escalations,
+    critical_session_reason,
     decide_dev,
     decide_review_session,
+    display_critical_reason,
+    display_pause_reason,
     preference_escalations,
     review_retry_or_exhaust,
 )
-from bmad_loop.model import StoryTask
+from bmad_loop.model import PAUSE_ESCALATION, PAUSE_STORY_GATE, RunState, StoryTask
 from bmad_loop.policy import LimitsPolicy, NotifyPolicy, Policy, ReviewPolicy
 from bmad_loop.verify import VerifyOutcome
 
@@ -41,6 +50,83 @@ def test_escalation_selectors_reject_every_non_list_shape():
         result = {"escalations": value}
         assert critical_escalations(result) == []
         assert preference_escalations(result) == []
+
+
+def test_escalation_selectors_absorb_a_non_mapping_document():
+    """The row above varies the `escalations` VALUE; this one varies the whole
+    document through direct helper calls (DW-181). The sweep lanes call the
+    critical selector before their validators, but the earlier engine
+    dereference prevents malformed session documents from reaching them.
+
+    ABLATION: restore `if not result_json` in `_escalation_list` and every
+    truthy row here raises `AttributeError` instead of returning `[]` -- the
+    empty list alone would pass for any reason a value could be absent, so the
+    mapping control below pins that the widened guard still lets a real
+    document through to its partition."""
+    for document in (None, {}, [], "", 0, False, ["nope"], "escalations", 7):
+        assert critical_escalations(document) == []
+        assert preference_escalations(document) == []
+
+    critical = {"severity": "CRITICAL", "detail": "stop"}
+    preference = {"severity": "PREFERENCE", "detail": "note"}
+    control = {"escalations": [critical, preference]}
+
+    assert critical_escalations(control) == [critical]
+    assert preference_escalations(control) == [preference]
+
+
+@pytest.mark.parametrize("role", ["dev", "review", "fix", "migration", "triage"])
+def test_every_critical_session_role_uses_the_shared_lossless_formatter(role):
+    detail = "begin\n" + "x" * 2500 + "TAIL"
+    reason = critical_session_reason(
+        role,
+        {"escalations": [{"severity": "CRITICAL", "detail": detail}]},
+    )
+    assert reason == f"CRITICAL escalation from {role} session: {detail}"
+    assert reason.endswith("TAIL")
+
+
+def test_critical_display_bound_marks_spec_or_journal_without_touching_short_text():
+    exact = "x" * CRITICAL_DISPLAY_MAX
+    assert display_critical_reason(exact) == exact
+    assert "truncated" not in display_critical_reason(exact)
+
+    with_spec = display_critical_reason(exact + "TAIL", "/tmp/spec.md")
+    without_spec = display_critical_reason(exact + "TAIL")
+    assert len(with_spec) <= CRITICAL_DISPLAY_MAX
+    assert "[… truncated; full detail in journal.jsonl]" in with_spec
+    assert "[recovery trail: /tmp/spec.md]" in with_spec
+    assert len(without_spec) <= CRITICAL_DISPLAY_MAX
+    assert "[… truncated; full detail in journal.jsonl]" in without_spec
+    assert "TAIL" not in with_spec
+
+
+def test_critical_display_preserves_source_spelling_and_compacts_an_overlong_source():
+    spaced = "/tmp/spec.md "
+    assert display_critical_reason("short", spaced) == f"short [recovery trail: {spaced}]"
+
+    source = "/root/" + "middle/" * 300 + "spec.md"
+    displayed = display_critical_reason("R" * 3000, source)
+    assert len(displayed) <= CRITICAL_DISPLAY_MAX
+    assert "R" * 1000 in displayed
+    assert "full detail in journal.jsonl" in displayed
+    assert "recovery trail: /root/" in displayed
+    assert displayed.endswith("spec.md]")
+    assert source not in displayed
+
+
+def test_decide_review_session_calls_the_shared_critical_formatter(monkeypatch):
+    calls = []
+
+    def shared(role, result_json):
+        calls.append((role, result_json))
+        return "shared review reason"
+
+    monkeypatch.setattr(escalation, "critical_session_reason", shared)
+    result = SessionResult(status="completed", result_json={"escalations": []})
+    decision = escalation.decide_review_session(_task(), result, POLICY)
+    assert calls == [("review", result.result_json)]
+    assert decision == escalation.Decision(Action.PAUSE, "shared review reason")
 
 
 def _task(**kw) -> StoryTask:
@@ -106,6 +192,152 @@ def test_dev_env_fault_session_pauses_even_when_budget_exhausted():
     decision = decide_dev(task, env_fault, None, POLICY)
     assert decision.action == Action.PAUSE
     assert "environment fault" in decision.reason
+
+
+def test_dev_no_work_session_pauses_even_with_budget_left():
+    """A dev session with no qualifying work evidence (#727), such as a CLI
+    parked on a permission dialog,
+    PAUSEs for a human instead of RETRYing into the identical wall. The reason
+    names the measurement, not the verdict alone.
+
+    ABLATION: delete the `produced_work` arm in `decide_dev` and this RETRYs."""
+    task = _task(attempt=1)  # 1 < 2 -> budget remains
+    parked = SessionResult(status="stalled", produced_work=False)
+    decision = decide_dev(task, parked, None, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("no work produced: dev session stalled")
+    assert "no completed turn or qualifying activity was observed" in decision.reason
+    assert "permission prompt" in decision.reason
+    assert "the attempt is not charged" in decision.reason
+
+
+def test_dev_no_work_session_pauses_even_when_budget_exhausted():
+    """The no-work pause outranks budget exhaustion like the env-fault pause does:
+    a spent budget must not file a CLI waiting on a human as deferred work."""
+    task = _task(attempt=2)  # 2 == max_dev_attempts -> budget spent
+    parked = SessionResult(status="crashed", produced_work=False)
+    decision = decide_dev(task, parked, None, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("no work produced: dev session crashed")
+
+
+def test_dev_produced_work_default_keeps_todays_routing():
+    """`produced_work` defaults True — "unknown never blocks" — so every positional
+    construction (the engine's hand-built results, opencode-http, every fixture)
+    keeps RETRY-with-budget / DEFER-without. Pinned on both arms so the default
+    cannot silently flip."""
+    plain = SessionResult(status="timeout")
+    assert plain.produced_work is True
+    assert decide_dev(_task(attempt=1), plain, None, POLICY).action == Action.RETRY
+    assert decide_dev(_task(attempt=2), plain, None, POLICY).action == Action.DEFER
+    assert "no work produced" not in decide_dev(_task(attempt=1), plain, None, POLICY).reason
+
+
+def test_dev_env_fault_outranks_no_work():
+    """Both flags set: the env-fault arm is checked first, so the reason blames
+    the transport, not the silence — a lost API connection explains a still
+    pane better than the still pane explains itself."""
+    task = _task(attempt=1)
+    both = SessionResult(
+        status="timeout",
+        env_fault=True,
+        env_fault_evidence="API Error: ETIMEDOUT",
+        produced_work=False,
+    )
+    decision = decide_dev(task, both, None, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("environment fault: dev session timeout")
+    assert "no work produced" not in decision.reason
+
+
+def test_no_work_reason_keeps_the_lost_session_suffix():
+    """#727 x #489: the no-work reason is composed over `session_failure_reason`,
+    so a session the multiplexer destroyed before it painted a second frame
+    carries both facts instead of one cancelling the other."""
+    task = _task(attempt=1)
+    both = SessionResult(status="crashed", session_vanished=True, produced_work=False)
+    decision = decide_dev(task, both, None, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("no work produced: dev session crashed:")
+    assert "multiplexer no longer reports the session" in decision.reason
+    # the review decider does not carry the arm (a named follow-up, not this wave)
+    review = decide_review_session(task, both, POLICY)
+    assert "no work produced" not in review.reason
+
+
+_PARKED_EVIDENCE = "Notification(permission_prompt) -> PermissionPrompt"
+
+
+@pytest.mark.parametrize("attempt", [1, 2])  # budget left, then spent
+def test_dev_parked_session_pauses_whatever_the_budget(attempt):
+    """DW-348/DW-350: a session the adapter ended parked (the CLI was waiting on a
+    human, so the stall nudge was withheld) PAUSEs instead of RETRYing into the
+    same prompt — with budget left, and ahead of exhaustion.
+
+    ABLATION: delete the `parked` arm in `decide_dev` and the budget-left row
+    RETRYs, the spent row DEFERs."""
+    parked = SessionResult(status="stalled", parked=True, parked_evidence=_PARKED_EVIDENCE)
+    decision = decide_dev(_task(attempt=attempt), parked, None, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("parked: dev session stalled (")
+    assert _PARKED_EVIDENCE in decision.reason
+    assert "the stall nudge was withheld" in decision.reason
+
+
+def test_dev_env_fault_outranks_parked():
+    both = SessionResult(
+        status="stalled",
+        env_fault=True,
+        env_fault_evidence="API Error: ETIMEDOUT",
+        parked=True,
+        parked_evidence=_PARKED_EVIDENCE,
+    )
+    decision = decide_dev(_task(attempt=1), both, None, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("environment fault: dev session stalled")
+
+
+def test_dev_parked_outranks_no_work():
+    """A named prompt explains the silence better than the silence does: the
+    parked arm is tested before the #727 `produced_work=False` arm."""
+    both = SessionResult(
+        status="stalled", parked=True, parked_evidence=_PARKED_EVIDENCE, produced_work=False
+    )
+    decision = decide_dev(_task(attempt=1), both, None, POLICY)
+    assert decision.reason.startswith("parked: dev session stalled")
+    assert "no work produced" not in decision.reason
+
+
+def test_parked_reason_keeps_the_lost_session_suffix_and_has_a_fallback():
+    """Composed over `session_failure_reason` (#489), and never an empty
+    parenthetical when the adapter kept no evidence string."""
+    result = SessionResult(status="stalled", parked=True)
+    assert escalation.parked_pause_reason("fix", result) == (
+        "parked: fix session stalled (parked-session signal; the CLI was waiting on "
+        "a human — the stall nudge was withheld so it could not answer the prompt)"
+    )
+    vanished = SessionResult(status="crashed", parked=True, session_vanished=True)
+    assert "multiplexer no longer reports the session" in escalation.parked_pause_reason(
+        "dev", vanished
+    )
+
+
+def test_review_parked_session_pauses_instead_of_charging_a_cycle():
+    """ABLATION: delete the `parked` arm in `decide_review_session` and this
+    RETRYs a review cycle."""
+    parked = SessionResult(status="stalled", parked=True, parked_evidence=_PARKED_EVIDENCE)
+    decision = decide_review_session(_task(attempt=1), parked, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("parked: review session stalled")
+
+
+def test_review_env_fault_outranks_parked():
+    both = SessionResult(
+        status="stalled", env_fault=True, parked=True, parked_evidence=_PARKED_EVIDENCE
+    )
+    decision = decide_review_session(_task(attempt=1), both, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("environment fault: review session stalled")
 
 
 def test_dev_plain_noncompleted_still_retries_with_budget():
@@ -280,3 +512,56 @@ def test_review_retry_or_exhaust_helper_matches_budget_semantics():
     assert review_retry_or_exhaust(_task(review_cycle=2), POLICY, "r").action == Action.DEFER
     latched = review_retry_or_exhaust(_task(review_cycle=2, resolved_redrive=True), POLICY, "r")
     assert latched.action == Action.PAUSE
+
+
+# ------------------------------------------ pause reasons shaped at display (DW-491)
+
+# A multi-line reason carrying an ESC byte, e.g. a `({error})` a RunPaused builder
+# interpolated raw: displayed, its second line must not land as a loose line.
+_MULTILINE_REASON = "ledger refused (fatal: x\x1b[31m\nhint: y)"
+_SHAPED_REASON = "ledger refused (fatal: x\\x1b[31m ⏎ hint: y)"
+
+
+def _paused_state(reason: str, stage: str, task: StoryTask | None = None) -> RunState:
+    state = RunState(run_id="r1", project="/p", started_at="now")
+    state.paused_reason = reason
+    state.paused_stage = stage
+    if task is not None:
+        state.tasks[task.story_key] = task
+        state.paused_story_key = task.story_key
+    return state
+
+
+@pytest.mark.parametrize("stage", [PAUSE_STORY_GATE, PAUSE_ESCALATION])
+def test_display_pause_reason_shapes_an_esc_and_newline_reason(stage):
+    """`display_pause_reason` folds a reason's line breaks into `` ⏎ `` segments and
+    escapes its control characters, so `status` and the TUI print one line; the
+    persisted reason stays raw (DW-491).
+
+    Ablation: drop the `notice_line` around the reason and the raw ESC and line
+    break come back."""
+    state = _paused_state(_MULTILINE_REASON, stage)
+
+    assert display_pause_reason(state) == _SHAPED_REASON
+    assert state.paused_reason == _MULTILINE_REASON
+
+
+def test_display_pause_reason_shapes_the_recovery_trail():
+    """The escalation recovery trail is a path, shaped like the reason (DW-491).
+
+    Ablation: drop the `notice_line` around the source and the raw line break
+    lands in the trail."""
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file="/p/spec\nx\x1b.md")
+    state = _paused_state("CRITICAL escalation from dev session: d", PAUSE_ESCALATION, task)
+
+    # `task_spec_path` renders the trail with the platform separator.
+    trail = f"{os.sep}p{os.sep}spec ⏎ x\\x1b.md"
+    assert display_pause_reason(state) == (
+        f"CRITICAL escalation from dev session: d [recovery trail: {trail}]"
+    )
+
+
+@pytest.mark.parametrize("stage", [PAUSE_STORY_GATE, PAUSE_ESCALATION])
+def test_display_pause_reason_keeps_a_plain_reason_unchanged(stage):
+    reason = "CRITICAL escalation from dev session: needs a human — resolve it"
+    assert display_pause_reason(_paused_state(reason, stage)) == reason

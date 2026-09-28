@@ -63,6 +63,25 @@ def test_writes_event_file(tmp_path):
     assert not list((tmp_path / "events").glob("*.tmp"))
 
 
+def test_notification_payload_carries_its_subtype(tmp_path):
+    """DW-348: a claude Notification's `notification_type` rides the event file,
+    so the adapter can tell a permission prompt from an auth success."""
+    env = {"BMAD_LOOP_RUN_DIR": str(tmp_path), "BMAD_LOOP_TASK_ID": "t1"}
+    proc = run_hook(
+        "Notification",
+        env,
+        {"session_id": "s1", "notification_type": "permission_prompt", "message": "Allow?"},
+    )
+    assert proc.returncode == 0
+    event = json.loads(next((tmp_path / "events").glob("*.json")).read_text())
+    assert event["event"] == "Notification"
+    assert event["notification_type"] == "permission_prompt"
+    # every other event carries the key as null
+    assert run_hook("Stop", env, {"session_id": "s1"}).returncode == 0
+    stop = next(f for f in (tmp_path / "events").glob("*-Stop.json"))
+    assert json.loads(stop.read_text())["notification_type"] is None
+
+
 def test_conversation_id_fallback(tmp_path):
     """Cursor-style payloads carry conversation_id instead of session_id."""
     env = {"BMAD_LOOP_RUN_DIR": str(tmp_path), "BMAD_LOOP_TASK_ID": "t1"}
@@ -410,9 +429,27 @@ def test_a_symlinked_env_directed_events_dir_writes_nothing_and_exits_zero(tmp_p
     assert not (run_dir / "events").exists()
 
 
-def test_installed_copy_matches_source(tmp_path):
+def test_installed_command_writes_without_workspace_script(tmp_path):
     from bmad_loop.install import install_into
 
-    install_into(tmp_path)
-    installed = (tmp_path / ".bmad-loop" / "bmad_loop_hook.py").read_text()
-    assert installed == SCRIPT.read_text()
+    assert install_into(tmp_path, skills=False) == 0
+    assert not (tmp_path / ".bmad-loop" / "bmad_loop_hook.py").exists()
+    config = json.loads((tmp_path / ".claude/settings.json").read_text())
+    command = config["hooks"]["Stop"][0]["hooks"][0]["command"]
+    proc = subprocess.run(
+        command,
+        shell=True,
+        cwd=tmp_path,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "BMAD_LOOP_RUN_DIR": str(tmp_path),
+            "BMAD_LOOP_TASK_ID": "t1",
+        },
+        input=json.dumps({"session_id": "s1"}),
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    assert proc.returncode == 0 and proc.stdout == ""
+    event = json.loads(next((tmp_path / "events").glob("*.json")).read_text())
+    assert event["event"] == "Stop" and event["task_id"] == "t1"

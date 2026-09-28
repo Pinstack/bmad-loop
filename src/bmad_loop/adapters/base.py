@@ -14,14 +14,30 @@ treating every CLI as a dumb terminal:
 
 from __future__ import annotations
 
+import dataclasses
 import stat
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..model import TokenUsage
 from ..platform_util import is_link_like, safe_segment
+
+if TYPE_CHECKING:
+    # `journal.py` imports nothing from `adapters/`, so the runtime import would be
+    # cycle-free too; TYPE_CHECKING keeps the adapter seam's import graph as thin as
+    # it was (journal pulls in model + platform_util) for the annotation alone.
+    from ..journal import Journal
+
+
+# `env_fault_evidence` stamped by `CodingCLIAdapter._classify_zero_token_timeout`
+# (DW-364). Lands verbatim in the pause reason / ATTENTION line, e.g.
+# `environment fault: dev session timeout (<this>)`.
+ZERO_TOKEN_TIMEOUT_EVIDENCE = (  # nosec B105 - diagnostic prose, not a credential
+    "session timed out having consumed zero tokens (tracked usage) — "
+    "the CLI never got a usable response from the provider"
+)
 
 
 class AdapterTaskDirectoryError(ValueError):
@@ -198,6 +214,14 @@ class SessionSpec:
     # resumed run is protected too — always an absolute path by the time it lands
     # here. Kept LAST alongside spec_snapshot so positional constructions stay valid.
     expected_spec: str | None = None
+    # Reasoning effort (#643), free-form because the legal names are provider- and
+    # model-specific; "" = provider default. Resolved per stage by
+    # `AdapterPolicy.resolved()` with the same client-specific inheritance as
+    # `model`. Only the opencode-http adapter has a channel for it — it rides every
+    # `prompt_async` body as `variant` — and the tmux generic family ignores it
+    # (`bmad-loop validate` warns). Never reaches argv, so `config_digest` is
+    # untouched. Kept LAST so positional SessionSpec constructions stay valid.
+    effort: str = ""
 
 
 @dataclass(frozen=True)
@@ -250,6 +274,34 @@ class SessionResult:
     # stalled/timeout/over_budget, which this flag can never accompany; add it
     # there if `crashed` ever joins that rescue set.
     session_vanished: bool = False
+    # Whether the session showed ANY sign of working before it ended on a
+    # non-completed verdict (#727). `True` when a `Stop` arrived, when the adapter
+    # has no pane log to read (opencode-http, unit fixtures — "unknown never
+    # blocks"), when the pane log changed on a tick later than
+    # `generic.FIRST_FRAME_S` after the wait loop started and before the first
+    # stall wake nudge was sent, or when the CLI's own transcript changed after
+    # its first sample / the usage sampler read a nonzero spend from it (writes a
+    # misbound pane sink cannot hide). `False` means the CLI painted at most its
+    # first frame and then sat still until the grace, the nudge and the exit: a
+    # permission dialog, a login prompt, a dead-on-arrival window. `decide_dev`
+    # PAUSEs such a session ahead of the attempt budget, the way an environment
+    # fault does, so re-arm restores the attempt instead of a fresh session being
+    # launched into the identical wall. Distinct from `stop_seen` (the hook half
+    # alone) and from `_ResultFileMixin._produced_work` (the #261 read-back gate's
+    # byte floor, which a rendered dialog clears). Default `True` so every
+    # positional construction keeps today's routing. APPENDED, never inserted.
+    produced_work: bool = True
+    # Parked-session signal (DW-348/DW-350): the CLI was waiting on a human — a
+    # permission, idle or quota prompt — when the stall grace expired, so the
+    # wait loop WITHHELD the stall wake nudge (its Enter could answer the prompt,
+    # #727) and ended the session `stalled`. Set only on that `stalled` exit,
+    # from a latched parked hook event or a `parked_prompt_patterns` match on the
+    # visible pane; never on a `crashed` (window death outranks it) or completed
+    # result. Every engine/sweep site PAUSEs on it like `env_fault` (which
+    # outranks it), so re-arm restores the attempt instead of a retry relaunching
+    # into the same prompt. `parked_evidence` names what matched. APPENDED.
+    parked: bool = False
+    parked_evidence: str | None = None
 
 
 class CodingCLIAdapter(ABC):
@@ -257,6 +309,14 @@ class CodingCLIAdapter(ABC):
     injection: str = ""
     observation: str = ""
     state: str = ""
+    # The run's journal, attached by the engine to every adapter it owns so the
+    # adapter can record what only it can see (the #680 `session-idle` /
+    # `session-active` pair). None outside an engine — `resolve.run_session`,
+    # `probe`, unit fixtures — and every adapter-side emit is gated on it: no
+    # journal, no entry. The wait loop runs on the engine thread while the
+    # engine's own journal is quiescent, so this adds no second writer, and
+    # entries keep the engine's `log_task`/`log_pos` stamps.
+    journal: Journal | None = None
 
     @abstractmethod
     def start_session(self, spec: SessionSpec) -> SessionHandle: ...
@@ -291,7 +351,8 @@ class CodingCLIAdapter(ABC):
         finally:
             self.kill(handle)
         result = self._post_kill_reconcile(handle, spec, result)
-        return self._classify_env_fault(handle, spec, result)
+        result = self._classify_env_fault(handle, spec, result)
+        return self._classify_zero_token_timeout(result)
 
     def _post_kill_reconcile(
         self, handle: SessionHandle, spec: SessionSpec, result: SessionResult
@@ -342,5 +403,52 @@ class CodingCLIAdapter(ABC):
         transport. This docstring used to say HTTP adapters had no
         post-mortem signal; that stopped being true once opencode_http began
         teeing its server log, and the stale premise is why a provider quota
-        outage went unclassified and burned three stories' retry budgets."""
+        outage went unclassified and burned three stories' retry budgets.
+
+        A second, transport-agnostic post-mortem runs after this hook in
+        ``run()``: ``_classify_zero_token_timeout`` (DW-364) labels a timeout
+        with tracked zero usage an environment fault. It lives in ``run()``
+        rather than here because ``EnvFaultMixin`` overrides this hook without
+        calling super."""
         return result
+
+    def _classify_zero_token_timeout(self, result: SessionResult) -> SessionResult:
+        """Label a ``timeout`` that consumed zero tokens an environment fault
+        (DW-364): a CLI whose session clock ran out without one billed token
+        never got a usable response from the provider (a quota stall, an API
+        error, a dead endpoint), so charging it as a dev attempt burns the
+        retry budget on a wall. Stamps ``env_fault`` / ``ZERO_TOKEN_TIMEOUT_EVIDENCE``; the
+        ``decide_*`` env-fault arms then PAUSE without charging the attempt
+        (re-arm resets it).
+
+        Runs LAST in ``run()``, after ``_classify_env_fault``, so a
+        pattern-matched evidence line wins (and ``read_usage`` is not even
+        consulted) and a reconcile upgrade to ``completed`` is never touched.
+        Only ``status == "timeout"`` with ``result_json is None`` is inspected —
+        ``stalled`` / ``crashed`` / ``over_budget`` are never classified here.
+
+        Tracked-zero only: ``read_usage`` must return a ``TokenUsage`` whose
+        ``total`` is 0. ``None`` means no usage signal (no transcript, an
+        unparsed format) — untracked never reads as free, so the session is
+        charged as before. Any ``read_usage`` fault leaves the verdict unchanged
+        here — usage is metadata, never a gate, and an escape would unwind
+        ``run()`` before the engine records the session: the engine's own
+        ``read_usage`` call right after ``run()`` re-raises it on its journaled
+        path, so the degrade stays visible rather than being folded into a
+        classification.
+
+        Cost: on timeout sessions only, this reads usage once more than the
+        engine does. ``read_usage`` is idempotent (DW-117), so the engine's
+        later read is unaffected; on an untracked timeout the generic adapter's
+        ``usage_grace_s`` poll (copilot: 8s) runs here too."""
+        if result.env_fault or result.status != "timeout" or result.result_json is not None:
+            return result
+        try:
+            usage = self.read_usage(result)
+        except Exception:  # usage is metadata, never a gate; the engine re-raises it
+            return result
+        if usage is None or usage.total != 0:
+            return result
+        return dataclasses.replace(
+            result, env_fault=True, env_fault_evidence=ZERO_TOKEN_TIMEOUT_EVIDENCE
+        )

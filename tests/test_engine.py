@@ -2,10 +2,12 @@
 
 import contextlib
 import dataclasses
+import errno
 import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -18,6 +20,7 @@ from conftest import (
     _OK,
     MARKER_IN_PROJECT,
     MARKER_IN_REPO_ROOT,
+    NUL_PATH_RESOLVE_FAULTS,
     PROJECT_MARKER_CMD,
     REPO_ROOT_MARKER_CMD,
     _disarm_check_script,
@@ -25,8 +28,11 @@ from conftest import (
     _self_disarming_cmd,
     _spec_baseline,
     _write_check_script,
+    assert_multiline_notice_keeps_its_lines,
     committing_crash_state,
     dev_effect,
+    fault_locked_ledger_read,
+    fault_metadata_probe,
     fault_read_text,
     generic_dev_effect,
     git,
@@ -35,6 +41,7 @@ from conftest import (
     refuse_to_resolve,
     review_effect,
     scripted_verify_runner,
+    seed_outer_decoy_ledger,
     set_sprint,
     spec_path,
     write_gated_ledger,
@@ -43,21 +50,22 @@ from conftest import (
     write_sprint,
 )
 
-from bmad_loop import deferredwork, platform_util, runs, verify
-from bmad_loop.adapters.base import SessionResult
+from bmad_loop import deferredwork, devcontract, gates, platform_util, runs, verify
+from bmad_loop.adapters.base import ZERO_TOKEN_TIMEOUT_EVIDENCE, SessionResult, SessionSpec
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import (
-    NOTICE_REASON_MAX,
+    _UNREADABLE_LEDGER_DIGEST,
     Engine,
     RunPaused,
     RunStopped,
     _digest_of,
     _LedgerAnchor,
-    _notice_reason,
     _run_depth,
     _session_task_id,
+    _UndecodableLedger,
+    _UnreadableLedger,
 )
-from bmad_loop.journal import LOGS_DIR, VERIFY_DIR, Journal, load_state
+from bmad_loop.journal import LOGS_DIR, VERIFY_DIR, Journal, load_state, save_state
 from bmad_loop.model import (
     PAUSE_EPIC_BOUNDARY,
     PAUSE_ESCALATION,
@@ -105,12 +113,25 @@ from bmad_loop.verify import (
 )
 
 QUIET = NotifyPolicy(desktop=False, file=True)
+# DW-310: attempt-owned spec restoration and lifecycle normalization refuse
+# before any write on a host without handle-anchored writes and pause for
+# manual adoption, so a rollback that has to put the bound spec back cannot
+# converge there by design. Both real hosts have an arm — POSIX `dir_fd`,
+# Windows `platform_util.win32_at` — so these rows run on both; the marker
+# mirrors `tests/test_recovery_flow.py`'s and only a host with neither skips.
+requires_descriptor_restoration = pytest.mark.skipif(
+    not platform_util.HANDLE_ANCHORED_WRITES,
+    reason="automatic owned-spec restore requires handle-anchored writes (DW-310)",
+)
 
 
 def make_engine(project, script, policy=None, **kwargs) -> tuple[Engine, MockAdapter]:
     run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
     adapter = MockAdapter(script, usage_per_session=TokenUsage(input_tokens=10, output_tokens=5))
     state = RunState(run_id="test-run", project=str(project.project), started_at="now")
+    journal = Journal(run_dir)
+    # the run dir's mint-time identity, as `runsetup.compose_run` records it (DW-446)
+    state.run_dir_identity = platform_util.root_identity_record(run_dir)
     engine = Engine(
         paths=project,
         policy=policy
@@ -124,7 +145,7 @@ def make_engine(project, script, policy=None, **kwargs) -> tuple[Engine, MockAda
         ),
         adapter=adapter,
         run_dir=run_dir,
-        journal=Journal(run_dir),
+        journal=journal,
         state=state,
         **kwargs,
     )
@@ -144,7 +165,13 @@ def resume_engine(project, engine, script, policy=None) -> tuple[Engine, MockAda
         policy=policy or engine.policy,
         adapter=adapter,
         run_dir=engine.run_dir,
-        journal=engine.journal,
+        # A real resume REOPENS the journal: `cli.cmd_resume` builds a fresh
+        # `Journal(run_dir)` and hands it to `runsetup.compose_resume`, so this
+        # harness builds the same shape (DW-241). `Journal` is file-backed either
+        # way; what a SHARED object leaks across the boundary is its
+        # `_log_task`/`_log_path` binding, which stamps `log_task`/`log_pos` onto
+        # rows a real resumed engine writes bare. See the row right below.
+        journal=Journal(engine.run_dir),
         state=state,
         # mirror cli._resume_paused_run: the run's scope + cap are restored from
         # persisted state so a resumed `--epic N` run keeps its selector.
@@ -153,6 +180,52 @@ def resume_engine(project, engine, script, policy=None) -> tuple[Engine, MockAda
         max_stories=state.max_stories,
     )
     return new_engine, adapter
+
+
+def test_the_resumed_engine_reopens_the_journal_off_disk(project):
+    """The harness's own fidelity: `resume_engine` builds the journal a REAL resume
+    builds rather than handing the pre-pause engine's object back (DW-241), the
+    `tests/test_sweep.py` row of the same name carried over to this file's helper.
+
+    `cli.cmd_resume` constructs `Journal(run_dir)` and passes it to
+    `runsetup.compose_resume`; a fresh `Journal` starts with `_log_task = None`.
+    Sharing one object carried the PRE-PAUSE session's `set_active_log` binding across
+    the resume boundary, and `Journal.append` stamps `log_task`/`log_pos` onto every
+    entry while that binding is set — so every row a resumed engine writes BEFORE
+    starting its own session (a replay pre-pass, a resume-carry, a cycle row) was
+    stamped with a log from the run before the pause. A real resume writes those rows
+    bare. `Journal` holds NO in-memory record list — `append` writes one line to
+    `run_dir/journal.jsonl` and `entries()` re-reads it — so the binding is the only
+    state a shared object could leak; every "exactly once" claim in this file's
+    resume rows was already round-tripping through disk.
+
+    Graded on the CONSEQUENCE, never on object identity: `resumed.journal is not
+    engine.journal` would be tautological and would red for a refactor that changed
+    nothing observable.
+
+    Ablation, performed: hand `resume_engine` the pre-pause `engine.journal` back as
+    its `journal=` argument and the FINAL assertion reds — the appended row carries
+    the pre-pause `log_task` and `log_pos`. That one only: the two `first[...]` lines
+    above it are the PREMISE and stay green under both spellings (they describe the
+    pre-pause row, stamped either way), and the reopen half stays green too, because
+    the file is what both objects read."""
+    engine, _ = make_engine(project, [])
+    engine.journal.set_active_log("1-1-a-dev-1")  # stands in for the pre-pause session
+    engine.journal.append("run-start", cycle=1)
+    save_state(engine.run_dir, engine.state)
+
+    resumed, _ = resume_engine(project, engine, [])
+
+    # reopened, not re-created: the rows already on disk are still what it reads
+    assert [e["kind"] for e in resumed.journal.entries()] == ["run-start"]
+    resumed.journal.append("run-start", cycle=2)
+    first, second = [e for e in resumed.journal.entries() if e["kind"] == "run-start"]
+    assert (first["cycle"], second["cycle"]) == (1, 2)  # appended AFTER, same file
+    assert first["log_task"] == "1-1-a-dev-1"  # premise: the pre-pause row WAS stamped...
+    # ...with BOTH fields, so the conclusion below pins both. `0` is deliberate: it is
+    # `append`'s `except OSError: size = 0` arm, since no pane log exists on disk here.
+    assert first["log_pos"] == 0
+    assert "log_task" not in second and "log_pos" not in second
 
 
 class _PostDevVerifyCaptureBus:
@@ -410,6 +483,44 @@ def test_verify_stream_capture_retains_a_bounded_tail(project):
     assert entry["stderr_captured_bytes"] == 0
     assert entry["stderr_truncated"] is False
     assert entry["capture_error"] is None
+
+
+@pytest.mark.parametrize("case", ["no-record", "runs-swapped"])
+def test_verify_stream_capture_refuses_an_unrecorded_or_swapped_run_dir(project, tmp_path, case):
+    """DW-446 through the engine: the verify stream is pinned to
+    `state.run_dir_identity`, the run dir's MINT-TIME record. With no record (a
+    legacy state not yet resumed), or with `runs/` swapped after the mint for a link
+    to a tree holding a real `<id>/`, the stream refuses and the engine degrades it
+    to `capture_error` — no pointer, nothing written in the outside tree.
+
+    Ablation: pass ``run_dir_identity=root_identity_record(self.run_dir)`` (a fresh
+    per-write `lstat`) from the engine and both rows redden — the no-record row
+    retains the stream, the swapped row writes `outside/test-run/verify/`."""
+    if case == "runs-swapped" and sys.platform == "win32":
+        pytest.skip("POSIX symlink swap")
+    engine = _capture_engine(project, 1)
+    assert engine.state.run_dir_identity is not None  # the premise: minted
+    outside = tmp_path / "outside"
+    if case == "no-record":
+        engine.state.run_dir_identity = None
+    else:
+        runs_dir = engine.run_dir.parent
+        (outside / engine.run_dir.name).mkdir(parents=True)
+        runs_dir.rename(runs_dir.with_name("runs-aside"))
+        runs_dir.symlink_to(outside, target_is_directory=True)
+
+    engine._journal_verify_command_results(
+        StoryTask(story_key="1-1-a", epic=1),
+        "dev",
+        (verify.CommandResult("pytest -q", 1, "tail", "out\n", "err\n"),),
+    )
+
+    entry = _sole_verify_record(engine)
+    assert entry["capture_error"] is not None
+    assert entry["stdout_path"] is None and entry["stderr_path"] is None
+    assert not (outside / engine.run_dir.name / "verify").exists()
+    if case == "no-record":
+        assert not (engine.run_dir / "verify").exists()
 
 
 def test_a_ceilinged_stream_still_reports_what_the_command_emitted(project):
@@ -753,17 +864,17 @@ def _dev_then_fix_run(project, monkeypatch, capture):
     the repair session's verify passes and the story commits. Both legs emit
     `post_dev_verify`, which is what the callers need.
 
-    FOUR scripted returns, FOUR journalled sequences, TWO hook emits — and the
-    inequality that remains is the documented scope boundary, not a miscount to
-    "fix". Returns 1 and 3 are the dev and repair verifications; returns 2 and 4
-    are the two `_skip_review_and_commit` review gates (the second runs after the
-    repair). All four are journalled now that the review gates carry a sink, but
-    only the dev and repair legs publish `post_dev_verify` — the review leg still
-    reaches no hook, which is the half of #656 that stays open (see the boundary
-    section in `docs/plugin-authoring-guide.md`). The count is load-bearing, not
-    padding: dropping the fourth value leaves the post-repair gate with nothing to
-    consume and the run ends `crashed=True, crash_error='StopIteration: '`
-    (measured), so a reader who trims the list finds out immediately.
+    FOUR scripted returns, FOUR journalled sequences, TWO `post_dev_verify` emits
+    — the other two passes are not a miscount to "fix". Returns 1 and 3 are the
+    dev and repair verifications; returns 2 and 4 are the two
+    `_skip_review_and_commit` review gates (the second runs after the repair).
+    All four are journalled, but only the dev and repair legs publish
+    `post_dev_verify`; the two review gates publish on their own stage,
+    `post_review_verify` (DW-357), which a capture bus bound to that stage sees.
+    The count is load-bearing, not padding: dropping the fourth value leaves the
+    post-repair gate with nothing to consume and the run ends
+    `crashed=True, crash_error='StopIteration: '` (measured), so a reader who
+    trims the list finds out immediately.
     """
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     engine, _ = make_engine(
@@ -839,6 +950,369 @@ def test_post_dev_verify_discriminates_a_dev_emit_from_a_fix_emit(project, monke
         assert [e["command_index"] for e in matched] == list(range(len(ctx.command_results)))
         assert [e["returncode"] for e in matched] == [r.returncode for r in ctx.command_results]
         assert [e["command"] for e in matched] == [r.command for r in ctx.command_results]
+
+
+class _StageCaptureBus:
+    """Hook-bus double binding an explicit set of stages.
+
+    Records every context it receives and, alongside it, the journal kinds that
+    had landed at emit time — what an ordering assertion ("emitted before the
+    engine routed the failure") needs, and what the context alone cannot say.
+    """
+
+    def __init__(self, *stages):
+        self.stages = frozenset(stages)
+        self.contexts = []
+        self.journal_at_emit = []
+        self.engine = None
+
+    def active(self, stage):
+        return stage in self.stages
+
+    def emit(self, stage, ctx):
+        self.contexts.append(ctx)
+        journal = self.engine.journal.entries() if self.engine is not None else []
+        self.journal_at_emit.append([e["kind"] for e in journal])
+        return ctx
+
+    def of(self, stage):
+        return [c for c in self.contexts if c.stage == stage]
+
+
+def _review_records(engine, sequence):
+    return [
+        e
+        for e in engine.journal.entries()
+        if e["kind"] == "verify-command-result"
+        and e["verification_stage"] == "review"
+        and e["verification_sequence"] == sequence
+    ]
+
+
+def test_post_review_verify_publishes_a_passing_review_gate(project, monkeypatch):
+    """A converged review pass publishes its verify gate to `post_review_verify`.
+
+    Exactly one context per gate visit, carrying the review session's status and
+    result plus the gate's own command records under `verification_stage ==
+    "review"`, joinable to the journalled `verify-command-result` entry through
+    `verification_sequence`. `post_dev_verify` stays the dev leg's alone.
+
+    Ablation: delete the `_emit("post_review_verify", ...)` call in
+    `Engine._review_verify_gate` and `review_ctx` below finds nothing; drop the
+    holder assignment in `_review_command_sink` and the stage/sequence/results
+    read back as `NO_VERIFY_COMMANDS`.
+    """
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            verify=VerifyPolicy(commands=("pytest -q",)),
+        ),
+    )
+    capture = _StageCaptureBus("post_dev_verify", "post_review_verify")
+    capture.engine = engine
+    engine._bus = capture
+    result = verify.CommandResult("pytest -q", 0, "out\nerr\n", "out\n", "err\n")
+    monkeypatch.setattr(
+        verify,
+        "run_verify_commands",
+        scripted_verify_runner(project.repo_root, lambda: [result]),
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    (dev_ctx,) = capture.of("post_dev_verify")
+    assert dev_ctx.verification_stage == "dev"
+    (review_ctx,) = capture.of("post_review_verify")
+    assert review_ctx.story_key == "1-1-a"
+    assert review_ctx.session_status == "completed"
+    assert review_ctx.result_json is not None and review_ctx.result_json["status"] == "done"
+    assert review_ctx.command_results == (result,)
+    assert review_ctx.verification_stage == "review"
+    # the join: story + stage + sequence names exactly this context's record
+    (entry,) = _review_records(engine, review_ctx.verification_sequence)
+    assert entry["story_key"] == "1-1-a"
+    assert entry["command"] == "pytest -q" and entry["returncode"] == 0
+    assert review_ctx.verification_sequence > dev_ctx.verification_sequence
+
+
+def test_post_review_verify_fires_before_a_failed_gate_is_routed(project, monkeypatch):
+    """A red review gate is published before the engine routes it, unaltered.
+
+    The first review gate's command fails (rc 1): the context carries the
+    failure's `verify_reason` and the failing records, and lands BEFORE the
+    `review-verify-failed` entry the engine journals for it. The repair and the
+    second review cycle then run exactly as they do without a plugin, and the
+    second gate publishes its own green pass under a later sequence.
+
+    Ablation: emit after the caller's `review-verify-failed` journal append
+    (e.g. move the `_emit` out of `_review_verify_gate` to just below that append
+    in the converged loop) and `journal_at_emit[0]` contains it, reddening the
+    ordering assertion.
+    """
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=True),
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=True),
+        ],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            verify=VerifyPolicy(commands=("pytest -q",)),
+        ),
+    )
+    capture = _StageCaptureBus("post_review_verify")
+    capture.engine = engine
+    engine._bus = capture
+    failing = verify.CommandResult("pytest -q", 1, "review fail", "", "review fail")
+    calls = iter(
+        [
+            [verify.CommandResult("pytest -q", 0, "dev", "dev-out", "")],
+            [failing],
+            [verify.CommandResult("pytest -q", 0, "fix", "fix-out", "")],
+            [verify.CommandResult("pytest -q", 0, "final", "final-out", "")],
+        ]
+    )
+    monkeypatch.setattr(
+        verify,
+        "run_verify_commands",
+        scripted_verify_runner(project.repo_root, lambda: next(calls)),
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert [s.role for s in adapter.sessions] == ["dev", "review", "dev", "review"]
+    red, green = capture.contexts
+    (failed,) = [e for e in engine.journal.entries() if e["kind"] == "review-verify-failed"]
+    assert red.verify_reason and red.verify_reason == failed["reason"]
+    assert red.command_results == (failing,)
+    assert red.verification_stage == "review"
+    assert [e["returncode"] for e in _review_records(engine, red.verification_sequence)] == [1]
+    # emitted before the engine journalled (and so routed) the failure
+    assert "review-verify-failed" not in capture.journal_at_emit[0]
+    assert green.verification_stage == "review"
+    assert [r.stdout for r in green.command_results] == ["final-out"]
+    assert green.verification_sequence > red.verification_sequence
+
+
+def test_post_review_verify_marks_a_gate_that_failed_before_its_commands(project):
+    """A gate refused at the sprint-status check publishes "no pass ran".
+
+    `verification_stage`/`verification_sequence` stay `None` and
+    `command_results` empty — the exact taxonomy `post_dev_verify` uses — while
+    `verify_reason` names why. The run's routing (escalate on the revoked
+    sign-off) is unchanged, and the emit precedes it.
+
+    This is the run's first review gate, so it cannot pin the holder reset —
+    `test_post_review_verify_does_not_republish_an_earlier_gates_records` does.
+    """
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            _signoff_revoking_review(project, "1-1-a", clean=True),
+        ],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            verify=VerifyPolicy(commands=(_OK,)),
+        ),
+    )
+    capture = _StageCaptureBus("post_review_verify")
+    capture.engine = engine
+    engine._bus = capture
+
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1
+    assert [s.role for s in adapter.sessions] == ["dev", "review"]
+    (ctx,) = capture.contexts
+    assert ctx.verification_stage is None and ctx.verification_sequence is None
+    assert ctx.command_results == ()
+    assert ctx.verify_reason and "revoked the sprint sign-off" in ctx.verify_reason
+    assert ctx.session_status == "completed"
+    assert "review-verify-failed" not in capture.journal_at_emit[0]
+    assert not [
+        e
+        for e in engine.journal.entries()
+        if e["kind"] == "verify-command-result" and e["verification_stage"] == "review"
+    ]
+
+
+def test_post_review_verify_covers_both_skip_review_gates(project, monkeypatch):
+    """The skip-review path publishes each of its two gates, with no session.
+
+    `_dev_then_fix_run` drives `_skip_review_and_commit` through a red gate, a
+    repair, and a green re-check: two `post_review_verify` contexts, both with
+    `session_status`/`result_json` `None` (no review session ran), carrying
+    sequences 2 and 4 — interleaved with the dev (1) and fix (3) passes that
+    `post_dev_verify` publishes.
+    """
+    capture = _StageCaptureBus("post_dev_verify", "post_review_verify")
+    engine, summary = _dev_then_fix_run(project, monkeypatch, capture)
+
+    assert summary.done == 1
+    assert [(c.stage, c.verification_sequence) for c in capture.contexts] == [
+        ("post_dev_verify", 1),
+        ("post_review_verify", 2),
+        ("post_dev_verify", 3),
+        ("post_review_verify", 4),
+    ]
+    first, second = capture.of("post_review_verify")
+    for ctx in (first, second):
+        assert ctx.session_status is None and ctx.result_json is None
+        assert ctx.verification_stage == "review"
+    assert [r.returncode for r in first.command_results] == [1]
+    assert first.verify_reason
+    assert [r.stdout for r in second.command_results] == ["final-out"]
+
+
+def test_post_review_verify_does_not_republish_an_earlier_gates_records(project):
+    """A gate that fails before its commands publishes `NO_VERIFY_COMMANDS`, even
+    right after a gate that did record — never the earlier gate's records.
+
+    Ablation: delete the `self._review_verify_records = NO_VERIFY_COMMANDS` reset
+    at the top of `Engine._review_verify_gate` and the second context carries the
+    first gate's stage, sequence and results.
+    """
+    engine, _ = make_engine(
+        project,
+        [],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            verify=VerifyPolicy(commands=(_OK,)),
+        ),
+    )
+    capture = _StageCaptureBus("post_review_verify")
+    engine._bus = capture
+    task = StoryTask(story_key="1-1-a", epic=1)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "done", verify.rev_parse_head(project.project))
+    task.spec_file = str(sp)
+
+    write_sprint(project, {"1-1-a": "done"})
+    assert engine._review_verify_gate(task).ok
+    write_sprint(project, {"1-1-a": "in-progress"})
+    assert not engine._review_verify_gate(task).ok
+
+    recorded, refused = capture.contexts
+    assert recorded.verification_stage == "review" and recorded.verification_sequence == 1
+    assert [r.command for r in recorded.command_results] == [_OK]
+    assert refused.verification_stage is None and refused.verification_sequence is None
+    assert refused.command_results == ()
+    assert refused.verify_reason and "revoked the sprint sign-off" in refused.verify_reason
+
+
+def test_post_review_verify_publishes_the_budget_rescue_gate(project, monkeypatch):
+    """The budget-exhaustion rescue gate publishes to `post_review_verify`.
+
+    Every review cycle recommends its own follow-up, so no in-loop gate runs:
+    the ONE context is the rescue's, carrying the last completed review
+    session's status and a sequence that joins its journal record. Scenario
+    from `test_budget_exhausted_finalized_work_commits`.
+    """
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a")]
+        + [review_effect(project, "1-1-a", clean=False, patched=1) for _ in range(3)],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            scm=ScmPolicy(rollback_on_failure=True),
+            limits=LimitsPolicy(max_followup_reviews=99),
+            verify=VerifyPolicy(commands=("pytest -q",)),
+        ),
+    )
+    capture = _StageCaptureBus("post_review_verify")
+    engine._bus = capture
+    result = verify.CommandResult("pytest -q", 0, "ok", "ok", "")
+    monkeypatch.setattr(
+        verify,
+        "run_verify_commands",
+        scripted_verify_runner(project.repo_root, lambda: [result]),
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert [e for e in engine.journal.entries() if e["kind"] == "review-budget-committed"]
+    (ctx,) = capture.contexts
+    assert ctx.verification_stage == "review"
+    assert ctx.session_status == "completed"
+    assert ctx.command_results == (result,)
+    (entry,) = _review_records(engine, ctx.verification_sequence)
+    assert entry["story_key"] == "1-1-a" and entry["command"] == "pytest -q"
+
+
+def test_post_review_verify_publishes_the_timeout_salvage_gate(project, monkeypatch):
+    """The review-timeout salvage gate publishes to `post_review_verify`, with the
+    timed-out review session's status. Scenario from
+    `test_review_timeout_salvage_commits_and_refiles`."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), SessionResult(status="timeout")],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            scm=ScmPolicy(rollback_on_failure=True),
+            review=ReviewPolicy(on_timeout="salvage-if-done"),
+            verify=VerifyPolicy(commands=("pytest -q",)),
+        ),
+    )
+    capture = _StageCaptureBus("post_review_verify")
+    engine._bus = capture
+    result = verify.CommandResult("pytest -q", 0, "ok", "ok", "")
+    monkeypatch.setattr(
+        verify,
+        "run_verify_commands",
+        scripted_verify_runner(project.repo_root, lambda: [result]),
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert [e for e in engine.journal.entries() if e["kind"] == "review-timeout-salvage"]
+    (ctx,) = capture.contexts
+    assert ctx.verification_stage == "review"
+    assert ctx.session_status == "timeout"
+    assert ctx.result_json is None
+    assert ctx.command_results == (result,)
+    (entry,) = _review_records(engine, ctx.verification_sequence)
+    assert entry["story_key"] == "1-1-a" and entry["command"] == "pytest -q"
+
+
+def test_post_review_verify_with_no_commands_configured(project):
+    """Zero `[verify] commands`: the gate's command pass ran and executed
+    nothing — stage `"review"`, sequence `None`, results empty."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=Policy(gates=GatesPolicy(mode="none"), notify=QUIET),
+    )
+    capture = _StageCaptureBus("post_review_verify")
+    engine._bus = capture
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    (ctx,) = capture.contexts
+    assert ctx.verification_stage == "review"
+    assert ctx.verification_sequence is None
+    assert ctx.command_results == ()
 
 
 def _critical(inner):
@@ -1705,24 +2179,72 @@ def test_snapshot_read_rejects_in_place_change_after_read(project, monkeypatch):
 
 @pytest.mark.parametrize(
     "fault",
-    [OSError(36, "File name too long"), RuntimeError("symlink loop")],
-    ids=["oserror", "runtime-error"],
+    [
+        pytest.param(OSError(36, "File name too long"), id="oserror"),
+        pytest.param(RuntimeError("symlink loop"), id="runtime-error"),
+        *NUL_PATH_RESOLVE_FAULTS,
+    ],
 )
 def test_dispatched_spec_observation_fault_leaves_attempt_unbound(project, monkeypatch, fault):
     """A filesystem observation fault cannot abort before DEV_RUNNING is saved.
 
-    Ablation: delete the typed guard in ``_dispatched_spec_for_attempt`` and both
-    rows raise instead of returning the deliberately unbound fallback.
+    Ablation: delete the typed guard in ``_dispatched_spec_for_attempt`` and the
+    fault rows raise instead of returning the deliberately unbound fallback.
     """
     engine, _ = make_engine(project, [])
-    task = StoryTask(story_key="1-1-a", epic=1, spec_file="recorded-spec.md")
-
-    def fail_observation(*_args, **_kwargs):
-        raise fault
-
-    monkeypatch.setattr(verify, "resolve_spec_path", fail_observation)
+    recorded = spec_path(project, "1-1-a")
+    write_spec(recorded, "ready-for-dev", rev_parse_head(project.project))
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(recorded))
+    refuse_to_resolve(monkeypatch, recorded, error=fault)
 
     assert engine._dispatched_spec_for_attempt(task) is None
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+def test_dispatched_snapshot_read_fault_retains_retry_authority(
+    project, monkeypatch, resolve_fault
+):
+    """A failed read observation does not erase an established retry binding."""
+    engine, _ = make_engine(project, [])
+    recorded = spec_path(project, "1-1-a")
+    write_spec(recorded, "ready-for-dev", rev_parse_head(project.project))
+    snapshot = recorded.read_bytes()
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        dispatched_spec_file=str(recorded.resolve()),
+        dispatched_spec_snapshot=snapshot,
+    )
+    refuse_to_resolve(monkeypatch, recorded, error=resolve_fault)
+
+    assert not engine._refresh_dispatched_spec_snapshot(task, clear_on_failure=False)
+    assert task.dispatched_spec_file == str(recorded)
+    assert task.dispatched_spec_snapshot == snapshot
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+def test_dispatched_snapshot_validation_fault_returns_false_without_mutation(
+    project, monkeypatch, resolve_fault
+):
+    """Accepted-path uncertainty cannot replace retained retry-chain authority."""
+    engine, _ = make_engine(project, [])
+    owned = spec_path(project, "1-1-owned")
+    accepted = spec_path(project, "1-1-accepted")
+    write_spec(owned, "ready-for-dev", rev_parse_head(project.project))
+    write_spec(accepted, "ready-for-dev", rev_parse_head(project.project))
+    snapshot = owned.read_bytes()
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        spec_file=str(accepted),
+        dispatched_spec_file=str(owned.resolve()),
+        dispatched_spec_snapshot=snapshot,
+    )
+    refuse_to_resolve(monkeypatch, accepted, error=resolve_fault)
+
+    assert not engine._validate_dispatched_spec_snapshot(task)
+    assert task.dispatched_spec_file == str(owned)
+    assert task.dispatched_spec_snapshot == snapshot
 
 
 def test_resume_continues_from_completed_review_session(project):
@@ -1850,11 +2372,16 @@ def test_resume_final_review_cycle_replays_clean_result(project):
     assert "resume-restart" not in kinds
 
 
-def test_resume_final_review_cycle_dirty_replay_defers_without_extra_budget(project):
+@pytest.mark.parametrize("malformed", [False, True])
+def test_resume_final_review_cycle_dirty_replay_defers_without_extra_budget(project, malformed):
     """The same final-cycle replay for a non-convergent review consumes the
     recorded pass, then the loop exits on the normal budget guard — no fresh
     session, no extra cycle — and the story defers. Proves the relaxed guard
-    burns no extra budget once the replayed result is consumed."""
+    burns no extra budget once the replayed result is consumed.
+
+    The malformed row rehydrates a non-mapping review document from state.json.
+    Ablation: restore `_review_and_commit`'s `rj = result.result_json or {}`
+    and that row crashes at the status read instead of deferring."""
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     engine, _ = make_engine(
         project,
@@ -1877,6 +2404,11 @@ def test_resume_final_review_cycle_dirty_replay_defers_without_extra_budget(proj
     engine._emit = crashing_emit
     assert engine.run().crashed
     assert load_state(engine.run_dir).tasks["1-1-a"].review_cycle == 1
+
+    if malformed:
+        engine.state.tasks["1-1-a"].sessions[-1].result_json = ["nope"]
+        engine._save()
+        assert load_state(engine.run_dir).tasks["1-1-a"].sessions[-1].result_json == ["nope"]
 
     resumed, adapter = resume_engine(project, engine, [])
     summary = resumed.run()
@@ -2200,6 +2732,118 @@ def test_run_session_record_result_json_isolated_from_later_mutation(project):
     assert saved.sessions[-1].result_json == {"workflow": "auto-dev"}  # on-disk snapshot
 
 
+@pytest.mark.parametrize("role", ["dev", "review"])
+@pytest.mark.parametrize(
+    "document", [["nope"], "escalations", 7, 3.5, [["a", 1]], False, 0, "", []]
+)
+def test_run_session_is_total_on_a_non_mapping_result_document(project, document, role):
+    """DW-206: `_run_session` read the raw document behind an `is not None` check
+    alone, so a non-mapping — even a falsy list, string, or number — raised
+    `AttributeError` out of `.get` at the very top of the frame, and could fail again
+    out of `dict(...)` at the record snapshot. That is one frame UPSTREAM of
+    DW-181's guards in `escalation._escalation_list` /
+    `sweep._normalize_bundle_names`, which made them unreachable on the
+    production path.
+
+    `adapters/generic.py _read_result` rejects a non-dict top level, so the
+    exposure is third-party adapters and `SessionRecord.from_dict`'s unchecked
+    rehydration — both reach the engine exactly as this mock does.
+
+    The document is refused through the existing empty-document channel: no new
+    raise, no escalation, no extra journal event. The session still completes,
+    its `session-start` is still paired with a `session-end`, and the persisted
+    snapshot is `{}` — not `None`, which would claim the session recorded no
+    payload at all.
+
+    The `[["a", 1]]` row is the reason this is parametrized rather than a single
+    case. The two old failures were NOT uniform: `.get` raised `AttributeError`
+    on every shape, but the `dict(...)` snapshot was shape-dependent —
+    `ValueError` for a list or string, `TypeError` for a number, and for a
+    pair-list it SUCCEEDED, silently persisting a fabricated `{"a": 1}` into
+    state.json as if the session had returned it. That shape corrupted rather
+    than crashed, so it is the one the crash-shaped rows would never have caught.
+
+    ABLATION: restore `result.result_json.get("post_kill_reconciled")` behind
+    `result.result_json is not None` and every row raises `AttributeError` out of
+    `_run_session`. Restore the `dict(result.result_json)` snapshot instead and
+    the truthy rows fail in three different ways — `ValueError`, `TypeError`,
+    and the pair-list row reddening on a fabricated `{"a": 1}` record. Empty
+    strings and lists already convert to `{}` and do not pin the snapshot."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [SessionResult(status="completed", result_json=document)])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    engine.state.tasks[task.story_key] = task
+    engine._save()
+
+    result = engine._run_session(task, role=role, prompt="/bmad-dev-auto 1-1-a", seq=1)
+
+    # the raw document reaches the caller untouched — the predicate reads it, it
+    # does not rewrite what the adapter returned
+    assert result.result_json == document
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert kinds.count("session-start") == 1 and kinds.count("session-end") == 1
+    # neither forensic breadcrumb fires: an unreadable document claims nothing
+    assert "session-rescued-post-kill" not in kinds
+    assert "session-synthesized-from-frontmatter" not in kinds
+    # `{}`, not `None`: both roles are resumable, so the record must say "a payload was
+    # returned and it carried nothing usable", not "no payload was persisted".
+    assert task.sessions[-1].result_json == {}
+    saved = load_state(engine.run_dir).tasks["1-1-a"]
+    assert saved.sessions[-1].result_json == {}
+
+
+def test_resume_from_a_rehydrated_non_mapping_dev_result_retries_instead_of_crashing(project):
+    """DW-206's OTHER entry point: the dev lane, reached without passing
+    `_run_session`'s guard at all.
+
+    `_run_session` guards its own reads but returns the document untouched, so
+    the twelve engine/stories/sweep conversions are downstream of it and need
+    their own arrival path. `SessionRecord.from_dict` rehydrates `result_json`
+    from state.json with no shape check, and `Engine._resumable_session`
+    rebuilds a `SessionResult` straight from `record.result_json` behind an
+    `is not None` check alone — so a corrupted or hand-edited run state delivers
+    a non-mapping directly into `_dev_phase`, which never re-enters
+    `_run_session` on the replay path.
+
+    It must degrade, not crash: the document claims no `spec_file`, so
+    `verify_dev` refuses it retryably and the dev leg retries into a real
+    session that succeeds.
+
+    ABLATION: revert `_dev_phase`'s `rj = result.result_json or {}` (or
+    `_harvest_spec_path` / `_post_dev_state_sync`'s reads) and the resumed run
+    comes back `crashed=True` with an `AttributeError` instead of done."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [dev_effect(project, "1-1-a")])
+
+    def crashing_emit(stage, *args, **kwargs):
+        if stage == "post_session":
+            raise RuntimeError("host died in the post-session window")
+        return original_emit(stage, *args, **kwargs)
+
+    original_emit = engine._emit
+    engine._emit = crashing_emit
+    assert engine.run().crashed
+    assert load_state(engine.run_dir).tasks["1-1-a"].phase == Phase.DEV_RUNNING
+
+    # Corrupt the durable record the way `from_dict` would happily rehydrate it.
+    engine.state.tasks["1-1-a"].sessions[0].result_json = ["nope"]
+    engine._save()
+    assert load_state(engine.run_dir).tasks["1-1-a"].sessions[0].result_json == ["nope"]
+
+    resumed, _ = resume_engine(
+        project,
+        engine,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+    )
+    summary = resumed.run()
+
+    assert not summary.crashed and summary.crash_error is None
+    final = load_state(resumed.run_dir).tasks["1-1-a"]
+    assert final.phase == Phase.DONE
+    # the replayed non-mapping was refused retryably, so the leg ran again
+    assert final.attempt == 2
+
+
 def test_run_session_persists_result_json_only_for_resumable_roles(project):
     """Only dev/review sessions (never a label) are consumed on resume, so only
     they persist result_json; triage/sweep and labeled plugin-workflow records
@@ -2383,56 +3027,22 @@ def test_current_dev_session_index_follows_the_generation(project):
     assert engine._current_dev_session_index(task) == 1
 
 
-def test_notice_reason_caps_a_long_single_line_and_marks_the_trim():
-    """The LENGTH half of `_notice_reason`'s contract, which no engine-level row
-    reaches.
-
-    `test_dev_retry_notice_collapses_a_multiline_reason` grades only the first-line
-    collapse: its long run sits on the third line, so `first` never exceeds the cap
-    and its `len(retry) < 300` bound passes for any cap value — including none. A
-    single-line reason is the shape that actually crosses it: a `[verify] commands`
-    entry whose invocation carries many paths makes `verify command failed (rc=N):
-    <command>` one line well past the cap, and with the cap gone that whole line
-    lands verbatim in ATTENTION and in the toast payload.
-
-    Pinned as a direct unit row rather than through the engine because the cap is a
-    property of the helper, and routing a 500-char command through a dev session to
-    observe it would grade the plumbing instead.
-
-    Ablation: delete the `if len(first) > NOTICE_REASON_MAX:` block and this reddens
-    on the length assertion; the sibling engine row stays green.
-    """
-    capped = _notice_reason("z" * 500)
-    assert capped == "z" * NOTICE_REASON_MAX + " […]"
-    assert len(capped) == NOTICE_REASON_MAX + len(" […]")
-
-    # exactly at the cap is not a trim — the marker would otherwise claim a cut that
-    # did not happen, which is the ambiguity the marker exists to remove
-    assert _notice_reason("z" * NOTICE_REASON_MAX) == "z" * NOTICE_REASON_MAX
-
-    # the reasonless RETRY: the helper returns "" so the call site's `or` fallback
-    # ("dev attempt rejected with no reason recorded") is what reaches the operator
-    assert _notice_reason("") == ""
-    assert _notice_reason("   \n\n  ") == ""
-
-
-def test_dev_retry_notice_collapses_a_multiline_reason(project, monkeypatch):
+def test_dev_retry_notice_folds_a_multiline_reason(project, monkeypatch):
     """The FIXABLE leg, which is where a `Decision.reason` is routinely multi-line:
     `verify.verify_command_results_outcome` appends the captured output tail below
     the command line on purpose, because the repair session reads that tail as its
     feedback.
 
-    `gates.notify` writes exactly one `[stamp] title: message` line and hands the
-    same string to a desktop toast, so a raw reason spills a whole build log into
-    ATTENTION as many un-prefixed lines — breaking the file's own grammar for every
-    later reader — and into a notification bubble. The sibling row above passes
-    without this only because a baseline mismatch happens to be single-line.
+    ATTENTION is one `[stamp] title: message` record per line, so a raw reason
+    spills a whole build log into it as many un-prefixed lines — breaking the file's
+    own grammar for every later reader. `gates.notify` FOLDS the reason instead
+    (DW-13/DW-332): every line survives, joined by ` ⏎ ` on the notice's one line.
 
     Nothing is lost: the untruncated reason is in the `dev-decision` journal entry,
-    which this asserts explicitly so the trim can never be mistaken for a drop.
+    which this asserts explicitly so the fold can never be mistaken for a drop.
 
-    Ablation: pass `decision.reason` raw and the one-line assertion reddens with the
-    tail's lines loose in the file.
+    Ablation: make `gates.notify` write the raw message and the one-line assertion
+    reddens with the tail's lines loose in the file.
     """
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     engine, _ = make_engine(
@@ -2472,9 +3082,10 @@ def test_dev_retry_notice_collapses_a_multiline_reason(project, monkeypatch):
     assert all(ln.startswith("[") for ln in lines), attention
     (retry,) = [ln for ln in lines if "dev retry: 1-1-a" in ln]
     assert "verify command failed (rc=1): pytest -q" in retry
-    assert retry.endswith("[…]")  # the trim is marked, not silent
-    assert "FAILED tests/test_a.py" not in attention  # the tail stayed out
-    assert len(retry) < 300
+    # the tail is folded onto the same line, not dropped and not loose
+    assert "pytest -q ⏎ FAILED tests/test_a.py::test_one ⏎ FAILED tests/test_b.py" in retry
+    assert retry.endswith("x" * 400)
+    assert not any(ln.startswith("FAILED") for ln in attention.splitlines())
 
     # ... and the whole reason is still on the record a maintainer reads
     (decision,) = [
@@ -2483,6 +3094,71 @@ def test_dev_retry_notice_collapses_a_multiline_reason(project, monkeypatch):
         if e["kind"] == "dev-decision" and e["action"] == "retry"
     ]
     assert "FAILED tests/test_b.py::test_two" in decision["reason"]
+
+
+def test_exhaustion_defer_folds_a_multiline_verify_reason_into_one_attention_line(
+    project, monkeypatch
+):
+    """DW-13: the exhaustion DEFER carries the same multi-line verify reason the
+    retry notice does (`rc=…: cmd` plus the captured output tail), and it reached
+    `gates.notify` raw — through `_record_defer`, with no first-line cap at all —
+    so one failing verify command spilled its whole tail into ATTENTION as loose,
+    un-prefixed lines, terminal control bytes included.
+
+    Every non-blank ATTENTION line must keep the `[stamp] title: message` shape;
+    the `story deferred` line carries both the `verify command failed (rc=1)` head
+    and the tail, folded onto it; and the journal keeps the raw multi-line reason.
+
+    Ablation: make `gates.notify` write the raw `message` (skip `notice_line`) and
+    this reddens on the all-lines-start-with-`[` assertion, with the tail loose.
+    """
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False)],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            review=ReviewPolicy(enabled=False),
+            limits=LimitsPolicy(max_dev_attempts=1),
+            verify=VerifyPolicy(commands=["pytest -q"]),
+            # auto-rollback ON: the defer path must not pause for a manual rollback,
+            # whose (deliberately multi-line) ACTION REQUIRED notice is not this row
+            scm=ScmPolicy(rollback_on_failure=True),
+        ),
+    )
+    tail = "FAILED tests/test_a.py::test_one\n\n  \x1b[31mFAILED tests/test_b.py::test_two\x1b[0m\n"
+    monkeypatch.setattr(
+        verify,
+        "run_verify_commands",
+        scripted_verify_runner(
+            project.repo_root, lambda: [verify.CommandResult("pytest -q", 1, tail)]
+        ),
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 0
+    assert engine.state.tasks["1-1-a"].phase == Phase.DEFERRED
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    lines = [ln for ln in attention.splitlines() if ln.strip()]
+    assert all(ln.startswith("[") for ln in lines), attention
+    (deferred,) = [ln for ln in lines if "story deferred: 1-1-a" in ln]
+    assert "verify command failed (rc=1): pytest -q" in deferred
+    assert " ⏎ FAILED tests/test_a.py::test_one ⏎ " in deferred
+    assert "\\x1b[31mFAILED tests/test_b.py::test_two\\x1b[0m" in deferred
+    assert "\x1b" not in attention  # no raw ESC reaches the file
+
+    # the journal stays raw: the whole multi-line reason is on the durable record
+    decisions = [
+        e
+        for e in engine.journal.entries()
+        if e["kind"] == "dev-decision" and "FAILED tests/test_a.py" in e.get("reason", "")
+    ]
+    assert decisions
+    assert "\n" in decisions[-1]["reason"] and "\x1b[31m" in decisions[-1]["reason"]
+    (story_deferred,) = [e for e in engine.journal.entries() if e["kind"] == "story-deferred"]
+    assert "FAILED tests/test_a.py::test_one\n" in story_deferred["reason"]
 
 
 def test_harvest_gate_exclude_is_rooted_on_the_code_tree(project, tmp_path):
@@ -2570,6 +3246,317 @@ def test_harvest_gate_exclude_degrade_arm_is_rooted_on_the_code_tree(
 
     monkeypatch.setattr(Path, "resolve", resolve_fault)
     assert engine._harvest_gate_exclude(task) == ()
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+@pytest.mark.parametrize("refused_operand", ["ledger", "repo-root"])
+def test_harvest_gate_value_error_family_resolution_fault_uses_lexical_exclusion(
+    project, monkeypatch, resolve_fault, refused_operand
+):
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.harvest_wrote_ledger = True
+    paths = engine.workspace.paths
+    refused = paths.deferred_work if refused_operand == "ledger" else paths.repo_root
+    refuse_to_resolve(monkeypatch, refused, error=resolve_fault)
+
+    assert engine._harvest_gate_exclude(task) == (
+        "_bmad-output/implementation-artifacts/deferred-work.md",
+    )
+
+
+def test_harvest_gate_exclude_names_the_prefixed_path_under_the_monorepo_shape(project):
+    """The VALUE claim the two sibling rows above cannot make (DW-64).
+
+    Both of those rows build the SIBLING shape for their divergent halves, where
+    the ledger sits outside the code tree entirely — so the only answer those
+    halves can assert is `()`, and a `paths.project` spelling is separable there
+    only because it is non-empty. (The first row does assert a non-empty value,
+    but under the COLLAPSED default shape, where the two roots are the same object
+    and no prefix distinguishes them.) No existing row makes a prefix-equality
+    claim under divergence. Nested, a project-rooted
+    spelling is not empty: git, running in the code tree, resolves
+    `_bmad-output/implementation-artifacts/deferred-work.md` onto the OUTER
+    project's real ledger and silently drops it from proof of work. That is the
+    layout where the #716 rule earns its keep, and only a prefix EQUALITY grades it.
+
+    The outer ledger is created deliberately rather than inherited from the sandbox
+    template, so the "wrong spelling names a real file" claim is graded by value
+    rather than by setup accident.
+
+    Ablation: set `root = paths.project` inside `_harvest_gate_exclude` and this
+    reddens on the `app/` prefix equality.
+    """
+    paths = nested_repo_root_paths(project)
+    # the premise the prefix assertion rests on: divergent AND nested (the sibling
+    # shape satisfies the first and not the second)
+    assert paths.project != paths.repo_root
+    assert paths.project.parent == paths.repo_root
+
+    # the OUTER project's ledger — the file a `project`-rooted pathspec silently
+    # names when git resolves it in the code tree
+    decoy, _ = seed_outer_decoy_ledger(paths)
+
+    engine, _ = make_engine(paths, [])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.harvest_wrote_ledger = True
+
+    exclude = engine._harvest_gate_exclude(task)
+    assert exclude == ("app/_bmad-output/implementation-artifacts/deferred-work.md",)
+    # the literal is only a proxy for the rule: what #716 promises is that the
+    # pathspec lands on THIS attempt's ledger when git resolves it in the code tree
+    assert (paths.repo_root / exclude[0]).resolve() == paths.deferred_work.resolve()
+    # silently wrong, not empty: the un-prefixed spelling resolves under the code
+    # tree onto a real file that is NOT the ledger it meant to exclude
+    assert decoy.is_file()
+    assert decoy.resolve() != paths.deferred_work.resolve()
+
+    # both disjuncts of the stand-down guard still hold under this shape
+    task.harvest_wrote_ledger = False
+    assert engine._harvest_gate_exclude(task) == ()
+    task.harvest_wrote_ledger = True
+    task.ledger_changed_before_harvest = True
+    assert engine._harvest_gate_exclude(task) == ()
+
+
+def test_harvest_gate_exclude_gates_the_nested_ledger_under_the_monorepo_shape(project):
+    """The OUTCOME claim the three value rows above cannot make (DW-121).
+
+    Each of those rows stops at the tuple's spelling. What none of them grades is
+    the JOIN `_verify_dev_artifacts` makes: it feeds that tuple to
+    `verify.verify_dev` as `engine_written`, and only running git with it proves
+    the pathspec resolves onto THIS attempt's nested ledger rather than onto the
+    outer project's. The verify-side monorepo cluster pairs every value row with an
+    outcome row and says so in prose; the engine-side producer had no such pair.
+
+    Built from the ENGINE side on purpose: the tuple driven through the gate is the
+    one `_harvest_gate_exclude` really returns, so an edit to the producer's root or
+    to the consumer's handling of `engine_written` reddens this row. It does NOT
+    grade the production WIRING — it calls `verify.verify_dev` directly rather than
+    through `_verify_dev_artifacts`, so deleting
+    `engine_written=self._harvest_gate_exclude(task)` from that caller leaves this
+    row and its three siblings green. That wiring is covered separately, by
+    `test_nonfixable_retry_reverts_harvest_before_the_next_attempt`. Its mirror,
+    `tests/test_verify.py::test_verify_dev_refuses_a_bare_spec_flip_under_the_monorepo_shape`,
+    grades the consumer's own exclusions; this one grades the tuple the engine hands it.
+
+    Every seeded file is COMMITTED because `verify._changes_since` counts untracked
+    files as residue: an untracked decoy, ledger or board would register as the work
+    this attempt never did, and the refusal would then hold for a reason that has
+    nothing to do with the pathspec's root. Committing also forces git's
+    exclude-pathspec branch, which is the branch this row exists to grade.
+
+    The decoy is created and then left ALONE. It exists to make "the wrong spelling
+    names a REAL file" true by value; had the attempt also touched it, the correct
+    spelling would count it as work and the gate could not refuse at all.
+
+    The gate outcome is asserted BEFORE the prefix equality deliberately. The
+    sibling value row above already grades the spelling, so under the ablation this
+    row has to redden on the OUTCOME to be worth its place — an equality assertion
+    reached first would make it a second copy of that row.
+
+    Ablation: set `root = paths.project` inside `_harvest_gate_exclude` and this
+    reddens with `ok=True` — the un-prefixed spelling excludes the untouched outer
+    decoy instead, this attempt's nested ledger append then counts as the work it
+    never did, and the proof-of-work gate passes.
+
+    Asserts the SPECIFIC reason, for the reason its verify-side mirror gives:
+    `not out.ok` alone is reachable from every other gate `verify_dev` runs
+    (workflow tag, status, baseline match, sprint pair), none of which is the
+    claim here.
+    """
+    paths = nested_repo_root_paths(project)
+    # the premise the whole row rests on: divergent AND nested. The sibling shape
+    # satisfies the first only, and there both spellings agree on the outcome.
+    assert paths.project != paths.repo_root
+    assert paths.project.parent == paths.repo_root
+
+    # the OUTER project's ledger: the real file a `project`-rooted pathspec names
+    # once git resolves it in the code tree
+    decoy, decoy_bytes = seed_outer_decoy_ledger(paths)
+
+    # every file the attempt below touches is seeded as TRACKED content first
+    initial_baseline = verify.rev_parse_head(paths.repo_root)
+    write_sprint(paths, {"1-1-a": "ready-for-dev"})
+    sp = spec_path(paths, "1-1-a")
+    write_spec(sp, "ready-for-dev", initial_baseline)
+    write_ledger(paths, {"DW-1": "open"}, commit=False)
+    git(
+        paths.repo_root,
+        "add",
+        decoy.relative_to(paths.repo_root).as_posix(),
+        paths.sprint_status.relative_to(paths.repo_root).as_posix(),
+        sp.relative_to(paths.repo_root).as_posix(),
+        paths.deferred_work.relative_to(paths.repo_root).as_posix(),
+    )
+    git(paths.repo_root, "commit", "-q", "-m", "seed tracked bookkeeping and both ledgers")
+
+    engine, _ = make_engine(paths, [])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    # the baseline is stamped where the session's cwd is: the CODE tree
+    task.baseline_commit = verify.rev_parse_head(paths.repo_root)
+    task.harvest_wrote_ledger = True
+
+    # the attempt's ENTIRE residue: the spec flip, the board advance, and the
+    # orchestrator's own append to the NESTED ledger. No source edit at all.
+    write_sprint(paths, {"1-1-a": "review"})
+    write_spec(sp, "in-review", task.baseline_commit)
+    with paths.deferred_work.open("a", encoding="utf-8") as fh:
+        fh.write("\n### DW-2: harvested from the spec\n\nstatus: open\n")
+
+    exclude = engine._harvest_gate_exclude(task)
+    result_json = {"workflow": "auto-dev", "spec_file": str(sp)}
+    out = verify.verify_dev(task, paths, result_json, engine_written=exclude)
+
+    assert not out.ok
+    assert out.reason == "no changes in worktree since baseline commit"
+    # The in-row control that makes the refusal ATTRIBUTABLE: the SAME attempt with
+    # NO exclusion at all passes. That shows the nested ledger append IS countable
+    # residue which only the pathspec removes, so the refusal above is produced by
+    # the exclusion landing on it. Without this, `not out.ok` rests entirely on an
+    # out-of-band ablation, and a fixture change that made the append uncountable
+    # (left untracked, or newly covered by `app/.gitignore`) would keep the row
+    # green for a reason that has nothing to do with the pathspec's root.
+    assert verify.verify_dev(task, paths, result_json, engine_written=()).ok
+    # the spelling that produced the refusal, pinned once the outcome has spoken
+    assert exclude == ("app/_bmad-output/implementation-artifacts/deferred-work.md",)
+    # the wrong spelling would have named a REAL file, and the decoy contributed no
+    # residue of its own — so the refusal above is about the nested ledger being
+    # excluded, not about the outer one being absent
+    assert decoy.is_file() and decoy.read_bytes() == decoy_bytes
+
+    # the same attempt with one real source edit passes, so the refusal is about the
+    # missing work and not about the fixture being unusable
+    (paths.project / "src.txt").write_text("real work\n", encoding="utf-8")
+    assert verify.verify_dev(task, paths, result_json, engine_written=exclude).ok
+
+
+def test_accepted_park_observation_excludes_the_nested_ledger_under_the_monorepo_shape(project):
+    """The PARK arm's copy of the row above — the arm whose producer join nothing
+    graded (DW-139).
+
+    `_harvest_gate_exclude` feeds BOTH arms of `verify.verify_dev`: the gate arm via
+    `extra_exclude`, and — once the park waiver fires — the observation arm via
+    `observe_skipped_proof`. Only the gate arm had a row grading that join. The park
+    arm's row,
+    `tests/test_verify.py::test_verify_dev_park_zero_diff_excludes_the_orchestrators_own_writes`
+    (DW-132), hand-spells `engine_written=("ledger.md",)`, so the producer is never
+    invoked there and re-rooting it leaves that row green.
+
+    Driven through `Engine._verify_dev_artifacts` rather than `verify.verify_dev`
+    directly — unlike its gate-arm sibling above — because for this arm that method
+    IS the join: it is where `engine_written=self._harvest_gate_exclude(task)` meets
+    `operator_park=self._operator_park_enabled()`, and the tuple graded here has to
+    be the one the producer really returns rather than one the row spelled itself.
+
+    The nested shape is what makes the producer's root separable, for the reason the
+    sibling states: a `project`-rooted spelling names the OUTER project's REAL ledger
+    once git resolves it in the code tree, instead of collapsing to a pathspec that
+    matches nothing and agreeing with the correct spelling by accident.
+
+    Every seeded file is COMMITTED, for two reasons that land on different files.
+    `verify._changes_since` filters untracked paths through the same exclusions the
+    probe applies, so the board, the spec and the nested ledger are unaffected by
+    their tracked state — the outer DECOY is the only file untracked residue could
+    come from, and `park_zero_diff` would then be `False` for a reason with nothing to
+    do with the pathspec's root. Committing the ledger and the board is what makes the
+    harvested append a TRACKED diff, which forces git's exclude-pathspec branch — the
+    branch this row exists to grade, and the sibling's stated reason for committing.
+
+    The decoy is created and then left ALONE. It exists to make "the wrong spelling
+    names a REAL file" true by value; had the attempt also touched it, the CORRECT
+    spelling would count it as residue and the observation could never be `True`.
+
+    The outcome is asserted BEFORE the prefix pin, deliberately and for the sibling's
+    reason: under the ablation this row must redden on the OBSERVATION rather than on
+    a spelling equality the value rows above already grade.
+
+    Ablation, measured: set `root = paths.project` inside `_harvest_gate_exclude` and
+    this reddens on `park_zero_diff is False` — the un-prefixed spelling excludes the
+    untouched outer decoy instead, so the orchestrator's own append to the NESTED
+    ledger is counted and an accepted park is recorded as having left residue it never
+    left. The DW-121 gate-arm row above reddens with it.
+    """
+    paths = nested_repo_root_paths(project)
+    # the premise: divergent AND nested. The sibling shape satisfies the first only,
+    # and there both spellings agree on the observation.
+    assert paths.project != paths.repo_root
+    assert paths.project.parent == paths.repo_root
+
+    # the OUTER project's ledger: the real file a `project`-rooted pathspec names
+    # once git resolves it in the code tree
+    decoy, decoy_bytes = seed_outer_decoy_ledger(paths)
+
+    # every file the attempt below touches is seeded as TRACKED content first, at
+    # PRE-park values: the flip INTO `awaiting-operator` with `operator_actions` has to
+    # be the attempt's own doing. Seeded already parked, the park status would be a
+    # setup artifact and the board write below would be byte-identical to what is
+    # committed, so neither would be residue this attempt produced.
+    initial_baseline = verify.rev_parse_head(paths.repo_root)
+    write_sprint(paths, {"1-1-a": "in-progress"})
+    sp = spec_path(paths, "1-1-a")
+    write_spec(sp, "ready-for-dev", initial_baseline)
+    write_ledger(paths, {"DW-1": "open"}, commit=False)
+    git(
+        paths.repo_root,
+        "add",
+        decoy.relative_to(paths.repo_root).as_posix(),
+        paths.sprint_status.relative_to(paths.repo_root).as_posix(),
+        sp.relative_to(paths.repo_root).as_posix(),
+        paths.deferred_work.relative_to(paths.repo_root).as_posix(),
+    )
+    git(paths.repo_root, "commit", "-q", "-m", "seed tracked bookkeeping and both ledgers")
+
+    engine, _ = make_engine(paths, [], policy=_park_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    # the baseline is stamped where the session's cwd is: the CODE tree
+    task.baseline_commit = verify.rev_parse_head(paths.repo_root)
+    task.harvest_wrote_ledger = True
+
+    # the attempt's ENTIRE residue: the spec flipped to the park status with its
+    # declared actions, the board advanced to the park token, and the orchestrator's
+    # own append to the NESTED ledger. No source edit at all — which is exactly what a
+    # legitimate park looks like.
+    write_spec(sp, "awaiting-operator", task.baseline_commit, operator_actions=ACTIONS)
+    write_sprint(paths, {"1-1-a": "awaiting-operator"})
+    with paths.deferred_work.open("a", encoding="utf-8") as fh:
+        fh.write("\n### DW-2: harvested from the spec\n\nstatus: open\n")
+
+    result_json = {"workflow": "auto-dev", "spec_file": str(sp), "park_asserted": True}
+    outcome = engine._verify_dev_artifacts(task, result_json)
+
+    assert outcome.ok
+    # the waiver fired, so the tuple reached `observe_skipped_proof` and not the gate
+    assert outcome.park_proof_skipped is True
+    # the claim: the pathspec the PRODUCER returned removed the nested append from
+    # the observation, so the accepted park is recorded as the zero-diff it is
+    assert outcome.park_zero_diff is True
+
+    # The in-row control that makes the observation ATTRIBUTABLE, driven through the
+    # SAME join rather than a hand-spelled `verify.verify_dev` call — spelling the
+    # call site's own arguments here would bypass the join this row exists to grade.
+    # Tripping the producer's stand-down disjunct makes it return `()` for this
+    # attempt, and the observation flips: the nested ledger append IS countable
+    # residue that only the pathspec removes, so the `True` above is produced by the
+    # exclusion landing on it. Without this, a fixture change that made the append
+    # uncountable (left untracked, or newly covered by `app/.gitignore`) would keep
+    # the row green for a reason unrelated to the pathspec's root. It also grades the
+    # stand-down disjunct on the PARK arm, which nothing did — the value rows above
+    # grade it on the returned tuple alone, never on what the observation then says.
+    task.ledger_changed_before_harvest = True
+    control = engine._verify_dev_artifacts(task, result_json)
+    assert control.park_proof_skipped is True
+    assert control.park_zero_diff is False
+    task.ledger_changed_before_harvest = False
+
+    # the spelling that produced the observation, pinned once the outcome has spoken
+    assert engine._harvest_gate_exclude(task) == (
+        "app/_bmad-output/implementation-artifacts/deferred-work.md",
+    )
+    # the wrong spelling would have named a REAL file, and the decoy contributed no
+    # residue of its own — so the `True` above is about the nested ledger being
+    # excluded, not about the outer one being absent
+    assert decoy.is_file() and decoy.read_bytes() == decoy_bytes
 
 
 # ------------------- `[verify] commands` run where the SESSION ran (#695, DW-3)
@@ -2822,11 +3809,11 @@ def test_dev_retry_notifies_the_operator_with_the_reason(project):
         for e in engine.journal.entries()
         if e["kind"] == "dev-decision" and e["action"] == "retry"
     ]
-    # the notice carries the reason's FIRST LINE, which is what `_notice_reason`
-    # promises — asserting the whole untrimmed reason passes only while that reason
-    # happens to stay single-line and under `NOTICE_REASON_MAX`, so it would go green
-    # for the wrong reason the moment a producer appended an evidence tail.
-    assert decision["reason"].splitlines()[0].strip() in retries[0]
+    # the notice carries the reason as `gates.notice_line` shapes it — asserting the
+    # raw reason passes only while that reason happens to stay single-line and
+    # control-free, so it would go green for the wrong reason the moment a producer
+    # appended an evidence tail.
+    assert gates.notice_line(decision["reason"]) in retries[0]
 
 
 def test_token_budget_discounts_cache_reads(project):
@@ -3879,11 +4866,15 @@ def test_a_failed_park_record_rollback_is_journaled_not_raised(project, monkeypa
     engine, record = _park_over_an_earlier_record(project, ["the earlier park's action"])
     real = platform_util.atomic_write_text_confined
 
-    def boom(path, text, *, confine_root, require_writable_target=False):
+    def boom(path, text, *, confine_root, require_writable_target=False, root_identity=None):
         if Path(path).name == record.name:
             raise OSError(30, "Read-only file system")
         return real(
-            path, text, confine_root=confine_root, require_writable_target=require_writable_target
+            path,
+            text,
+            confine_root=confine_root,
+            require_writable_target=require_writable_target,
+            root_identity=root_identity,
         )
 
     monkeypatch.setattr("bmad_loop.engine.atomic_write_text_confined", boom)
@@ -4040,6 +5031,572 @@ def test_park_notifies_with_the_actions_and_the_confirm_command(project):
     assert "CRITICAL" not in attention
 
 
+def test_park_notice_keeps_its_numbered_action_list_on_separate_lines(project):
+    """`_notify_park` is multi-line BY DESIGN (`multiline=True`): the numbered
+    operator action list must stay one action per line in ATTENTION, not fold onto
+    the header line the way a reason-carrying notice does.
+
+    Ablation: drop `multiline=True` from `_notify_park` and the actions fold onto
+    the header line with ` ⏎ `, so the per-line assertions redden."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            generic_dev_effect(
+                project, "1-1-a", final_status="awaiting-operator", operator_actions=ACTIONS
+            )
+        ],
+        policy=_park_policy(),
+    )
+
+    engine.run()
+
+    lines = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8").splitlines()
+    (header,) = [i for i, ln in enumerate(lines) if "story awaiting operator: 1-1-a" in ln]
+    assert " ⏎ " not in lines[header]
+    for n, action in enumerate(ACTIONS, 1):
+        assert lines[header + n] == f"  {n}. {action}"
+    assert lines[header + len(ACTIONS) + 1].startswith("run `bmad-loop confirm 1-1-a`")
+
+
+# A multi-line, control-bearing untrusted fragment (DW-417): its second line must
+# never land in ATTENTION as a loose, unprefixed line.
+_MULTILINE_FRAGMENT = "fatal: x\x1b[31m\nhint: y"
+_FOLDED_FRAGMENT = "fatal: x\\x1b[31m ⏎ hint: y"
+
+
+def _assert_attention_folds_the_fragment(run_dir: Path) -> list[str]:
+    lines = (run_dir / "ATTENTION").read_text(encoding="utf-8").splitlines()
+    assert lines and lines[0].startswith("[")
+    assert not any(line.lstrip().startswith("hint: y") for line in lines)
+    assert any(_FOLDED_FRAGMENT in line for line in lines)
+    assert "\x1b" not in "\n".join(lines)
+    return lines
+
+
+def test_park_notice_folds_a_multiline_action_onto_its_numbered_line(project):
+    """An agent-authored operator action is untrusted text: `_notify_park` folds it
+    through `gates.notice_line`, so an embedded line break stays on the action's
+    own numbered line and every other action keeps its line (DW-417).
+
+    Ablation: interpolate the raw action in `_notify_park` and `hint: y` lands in
+    ATTENTION as a loose line after `  1. fatal: x…`."""
+    engine, _ = make_engine(project, [], policy=_park_policy())
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    actions = [_MULTILINE_FRAGMENT, ACTIONS[1]]
+    task = StoryTask(story_key="1-1-a", epic=1, operator_actions=list(actions))
+
+    engine._notify_park(task)
+
+    lines = _assert_attention_folds_the_fragment(engine.run_dir)
+    (header,) = [i for i, ln in enumerate(lines) if "story awaiting operator: 1-1-a" in ln]
+    assert lines[header + 1] == f"  1. {_FOLDED_FRAGMENT}"
+    assert lines[header + 2] == f"  2. {ACTIONS[1]}"
+    assert lines[header + 3].startswith("run `bmad-loop confirm 1-1-a`")
+    assert task.operator_actions == actions  # the task keeps the raw text
+
+
+def test_ledger_repair_pause_folds_a_multiline_error(project):
+    """`_pause_for_ledger_repair`'s `{error}` is folded into one segment of its
+    notice line; the `ledger-read-refused` row keeps it raw (DW-417).
+
+    Ablation: interpolate the raw `error` in the notice and a loose `hint: y` line
+    lands in ATTENTION."""
+    engine, _ = make_engine(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    task = StoryTask(story_key="1-1-a", epic=1)
+    engine.state.tasks[task.story_key] = task
+    error = f"{project.deferred_work}: {_MULTILINE_FRAGMENT}"
+
+    with pytest.raises(RunPaused):
+        engine._pause_for_ledger_repair(task, project.deferred_work, error, site="test-site")
+
+    _assert_attention_folds_the_fragment(engine.run_dir)
+    (refused,) = [e for e in engine.journal.entries() if e["kind"] == "ledger-read-refused"]
+    assert refused["error"] == error
+
+
+@pytest.mark.parametrize("error", [None, "probe fault"])
+def test_harvest_carry_foreign_dirt_pause_folds_a_multiline_ledger_path(project, error):
+    """`_pause_for_harvest_carry_foreign_dirt` folds `{ledger}` into one segment of
+    its notice line, on both the foreign-dirt and the probe-fault arms; the
+    `harvest-carry-foreign-dirt` row keeps it raw (DW-492).
+
+    Ablation: interpolate the raw `ledger` in the notice and a loose `hint: y` line
+    lands in ATTENTION."""
+    engine, _ = make_engine(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    task = StoryTask(story_key="1-1-a", epic=1)
+    engine.state.tasks[task.story_key] = task
+    ledger = Path(f"/ledger/{_MULTILINE_FRAGMENT}.md")
+
+    with pytest.raises(RunPaused):
+        engine._pause_for_harvest_carry_foreign_dirt(task, ledger, error=error)
+
+    lines = _assert_attention_folds_the_fragment(engine.run_dir)
+    # `Path` renders the ledger with the platform separator.
+    assert any(f"`{os.sep}ledger{os.sep}{_FOLDED_FRAGMENT}.md`" in line for line in lines)
+    (dirt,) = [e for e in engine.journal.entries() if e["kind"] == "harvest-carry-foreign-dirt"]
+    assert dirt["ledger"] == str(ledger)
+
+
+# ------------------------ review demotion -> park (DW-383, on_review_demotion)
+
+
+def _demotion_policy(mode="park", **kw):
+    return _park_policy(operator=OperatorPolicy(on_review_demotion=mode), **kw)
+
+
+def _review_pass(paths, story_key, status, *, operator_actions=None, on_entry=None):
+    """A review pass that finalizes the spec at ``status`` and — like the real
+    skill, which is told never to write the board — leaves sprint-status alone.
+    (``review_effect`` writes the board to ``done`` itself, which would mask the
+    orchestrator's own board writes these tests are about.) ``on_entry`` runs
+    first, to observe the state the pass was launched into."""
+
+    def effect(spec: SessionSpec) -> SessionResult:
+        if on_entry is not None:
+            on_entry()
+        sp = spec_path(paths, story_key)
+        baseline = _spec_baseline(sp)
+        write_spec(sp, status, baseline, operator_actions=operator_actions)
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": story_key,
+                "spec_file": str(sp),
+                "baseline_commit": baseline,
+                "status": status,
+                "followup_review_recommended": False,
+                "escalations": [],
+            },
+        )
+
+    return effect
+
+
+def test_review_demotion_parks_under_park_policy_and_the_run_continues(project):
+    """The DW-383 path end to end: dev finalizes `done` (board -> done), the review
+    pass concludes the story owes a human action and finalizes `awaiting-operator`.
+    Under `on_review_demotion = "park"` the board regresses through the one
+    allowlisted pair, the gate clears, the story commits and parks, and the run
+    moves on.
+
+    Ablation: delete the demotion branch in `_review_and_commit` and this fails —
+    the pass reads as non-terminal, the loop asks for an unscripted review session
+    and the story never parks."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev", "1-2-b": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [
+            generic_dev_effect(project, "1-1-a"),
+            _review_pass(project, "1-1-a", "awaiting-operator", operator_actions=ACTIONS),
+            generic_dev_effect(project, "1-2-b"),
+            review_effect(project, "1-2-b", clean=True),
+        ],
+        policy=_demotion_policy(),
+    )
+
+    summary = engine.run()
+
+    parked = engine.state.tasks["1-1-a"]
+    assert parked.phase == Phase.AWAITING_OPERATOR
+    assert parked.operator_actions == ACTIONS
+    assert parked.board_advance_intended == "awaiting-operator"
+    assert parked.commit_sha and parked.commit_sha != parked.baseline_commit
+    assert story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+    assert engine.state.tasks["1-2-b"].phase == Phase.DONE
+    assert summary.awaiting_operator == 1 and summary.done == 1 and not summary.paused
+    assert summary.deferred == 0 and summary.escalated == 0
+    assert len([s for s in adapter.sessions if s.role == "review"]) == 2
+
+    entries = engine.journal.entries()
+    review_results = [
+        e for e in entries if e["kind"] == "review-result" and e["story_key"] == "1-1-a"
+    ]
+    assert [e["status"] for e in review_results] == ["awaiting-operator"]
+    parked_entry = next(e for e in entries if e["kind"] == "story-awaiting-operator")
+    assert parked_entry["actions"] == ACTIONS and parked_entry["commit"] == parked.commit_sha
+    assert "review-verify-failed" not in [e["kind"] for e in entries]
+    # the park record for `bmad-loop confirm` rides the story's own commit
+    assert ".bmad-loop/operator/1-1-a.json" in git(
+        project.project, "ls-tree", "-r", "--name-only", parked.commit_sha
+    )
+
+
+def test_review_demotion_is_not_taken_under_the_default_escalate(project):
+    """The same scripting under the default `escalate`: nothing changes from before
+    DW-383 — the demotion is a non-terminal status, the loop cycles to the budget,
+    the board is never regressed, and nothing parks.
+
+    Ablation: drop the `== "park"` check from `_review_demotion_parks` and the
+    story parks — the board reads `awaiting-operator`, not `done`."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    policy = _park_policy()
+    assert policy.operator.on_review_demotion == "escalate"
+    demote = _review_pass(project, "1-1-a", "awaiting-operator", operator_actions=ACTIONS)
+    engine, adapter = make_engine(
+        project,
+        [generic_dev_effect(project, "1-1-a")] + [demote] * policy.limits.max_review_cycles,
+        policy=policy,
+    )
+
+    summary = engine.run()
+
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DEFERRED and task.operator_actions == []
+    assert summary.awaiting_operator == 0
+    assert story_status(project.sprint_status, "1-1-a") == "done"
+    assert task.board_advance_intended == "done"
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "story-awaiting-operator" not in kinds
+    assert "non-terminal status 'awaiting-operator'" in (task.defer_reason or "")
+    # and no review prompt offered the park
+    assert all(PARK_HEAD not in s.prompt for s in adapter.sessions if s.role == "review")
+
+
+def test_failed_review_demotion_restores_the_board_and_latches_nothing(project):
+    """A demotion the gate refuses (here: no usable operator_actions — fixable)
+    unwinds the orchestrator's own board write before the failure is routed like
+    a failed `done` gate: the repair session sees the board back at `done` and no
+    actions latched, and a later pass that finalizes `done` commits DONE.
+
+    Neither the repair nor the final pass writes the board, so the restore is load-
+    bearing. Ablation: drop the re-advance to `done` and the final pass trips the
+    sign-off-regression escalation (board `awaiting-operator`, spec `done`); drop
+    the `board_advance_intended` restore and the final assertion on it fails;
+    latch before the gate and the repair observes the actions."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    seen: list[tuple[str | None, list[str], str | None]] = []
+
+    def observe():
+        task = engine.state.tasks["1-1-a"]
+        seen.append(
+            (
+                story_status(project.sprint_status, "1-1-a"),
+                list(task.operator_actions),
+                task.board_advance_intended,
+            )
+        )
+
+    repair = generic_dev_effect(project, "1-1-a")
+
+    def observed_repair(spec: SessionSpec) -> SessionResult:
+        observe()
+        return repair(spec)
+
+    engine, adapter = make_engine(
+        project,
+        [
+            generic_dev_effect(project, "1-1-a"),
+            _review_pass(project, "1-1-a", "awaiting-operator", operator_actions=[]),
+            observed_repair,
+            _review_pass(project, "1-1-a", "done"),
+        ],
+        policy=_demotion_policy(),
+    )
+
+    summary = engine.run()
+
+    assert seen == [("done", [], "done")]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE and task.operator_actions == []
+    assert task.board_advance_intended == "done"
+    assert story_status(project.sprint_status, "1-1-a") == "done"
+    assert summary.done == 1 and summary.awaiting_operator == 0 and not summary.paused
+    entries = engine.journal.entries()
+    failed = [e for e in entries if e["kind"] == "review-verify-failed"]
+    assert len(failed) == 1 and "operator_actions" in failed[0]["reason"]
+    assert "story-awaiting-operator" not in [e["kind"] for e in entries]
+    assert [s.role for s in adapter.sessions] == ["dev", "review", "dev", "review"]
+
+
+def test_replayed_failed_review_demotion_still_restores_the_board(project):
+    """The crash-replay shape: the demotion's board write landed, the host died
+    before the gate's failure could unwind it, and the replayed pass re-enters
+    the branch with the row ALREADY at `awaiting-operator` while the recorded
+    sign-off (`board_advance_intended`, never saved mid-demotion) still reads
+    `done`. That row is the orchestrator's own unrestored write, so a failed gate
+    must still put it back — or the next pass finalizing `done` escalates a
+    sign-off regression on a board nobody but the orchestrator touched.
+
+    Ablation: restrict the restore to a row that read `done` and the repair
+    observes `awaiting-operator`."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    seen: list[tuple[str | None, str | None]] = []
+    repair = generic_dev_effect(project, "1-1-a")
+
+    def observed_repair(spec: SessionSpec) -> SessionResult:
+        task = engine.state.tasks["1-1-a"]
+        seen.append((story_status(project.sprint_status, "1-1-a"), task.board_advance_intended))
+        return repair(spec)
+
+    engine, _ = make_engine(
+        project,
+        [
+            generic_dev_effect(project, "1-1-a"),
+            _review_pass(
+                project,
+                "1-1-a",
+                "awaiting-operator",
+                operator_actions=[],
+                on_entry=lambda: set_sprint(project, "1-1-a", "awaiting-operator"),
+            ),
+            observed_repair,
+            _review_pass(project, "1-1-a", "done"),
+        ],
+        policy=_demotion_policy(),
+    )
+
+    summary = engine.run()
+
+    assert seen == [("done", "done")]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE and not summary.paused
+    assert story_status(project.sprint_status, "1-1-a") == "done"
+
+
+@pytest.mark.parametrize("board_at_death", ["done", "awaiting-operator"])
+def test_resume_replays_a_review_demotion_through_the_review_loop(project, board_at_death):
+    """A host death in the review decision window of a demoting pass (REVIEW_VERIFY
+    persisted with the completed review record, before or after the demotion's
+    board write) resumes by REPLAYING that pass into the review loop's demotion
+    branch — the same park as the uncrashed run, with the park-stage intent — not
+    through the dev-declared park's skip-review path, which reads the review's own
+    `awaiting-operator` spec as a dev park: a `done` board then fails its gate
+    and the verified work is deferred, and an already-regressed board parks with
+    the intent still `done`.
+
+    Ablation: drop the replay exemption from `_review_and_commit`'s
+    `_park_awaiting_operator` intercept and both cases redden."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            generic_dev_effect(project, "1-1-a"),
+            _review_pass(project, "1-1-a", "awaiting-operator", operator_actions=ACTIONS),
+        ],
+        policy=_demotion_policy(),
+    )
+
+    def crashing_emit(stage, *args, **kwargs):
+        if stage == "post_review_result":
+            raise RuntimeError("host died in the review decision window")
+        return original_emit(stage, *args, **kwargs)
+
+    original_emit = engine._emit
+    engine._emit = crashing_emit
+    assert engine.run().crashed
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed.phase == Phase.REVIEW_VERIFY
+    assert crashed.board_advance_intended == "done"
+    set_sprint(project, "1-1-a", board_at_death)
+
+    resumed, adapter = resume_engine(project, engine, [], policy=_demotion_policy())
+    summary = resumed.run()
+
+    assert summary.awaiting_operator == 1 and not summary.crashed and not summary.paused
+    final = load_state(resumed.run_dir).tasks["1-1-a"]
+    assert final.phase == Phase.AWAITING_OPERATOR
+    assert final.operator_actions == ACTIONS
+    assert final.board_advance_intended == "awaiting-operator"
+    assert final.review_cycle == 1  # the replay burned no review-budget slot
+    assert story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+    assert adapter.sessions == []
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "resume-verify" in kinds and "story-awaiting-operator" in kinds
+    assert "review-skipped-awaiting-operator" not in kinds
+    assert "review-verify-failed" not in kinds
+
+
+def test_a_hard_stop_inside_the_demotion_gate_unwinds_before_it_travels(project, monkeypatch):
+    """A raise out of the demotion gate — here a hard stop's `RunStopped`, as the
+    review command sink raises it — must not leave the orchestrator's own board
+    regression behind. The run's trailing save would otherwise persist the
+    park-stage intent over a regressed board, the replay unwind (which keys on a
+    persisted `done` intent) would no longer recognize the write, and a later `done`
+    pass would escalate a false sign-off regression.
+
+    Ablation: drop the `except BaseException` unwind in `_park_review_demotion` and
+    both the persisted intent and the board read `awaiting-operator`."""
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            generic_dev_effect(project, "1-1-a"),
+            _review_pass(project, "1-1-a", "awaiting-operator", operator_actions=ACTIONS),
+        ],
+        policy=_demotion_policy(),
+    )
+
+    def stop(*_a, **_kw):
+        raise RunStopped()  # hard (graceful=False), as the command sink raises
+
+    monkeypatch.setattr(engine, "_review_verify_gate", stop)
+
+    engine.run()
+
+    persisted = load_state(engine.run_dir)
+    assert persisted.stopped
+    for task in (engine.state.tasks["1-1-a"], persisted.tasks["1-1-a"]):
+        assert task.board_advance_intended == "done"
+        assert task.operator_actions == []
+    assert story_status(project.sprint_status, "1-1-a") == "done"
+
+
+def test_a_demotion_whose_actions_vanish_after_the_gate_is_not_parked(project, monkeypatch):
+    """The post-gate re-read fallback: the gate passed, but re-reading the spec for
+    the actions to latch finds none (here: the read degrades to None, as
+    `_observed_frontmatter` does on an OSError). Committing then would file a park
+    that owes nothing — `_finalize_commit_phase` would land it DONE over a board at
+    `awaiting-operator` — so the pass is routed as a failed gate: board back at
+    `done`, intent restored, no latch, a `review-verify-failed` naming the actions,
+    and the loop runs another pass.
+
+    Ablation: latch whatever the re-read returned and return the passing outcome,
+    and the story commits on the demotion pass instead of reaching the next one."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    seen: list[tuple[str | None, list[str], str | None]] = []
+    real_observed = Engine._observed_frontmatter
+
+    def observed(self, spec_path, story_key, site):
+        if site == "review-demotion":
+            return None
+        return real_observed(self, spec_path, story_key, site)
+
+    monkeypatch.setattr(Engine, "_observed_frontmatter", observed)
+
+    def observe():
+        task = engine.state.tasks["1-1-a"]
+        seen.append(
+            (
+                story_status(project.sprint_status, "1-1-a"),
+                list(task.operator_actions),
+                task.board_advance_intended,
+            )
+        )
+
+    engine, adapter = make_engine(
+        project,
+        [
+            generic_dev_effect(project, "1-1-a"),
+            _review_pass(project, "1-1-a", "awaiting-operator", operator_actions=ACTIONS),
+            _review_pass(project, "1-1-a", "done", on_entry=observe),
+        ],
+        policy=_demotion_policy(),
+    )
+
+    summary = engine.run()
+
+    assert seen == [("done", [], "done")]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE and task.operator_actions == []
+    assert task.board_advance_intended == "done"
+    assert story_status(project.sprint_status, "1-1-a") == "done"
+    assert summary.done == 1 and summary.awaiting_operator == 0 and not summary.paused
+    entries = engine.journal.entries()
+    failed = [e for e in entries if e["kind"] == "review-verify-failed"]
+    assert len(failed) == 1 and "operator_actions" in failed[0]["reason"]
+    assert "story-awaiting-operator" not in [e["kind"] for e in entries]
+    assert [s.role for s in adapter.sessions] == ["dev", "review", "review"]
+
+
+def test_red_verify_on_a_review_demotion_unwinds_before_the_repair(project, monkeypatch):
+    """The other gate failure: a well-formed demotion (actions declared) whose
+    verify commands are red. The failure is fixable, so a repair runs — and it must
+    find the board back at `done` and NO actions latched, or a later `done` commit
+    would be silently turned into a park.
+
+    Ablation: latch `task.operator_actions` before the gate (as the dev-side park
+    does before `_commit`) and the repair observes the actions — and the story that
+    the final pass finalized `done` lands AWAITING_OPERATOR."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    red = {"on": False}
+    seen: list[tuple[str | None, list[str], str | None]] = []
+
+    def run_verify(_policy, cwd):
+        ok = verify.CommandResult("pytest -q", 0, "", "", "")
+        bad = verify.CommandResult("pytest -q", 1, "boom\n", "boom\n", "")
+        return [bad if red["on"] else ok]
+
+    monkeypatch.setattr(verify, "run_verify_commands", run_verify)
+
+    def arm():
+        red["on"] = True
+
+    repair = generic_dev_effect(project, "1-1-a")
+
+    def observed_repair(spec: SessionSpec) -> SessionResult:
+        task = engine.state.tasks["1-1-a"]
+        seen.append(
+            (
+                story_status(project.sprint_status, "1-1-a"),
+                list(task.operator_actions),
+                task.board_advance_intended,
+            )
+        )
+        red["on"] = False
+        return repair(spec)
+
+    engine, _ = make_engine(
+        project,
+        [
+            generic_dev_effect(project, "1-1-a"),
+            _review_pass(
+                project, "1-1-a", "awaiting-operator", operator_actions=ACTIONS, on_entry=arm
+            ),
+            observed_repair,
+            _review_pass(project, "1-1-a", "done"),
+        ],
+        policy=_demotion_policy(),
+    )
+
+    summary = engine.run()
+
+    assert seen == [("done", [], "done")]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE and task.operator_actions == []
+    assert story_status(project.sprint_status, "1-1-a") == "done"
+    assert summary.done == 1 and summary.awaiting_operator == 0 and not summary.paused
+
+
+def test_review_demotion_is_inert_when_parking_is_disabled(project):
+    """`on_review_demotion = "park"` needs parking itself to be live: with
+    `[operator] enabled = false` the knob is documented-inert, not an error, and the
+    review prompt carries no park clause."""
+    engine, _ = make_engine(
+        project,
+        [],
+        policy=_park_policy(operator=OperatorPolicy(enabled=False, on_review_demotion="park")),
+    )
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(spec_path(project, "1-1-a")))
+
+    assert engine._review_demotion_parks() is False
+    assert PARK_HEAD not in engine._review_prompt(task)
+
+
+def test_review_prompt_carries_the_park_clause_only_under_park(project):
+    """The review prompt offers the park only in the one mode that accepts it, and
+    appends it LAST (board clauses first, as on the dev seam). The default prompt
+    is byte-identical to the pre-DW-383 one."""
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(spec_path(project, "1-1-a")))
+    default_engine, _ = make_engine(project, [], policy=_park_policy())
+    park_engine, _ = make_engine(project, [], policy=_demotion_policy())
+
+    default = default_engine._review_prompt(task)
+    parked = park_engine._review_prompt(task)
+
+    assert PARK_HEAD not in default
+    assert default.endswith("the board is not.")
+    assert parked == f"{default} {park_engine._operator_park_instruction()}"
+    assert parked.endswith(PARK_TAIL)
+    assert parked.index(BOARD_OWNED) < parked.index(BLOCKED_INVITE) < parked.index(PARK_HEAD)
+    assert "append" not in parked.lower()
+    assert "  " not in parked
+
+
 def test_run_summary_render_labels_both_units(project):
     """render() feeds stdout, the ATTENTION file and the desktop notification
     from one place, so this covers all three."""
@@ -4056,6 +5613,31 @@ def test_run_summary_render_labels_both_units(project):
     assert "1,320 weighted tokens (2,320 raw incl. cache reads)" in rendered
     # the bare, unlabeled figure the issue reported must be gone
     assert "2,320 tokens" not in rendered
+
+
+def test_run_summary_render_folds_a_multiline_crash_error():
+    """A crash_error is `f"{type}: {str(exc)}"`, and git/subprocess text is routinely
+    multi-line; render() feeds the multiline run-finished notice and stdout, so the
+    CRASHED: reason is folded onto its own line with controls escaped. Ablation:
+    rendering `CRASHED: {self.crash_error}` raw fails this test."""
+    from bmad_loop.engine import RunSummary
+
+    summary = RunSummary(
+        run_id="r1",
+        done=0,
+        deferred=0,
+        escalated=0,
+        paused=False,
+        paused_reason="",
+        total_tokens=0,
+        weighted_tokens=0,
+        crashed=True,
+        crash_error="GitError: x\nstderr tail\n\x1b[31m",
+    )
+    lines = summary.render().splitlines()
+
+    assert "CRASHED: GitError: x ⏎ stderr tail ⏎ \\x1b[31m" in lines
+    assert not any(ln in ("stderr tail", "\x1b[31m") for ln in lines)
 
 
 def test_run_summary_render_untracked_usage_stays_one_plain_zero(project):
@@ -4909,6 +6491,62 @@ def test_generic_reconcile_leaves_unknown_custom_status(project):
     assert sp.read_bytes() == before  # the deliberate token survives
     assert rj["status"] == "needs-triage"  # result dict untouched
     assert "spec-status-reconciled" not in [e["kind"] for e in engine.journal.entries()]
+    # DW-382: the refusal is journaled, not silent.
+    skipped = [e for e in engine.journal.entries() if e["kind"] == "spec-reconcile-skipped-status"]
+    assert len(skipped) == 1
+    assert skipped[0]["story_key"] == "1-1-a"
+    assert skipped[0]["spec"] == str(sp)
+    assert skipped[0]["status"] == "needs-triage"
+
+
+def test_generic_reconcile_journals_blocked_refusal(project):
+    """DW-382: a `blocked` frontmatter is never reconciled (it must still route to
+    PAUSE), even under a prose `done`. The refusal used to leave no journal row, so
+    a spec stuck at a status the repair cannot move was indistinguishable from a
+    reconcile that never ran. Its sibling, a reconcilable status that IS repaired,
+    emits no skip row."""
+    from bmad_loop.policy import DevPolicy, ReviewPolicy
+
+    sp = spec_path(project, "1-1-a")
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    sp.write_text(
+        "---\ntitle: 'x'\nstatus: blocked\n---\n\n## Auto Run Result\n\n- Status: done\n",
+        encoding="utf-8",
+    )
+    before = sp.read_bytes()
+
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    engine, _ = make_engine(project, [generic_dev_effect(project, "1-1-a")], policy=pol)
+    task = StoryTask(story_key="1-1-a", epic=1)
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "status": "blocked"}
+
+    engine._reconcile_generic_terminal_status(task, rj)
+
+    assert sp.read_bytes() == before
+    assert rj["status"] == "blocked"
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert kinds.count("spec-reconcile-skipped-status") == 1
+    assert "spec-status-reconciled" not in kinds
+    skipped = next(
+        e for e in engine.journal.entries() if e["kind"] == "spec-reconcile-skipped-status"
+    )
+    assert skipped["status"] == "blocked" and skipped["story_key"] == "1-1-a"
+
+    # A reconcilable status takes the repair arm, never the refusal row.
+    sp.write_text(
+        "---\ntitle: 'x'\nstatus: in-progress\n---\n\n## Auto Run Result\n\n- Status: done\n",
+        encoding="utf-8",
+    )
+    engine._reconcile_generic_terminal_status(task, {"spec_file": str(sp)})
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert kinds.count("spec-reconcile-skipped-status") == 1  # unchanged
+    assert kinds.count("spec-status-reconciled") == 1
 
 
 def test_generic_reconcile_skips_out_of_tree_spec(project, tmp_path):
@@ -5385,25 +7023,19 @@ def test_closes_deferred_external_ledger_is_written_and_journaled(project, tmp_p
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
-@pytest.mark.parametrize("shape", ["dangling", "looping"])
-def test_closes_deferred_in_repo_broken_ledger_link_is_an_outage_not_a_typo(project, shape):
+def test_closes_deferred_in_repo_dangling_ledger_link_is_an_outage_not_a_typo(project):
     """A broken ledger link must read as an outage, not as an empty ledger: an
     empty read classifies every declared id `unknown`, and the story then
     reports a typo (`unmatched`) for a mount that went away.
 
-    Both shapes land in the same answer by different routes: the loop is
-    refused at the read (ELOOP), the dangling link by the symlink check behind
+    A dangling link reaches that answer through the symlink check behind
     `FileNotFoundError` — the link existing at all is the evidence a ledger is
-    expected there."""
+    expected there. The symlink-LOOP shape used to share this row and no longer
+    does; see the row below it."""
     engine = _closes_deferred_run(project, ["DW-1"])
     ledger = project.deferred_work
     ledger.unlink()
-    if shape == "dangling":
-        ledger.symlink_to(project.project / "gone-mount" / "deferred-work.md")
-    else:
-        other = project.project / "ledger-loop"
-        ledger.symlink_to(other)
-        other.symlink_to(ledger)
+    ledger.symlink_to(project.project / "gone-mount" / "deferred-work.md")
 
     summary = engine.run()
 
@@ -5412,6 +7044,260 @@ def test_closes_deferred_in_repo_broken_ledger_link_is_an_outage_not_a_typo(proj
     assert "deferred-close-ledger-unavailable" in kinds
     assert "deferred-close-unmatched" not in kinds
     assert "story-deferred-closed" not in kinds
+
+
+def test_closes_deferred_ledger_replaced_by_a_directory_is_an_outage_not_a_typo(project):
+    """`_close_declared_deferred`'s `except (OSError, UnicodeDecodeError)` degrade
+    arm, which is the arm the symlink-LOOP shape used to reach before DW-221 moved
+    ELOOP up to the earlier fail-loud probe. A directory at the ledger's own name
+    still reaches it — `read_text` raises `IsADirectoryError`, an `OSError` — so
+    the arm keeps an entry path and the row that grades it is not the split-out
+    loop row.
+
+    Nothing crashes on the way here: `read_for_write` answers `None` for a
+    non-regular file, so the baseline digest treats it as an absent ledger, and the
+    outage is reported where the ids are actually classified. The claim is the same
+    one the dangling row makes — close nothing and SAY so, rather than read an
+    outage as "no such entries" and blame the author for a typo.
+
+    Ablation: drop `OSError` from that except tuple and this reds with
+    `IsADirectoryError` ending the run instead of the journal row appearing."""
+    engine = _closes_deferred_run(project, ["DW-1"])
+    ledger = project.deferred_work
+    ledger.unlink()
+    ledger.mkdir()
+    # Windows refuses a directory read with PermissionError rather than
+    # IsADirectoryError; grade the actual OS fault without depending on its locale.
+    with pytest.raises(OSError) as fault:
+        ledger.read_text(encoding="utf-8")
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed  # the story still lands
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "deferred-close-ledger-unavailable" in kinds
+    assert "deferred-close-unmatched" not in kinds
+    assert "story-deferred-closed" not in kinds
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    notices = [
+        line for line in attention.splitlines() if "declared deferred closes unapplied" in line
+    ]
+    assert len(notices) == 1, attention
+    notice = notices[0]
+    assert "1-1-a" in notice and "DW-1" in notice and str(ledger) in notice
+    assert type(fault.value).__name__ in notice and f"[Errno {fault.value.errno}]" in notice
+
+
+def _loop_the_ledger(project) -> Path:
+    """Replace the committed ledger with a symlink CYCLE (ELOOP), the OS-refused
+    shape the engine's own `read_for_write` sites meet as a `Path.stat` errno
+    (DW-221). Returns the loop's other end so a repair can unlink both."""
+    ledger = project.deferred_work
+    ledger.unlink()
+    other = project.project / "ledger-loop"
+    ledger.symlink_to(other)
+    other.symlink_to(ledger)
+    return other
+
+
+def _loop_the_ledger_past_the_gate(project, engine) -> Path:
+    """Install `_loop_the_ledger`'s cycle the moment `_refuse_gated_story` has
+    passed the story, so the loop reaches the DW-258 sites downstream of the gate
+    — `_ledger_digest`'s baseline capture first. Until DW-266 the gate probed with
+    `Path.is_file()`, which absorbs ELOOP on every interpreter, so a loop installed
+    up front passed it; the gate's `Path.stat` probe now reports the errno and
+    pauses the run before any of those sites is reached (`test_dispatch_pauses_
+    when_the_ledger_cannot_be_read`), which is the right verdict for a ledger
+    that exists and cannot be read, and not the window these rows grade. Returns
+    the loop's other end, resolved once the gate has run."""
+    other = project.project / "ledger-loop"
+    real_gate = engine._refuse_gated_story
+
+    def gate_then_loop(story_key: str) -> None:
+        real_gate(story_key)  # over the readable, committed ledger
+        if not project.deferred_work.is_symlink():
+            _loop_the_ledger(project)
+
+    engine._refuse_gated_story = gate_then_loop
+    return other
+
+
+def _repair_looped_ledger(project, other: Path) -> None:
+    """Undo `_loop_the_ledger`: drop both links and put the committed ledger back."""
+    project.deferred_work.unlink()
+    other.unlink()
+    git(project.project, "checkout", "--", str(project.deferred_work))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_closes_deferred_in_repo_ledger_link_loop_degrades_the_digest_and_pauses_the_harvest(
+    project,
+):
+    """A read the OS refuses is routed at the engine's four direct `read_for_write`
+    sites the way DW-231 routes a decode fault (DW-258). This row was the crash
+    DW-221 left behind: `Path.stat` reports ELOOP where `is_file()` used to answer
+    False, so the first site to meet the loop — `_ledger_digest`'s baseline
+    capture — raised `OSError` and the run died as `run-crash` with `crash.txt`
+    as the only account.
+
+    Now the OBSERVATION reads degrade (`ledger-read-degraded` for `ledger-digest`
+    and `pre-harvest-snapshot`, each naming the ledger and the `OSError`), the dev
+    session runs once and records its findings, and the PUBLISH read at the harvest
+    pauses the run for repair (`ledger-read-refused`, site `spec-deferrals-harvest`)
+    with the task left at `DEV_VERIFY` — not `run-crash`. The claim the old row
+    made survives: the outage is never reported as a typo (`deferred-close-
+    unmatched`) and the close is never applied. After the loop is replaced by a
+    readable ledger, `resume` replays the recorded session result with ZERO
+    sessions, files the finding and closes the declared entry.
+
+    Ablation: narrow `_ledger_text`'s `except` tuple back to `LedgerReadError` and
+    this reds with `run-crash` (`OSError`) at the baseline digest, zero sessions."""
+    engine = _closes_deferred_run(project, ["DW-1"], deferred=[HARVEST_A])
+    ledger = project.deferred_work
+    other = _loop_the_ledger_past_the_gate(project, engine)
+
+    summary = engine.run()
+
+    assert len(engine.adapters["dev"].sessions) == 1  # the session ran once
+    assert summary.paused and not summary.crashed and summary.done == 0
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DEV_VERIFY
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "run-crash" not in kinds
+    assert "deferred-close-unmatched" not in kinds  # never reported as a typo
+    assert "story-deferred-closed" not in kinds
+    degraded = {
+        e["site"]: e for e in engine.journal.entries() if e["kind"] == "ledger-read-degraded"
+    }
+    assert {"ledger-digest", "pre-harvest-snapshot"} <= set(degraded)
+    for row in degraded.values():
+        assert row["ledger"] == str(ledger) and row["story_key"] == "1-1-a"
+        assert "OSError" in row["error"] and str(ledger) in row["error"]  # names the file
+    assert task.baseline_ledger_digest == _UNREADABLE_LEDGER_DIGEST
+    assert task.ledger_changed_before_harvest is False  # unknown, so not credited
+    (refused,) = [e for e in engine.journal.entries() if e["kind"] == "ledger-read-refused"]
+    assert refused["site"] == "spec-deferrals-harvest" and "OSError" in refused["error"]
+    assert ledger.is_symlink()  # nothing written through the loop
+
+    _repair_looped_ledger(project, other)
+    resumed, resumed_adapter = resume_engine(project, engine, [])
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    assert resumed_adapter.sessions == []  # ZERO sessions: the harvest was retried
+    assert resumed.state.tasks["1-1-a"].phase == Phase.DONE
+    entries = _ledger_entries(project)
+    assert entries["DW-1"].status.startswith("done")
+    assert [e.title for e in entries.values() if e.open] == [HARVEST_A["summary"]]
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "story-deferred-closed" in kinds and "deferred-close-unmatched" not in kinds
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_closes_deferred_over_a_looped_ledger_with_no_findings_completes_and_journals_the_outage(
+    project,
+):
+    """The shape the deleted crash row existed for: a symlink-loop ledger, a
+    `closes_deferred:` declaration and NO `deferred:` findings. With nothing to
+    harvest no publish read is reached, so every read after the session is an
+    observation and degrades (`ledger-read-degraded` naming the ledger and the
+    `OSError`); the story completes, and the declared close reaches
+    `_close_declared_deferred`'s own degrade arm, which journals
+    `deferred-close-ledger-unavailable` and notifies with every unapplied ID
+    (DW-277) rather than closing — never a typo
+    (`deferred-close-unmatched`), never `story-deferred-closed`, and since DW-258
+    never `run-crash`.
+
+    Ablation: narrow `_ledger_text`'s tuple back to `LedgerReadError` and this
+    reds with `run-crash` (`OSError`) at the baseline digest. Remove only the
+    `gates.notify` call in `_journal_ledger_unavailable` and this fails on the
+    missing outage notice, while the lifecycle and journal checks still pass."""
+    # Exceed the retired 200-char fault-prose cap so truncating the whole notice
+    # would drop declared IDs.
+    ids = [f"DW-{number}" for number in range(1, 41)]
+    assert len(", ".join(ids)) > 200
+    engine = _closes_deferred_run(project, ids, ledger=dict.fromkeys(ids, "open"))
+    ledger = project.deferred_work
+    _loop_the_ledger_past_the_gate(project, engine)
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed and not summary.paused
+    assert len(engine.adapters["dev"].sessions) == 1
+    degraded = [e for e in engine.journal.entries() if e["kind"] == "ledger-read-degraded"]
+    assert degraded and all(
+        e["ledger"] == str(ledger) and "OSError" in e["error"] and str(ledger) in e["error"]
+        for e in degraded
+    )
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "deferred-close-ledger-unavailable" in kinds
+    assert "run-crash" not in kinds and "ledger-read-refused" not in kinds
+    assert "deferred-close-unmatched" not in kinds and "story-deferred-closed" not in kinds
+    (outage,) = [
+        e for e in engine.journal.entries() if e["kind"] == "deferred-close-ledger-unavailable"
+    ]
+    assert outage["story_key"] == "1-1-a" and outage["dw_ids"] == ids
+    assert outage["ledger"] == str(ledger) and "OSError" in outage["error"]
+    assert ledger.is_symlink()  # the advisory snapshot did not replace the loop
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    notices = [
+        line for line in attention.splitlines() if "declared deferred closes unapplied" in line
+    ]
+    assert len(notices) == 1, attention
+    notice = notices[0]
+    assert "1-1-a" in notice and "declared closes were not applied" in notice
+    assert set(re.findall(r"\bDW-\d+\b", notice)) == set(ids)
+    assert str(ledger) in notice
+    assert "OSError" in notice and f"[Errno {errno.ELOOP}]" in notice
+    assert "story continues" in notice and "sweep" in notice
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_no_work_session_over_a_looped_ledger_never_lands_on_the_engines_own_append(project):
+    """The no-work twin of the row above, and the reason `_ledger_changed_since_
+    baseline` answers False over the `<unreadable>` sentinel rather than a plain
+    `!=` (DW-258, resolution 2026-09-11). The baseline digest was captured over the
+    loop, so it IS the sentinel; after the repair the harvest appends over a
+    readable ledger whose real digest differs from it. A plain `!=` would call
+    that CHANGED, `_harvest_gate_exclude` would stand the ledger exclusion down,
+    and the engine's own harvest append would pass a session that wrote NOTHING
+    through the proof-of-work gate — `DONE` on zero sessions.
+
+    Unknown attribution is not credited: `ledger_changed_before_harvest` stays
+    False, the ledger path stays excluded, the replayed attempt fails the gate and
+    is rolled back, and the retries run over a readable baseline where attribution
+    is exact — so the story defers exactly as the same no-work session over a
+    readable ledger does, and the declared close is never applied.
+
+    Ablation: make `_ledger_changed_since_baseline` a plain `!=` and this reds by
+    landing `DONE` with zero sessions on the resume."""
+    engine = _closes_deferred_run(project, ["DW-1"], deferred=[HARVEST_A], write_src=False)
+    other = _loop_the_ledger_past_the_gate(project, engine)
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed and summary.done == 0
+    task = engine.state.tasks["1-1-a"]
+    assert task.baseline_ledger_digest == _UNREADABLE_LEDGER_DIGEST
+    assert task.ledger_changed_before_harvest is False
+
+    _repair_looped_ledger(project, other)
+    # `max_dev_attempts` is 2: the replayed attempt fails the gate, one retry runs.
+    retry = dev_effect(
+        project, "1-1-a", followup_review=False, closes_deferred=["DW-1"], write_src=False
+    )
+    resumed, resumed_adapter = resume_engine(project, engine, [retry])
+    summary = resumed.run()
+
+    assert summary.done == 0  # never DONE on the engine's own append
+    assert summary.deferred == 1 and not summary.crashed
+    assert len(resumed_adapter.sessions) == 1  # the replay failed the gate; the retry ran
+    assert resumed.state.tasks["1-1-a"].phase == Phase.DEFERRED
+    assert resumed.state.tasks["1-1-a"].ledger_changed_before_harvest is False
+    assert _ledger_entries(project)["DW-1"].open  # never claimed resolved
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "story-deferred" in kinds and "story-deferred-closed" not in kinds
 
 
 def test_closes_deferred_re_reads_the_declaration_at_the_commit_boundary(project, monkeypatch):
@@ -6738,7 +8624,8 @@ def test_per_stage_adapter_and_model_dispatch(project):
         adapter=AdapterPolicy(
             name="claude",
             model="opus",
-            review=StageAdapterPolicy(name="codex", model="gpt-5-codex"),
+            effort="high",
+            review=StageAdapterPolicy(name="codex", model="gpt-5-codex", effort="max"),
         ),
     )
     engine = Engine(
@@ -6757,6 +8644,9 @@ def test_per_stage_adapter_and_model_dispatch(project):
     assert [s.role for s in review_mock.sessions] == ["review"]
     assert dev_mock.sessions[0].model == "opus"
     assert review_mock.sessions[0].model == "gpt-5-codex"
+    # #643: the resolved per-stage effort rides the SessionSpec the same way
+    assert dev_mock.sessions[0].effort == "high"
+    assert review_mock.sessions[0].effort == "max"
 
 
 def test_review_loop_converges_within_budget(project):
@@ -6895,6 +8785,41 @@ def test_budget_exhausted_finalized_work_commits(project):
         e.open and "origin: review-budget-followup" in e.body
         for e in deferredwork.parse_ledger(ledger)
     )
+
+
+def test_review_budget_journal_survives_an_undecodable_ledger(project):
+    """DW-146's OBSERVATION row inside the engine. `_journal_review_budget_spent`
+    reads the ledger for ONE purpose — the `re_review_capped` flag on the row it is
+    about to write — and writes nothing to the ledger itself. Raising a
+    `UnicodeDecodeError` out of a journaling helper is the wrong failure: the story
+    is already committed and verify-green by the time this runs, so the fault would
+    abort a run over a flag. It degrades to the flag's own default (`False`: no
+    evidence this story came from a follow-up entry) and journals the attributed
+    fault, so the missing evidence is visible rather than indistinguishable from a
+    genuine `False`.
+    Ablation: revert the read to
+    `deferredwork.parse_ledger(ledger.read_text(encoding="utf-8"))` under an
+    `is_file()` guard and this reddens with `UnicodeDecodeError` escaping."""
+    engine, _ = make_engine(
+        project, [], policy=Policy(gates=GatesPolicy(mode="none"), notify=QUIET)
+    )
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.dw_ids = ["DW-1"]
+    ledger = engine.workspace.paths.deferred_work
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_bytes(b"# Deferred Work\n\n### DW-1: bad \xff byte\n\nstatus: open\n")
+
+    engine._journal_review_budget_spent(task)
+
+    entries = engine.journal.entries()
+    faults = [e for e in entries if e["kind"] == "review-budget-ledger-unreadable"]
+    assert len(faults) == 1
+    assert faults[0]["ledger"] == str(ledger) and faults[0]["dw_ids"] == ["DW-1"]
+    assert faults[0]["error"].startswith("UnicodeDecodeError: ")
+    committed = [e for e in entries if e["kind"] == "review-budget-committed"]
+    assert len(committed) == 1 and committed[0]["re_review_capped"] is False
+    # nothing was written to the ledger by a journaling helper
+    assert ledger.read_bytes().endswith(b"status: open\n")
 
 
 def test_budget_exhausted_unfinalized_defers(project):
@@ -8427,6 +10352,60 @@ def test_rollback_emits_pre_and_post_around_reset(project):
     ]
 
 
+class _RollbackCaptureBus:
+    """Hook-bus double recording the real contexts the engine builds for the
+    rollback stages."""
+
+    def __init__(self):
+        self.contexts = []
+
+    def active(self, stage):
+        return stage in ("pre_rollback", "post_rollback")
+
+    def emit(self, stage, ctx):
+        self.contexts.append(ctx)
+        return ctx
+
+
+@pytest.mark.parametrize("pause", [False, True], ids=["completed", "paused"])
+def test_rollback_post_hook_carries_outcome_through_real_engine(project, monkeypatch, pause):
+    """DW-322 end to end: the engine's own `_make_context` accepts the outcome
+    field, `pre_rollback` carries none, and a rollback that pauses after
+    `pre_rollback` (here a commit-preservation failure) still delivers exactly
+    one `post_rollback` labelled "paused" while the run pauses as before."""
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    engine, _ = make_engine(project, [], policy=policy)
+    capture = _RollbackCaptureBus()
+    engine._bus = capture
+    repo = project.project
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = rev_parse_head(repo)
+    task.baseline_untracked = []
+    (repo / "impl.txt").write_text("committed implementation\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "attempt work")
+
+    if pause:
+
+        def no_ref(*a, **k):
+            raise verify.GitError("branch creation failed")
+
+        monkeypatch.setattr(verify, "preserve_commits", no_ref)
+        with pytest.raises(RunPaused, match="could not be auto-preserved"):
+            engine._rollback_or_pause(task)
+    else:
+        engine._rollback_or_pause(task)
+
+    assert [(c.stage, c.rollback_outcome) for c in capture.contexts] == [
+        ("pre_rollback", None),
+        ("post_rollback", "paused" if pause else "completed"),
+    ]
+
+
 def test_rollback_emits_are_observe_only(project):
     """The rollback emits are observe-only, like pre_worktree_teardown: the returned
     ctx is never routed through ``_vetoed``, so a failed Editor quiesce can never
@@ -8485,6 +10464,91 @@ def test_rollback_preserves_uncommitted_attempt_worktree(project):
     # (conftest `git` strips, so compare against the newline-free blob content)
     assert git(repo, "show", f"{ref}:src.txt") == "uncommitted tracked edit"
     assert git(repo, "show", f"{ref}:new_test.txt") == "uncommitted new file"
+
+
+def _dirty_timeout_effect(paths, text: str):
+    """A dev session that times out mid-work, leaving an uncommitted edit that
+    the non-fixable retry's rollback parks under a worktree snapshot."""
+
+    def effect(spec):
+        (paths.project / "src.txt").write_text(text)
+        return SessionResult(status="timeout")
+
+    return effect
+
+
+def test_retry_dev_prompt_names_the_earlier_attempts_parked_work(project):
+    """#777: attempt 1 times out with work on the tree; the retry rolls it back
+    and parks it. Attempt 2's prompt names that verified snapshot — and only
+    attempt 2's: the first dispatch has nothing earlier to point at."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [
+            _dirty_timeout_effect(project, "half-built attempt 1\n"),
+            dev_effect(project, "1-1-a", followup_review=False),
+        ],
+    )
+
+    assert engine.run().done == 1
+
+    (entry,) = [e for e in engine.journal.entries() if e["kind"] == "attempt-worktree-preserved"]
+    ref = entry["ref"]
+    first, second = [s.prompt for s in adapter.sessions if s.role == "dev"]
+    assert "earlier attempt" not in first
+    base = engine.state.tasks["1-1-a"].baseline_commit
+    assert (
+        "\n\nAn earlier attempt at this work was rolled back; its work is preserved at " in second
+    )
+    assert f"`git diff {base} {ref}`" in second
+    assert "every gate must pass fresh on this attempt" in second
+    assert "half-built attempt 1" in git(project.project, "show", f"{ref}:src.txt")
+
+
+def test_retry_dev_prompt_names_work_parked_after_a_mid_session_crash(project):
+    """#777: a host death mid-session records no session, so the resume's restart
+    arm parks the dirty tree with only the durable DEV_RUNNING to attribute it.
+    The re-dispatched attempt's prompt still names that work.
+
+    Ablation: drop the DEV_RUNNING arm of `Engine._dev_attempt_dispatched` and
+    the paragraph disappears from the resumed prompt."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+
+    def crash_mid_session(spec):
+        (project.project / "src.txt").write_text("half-built before the crash\n")
+        raise RuntimeError("host died mid-session")
+
+    engine, _ = make_engine(project, [crash_mid_session])
+    assert engine.run().crashed
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed.phase == Phase.DEV_RUNNING and crashed.sessions == []
+
+    resumed, adapter = resume_engine(
+        project, engine, [dev_effect(project, "1-1-a", followup_review=False)]
+    )
+    assert resumed.run().done == 1
+
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "resume-restart" in kinds
+    (entry,) = [e for e in resumed.journal.entries() if e["kind"] == "attempt-worktree-preserved"]
+    ref = entry["ref"]
+    (prompt,) = [s.prompt for s in adapter.sessions if s.role == "dev"]
+    assert f"its work is preserved at `{ref}`" in prompt
+    assert "half-built before the crash" in git(project.project, "show", f"{ref}:src.txt")
+
+
+def test_retry_dev_prompt_has_no_preserve_paragraph_when_nothing_was_parked(project):
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [SessionResult(status="timeout"), dev_effect(project, "1-1-a", followup_review=False)],
+    )
+
+    assert engine.run().done == 1
+
+    assert engine.state.tasks["1-1-a"].preserve_ref is None
+    second = [s.prompt for s in adapter.sessions if s.role == "dev"][1]
+    assert "earlier attempt" not in second
 
 
 def test_rollback_preserves_distinct_refs_across_repeated_dirty_rollbacks(project):
@@ -9064,6 +11128,7 @@ def test_resolved_escalation_resume_dirty_tree_auto_recovers(project):
     assert "rollback-manual-required" not in kinds
 
 
+@requires_descriptor_restoration
 def test_resolved_redrive_owned_dirty_spec_routes_explicitly_and_converges(project):
     """T22: #123 ownership recovery and #630 explicit routing converge together.
 
@@ -9187,6 +11252,7 @@ def test_resolved_redrive_owned_dirty_spec_routes_explicitly_and_converges(proje
     assert "rollback-manual-required" not in kinds
 
 
+@requires_descriptor_restoration
 @pytest.mark.parametrize("resolved_redrive", [False, True], ids=["plain", "resolved-redrive"])
 def test_bound_fixable_chain_restores_first_snapshot_before_fresh_retry(project, resolved_redrive):
     """A repair child cannot replace the correction retained for chain rollback.
@@ -9684,19 +11750,20 @@ def test_dev_escalation_records_spec_for_rearm(project):
     again on the stale `blocked` status — the loop seen in the live run."""
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     sp = spec_path(project, "1-1-a")
+    patch = project.implementation_artifacts / "intent-gap-attempt.patch"
+    patch.parent.mkdir(parents=True, exist_ok=True)
+    patch.write_text("saved attempt\n", encoding="utf-8")
+    detail = f"intent gap; saved patch: {patch}"
 
     def halt_blocked(spec):
         write_spec(sp, "blocked", rev_parse_head(project.project))
+        with sp.open("a", encoding="utf-8") as f:
+            f.write(f"\n## Auto Run Result\n\nStatus: blocked\n\n{detail}\n")
+        synthesized = devcontract.synthesize_result(sp, story_key="1-1-a").result_json
+        assert synthesized is not None
         return SessionResult(
             status="completed",
-            result_json={
-                "workflow": "auto-dev",
-                "story_key": "1-1-a",
-                "spec_file": str(sp),
-                "escalations": [
-                    {"type": "blocked", "severity": "CRITICAL", "detail": "blocked spec supplied"}
-                ],
-            },
+            result_json=synthesized,
         )
 
     engine, _ = make_engine(project, [halt_blocked])
@@ -9706,11 +11773,71 @@ def test_dev_escalation_records_spec_for_rearm(project):
     task = load_state(engine.run_dir).tasks["1-1-a"]
     assert task.phase == Phase.ESCALATED
     assert task.spec_file and Path(task.spec_file).name == sp.name  # recorded despite HALT
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert f"recovery trail: {sp}" in attention
+    spec_text = sp.read_text(encoding="utf-8")
+    assert str(patch) in spec_text
+    result = task.sessions[-1].result_json
+    assert result is not None
+    assert result["escalations"][0]["spec_file"] == str(sp)
 
     rearm_escalation(
         engine.run_dir, isolated_redrive=False, resolution_recorded=True
     )  # the resolve workflow's re-arm step
     assert read_frontmatter(sp)["status"] == "ready-for-dev"  # re-drive will not HALT
+
+
+def test_long_critical_reason_is_lossless_in_records_and_bounded_only_for_display(project):
+    """The recovery tail survives every durable/machine surface while notices and
+    the run summary identify the blocked spec instead of silently cutting it."""
+    from bmad_loop.documents import status_document
+    from bmad_loop.escalation import CRITICAL_DISPLAY_MAX
+
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    sp = spec_path(project, "1-1-a")
+    tail = "RECOVERY-TAIL"
+    detail = "x" * 2500 + tail
+
+    def halt_blocked(_spec):
+        write_spec(sp, "blocked", rev_parse_head(project.project))
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": "1-1-a",
+                "spec_file": str(sp),
+                "escalations": [
+                    {
+                        "type": "blocked",
+                        "severity": "CRITICAL",
+                        "detail": detail,
+                        "spec_file": str(sp),
+                    }
+                ],
+            },
+        )
+
+    engine, _ = make_engine(project, [halt_blocked])
+    summary = engine.run()
+    saved = load_state(engine.run_dir)
+
+    assert saved.paused_reason.endswith(tail)
+    assert saved.tasks["1-1-a"].sessions[-1].result_json["escalations"][0]["detail"].endswith(tail)
+    for kind in ("dev-decision", "story-escalated", "run-paused"):
+        (record,) = [entry for entry in engine.journal.entries() if entry["kind"] == kind]
+        assert record["reason"].endswith(tail)
+    assert status_document(saved)["paused_reason"].endswith(tail)
+
+    display = summary.paused_reason
+    assert len(display) <= CRITICAL_DISPLAY_MAX
+    assert "[… truncated; full detail in journal.jsonl]" in display
+    assert f"[recovery trail: {sp}]" in display
+    assert tail not in display
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert "[… truncated; full detail in journal.jsonl]" in attention
+    assert f"[recovery trail: {sp}]" in attention
+    assert tail not in attention
+    assert f"PAUSED: {display}" in summary.render()
 
 
 # ------------------------------------------------------ deferred-artifact stash
@@ -9989,6 +12116,7 @@ def test_restore_redrive_prompt_points_at_the_spec(project):
     assert prompt != "/bmad-dev-auto 1-1-a"  # never the bare key on a restore
 
 
+@requires_descriptor_restoration
 def test_intent_gap_restore_reapplies_after_mid_redrive_rollback(project):
     """A non-fixable retry inside the restore re-drive resets to baseline (clearing
     the restored code), so the patch is re-applied before the next dispatch; the
@@ -10108,8 +12236,57 @@ def test_critical_escalation_pauses_and_resume_continues(project):
         [dev_effect(project, "1-2-b"), review_effect(project, "1-2-b", clean=True)],
     )
     summary2 = resumed.run()
-    assert summary2.done == 1 and not summary2.paused
-    assert resumed.state.finished
+    assert summary2.done == 1
+    # DW-386: the resumed queue drained past the unresolved escalation, so the run
+    # re-pauses on it instead of being stamped finished (which `resolve` refuses).
+    assert summary2.paused and not resumed.state.finished
+    assert resumed.state.paused_stage == PAUSE_ESCALATION
+    assert resumed.state.paused_story_key == "1-1-a"
+
+
+def test_critical_escalation_with_a_multiline_detail_keeps_attention_one_record_per_line(
+    project,
+):
+    """DW-332's headline surface: `_escalate` hands a CRITICAL reason (routinely a
+    verify tail or a session's multi-line detail) to `gates.notify`, and the run
+    summary then repeats it as `PAUSED: <reason>` inside the deliberately
+    multi-line run-finished notice. Both must stay one ATTENTION record per line:
+    the escalation notice folds on the default path, and `RunSummary.render`
+    folds the embedded reason onto its own `PAUSED:` line.
+
+    Ablation: skip `notice_line` in `gates.notify` and the `CRITICAL escalation:`
+    line loses its fold, with the tail loose; render `PAUSED: {paused_reason}` raw
+    and the tail lines after `PAUSED:` redden the all-lines-start-with-`[` check.
+    """
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    detail = "config key missing\nFAILED tests/test_a.py::test_one\n\n  FAILED tests/test_b.py"
+    escalating = SessionResult(
+        status="completed",
+        result_json={
+            "workflow": "auto-dev",
+            "escalations": [{"type": "missing-config", "severity": "CRITICAL", "detail": detail}],
+        },
+    )
+    engine, _ = make_engine(project, [escalating])
+
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1
+    text = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    lines = text.splitlines()
+    (critical,) = [ln for ln in lines if "CRITICAL escalation: 1-1-a" in ln]
+    assert "config key missing ⏎ FAILED tests/test_a.py::test_one ⏎ FAILED tests/test_b.py" in (
+        critical
+    )
+    (finished,) = [i for i, ln in enumerate(lines) if "bmad-loop run finished" in ln]
+    paused = lines[finished + 1]
+    assert paused.startswith("PAUSED: ") and " ⏎ FAILED tests/test_b.py" in paused
+    # the PAUSED line is the notice's continuation; nothing else is loose
+    loose = [ln for ln in lines if ln.strip() and not ln.startswith("[")]
+    assert loose == [paused], text
+    assert not any(ln.lstrip().startswith("FAILED") for ln in lines)
+    # the state keeps the raw reason
+    assert "\n" in load_state(engine.run_dir).paused_reason
 
 
 def test_dispatch_refuses_a_story_an_unlanded_entry_gates(project):
@@ -10213,14 +12390,97 @@ def test_dispatch_gate_does_not_fire_for_a_story_it_does_not_name(project):
     assert summary.done == 1 and not summary.paused
 
 
-def test_dispatch_pauses_when_the_ledger_cannot_be_read(project, monkeypatch):
+@pytest.mark.parametrize("fault", ["read_text", "metadata-3.14", "metadata-3.13"])
+def test_dispatch_pauses_when_the_ledger_cannot_be_read(project, monkeypatch, fault):
     """Degrading to "not gated" would let a broken file disable the one deferred
     check that refuses, and "does this project use gates?" is answerable only from
-    the file that will not open. `validate` reports the same fault as a problem."""
+    the file that will not open. `validate` reports the same fault as a problem.
+
+    Three faults, one arm. `read_text` is the read refused; the two `metadata`
+    rows refuse the PRESENCE PROBE (DW-266). `metadata-3.14` pins `Path.is_file`
+    False for the ledger AND refuses `stat`, the shape Python 3.14 gives a refused
+    ledger — `is_file()` there suppresses every OS error and answers False, so the
+    old `read_text(...) if ledger.is_file() else ""` read the refusal as an empty
+    ledger and the hard gate failed OPEN. `metadata-3.13` refuses `stat` alone,
+    which `is_file()` re-raised on 3.11–3.13. Ablation: restore
+    `if ledger.is_file() else ""` and the `metadata-3.14` row reds with
+    `summary.done == 1` and no pause — the story dispatched past the gate."""
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     write_gated_ledger(project, {"DW-1": ("open", ["gate: 9-9"])})
     engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")])
-    fault_read_text(monkeypatch, project.deferred_work)
+    ledger = project.deferred_work
+    if fault == "read_text":
+        fault_read_text(monkeypatch, ledger)
+    else:
+        if fault == "metadata-3.14":
+            real = Path.is_file
+            monkeypatch.setattr(
+                Path,
+                "is_file",
+                lambda self, *a, **kw: False if self == ledger else real(self, *a, **kw),
+            )
+        fault_metadata_probe(monkeypatch, ledger, "stat")
+
+    summary = engine.run()
+
+    assert summary.paused
+    saved = load_state(engine.run_dir)
+    assert saved.paused_stage == PAUSE_STORY_GATE
+    assert adapter.sessions == []
+    assert "cannot be read" in saved.paused_reason
+    assert [e["kind"] for e in engine.journal.entries()].count("story-gate-unreadable") == 1
+
+
+@pytest.mark.parametrize("fault", NUL_PATH_RESOLVE_FAULTS)
+def test_dispatch_pauses_when_the_ledger_path_cannot_be_encoded(project, monkeypatch, fault):
+    """The `ValueError` class of the gate's `except`, driven on its own. `Path.stat`
+    raises a plain `ValueError` for an embedded NUL in the configured
+    `deferred_work` path and a `UnicodeEncodeError` (a `ValueError` subclass) for
+    a lone surrogate — neither an `OSError`, and both a path `is_file()` had
+    answered False for. Before DW-266 that False read as an empty ledger and the
+    gate failed OPEN; after it the probe raised past a tuple spelled
+    `(OSError, UnicodeDecodeError)` and the run CRASHED at dispatch (#794 review).
+    An observation arm attributes a non-encodable path as a fault, never as
+    absence (`deferredwork.probe_absence`'s contract), so the verdict is the
+    same `PAUSE_STORY_GATE` pause a refused `stat` takes, with the fault's text
+    in the reason. Injected through `fault_metadata_probe(..., "stat", error=)`
+    from `NUL_PATH_RESOLVE_FAULTS` so both classes are driven on every platform.
+    Ablation: narrow the gate's tuple back to `(OSError, UnicodeDecodeError)` and
+    both rows red with the injected fault escaping `engine.run()`; the
+    `PermissionError` rows above stay green."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 9-9"])})
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")])
+    fault_metadata_probe(monkeypatch, project.deferred_work, "stat", error=fault)
+
+    summary = engine.run()
+
+    assert summary.paused
+    saved = load_state(engine.run_dir)
+    assert saved.paused_stage == PAUSE_STORY_GATE
+    assert adapter.sessions == []
+    assert "cannot be read" in saved.paused_reason and str(fault) in saved.paused_reason
+    unreadable = [e for e in engine.journal.entries() if e["kind"] == "story-gate-unreadable"]
+    assert len(unreadable) == 1 and unreadable[0]["error"] == str(fault)
+
+
+def test_dispatch_pauses_on_a_symlink_loop_at_the_ledgers_name(project):
+    """A REAL OS refusal ahead of the gate, not an injected one: a symlink cycle at
+    the ledger's name is a path that exists and cannot be read, and `is_file()`
+    absorbed its ELOOP on every interpreter (not only 3.14's blanket suppression),
+    so the loop passed the `gate:` hard gate as an empty ledger. The gate's `stat`
+    probe reports errno 40 (DW-266), the side-switch DW-254 recorded for the
+    observation reader, so the run pauses at `PAUSE_STORY_GATE` before any
+    session. Ablation: absorb ELOOP as absence in `_refuse_gated_story` (add
+    `OSError` with `errno.ELOOP` to the inner `except`) and this reds with the
+    story dispatched — `adapter.sessions` non-empty, no pause."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 9-9"])})
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")])
+    try:
+        _loop_the_ledger(project)
+    except OSError as exc:  # symlinks unavailable on this host
+        pytest.skip(f"symlinks unavailable: {exc}")
 
     summary = engine.run()
 
@@ -10699,14 +12959,17 @@ def test_unusable_verify_cwd_pauses_the_run_instead_of_crashing_it(project, monk
     with the traceback in `crash.txt`, which is the bug verbatim."""
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     missing = project.project / "no-such-root"
-    real_run = subprocess.run
+    # Refused at `Popen`: verify children spawn through `childrun.run_child`'s
+    # Popen since DW-353. `subprocess.run` also resolves Popen here, but no git
+    # spawn passes `shell`.
+    real_popen = subprocess.Popen
 
-    def refusing_run(*args, **kwargs):
+    def refusing_popen(*args, **kwargs):
         if kwargs.get("shell"):
             raise NotADirectoryError(20, "Not a directory", str(missing))
-        return real_run(*args, **kwargs)
+        return real_popen(*args, **kwargs)
 
-    monkeypatch.setattr(subprocess, "run", refusing_run)
+    monkeypatch.setattr(subprocess, "Popen", refusing_popen)
     policy = Policy(
         gates=GatesPolicy(mode="none"),
         notify=QUIET,
@@ -10766,7 +13029,7 @@ def test_review_spawn_fault_is_journalled_and_pauses_without_a_fix(project, monk
     environment escalation stops the loop; neither repair nor another review is
     spent trying to fix the host."""
     write_sprint(project, {"1-1-a": "ready-for-dev"})
-    real_run = subprocess.run
+    real_popen = subprocess.Popen
     shell_calls = 0
     failed_cwd = project.project / "review-cwd-became-unusable"
 
@@ -10776,9 +13039,10 @@ def test_review_spawn_fault_is_journalled_and_pauses_without_a_fix(project, monk
             shell_calls += 1
             if shell_calls == 2:
                 raise NotADirectoryError(20, "Not a directory", str(failed_cwd))
-        return real_run(*args, **kwargs)
+        return real_popen(*args, **kwargs)
 
-    monkeypatch.setattr(subprocess, "run", refuse_the_review_spawn)
+    # verify children spawn through `childrun.run_child`'s Popen (DW-353)
+    monkeypatch.setattr(subprocess, "Popen", refuse_the_review_spawn)
     policy = Policy(
         gates=GatesPolicy(mode="none"),
         notify=QUIET,
@@ -10956,6 +13220,171 @@ def test_session_env_fault_pauses_dev_without_burning_budget(project):
     assert load_state(engine.run_dir).tasks["1-1-a"].attempt == 0
 
 
+def test_zero_token_timeout_pauses_dev_without_burning_budget(project):
+    """DW-364: a dev session that times out with TRACKED zero usage (a provider
+    quota stall — the CLI never got a usable response) is classified an environment
+    fault by the base adapter's post-mortem, so the run pauses at the first story
+    with the zero-token evidence instead of charging the attempt; the session-end
+    journal carries `env_fault: true` and re-arm restores the budget.
+
+    ABLATION: drop the `_classify_zero_token_timeout` call from
+    `CodingCLIAdapter.run()` and this RETRYs — a second dev session is launched."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [SessionResult(status="timeout"), SessionResult(status="timeout")],
+    )
+    adapter.usage_per_session = TokenUsage()  # tracked, and zero
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev"]  # no retry session burned
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED
+    assert task.attempt == 1
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    assert "environment fault: dev session timeout" in engine.state.paused_reason
+    assert ZERO_TOKEN_TIMEOUT_EVIDENCE in engine.state.paused_reason
+
+    dec = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"][-1]
+    assert dec["action"] == "pause"
+    assert dec["env_fault"] is True
+    end = [e for e in engine.journal.entries() if e["kind"] == "session-end"][-1]
+    assert end["env_fault"] is True
+    assert end["env_fault_evidence"] == ZERO_TOKEN_TIMEOUT_EVIDENCE
+    assert end["tokens"] == 0  # tracked zero, journaled as 0 (not None)
+
+    rearm_escalation(engine.run_dir, isolated_redrive=False, resolution_recorded=True)
+    assert load_state(engine.run_dir).tasks["1-1-a"].attempt == 0
+
+
+def test_untracked_usage_timeout_is_charged_and_retried(project):
+    """DW-364 guard pin: untracked usage (`read_usage` -> None) never reads as
+    free, so a timeout is charged and retried exactly as before."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [SessionResult(status="timeout"), SessionResult(status="timeout")],
+    )
+    adapter.usage_per_session = None  # untracked
+    engine.run()
+
+    assert [s.role for s in adapter.sessions] == ["dev", "dev"]  # the retry ran
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert decisions[0]["action"] == "retry"
+    assert all(d["env_fault"] is False for d in decisions)
+    ends = [e for e in engine.journal.entries() if e["kind"] == "session-end"]
+    assert all(e["tokens"] is None and "env_fault" not in e for e in ends)
+
+
+def test_session_with_no_work_pauses_dev_without_burning_budget(project):
+    """A dev session that produced nothing (#727 — a CLI parked on a permission
+    dialog until the grace, the nudge and window death) pauses the run at the
+    first story rather than charging the attempt and launching a second session
+    into the same wall; `dev-decision` and `session-end` both carry the flag, and
+    re-arm restores the budget (attempt -> 0).
+
+    ABLATION: delete the `produced_work` arm in `decide_dev` and this RETRYs — a
+    second dev session is launched and the story ends deferred, not paused."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [SessionResult(status="stalled", produced_work=False)],
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev"]  # no retry session burned
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED
+    assert task.attempt == 1  # the one real session, not a spent budget
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    assert engine.state.paused_reason.startswith("no work produced: dev session stalled")
+
+    dec = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"][-1]
+    assert dec["action"] == "pause"
+    assert dec["produced_work"] is False
+    assert dec["env_fault"] is False
+    end = [e for e in engine.journal.entries() if e["kind"] == "session-end"][-1]
+    assert end["produced_work"] is False
+
+    # the resolve workflow's re-arm step is what makes "not charged" true
+    rearm_escalation(engine.run_dir, isolated_redrive=False, resolution_recorded=True)
+    assert load_state(engine.run_dir).tasks["1-1-a"].attempt == 0
+
+
+def test_parked_session_pauses_dev_without_burning_budget(project):
+    """DW-348/DW-350 acceptance: a dev session the adapter ended parked — the CLI
+    was waiting on a human, so the stall nudge was withheld — pauses the run at
+    the first story with budget left, instead of retrying into the same prompt;
+    `dev-decision` and `session-end` carry the flag and the evidence, and re-arm
+    restores the budget (attempt -> 0).
+
+    ABLATION: delete the `parked` arm in `decide_dev` and this RETRYs — a second
+    dev session is launched and the story ends deferred, not paused."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    evidence = "Notification(permission_prompt) -> PermissionPrompt"
+    engine, adapter = make_engine(
+        project,
+        [SessionResult(status="stalled", parked=True, parked_evidence=evidence)],
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev"]  # no retry session burned
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED
+    assert task.attempt == 1
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    assert engine.state.paused_reason.startswith("parked: dev session stalled")
+    assert evidence in engine.state.paused_reason
+
+    dec = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"][-1]
+    assert dec["action"] == "pause"
+    assert dec["parked"] is True
+    assert dec["parked_evidence"] == evidence
+    end = [e for e in engine.journal.entries() if e["kind"] == "session-end"][-1]
+    assert end["parked"] is True
+    assert end["parked_evidence"] == evidence
+
+    rearm_escalation(engine.run_dir, isolated_redrive=False, resolution_recorded=True)
+    assert load_state(engine.run_dir).tasks["1-1-a"].attempt == 0
+
+
+def test_unparked_session_end_carries_no_parked_key(project):
+    """`parked` is present-only on session-end (the `produced_work` convention), so
+    a grep for it finds exactly the sessions whose nudge was withheld."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [SessionResult(status="timeout")])
+    engine.run()
+    ends = [e for e in engine.journal.entries() if e["kind"] == "session-end"]
+    assert ends and all("parked" not in e for e in ends)
+    dec = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert dec and all(d["parked"] is False for d in dec)
+
+
+def test_engine_attaches_its_journal_to_every_adapter(project):
+    """The engine hands its `Journal` to the adapters it owns (#680), so an
+    adapter-side `session-idle` lands in the same file with the same
+    `log_task`/`log_pos` stamps; a session that worked leaves no `produced_work`
+    key on `session-end` (the field is present only when False, like
+    `session_vanished`) and `dev-decision` records it True."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    review_adapter = MockAdapter([])
+    engine, adapter = make_engine(
+        project, [SessionResult(status="timeout")], review_adapter=review_adapter
+    )
+    assert adapter.journal is engine.journal
+    assert review_adapter is not adapter
+    assert engine.adapters["review"] is review_adapter
+    assert review_adapter.journal is engine.journal
+    engine.run()
+    dec = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert dec and all(d["produced_work"] is True for d in dec)
+    ends = [e for e in engine.journal.entries() if e["kind"] == "session-end"]
+    assert ends and all("produced_work" not in e for e in ends)
+
+
 def test_two_plain_timeouts_still_defer(project):
     """Guard: NON-env-fault timeouts keep today's flow — two of them exhaust the
     dev budget and defer the story (the env-fault pause must not intercept them)."""
@@ -11090,6 +13519,46 @@ def test_fix_phase_session_env_fault_escalates(project):
     assert evidence in engine.state.paused_reason
     fix = [e for e in engine.journal.entries() if e["kind"] == "fix-decision"][-1]
     assert fix["env_fault"] is True
+
+
+def test_fix_phase_parked_session_escalates(project):
+    """DW-348/DW-350: a fix session the adapter ended parked (stall nudge withheld
+    on a human-only prompt) escalates like an env-fault one, instead of spending
+    the remaining dev budget relaunching repair sessions into the same prompt.
+
+    ABLATION: delete the fix site's `parked` escalate arm and a second fix session
+    is launched."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    marker = project.project / "fixed.marker"
+
+    def dev_with_marker(spec):
+        marker.write_text("ok\n")
+        return dev_effect(project, "1-1-a")(spec)
+
+    def breaking_review(spec):
+        marker.unlink()  # ordinary fixable failure -> routes to a fix session
+        return review_effect(project, "1-1-a", clean=True)(spec)
+
+    evidence = "pane matched 'Enter to confirm': …"
+    parked_fix = SessionResult(status="stalled", parked=True, parked_evidence=evidence)
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker), _OK)),
+        limits=LimitsPolicy(max_dev_attempts=3),  # budget left -> must not be spent
+    )
+    engine, adapter = make_engine(
+        project, [dev_with_marker, breaking_review, parked_fix, parked_fix], policy=policy
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev", "review", "dev"]  # one fix, then stop
+    assert engine.state.paused_reason.startswith("parked: fix session stalled")
+    assert evidence in engine.state.paused_reason
+    fix = [e for e in engine.journal.entries() if e["kind"] == "fix-decision"][-1]
+    assert fix["parked"] is True
+    assert fix["parked_evidence"] == evidence
 
 
 def test_max_stories_limit(project):
@@ -11251,7 +13720,7 @@ def test_auto_sweep_no_refire_on_resume(project):
         policy=policy,
         adapter=adapter,
         run_dir=engine.run_dir,
-        journal=engine.journal,
+        journal=Journal(engine.run_dir),  # as cli.cmd_resume does (DW-241)
         state=state,
         sweep_factory=recording_factory(calls),
     )
@@ -11333,7 +13802,7 @@ def _re_ask(project, engine, policy, factory) -> Engine:
         policy=policy,
         adapter=MockAdapter([]),
         run_dir=engine.run_dir,
-        journal=engine.journal,
+        journal=Journal(engine.run_dir),  # as cli.cmd_resume does (DW-241)
         state=load_state(engine.run_dir),
         sweep_factory=factory,
     )
@@ -11382,6 +13851,103 @@ def test_auto_sweep_that_started_then_failed_keeps_the_trigger_spent(project):
 
     _re_ask(project, engine, policy, started_then_failed)._maybe_auto_sweep("run-end", "run-end")
     assert calls == ["run-end"]  # refused by the persisted latch
+
+
+def test_auto_sweep_records_a_child_stopped_by_a_ledger_fault_as_finished(project, monkeypatch):
+    """What the PARENT records when its child sweep cannot read the ledger — a
+    record DW-197 changed, and which no row pinned in either direction.
+
+    Before it, the child's own top-of-cycle `read_for_write` raised, `_run_inner`'s
+    nested arm re-raised, and the raise landed in `_maybe_auto_sweep`'s
+    `except (Exception, SystemExit)` arm: the parent recorded `SWEEP_REFUSED_FAILED`,
+    journaled `sweep-auto-failed` and notified. The child now STOPS instead, so the
+    factory returns plainly and the parent takes the `else` arm — trigger spent,
+    `sweep-auto-finished`, no refusal and no notification.
+
+    That is the truthful record, which is why the row asserts it rather than trying
+    to restore the old one: the child finalized its run dir and reported its own stop, with its own
+    repair notice naming the ledger. Repair is followed by a fresh sweep. The cost, named in
+    `docs/FEATURES.md` beside the other auto-sweep residuals, is that the PARENT's
+    journal no longer says anything about the ledger — the stop token lives in the
+    child's run dir. This row is where that trade is written down.
+
+    The child is driven through the real `sweep_factory` seam with a real
+    `SweepEngine`, because a factory that merely returned would be
+    indistinguishable from `..._latches_a_factory_that_never_signalled` above and
+    would grade nothing about DW-197. The fault is armed INSIDE the factory and
+    undone as it returns, so the parent's own run never meets it.
+
+    Ablation: restore the raise at `_loop`'s read (narrow `_read_cycle_ledger` to
+    `except deferredwork.LedgerReadError` alone). The parent goes back to recording
+    a failed child — `sweeps_refused == {"run-end": "failed"}`, `sweep-auto-failed`
+    journaled and `sweep-auto-finished` gone, all three verified under the mutation
+    — but the row reds first on the absent child journal. The real nested lifecycle
+    re-raises the fault before it can journal the refusal or finalize the child."""
+    from bmad_loop.sweep import SweepEngine
+
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_ledger(project, {"DW-1": "open"})
+    policy = Policy(gates=GatesPolicy(mode="none"), notify=QUIET, sweep=SweepPolicy(auto="run-end"))
+    child_dir = project.project / ".bmad-loop" / "runs" / "child-sweep"
+
+    def faulted_child(trigger, *, started):
+        started()  # the child owns a published run dir before it reads anything
+        child_dir.mkdir(parents=True, exist_ok=True)
+        child = SweepEngine(
+            paths=project,
+            policy=Policy(
+                gates=GatesPolicy(mode="none"), notify=QUIET, sweep=SweepPolicy(repeat=True)
+            ),
+            adapter=MockAdapter([]),
+            run_dir=child_dir,
+            journal=Journal(child_dir),
+            state=RunState(run_id="child-sweep", project=str(project.project), started_at="now"),
+        )
+        fault_read_text(monkeypatch, project.deferred_work)
+        try:
+            child.run()  # exercise nested finalization as well as the loop return
+        finally:
+            monkeypatch.undo()  # the parent's own run must not meet the fault
+
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=policy,
+        sweep_factory=faulted_child,
+    )
+    summary = engine.run()
+
+    # premise: the child really did meet the fault and really did stop on it —
+    # without this the parent's clean record below would pass for the wrong reason
+    child_journal = [
+        json.loads(line)
+        for line in (child_dir / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    [refused] = [e for e in child_journal if e["kind"] == "sweep-cycle-ledger-refused"]
+    assert refused["reason"] == "ledger-inaccessible"
+    [done] = [e for e in child_journal if e["kind"] == "sweep-repeat-done"]
+    assert done["stop_cause"] == "ledger-inaccessible" and done["cycles"] == 0
+    child_state = load_state(child_dir)
+    assert child_state.finished and not child_state.crashed and not child_state.stopped
+    assert any(e["kind"] == "run-complete" for e in child_journal)
+
+    assert summary.done == 1 and engine.state.finished  # parent unaffected, as always
+    saved = load_state(engine.run_dir)
+    assert saved.sweeps_triggered == ["run-end"]  # a child that RAN
+    assert saved.sweeps_refused == {}  # ...and not one that failed
+    journal = (engine.run_dir / "journal.jsonl").read_text(encoding="utf-8")
+    assert "sweep-auto-finished" in journal
+    assert "sweep-auto-failed" not in journal
+    assert "sweep-auto-not-started" not in journal
+    # the parent notifies nothing: the child's own ATTENTION carries the repair
+    parent_attention = engine.run_dir / "ATTENTION"
+    assert "auto sweep failed" not in (
+        parent_attention.read_text(encoding="utf-8") if parent_attention.exists() else ""
+    )
+    assert f"repair {project.deferred_work} by hand" in (
+        (child_dir / "ATTENTION").read_text(encoding="utf-8")
+    )
 
 
 def test_auto_sweep_re_asks_a_trigger_whose_child_never_started(project):
@@ -11438,7 +14004,7 @@ def test_auto_sweep_not_started_still_notifies_with_its_own_wording(project, mon
     notes = []
     monkeypatch.setattr(
         "bmad_loop.gates.notify",
-        lambda policy, rd, title, message: notes.append((title, message)),
+        lambda policy, rd, title, message, **_kw: notes.append((title, message)),
     )
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     policy = Policy(gates=GatesPolicy(mode="none"), notify=QUIET, sweep=SweepPolicy(auto="run-end"))
@@ -11504,6 +14070,38 @@ def test_auto_sweep_skips_a_dirty_tree_and_keeps_the_trigger(project):
     # from the `if not clean:` block and this line fails while the two above stay
     # green — they grade the refusal, this one grades the record of it.
     assert saved.sweeps_refused == {"run-end": SWEEP_REFUSED_DIRTY}
+
+
+def test_auto_sweep_ignores_a_nested_projects_policy_edit(project):
+    """Under nested roots the auto-sweep gate probes the code root with the PROJECT's
+    policy.toml excluded at its offset (`app/.bmad-loop/policy.toml`, DW-379), so a
+    settings edit to a tracked nested policy does not refuse the sweep — while any
+    other dirt still does (the second half, so the first cannot pass on a gate that
+    stopped probing).
+
+    Ablation: drop `project=` from `_maybe_auto_sweep`'s `worktree_clean` call and
+    the first half reddens — the exclusion falls back to `.bmad-loop/policy.toml`
+    relative to the code root, which matches nothing, and the edit reads as dirt."""
+    paths = nested_repo_root_paths(project)
+    policy_file = paths.project / ".bmad-loop" / "policy.toml"
+    policy_file.parent.mkdir(parents=True, exist_ok=True)
+    policy_file.write_text("# nested policy\n", encoding="utf-8")
+    git(paths.repo_root, "add", "-f", policy_file.relative_to(paths.repo_root).as_posix())
+    git(paths.repo_root, "commit", "-qm", "track the nested policy")
+    policy_file.write_text("# nested policy\n# edited\n", encoding="utf-8")
+    calls = []
+    engine = _sweep_gate_engine(paths, recording_factory(calls))
+
+    engine._maybe_auto_sweep("run-end", "run-end")
+
+    assert calls == ["run-end"]
+    assert _skipped_dirty(engine) == []
+
+    # a fresh trigger: the first one is spent by the sweep that ran above
+    (paths.repo_root / "other.txt").write_text("uncommitted\n", encoding="utf-8")
+    engine._maybe_auto_sweep("run-end", "run-end-again")
+    assert calls == ["run-end"]
+    assert [e["reason"] for e in _skipped_dirty(engine)] == ["dirty"]
 
 
 def test_auto_sweep_skips_a_git_fault_and_keeps_the_trigger(project, monkeypatch):
@@ -12047,15 +14645,24 @@ def test_run_crash_after_finish_clears_finished(project, monkeypatch):
     from bmad_loop import runs
 
     monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
-    engine, _ = make_engine(project, [])  # loop completes → sets finished=True
+    # a board with nothing left to pick, so the loop completes and sets finished=True
+    write_sprint(project, {"1-1-a": "done"})
+    engine, _ = make_engine(project, [])
+    original_emit = engine._emit
 
-    def boom():
-        raise RuntimeError("post-run boom")
+    # post_run fires after finished=True (the run-end GC now runs before it, so a
+    # GC fault would never reach the masking flag). Ablation: drop the crash arm's
+    # `finished = False` reset and this classifies FINISHED.
+    def boom_on_post_run(stage, *args, **kwargs):
+        if stage == "post_run":
+            raise RuntimeError("post-run boom")
+        return original_emit(stage, *args, **kwargs)
 
-    monkeypatch.setattr(engine, "_gc_run_worktrees", boom)
+    engine._emit = boom_on_post_run
 
     summary = engine.run()  # does not raise
 
+    assert "post-run boom" in (engine.run_dir / "crash.txt").read_text()
     state = load_state(engine.run_dir)
     assert state.crashed is True
     assert state.finished is False  # the masking flag was cleared
@@ -12067,6 +14674,30 @@ def test_run_crash_after_finish_clears_finished(project, monkeypatch):
         runs._classify(state.finished, state.paused, state.stopped, state.crashed, engine.run_dir)
         == runs.CRASHED
     )
+
+
+def test_run_end_gc_pause_leaves_the_run_resumable(project, monkeypatch):
+    """The run-end worktree GC can pause (DW-368's pinned-config edit, or an
+    unpublished bundle source), and its remedy is `bmad-loop resume` — which a run
+    recorded `finished` refuses. So the GC runs before `finished` is set.
+    Ablation: set `finished = True` ahead of `_gc_run_worktrees()` again and the
+    `finished is False` assertion fails."""
+    engine, _ = make_engine(project, [])
+    _stub_run_side_effects(engine, monkeypatch)
+
+    def pause():
+        raise RunPaused("pinned config edited (DW-368)", "worktree-gc", "1-1")
+
+    monkeypatch.setattr(engine, "_gc_run_worktrees", pause)
+
+    engine.run()
+
+    state = load_state(engine.run_dir)
+    assert state.finished is False
+    assert state.paused_reason == "pinned config edited (DW-368)"
+    assert state.paused_story_key == "1-1"
+    assert "run-paused" in (engine.run_dir / "journal.jsonl").read_text()
+    assert "run-complete" not in (engine.run_dir / "journal.jsonl").read_text()
 
 
 def test_top_level_crash_without_signal_handlers_still_records(project, monkeypatch):
@@ -12132,6 +14763,51 @@ def _escalate_blocked(project, story_key):
         )
 
     return effect
+
+
+def test_resume_past_an_escalation_pauses_instead_of_finishing(project):
+    """DW-386: a plain `resume` skips the terminal ESCALATED task and can drain the
+    queue, but the run must not then be stamped `finished` — `resume`/`resolve`
+    refuse a finished run and worktree reconciliation reclaims its kept worktree.
+    It re-pauses at the escalation instead, the shape `resolve` accepts.
+
+    Ablation, performed: delete the ESCALATED guard in `Engine._run_inner` and this
+    reddens on `finished`."""
+    write_sprint(project, {"1-1-a": "ready-for-dev", "1-2-b": "ready-for-dev"})
+    engine, _ = make_engine(project, [_escalate_blocked(project, "1-1-a")])
+    engine.run()
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
+
+    resumed, _ = resume_engine(
+        project,
+        engine,
+        [dev_effect(project, "1-2-b"), review_effect(project, "1-2-b", clean=True)],
+    )
+    summary = resumed.run()
+
+    assert resumed.state.tasks["1-2-b"].phase == Phase.DONE
+    saved = load_state(engine.run_dir)
+    assert not saved.finished and summary.paused
+    assert saved.paused_stage == PAUSE_ESCALATION
+    assert saved.paused_story_key == "1-1-a"
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "run-complete" not in kinds
+    paused = [e for e in resumed.journal.entries() if e["kind"] == "run-paused"][-1]
+    assert paused["stage"] == PAUSE_ESCALATION and paused["story_key"] == "1-1-a"
+
+
+def test_run_without_an_escalation_still_finishes(project):
+    """DW-386's guard is inert when no task is ESCALATED."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project, [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)]
+    )
+    summary = engine.run()
+
+    assert not summary.paused
+    assert load_state(engine.run_dir).finished
+    assert "run-complete" in [e["kind"] for e in engine.journal.entries()]
 
 
 def test_resume_with_epic_filter_stays_in_scoped_epic(project):
@@ -12204,6 +14880,7 @@ def test_pick_next_prefers_current_epic_over_earlier_file_position(project):
     assert engine._pick_next().key == "5-1-e5"
 
 
+@requires_descriptor_restoration
 def test_resolved_redrive_reescalates_instead_of_deferring(project):
     """Fix C (Bug 1): a story from a human-resolved CRITICAL escalation whose
     re-drive still can't converge must RE-ESCALATE (pause for the human), not
@@ -12365,7 +15042,7 @@ def test_graceful_stop_runs_clean_finalization_and_notifies(project, monkeypatch
     notes = []
     monkeypatch.setattr(
         "bmad_loop.gates.notify",
-        lambda policy, rd, title, message: notes.append((title, message)),
+        lambda policy, rd, title, message, **kw: notes.append((title, message, kw)),
     )
     write_sprint(project, {"1-1-a": "ready-for-dev", "1-2-b": "ready-for-dev"})
     run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
@@ -12400,6 +15077,9 @@ def test_graceful_stop_runs_clean_finalization_and_notifies(project, monkeypatch
     assert notes and notes[-1][0] == "bmad-loop run stopped gracefully"
     assert "bmad-loop resume test-run" in notes[-1][1]
     assert "1 story remaining" in notes[-1][1]
+    # the body is a deliberate multi-line list (summary, remaining, resume hint);
+    # ablation: drop `multiline=True` from the graceful-stop notify and this reddens
+    assert notes[-1][2] == {"multiline": True}
 
 
 def test_epic_boundary_auto_sweep_suppressed_by_graceful_stop(project, monkeypatch):
@@ -13198,13 +15878,25 @@ def test_review_timeout_salvage_nonterminal_spec_falls_back(project):
 
 def test_review_timeout_salvage_skipped_under_isolation(project):
     """Worktree isolation: a defer already preserves the unit's worktree + diff,
-    and committing into the main repo would be wrong — salvage never applies."""
+    and committing into the main repo would be wrong — salvage never applies.
+
+    The spec reads ``done`` and no ``worktree_path`` is recorded, so every other
+    applicability leg would admit salvage: only the ``self._isolated`` arm of the
+    guard decides this outcome (DW-378)."""
     policy = dataclasses.replace(
         _salvage_policy(), scm=ScmPolicy(rollback_on_failure=True, isolation="worktree")
     )
+    write_sprint(project, {"1-1-a": "done"})
     engine, _ = make_engine(project, [], policy=policy)
-    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(spec_path(project, "1-1-a")))
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "done", rev_parse_head(project.project))
+    before = sp.read_bytes()
+    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.REVIEW_VERIFY, spec_file=str(sp))
     assert engine._salvage_review_timeout(task, SessionResult(status="timeout")) is False
+    assert sp.read_bytes() == before
+    assert not [
+        e for e in engine.journal.entries() if e["kind"].startswith("review-timeout-salvage")
+    ]
 
 
 def test_review_timeout_salvage_requires_spec_file(project):
@@ -13780,18 +16472,29 @@ def test_spec_deferrals_skip_out_of_tree_session_spec(project, tmp_path):
     assert skipped[0]["spec"] == str(outside)
 
 
-@pytest.mark.parametrize("error_type", [OSError, RuntimeError])
-def test_spec_deferrals_skip_when_containment_probe_faults(project, monkeypatch, error_type):
+@pytest.mark.parametrize(
+    "resolve_fault",
+    [
+        pytest.param(OSError("injected containment fault"), id="oserror"),
+        pytest.param(RuntimeError("injected containment fault"), id="runtimeerror"),
+        *NUL_PATH_RESOLVE_FAULTS,
+    ],
+)
+def test_spec_deferrals_skip_when_containment_probe_faults(project, monkeypatch, resolve_fault):
     engine, _ = make_engine(project, [], policy=_harvest_policy())
     task = StoryTask(story_key="1-1-a", epic=1)
     sp = spec_path(project, task.story_key)
     sp.parent.mkdir(parents=True, exist_ok=True)
     write_spec(sp, "done", "abc123", deferred=[HARVEST_A])
 
-    def containment_fault(*args, **kwargs):
-        raise error_type("injected containment fault")
+    if isinstance(resolve_fault, (OSError, RuntimeError)):
 
-    monkeypatch.setattr(verify, "spec_within_roots", containment_fault)
+        def containment_fault(*_args, **_kwargs):
+            raise type(resolve_fault)(*resolve_fault.args)
+
+        monkeypatch.setattr(verify, "spec_within_roots", containment_fault)
+    else:
+        refuse_to_resolve(monkeypatch, sp, error=resolve_fault)
     engine._harvest_spec_deferrals(task, {"spec_file": str(sp)})
 
     assert not project.deferred_work.exists()
@@ -13799,6 +16502,31 @@ def test_spec_deferrals_skip_when_containment_probe_faults(project, monkeypatch,
     assert task.harvest_wrote_ledger is False
     skipped = [
         e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-skipped-out-of-tree"
+    ]
+    assert len(skipped) == 1 and skipped[0]["spec"] == str(sp)
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+def test_declared_deferred_ids_skip_value_error_family_containment_faults(
+    project, monkeypatch, resolve_fault
+):
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    sp = spec_path(project, task.story_key)
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(sp, "done", "abc123", closes_deferred=["DW-1"])
+    task.spec_file = str(sp)
+    before = project.deferred_work.read_bytes()
+    refuse_to_resolve(monkeypatch, sp, error=resolve_fault)
+
+    engine._close_declared_deferred(task)
+
+    assert project.deferred_work.read_bytes() == before
+    skipped = [
+        event
+        for event in engine.journal.entries()
+        if event["kind"] == "deferred-close-skipped-out-of-tree"
     ]
     assert len(skipped) == 1 and skipped[0]["spec"] == str(sp)
 
@@ -13902,7 +16630,7 @@ def test_spec_deferral_provenance_is_durable_before_append_for_crash_replay(proj
         policy=engine.policy,
         adapter=MockAdapter([]),
         run_dir=engine.run_dir,
-        journal=engine.journal,
+        journal=Journal(engine.run_dir),  # as cli.cmd_resume does (DW-241)
         state=saved,
     )
     resumed._harvest_spec_deferrals(saved_task, result_json)
@@ -14484,6 +17212,42 @@ def test_harvest_files_the_finding_when_the_seen_again_match_goes_stale(project,
     ]
 
 
+def test_harvest_dedupes_a_cross_spec_twin_that_lands_after_the_snapshot(project, monkeypatch):
+    """The writer suppresses a rival cross-spec twin missed by the snapshot.
+
+    The real append primitive runs after the wrapper creates the rival row, so
+    only its opted-in origin scan can prevent a second open row.
+
+    Ablation: remove the harvest producer's flag (or the writer's origin-only
+    arm) and the harvest files DW-2 and reports ``deduped == 0``."""
+    from bmad_loop import devcontract
+
+    fp = devcontract.harvest_fingerprint(HARVEST_A["summary"], HARVEST_A["location"])
+    origin = f"spec-deferred {fp}"
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A])],
+        policy=_harvest_policy(),
+    )
+    assert not project.deferred_work.is_file()
+    real_append = deferredwork.append_entries_published
+
+    def file_the_rival_first(path, specs):
+        _seeded_ledger(project, origin=origin, source_spec="spec-9-9-z.md")
+        return real_append(path, specs)
+
+    monkeypatch.setattr(deferredwork, "append_entries_published", file_the_rival_first)
+
+    assert engine.run().done == 1
+
+    entries = _harvest_entries(project)
+    assert [entry.id for entry in entries] == ["DW-1"]
+    assert deferredwork.field_line_present(entries[0], "source_spec", "spec-9-9-z.md")
+    (event,) = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert event["dw_ids"] == [] and event["deduped"] == 1
+
+
 def test_ledger_digest_collapses_absent_and_empty_only():
     assert _digest_of(None) == _digest_of("")
     assert _digest_of("# Deferred Work\n") != _digest_of(None)
@@ -14575,6 +17339,19 @@ def test_ledger_classifier_reports_tracked_inside_workspace_as_gits(project):
     engine, _ = make_engine(project, [], policy=_harvest_policy())
 
     assert engine._ledger_is_gits_to_restore(StoryTask(story_key="1-1-a", epic=1)) is True
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+@pytest.mark.parametrize("refused_operand", ["ledger", "workspace-root"])
+def test_ledger_in_repo_value_error_family_fault_is_observed_as_external(
+    project, monkeypatch, resolve_fault, refused_operand
+):
+    engine, _ = make_engine(project, [])
+    ledger = project.deferred_work
+    refused = ledger if refused_operand == "ledger" else engine.workspace.root
+    refuse_to_resolve(monkeypatch, refused, error=resolve_fault)
+
+    assert engine._ledger_in_repo(ledger) is False
 
 
 @pytest.mark.skipif(
@@ -14675,6 +17452,76 @@ def test_ledger_rel_derives_lexically_before_resolving(project, monkeypatch):
     assert engine._ledger_baseline_text(task) == (_LedgerAnchor.BASELINE, committed)
 
 
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+@pytest.mark.parametrize("refused_operand", ["ledger", "workspace-root"])
+def test_ledger_rel_value_error_family_resolution_fault_is_uncertain(
+    project, tmp_path, monkeypatch, resolve_fault, refused_operand
+):
+    from bmad_loop.workspace import Workspace
+
+    engine, _ = make_engine(project, [])
+    lexical_alias = tmp_path / "workspace-alias"
+    engine.workspace = Workspace(root=lexical_alias, paths=project)
+    ledger = project.deferred_work
+    refused = ledger if refused_operand == "ledger" else lexical_alias
+    refuse_to_resolve(monkeypatch, refused, error=resolve_fault)
+
+    rel, fault = engine._ledger_rel()
+
+    assert rel is None
+    assert fault is not None
+    assert type(fault) is type(resolve_fault)
+    assert fault.args == resolve_fault.args
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+@pytest.mark.parametrize("refused_operand", ["ledger", "repo-root"])
+def test_harvest_carry_value_error_family_resolution_fault_cannot_degrade(
+    project, monkeypatch, resolve_fault, refused_operand
+):
+    engine, _ = make_engine(project, [])
+    ledger = project.deferred_work
+    refused = ledger if refused_operand == "ledger" else project.repo_root
+    refuse_to_resolve(monkeypatch, refused, error=resolve_fault)
+
+    assert engine._harvest_carry_commit_may_degrade(ledger) is False
+
+
+def test_harvest_carry_degrades_only_for_a_successfully_resolved_external_ledger(project, tmp_path):
+    engine, _ = make_engine(project, [])
+    ledger = project.deferred_work
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text("# Deferred Work\n", encoding="utf-8")
+
+    assert engine._harvest_carry_commit_may_degrade(ledger) is False
+    assert engine._harvest_carry_commit_may_degrade(tmp_path / "external-ledger.md") is True
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+@pytest.mark.parametrize("refused_operand", ["board", "repo-root"])
+def test_board_carry_value_error_family_resolution_fault_requires_ownership_proof(
+    project, monkeypatch, resolve_fault, refused_operand
+):
+    engine, _ = make_engine(project, [])
+    board = project.sprint_status
+    refused = board if refused_operand == "board" else project.repo_root
+    refuse_to_resolve(monkeypatch, refused, error=resolve_fault)
+
+    assert engine._board_carry_must_prove_ownership(board) is True
+
+
+def test_board_carry_distinguishes_in_repo_dirt_from_a_resolved_external_board(project, tmp_path):
+    engine, _ = make_engine(project, [])
+    board = project.sprint_status
+    write_sprint(project, {"1-1-a": "in-progress"})
+
+    assert engine._board_carry_must_prove_ownership(board) is True
+    git(project.project, "add", board.relative_to(project.project).as_posix())
+    git(project.project, "commit", "-q", "-m", "track sprint board")
+    assert engine._board_carry_must_prove_ownership(board) is False
+    assert engine._board_carry_must_prove_ownership(tmp_path / "external-board.yaml") is False
+
+
 def test_ledger_baseline_text_reads_the_committed_blob(project, monkeypatch):
     """The reset-owned write anchor is the committed blob, read before the lock.
 
@@ -14744,7 +17591,7 @@ def test_ledger_baseline_text_normalizes_committed_crlf(project):
     )
     # The point of the normalization: the anchor must equal what the ONLY thing
     # it is ever compared against reads back off those same bytes.
-    assert expected == engine._ledger_text()
+    assert expected == engine._ledger_text(site="test")
 
 
 def test_ledger_baseline_text_reports_absence_at_baseline(project):
@@ -15117,6 +17964,1173 @@ def test_restore_still_retracts_the_engines_own_harvest(project):
     ] == []
 
 
+# ------------------------------------------------- DW-231 engine ledger read faults
+#
+# The base Engine reads the ledger through `deferredwork.read_for_write` at four
+# sites and used to catch `LedgerReadError` at none of them, so a story run over
+# undecodable bytes armed, ran its session and died as `run-crash`. Each site now
+# routes the fault in the direction its consumer can survive: the observation
+# reads degrade to a typed answer nothing can write back (`ledger-read-degraded`),
+# and the two publish reads pause the run for repair with the phase untouched
+# (`ledger-read-refused`), so `bmad-loop resume` replays the recorded session
+# result and retries the write instead of re-running a session.
+
+UNDECODABLE_LEDGER_BYTES = b"# Deferred Work\n\n### DW-1: bad \xff byte\n\nstatus: open\n"
+
+
+def _degraded_sites(engine) -> list[str]:
+    return [e["site"] for e in engine.journal.entries() if e["kind"] == "ledger-read-degraded"]
+
+
+def _corrupting_ledger(effect, ledger: Path):
+    """Run a scripted session, then leave the ledger UNDECODABLE behind it.
+
+    The bytes go bad DURING the session, not before the run: the hard-gate check
+    (`_refuse_gated_story`) already refuses to START a story over a ledger it
+    cannot read, so a ledger corrupt from the outset never reaches the engine's
+    own reads. What does reach them is exactly this shape — a session, a rival
+    writer or a failing disk turning the file undecodable after dispatch — and it
+    is the shape DW-231 is about: the reads that follow a completed session."""
+
+    def run(spec):
+        result = effect(spec)
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        ledger.write_bytes(UNDECODABLE_LEDGER_BYTES)
+        return result
+
+    return run
+
+
+def test_harvest_over_undecodable_ledger_pauses_and_resume_replays_the_session(project):
+    """The PUBLISH arm at the spec-deferral harvest, and the recovery it is shaped
+    for. The dev session completes and records findings; the harvest cannot read
+    the ledger it is about to append to, so the run PAUSES at `escalation` with an
+    `ACTION REQUIRED` notice naming the ledger and the resume command — not
+    `run-crash`, and not `_escalate` (the task stays `DEV_VERIFY`, never
+    `ESCALATED`, so no `bmad-loop resolve` session and no clean rebuild is owed
+    over a fault that is not the story's). The observation reads ahead of it
+    (`_ledger_digest`, the pre-harvest snapshot) degraded and were journaled.
+
+    After the repair, `resume` finds the recorded dev result through
+    `_resumable_session`, replays it into `_dev_phase`, and the harvest files the
+    entry against the readable ledger: the story lands `DONE` and the resumed
+    adapter ran ZERO sessions.
+
+    Ablation: delete the `except LedgerReadError` around the harvest's
+    `read_for_write` and the first half reds with `run-crash` (`LedgerReadError`)
+    instead of the pause."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    ledger = project.deferred_work
+    engine, adapter = make_engine(
+        project,
+        [
+            _corrupting_ledger(
+                dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A]),
+                ledger,
+            )
+        ],
+        policy=_harvest_policy(),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed and summary.done == 0
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    assert engine.state.paused_story_key == "1-1-a"
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DEV_VERIFY  # left where it was: not ESCALATED
+    assert len(adapter.sessions) == 1  # the session ran once and its result is durable
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "run-crash" not in kinds and "story-escalated" not in kinds
+    assert {"ledger-digest", "pre-harvest-snapshot"} <= set(_degraded_sites(engine))
+    (refused,) = [e for e in engine.journal.entries() if e["kind"] == "ledger-read-refused"]
+    assert refused["site"] == "spec-deferrals-harvest"
+    assert refused["story_key"] == "1-1-a" and refused["ledger"] == str(ledger)
+    assert "not valid UTF-8" in refused["error"]
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert "ACTION REQUIRED" in attention
+    assert str(ledger) in attention and "`bmad-loop resume test-run`" in attention
+    assert ledger.read_bytes() == UNDECODABLE_LEDGER_BYTES  # nothing written over them
+    assert_multiline_notice_keeps_its_lines(
+        engine.run_dir,
+        "ACTION REQUIRED: repair the deferred-work ledger for 1-1-a",
+        engine.state.paused_reason,
+    )
+    # The snapshot was left UNARMED over the typed answer, so no later restore
+    # can put back "text" nobody could read.
+    assert task.pre_harvest_ledger_captured is False and task.post_engine_ledger_digest is None
+
+    # Resume WITHOUT the repair first — the shape DW-231's entry names: a resumed
+    # story run over undecodable bytes. It replays the recorded result and pauses
+    # again at the same site, with no session and no crash.
+    unrepaired, unrepaired_adapter = resume_engine(project, engine, [])
+    summary = unrepaired.run()
+    assert summary.paused and not summary.crashed and summary.done == 0
+    assert unrepaired_adapter.sessions == []
+    assert unrepaired.state.tasks["1-1-a"].phase == Phase.DEV_VERIFY
+    assert [
+        e["site"] for e in unrepaired.journal.entries() if e["kind"] == "ledger-read-refused"
+    ] == [
+        "spec-deferrals-harvest",
+        "spec-deferrals-harvest",
+    ]
+
+    # Repair, then resume: the recorded result is replayed, no session re-runs.
+    ledger.write_text("# Deferred Work\n", encoding="utf-8")
+    resumed, resumed_adapter = resume_engine(project, unrepaired, [])
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    assert resumed_adapter.sessions == []  # ZERO sessions: the harvest was retried, not the dev
+    assert resumed.state.tasks["1-1-a"].phase == Phase.DONE
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "resume-verify" in kinds
+    (entry,) = _harvest_entries(project)
+    assert entry.title == HARVEST_A["summary"] and entry.open
+    assert [e["site"] for e in resumed.journal.entries() if e["kind"] == "ledger-read-refused"] == [
+        "spec-deferrals-harvest",
+        "spec-deferrals-harvest",
+    ]  # the two pauses' own rows, and no third one
+
+
+# DW-259: the window INSIDE each write. Every `deferredwork` mutator takes its
+# own locked `read_for_write` after the engine's pre-read (or, for the salvage
+# refile and the close carry, with no pre-read at all). Decode faults (DW-259)
+# and OS metadata/text-read faults (DW-279) raise `LedgerReadError` from the
+# mutator call itself. The engine
+# catches exactly that class at each of its six mutator calls and takes the same
+# repair pause as the pre-reads, under a site name ending in `-locked`.
+
+
+def _corrupting_mutator(monkeypatch, name: str, ledger: Path, fault_mode="decode"):
+    """Fault the real mutator's authoritative read after successful earlier reads.
+
+    The decode row corrupts `ledger` immediately before `deferredwork.<name>`;
+    OS rows preserve valid bytes and refuse stat/read_text under its real lock.
+    Both execute the real reader so the exception is the one production routes.
+    Naming the sandbox's ledger keeps the target explicit. Returns the bytes
+    that must survive the refusal."""
+    if fault_mode != "decode":
+        return fault_locked_ledger_read(monkeypatch, ledger, fault_mode)
+    real = getattr(deferredwork, name)
+
+    def corrupt_then_call(path, *a, **kw):
+        assert Path(path) == ledger
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        ledger.write_bytes(UNDECODABLE_LEDGER_BYTES)
+        return real(path, *a, **kw)
+
+    monkeypatch.setattr(deferredwork, name, corrupt_then_call)
+    return UNDECODABLE_LEDGER_BYTES
+
+
+def _refused_sites(engine) -> list[str]:
+    return [e["site"] for e in engine.journal.entries() if e["kind"] == "ledger-read-refused"]
+
+
+@pytest.mark.parametrize("fault_mode", ["decode", "stat", "read_text"])
+def test_harvest_append_over_a_ledger_corrupted_under_the_lock_pauses_and_resume_files(
+    project, monkeypatch, fault_mode
+):
+    """The harvest's pre-read succeeds; the locked re-read refuses on decoding
+    or OS metadata/text access. The decode row corrupts bytes before the mutator;
+    OS rows keep them valid and fault only under `append_entries_published`'s lock. The run PAUSES at `escalation` under site
+    `spec-deferrals-harvest-append-locked` with the task left at `DEV_VERIFY`,
+    the bytes untouched and nothing filed — not `run-crash`. After the repair,
+    `resume` replays the recorded dev result with ZERO sessions and the retried
+    append files the entry.
+
+    Ablation: delete the `except LedgerReadError` around the harvest's
+    `append_entries_published` and this reds with `run-crash`."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    ledger = project.deferred_work
+    expected = _corrupting_mutator(monkeypatch, "append_entries_published", ledger, fault_mode)
+    engine, adapter = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A])],
+        policy=_harvest_policy(),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed and summary.done == 0
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DEV_VERIFY  # left where it was: not ESCALATED
+    assert len(adapter.sessions) == 1
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "run-crash" not in kinds and "story-escalated" not in kinds
+    assert "spec-deferrals-harvested" not in kinds  # the write never happened
+    assert _refused_sites(engine) == ["spec-deferrals-harvest-append-locked"]
+    (refused,) = [e for e in engine.journal.entries() if e["kind"] == "ledger-read-refused"]
+    assert (
+        refused["ledger"] == str(ledger)
+        and ("not valid UTF-8" if fault_mode == "decode" else "PermissionError") in refused["error"]
+    )
+    assert ledger.read_bytes() == expected  # nothing written over them
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert "ACTION REQUIRED" in attention and "`bmad-loop resume test-run`" in attention
+
+    monkeypatch.undo()
+    ledger.write_text("# Deferred Work\n", encoding="utf-8")
+    resumed, resumed_adapter = resume_engine(project, engine, [])
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    assert resumed_adapter.sessions == []  # the append was retried, not the dev
+    assert resumed.state.tasks["1-1-a"].phase == Phase.DONE
+    assert "resume-verify" in [e["kind"] for e in resumed.journal.entries()]
+    (entry,) = _harvest_entries(project)
+    assert entry.title == HARVEST_A["summary"] and entry.open
+    assert _refused_sites(resumed) == ["spec-deferrals-harvest-append-locked"]  # no second
+
+
+@pytest.mark.parametrize("fault_mode", ["decode", "stat", "read_text"])
+def test_harvest_mark_over_a_ledger_corrupted_under_the_lock_pauses_and_resume_stamps(
+    project, monkeypatch, fault_mode
+):
+    """The seen-again mark's own locked re-read. An open entry from ANOTHER spec
+    carries the finding's fingerprint, so the harvest decides to stamp
+    `seen-again:` on it rather than file a twin. The decode row corrupts bytes
+    before `mark_seen_again_many`; OS rows keep valid bytes and refuse metadata
+    or text access only under its lock. The run pauses
+    under site `spec-deferrals-harvest-mark-locked`, nothing is stamped and
+    nothing filed. After the repair, the resume replays the recorded result
+    with ZERO sessions, stamps the sighting and files no duplicate.
+
+    Ablation: delete the `except LedgerReadError` around the harvest's
+    `mark_seen_again_many` and this reds with `run-crash`."""
+    from bmad_loop import devcontract
+
+    fp = devcontract.harvest_fingerprint(HARVEST_A["summary"], HARVEST_A["location"])
+    origin = f"spec-deferred {fp}"
+    _seeded_ledger(project, origin=origin, source_spec="spec-9-9-z.md")
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    ledger = project.deferred_work
+    expected = _corrupting_mutator(monkeypatch, "mark_seen_again_many", ledger, fault_mode)
+    engine, adapter = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A])],
+        policy=_harvest_policy(),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed and summary.done == 0
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    assert engine.state.tasks["1-1-a"].phase == Phase.DEV_VERIFY
+    assert len(adapter.sessions) == 1
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "run-crash" not in kinds and "spec-deferrals-harvested" not in kinds
+    assert _refused_sites(engine) == ["spec-deferrals-harvest-mark-locked"]
+    assert ledger.read_bytes() == expected
+
+    monkeypatch.undo()
+    _seeded_ledger(project, origin=origin, source_spec="spec-9-9-z.md")  # the hand repair
+    resumed, resumed_adapter = resume_engine(project, engine, [])
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    assert resumed_adapter.sessions == []
+    (entry,) = _harvest_entries(project)  # no duplicate filed
+    assert entry.id == "DW-1" and entry.open and "seen-again: " in entry.body
+    (event,) = [e for e in resumed.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert event["dw_ids"] == [] and event["seen_again"] == ["DW-1"]
+
+
+@pytest.mark.parametrize("fault_mode", ["decode", "stat", "read_text"])
+def test_commit_boundary_close_over_a_ledger_corrupted_under_the_lock_pauses_and_resume_closes(
+    project, monkeypatch, fault_mode
+):
+    """The commit-boundary close's own locked re-read. `_close_declared_deferred`'s
+    snapshot decoded and classified `DW-1` open. The decode row then corrupts
+    bytes; OS rows preserve them and refuse metadata/text access under
+    `mark_done_many_reopenable`'s lock. Either raises ahead of any write. The run pauses under site `story-close-locked` with the task left
+    COMMITTING, nothing flipped and — because the armed `_ArmedClose` is cleared
+    before the pause — NO rollback attempted: no `story-deferred-closed`, no
+    `deferred-close-rolled-back`, and no false `deferred-close-rollback-failed`
+    against bytes `mark_open_many` could not read either. After the repair,
+    `resume` re-drives the commit phase (`resume-commit`), the close lands `DW-1`
+    done once inside the single story commit, with ZERO sessions.
+
+    Ablation: delete the `except LedgerReadError` around `_apply_deferred_closes`
+    and this reds with `run-crash`; delete only the `snapshot.clear()` inside it
+    and this reds on the `deferred-close-rollback-failed` row."""
+    ledger = project.deferred_work
+    engine = _closes_deferred_run(project, ["DW-1"])
+    expected = _corrupting_mutator(monkeypatch, "mark_done_many_reopenable", ledger, fault_mode)
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed and summary.done == 0
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.COMMITTING  # left where it was
+    assert task.commit_sha is None
+    # the pause `_save()`d: no intent record for a close that flipped nothing
+    assert load_state(engine.run_dir).tasks["1-1-a"].story_closes_intended == []
+    baseline = task.baseline_commit
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "run-crash" not in kinds and "story-escalated" not in kinds
+    assert "story-deferred-closed" not in kinds
+    assert "deferred-close-rolled-back" not in kinds
+    assert "deferred-close-rollback-failed" not in kinds
+    assert _refused_sites(engine) == ["story-close-locked"]
+    assert ledger.read_bytes() == expected
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert "ACTION REQUIRED" in attention and "declared close" in attention
+
+    monkeypatch.undo()
+    write_ledger(project, {"DW-1": "open"}, commit=False)  # the hand repair
+    resumed, resumed_adapter = resume_engine(project, engine, [])
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    assert resumed_adapter.sessions == []
+    final = load_state(resumed.run_dir).tasks["1-1-a"]
+    assert final.phase == Phase.DONE
+    assert final.commit_sha == rev_parse_head(project.project) != baseline
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "resume-commit" in kinds and "story-done" in kinds
+    assert kinds.count("story-deferred-closed") == 1
+    assert "deferred-close-rollback-failed" not in kinds
+    entry = _ledger_entries(project)["DW-1"]
+    assert entry.status.startswith("done")
+    assert entry.body.count("resolution: resolved by story 1-1-a") == 1
+    # the close rode the ONE story commit above baseline
+    log = git(project.project, "log", "--format=%s", f"{baseline}..HEAD")
+    assert len(log.splitlines()) == 1
+    ledger_rel = ledger.relative_to(project.project).as_posix()
+    assert "status: done" in git(project.project, "show", f"HEAD:{ledger_rel}")
+    assert worktree_clean(project.project)
+
+
+@pytest.mark.parametrize("rollback", [False, True])
+@pytest.mark.parametrize("repair_ledger", [False, True])
+@pytest.mark.parametrize("review_enabled", [False, True])
+@pytest.mark.parametrize("fault_mode", ["decode", "stat", "read_text"])
+def test_review_timeout_salvage_refile_over_an_undecodable_ledger_pauses_and_resume_refiles(
+    project, monkeypatch, rollback, repair_ledger, review_enabled, fault_mode
+):
+    """A repair pause preserves the verified product and its pending refile.
+
+    Decode rows corrupt bytes before the refile; OS rows keep valid bytes and
+    refuse metadata/text access only under the mutator's real lock.
+
+    Ablation: remove `_pending_salvage_session` from the resume arm and repaired
+    retries restart or pause for rollback instead of committing with zero sessions.
+    Delete the salvage's `except LedgerReadError` and the initial run crashes.
+    Restore the unconditional review-disabled shortcut and disabled-review rows
+    skip the owed publication instead of refile/repair-pause recovery.
+    """
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    ledger = project.deferred_work
+    expected = _corrupting_mutator(monkeypatch, "append_entry", ledger, fault_mode)
+    policy = dataclasses.replace(_salvage_policy(), scm=ScmPolicy(rollback_on_failure=rollback))
+    engine, adapter = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), SessionResult(status="timeout")],
+        policy=policy,
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed and summary.done == 0
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    task = load_state(engine.run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.REVIEW_VERIFY
+    assert task.followup_review_recommended is True
+    assert task.salvage_refile_pending is True
+    assert task.commit_sha is None
+    assert len(adapter.sessions) == 2
+    assert _refused_sites(engine) == ["review-timeout-salvage-refile-locked"]
+    assert ledger.read_bytes() == expected
+    product = (project.project / "src.txt").read_bytes()
+    assert product != b"original\n"
+    baseline = rev_parse_head(project.project)
+
+    monkeypatch.undo()
+    if repair_ledger:
+        ledger.write_text("# Deferred Work\n", encoding="utf-8")
+    elif fault_mode != "decode":
+        fault_locked_ledger_read(monkeypatch, ledger, fault_mode)
+    resume_policy = dataclasses.replace(
+        policy, review=dataclasses.replace(policy.review, enabled=review_enabled)
+    )
+    resumed, resumed_adapter = resume_engine(project, engine, [], policy=resume_policy)
+    summary = resumed.run()
+
+    assert not summary.crashed
+    assert len(resumed_adapter.sessions) == 0
+    assert (project.project / "src.txt").read_bytes() == product
+    final = load_state(resumed.run_dir).tasks["1-1-a"]
+    assert (final.attempt, final.review_cycle, final.generation) == (
+        task.attempt,
+        task.review_cycle,
+        task.generation,
+    )
+    assert final.sessions == task.sessions
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "resume-restart" not in kinds
+    if not repair_ledger:
+        assert summary.paused and summary.done == 0
+        assert final.phase == Phase.REVIEW_VERIFY
+        assert final.salvage_refile_pending and final.followup_review_recommended
+        assert final.commit_sha is None
+        assert rev_parse_head(project.project) == baseline
+        assert ledger.read_bytes() == expected
+        assert _refused_sites(resumed) == ["review-timeout-salvage-refile-locked"] * 2
+        return
+
+    assert summary.done == 1 and not summary.paused
+    (salvage,) = [e for e in resumed.journal.entries() if e["kind"] == "review-timeout-salvage"]
+    assert salvage["refiled"] and salvage["refiled"].startswith("DW-")
+    text = ledger.read_text(encoding="utf-8")
+    assert text.count("origin: review-timeout-salvage") == 1 and "1-1-a" in text
+    assert final.phase == Phase.DONE and final.commit_sha
+    assert final.followup_review_recommended is False
+    assert final.salvage_refile_pending is False
+
+
+@pytest.mark.parametrize("interruption", ["notification", "commit-gate-save"])
+def test_pending_salvage_refile_survives_interrupted_commit_handoff(
+    project, monkeypatch, interruption
+):
+    """Successful publication retains replay authority until COMMITTING saves.
+
+    Ablation: clear the latch in salvage before its save and either interruption
+    persists an unresumable timeout. Remove the pending-latch exception from the
+    recommendation shortcut and replay bypasses salvage verification.
+    """
+
+    class PowerLoss(BaseException):
+        pass
+
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    ledger = project.deferred_work
+    _corrupting_mutator(monkeypatch, "append_entry", ledger)
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), SessionResult(status="timeout")],
+        policy=dataclasses.replace(_salvage_policy(), scm=ScmPolicy(rollback_on_failure=False)),
+    )
+    assert engine.run().paused
+    monkeypatch.undo()
+    ledger.write_text("# Deferred Work\n", encoding="utf-8")
+    resumed, adapter = resume_engine(project, engine, [SessionResult(status="completed")])
+
+    if interruption == "notification":
+
+        def notify_then_die(*args, **kwargs):
+            raise PowerLoss
+
+        monkeypatch.setattr(gates, "notify", notify_then_die)
+    else:
+
+        def gate_then_die(stage, task, seq):
+            assert stage == "pre_commit_gate"
+            # The workflow's actual session path saves the live task while it
+            # remains REVIEW_VERIFY; a later gate save must retain the latch.
+            resumed._run_session(
+                task,
+                role="review",
+                prompt="commit gate",
+                seq=seq,
+                label="test.pre_commit_gate",
+            )
+            raise PowerLoss
+
+        monkeypatch.setattr(resumed, "_run_workflows", gate_then_die)
+
+    # Drive the recovery arm directly so run()'s final save cannot simulate a
+    # graceful shutdown and hide what was durable at the host-loss boundary.
+    with pytest.raises(PowerLoss):
+        resumed._finish_inflight()
+    saved = load_state(engine.run_dir).tasks["1-1-a"]
+    assert saved.phase == Phase.REVIEW_VERIFY and saved.salvage_refile_pending
+    assert saved.followup_review_recommended is False
+    assert len(adapter.sessions) == (interruption == "commit-gate-save")
+    assert ledger.read_text(encoding="utf-8").count("origin: review-timeout-salvage") == 1
+    product = (project.project / "src.txt").read_bytes()
+    monkeypatch.undo()
+    recovered, recovered_adapter = resume_engine(project, resumed, [])
+    gates_run = []
+    original_workflows = recovered._run_workflows
+
+    def record_commit_gate(stage, task, seq):
+        gates_run.append(stage)
+        return original_workflows(stage, task, seq)
+
+    monkeypatch.setattr(recovered, "_run_workflows", record_commit_gate)
+    summary = recovered.run()
+
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    assert len(recovered_adapter.sessions) == 0
+    assert gates_run == ["pre_commit_gate"]
+    assert (project.project / "src.txt").read_bytes() == product
+    final = load_state(recovered.run_dir).tasks["1-1-a"]
+    assert final.phase == Phase.DONE and not final.salvage_refile_pending
+    assert (final.attempt, final.review_cycle, final.generation) == (
+        saved.attempt,
+        saved.review_cycle,
+        saved.generation,
+    )
+    assert ledger.read_text(encoding="utf-8").count("origin: review-timeout-salvage") == 1
+    # Both handoffs ran salvage's authoritative verification; the second did
+    # not publish again because the successful refile was already persisted.
+    salvages = [e for e in recovered.journal.entries() if e["kind"] == "review-timeout-salvage"]
+    assert len(salvages) == 2 and salvages[-1]["refiled"] is None
+
+
+@pytest.mark.parametrize("rollback", [False, True])
+@pytest.mark.parametrize("interruption", ["notification", "commit-gate"])
+def test_first_salvage_latches_before_its_handoff_save(
+    project, monkeypatch, rollback, interruption
+):
+    """The row above replays a salvage the repair-pause arm had already latched;
+    this one is the FIRST, fault-free salvage (#794 review). Its handoff save —
+    refile published, recommendation cleared — was the last save before
+    `_commit`'s COMMITTING save, with `gates.notify` and the `pre_commit_gate`
+    workflow between them, and the latch was set only by the `LedgerReadError`
+    arm. A host death in that window therefore persisted REVIEW_VERIFY over a
+    timeout record with the latch False: `_pending_salvage_session` declined,
+    `_resumable_session` never matches a non-`completed` record, and resume took
+    restart recovery — under rollback it erased the refile just published and
+    re-drove dev AND review over finished, verify-green work; without it, it
+    paused for manual recovery. Latched, resume replays this timeout with zero
+    sessions, re-verifies the preserved product, and appends nothing twice.
+
+    Ablation: drop the `task.salvage_refile_pending = True` ahead of the salvage's
+    handoff save and every row reds on `resume-restart` (rollback rows also on
+    the two re-driven sessions; no-rollback rows on the pause)."""
+
+    class PowerLoss(BaseException):
+        pass
+
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    ledger = project.deferred_work
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), SessionResult(status="timeout")],
+        policy=dataclasses.replace(_salvage_policy(), scm=ScmPolicy(rollback_on_failure=rollback)),
+    )
+    if interruption == "notification":
+
+        def notify_then_die(*args, **kwargs):
+            raise PowerLoss
+
+        monkeypatch.setattr(gates, "notify", notify_then_die)
+    else:
+        original_workflows = engine._run_workflows
+
+        def gate_then_die(stage, task, seq):
+            if stage != "pre_commit_gate":
+                return original_workflows(stage, task, seq)
+            raise PowerLoss
+
+        monkeypatch.setattr(engine, "_run_workflows", gate_then_die)
+
+    with pytest.raises(PowerLoss):
+        engine.run()
+
+    saved = load_state(engine.run_dir).tasks["1-1-a"]
+    assert saved.phase == Phase.REVIEW_VERIFY and saved.salvage_refile_pending
+    assert saved.followup_review_recommended is False and saved.commit_sha is None
+    assert ledger.read_text(encoding="utf-8").count("origin: review-timeout-salvage") == 1
+    product = (project.project / "src.txt").read_bytes()
+    monkeypatch.undo()
+    # the script is a trap: a replay drives no session, so a restart would consume it
+    resumed, adapter = resume_engine(
+        project, engine, [dev_effect(project, "1-1-a"), SessionResult(status="timeout")]
+    )
+
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    assert len(adapter.sessions) == 0
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "resume-restart" not in kinds and "resume-verify" in kinds
+    assert (project.project / "src.txt").read_bytes() == product
+    final = load_state(resumed.run_dir).tasks["1-1-a"]
+    assert final.phase == Phase.DONE and not final.salvage_refile_pending
+    assert (final.attempt, final.review_cycle, final.generation) == (
+        saved.attempt,
+        saved.review_cycle,
+        saved.generation,
+    )
+    assert ledger.read_text(encoding="utf-8").count("origin: review-timeout-salvage") == 1
+    # Both handoffs ran salvage's authoritative verification; the replay did not
+    # publish again because the first run's refile was already persisted.
+    salvages = [e for e in resumed.journal.entries() if e["kind"] == "review-timeout-salvage"]
+    assert len(salvages) == 2 and salvages[-1]["refiled"] is None
+
+
+@pytest.mark.parametrize("rollback", [False, True])
+def test_unlatched_review_timeout_resume_keeps_restart_recovery(project, monkeypatch, rollback):
+    """Legacy timeout state still rebuilds or pauses for manual recovery.
+
+    Ablation: remove the latch condition from `_pending_salvage_session` and
+    this commits the preserved product instead of taking restart recovery.
+    """
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    _corrupting_mutator(monkeypatch, "append_entry", project.deferred_work)
+    policy = dataclasses.replace(_salvage_policy(), scm=ScmPolicy(rollback_on_failure=rollback))
+    engine, _ = make_engine(
+        project, [dev_effect(project, "1-1-a"), SessionResult(status="timeout")], policy=policy
+    )
+    assert engine.run().paused
+    state = load_state(engine.run_dir)
+    state.tasks["1-1-a"].salvage_refile_pending = False
+    save_state(engine.run_dir, state)
+    monkeypatch.undo()
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    resumed, adapter = resume_engine(
+        project, engine, [dev_effect(project, "1-1-a"), SessionResult(status="timeout")]
+    )
+
+    summary = resumed.run()
+
+    assert not summary.crashed
+    assert "resume-restart" in [e["kind"] for e in resumed.journal.entries()]
+    if rollback:
+        assert summary.done == 1 and not summary.paused
+        assert len(adapter.sessions) == 2
+    else:
+        assert summary.paused and summary.done == 0
+        assert "manual rollback needed" in resumed.state.paused_reason.lower()
+        assert len(adapter.sessions) == 0
+
+
+@pytest.mark.parametrize("status", ["timeout", "stalled", "over_budget"])
+@pytest.mark.parametrize("phase", [Phase.REVIEW_RUNNING, Phase.REVIEW_VERIFY])
+def test_pending_salvage_session_replays_current_timeout(project, status, phase):
+    engine, _ = make_engine(project, [], policy=_salvage_policy())
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        phase=phase,
+        attempt=2,
+        review_cycle=3,
+        generation=1,
+        salvage_refile_pending=True,
+    )
+    record = SessionRecord(
+        task_id=_session_task_id(task.story_key, "review", 3, 1),
+        role="review",
+        status=status,
+    )
+    task.record_session(record)
+    role, result = engine._pending_salvage_session(task)
+    assert role == "review" and result.status == status
+    assert engine._resumable_session(task) is None  # still an incomplete session
+
+
+@pytest.mark.parametrize("mismatch", ["phase", "cycle", "generation", "role", "status"])
+def test_pending_salvage_session_requires_current_review_record(project, mismatch):
+    """The latch cannot authorize a different phase, identity, or result.
+
+    Ablation targets: remove the phase guard, ID comparison, or role/status
+    refusal separately; their corresponding mismatch rows then return a replay.
+    """
+    engine, _ = make_engine(project, [], policy=_salvage_policy())
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        phase=Phase.REVIEW_VERIFY,
+        attempt=2,
+        review_cycle=3,
+        generation=1,
+        salvage_refile_pending=True,
+    )
+    record = SessionRecord(
+        task_id=_session_task_id(task.story_key, "review", 3, 1),
+        role="review",
+        status="timeout",
+    )
+    if mismatch == "phase":
+        task.phase = Phase.DEV_VERIFY
+    elif mismatch == "cycle":
+        task.review_cycle += 1
+    elif mismatch == "generation":
+        task.generation += 1
+    elif mismatch == "role":
+        record.role = "dev"
+    else:
+        # An older eligible record cannot override the newest matching result.
+        task.record_session(dataclasses.replace(record))
+        record.status = "running"
+    task.record_session(record)
+    assert engine._pending_salvage_session(task) is None
+
+
+def test_pending_salvage_refile_resume_reverifies_preserved_product(project, monkeypatch):
+    """Verification failure after repair follows the normal exhausted fallback.
+
+    Ablation: replace salvage's `_verify_review` outcome with a pass and this
+    commits the now-invalid product instead of deferring it.
+    """
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    marker = project.project / "verify-marker.txt"
+    marker.write_text("ok", encoding="utf-8")
+    policy = dataclasses.replace(
+        _salvage_policy(max_review_cycles=1),
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker),)),
+    )
+    _corrupting_mutator(monkeypatch, "append_entry", project.deferred_work)
+    engine, _ = make_engine(
+        project, [dev_effect(project, "1-1-a"), SessionResult(status="timeout")], policy=policy
+    )
+    assert engine.run().paused
+    assert load_state(engine.run_dir).tasks["1-1-a"].salvage_refile_pending
+    monkeypatch.undo()
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    marker.unlink()
+    resumed, adapter = resume_engine(project, engine, [])
+
+    summary = resumed.run()
+
+    assert summary.deferred == 1 and summary.done == 0 and not summary.crashed
+    assert len(adapter.sessions) == 0
+    final = load_state(resumed.run_dir).tasks["1-1-a"]
+    assert final.commit_sha is None and final.salvage_refile_pending is False
+    assert "salvage not applicable" in final.defer_reason
+    assert "review-timeout-salvage-failed" in [e["kind"] for e in resumed.journal.entries()]
+
+
+def test_story_over_undecodable_ledger_completes_when_the_spec_records_no_findings(project):
+    """The OBSERVATION arm on a full run. With no `deferred:` findings the harvest
+    never reads the ledger, so every read this run makes after the session is an
+    observation — `_ledger_digest` after the session, the pre-harvest snapshot —
+    and each degrades: one `ledger-read-degraded` row per read, the story lands
+    `DONE`, and the bytes are exactly as they were. Before DW-231 the FIRST of
+    those reads crashed the run with the completed session's work on disk.
+
+    Ablation: delete the `except LedgerReadError` in `_ledger_text` and this reds
+    with `run-crash` (`LedgerReadError`) and zero sessions."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    ledger = project.deferred_work
+    engine, adapter = make_engine(
+        project,
+        [_corrupting_ledger(dev_effect(project, "1-1-a", followup_review=False), ledger)],
+        policy=_harvest_policy(),
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed and not summary.paused
+    assert len(adapter.sessions) == 1
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "run-crash" not in kinds and "ledger-read-refused" not in kinds
+    sites = _degraded_sites(engine)
+    assert {"ledger-digest", "pre-harvest-snapshot"} <= set(sites)
+    assert all(
+        e["ledger"] == str(ledger) and e["story_key"] == "1-1-a" and "not valid UTF-8" in e["error"]
+        for e in engine.journal.entries()
+        if e["kind"] == "ledger-read-degraded"
+    )
+    assert ledger.read_bytes() == UNDECODABLE_LEDGER_BYTES
+
+
+def test_in_place_defer_over_undecodable_ledger_degrades_the_snapshot(project):
+    """The OBSERVATION arm at `_defer`'s in-place snapshot: the review never
+    converges, the defer resets the tree, and the snapshot that would feed
+    `_restore_defer_ledger` cannot be read. It degrades to NO snapshot
+    (`ledger-read-degraded`, site `defer-snapshot`) so the restore is skipped —
+    nothing is merged from, or republished over, bytes nobody could read — and
+    the defer records normally. Ablation: delete the `except LedgerReadError`
+    around the snapshot read and this reds with `run-crash` after the reset."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    ledger = project.deferred_work
+    engine, _ = make_engine(
+        project,
+        [_corrupting_ledger(dev_effect(project, "1-1-a"), ledger)]
+        + [
+            review_effect(project, "1-1-a", clean=False, patched=1, finalized=False)
+            for _ in range(3)
+        ],
+    )
+
+    summary = engine.run()
+
+    assert summary.deferred == 1 and not summary.crashed and not summary.paused
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DEFERRED
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "story-deferred" in kinds and "run-crash" not in kinds
+    assert "defer-ledger-restore-diverged" not in kinds  # the restore never ran
+    assert "defer-snapshot" in _degraded_sites(engine)
+    assert ledger.read_bytes() == UNDECODABLE_LEDGER_BYTES
+    assert (project.project / "src.txt").read_text() == "original\n"  # the reset still ran
+
+
+def test_restore_ledger_skips_a_ledger_that_became_undecodable(project):
+    """`_restore_ledger` over a ledger that turned undecodable AFTER the snapshot
+    was armed. `_ledger_text` answers the typed `_UndecodableLedger`, which equals
+    no snapshot and is never digested as "ours", so the locked read takes the
+    `diverged` arm explicitly: no write, no unlink, `ledger-restore-skipped-
+    diverged` beside the degraded-read rows. A str sentinel could have been
+    digested, matched and written back — the type is what makes this a skip.
+
+    Ablation: delete the `except LedgerReadError` in `_ledger_text` and the raise
+    escapes this direct call."""
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    ledger = project.deferred_work
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    snapshot = "# Deferred Work\n\n## DW-1 pre-existing\n"
+    task.post_engine_ledger_digest = _digest_of(snapshot + "\n## DW-2 our harvest row\n")
+    ledger.write_bytes(UNDECODABLE_LEDGER_BYTES)
+
+    engine._restore_ledger(task, snapshot)
+
+    assert ledger.read_bytes() == UNDECODABLE_LEDGER_BYTES  # no write
+    (event,) = [
+        e for e in engine.journal.entries() if e["kind"] == "ledger-restore-skipped-diverged"
+    ]
+    assert event["story_key"] == "1-1-a" and event["ledger"] == str(ledger)
+    assert _degraded_sites(engine) == ["ledger-restore", "ledger-restore-locked"]
+
+    # The None-snapshot arm is the one that could UNLINK; the typed answer never
+    # reaches it either.
+    engine._restore_ledger(task, None)
+    assert ledger.read_bytes() == UNDECODABLE_LEDGER_BYTES
+
+
+def test_restore_defer_ledger_never_merges_onto_an_undecodable_ledger(project):
+    """`_restore_defer_ledger` over a TRACKED ledger that turned undecodable after
+    the defer snapshot was taken. The locked read answers the typed
+    `_UndecodableLedger`; the baseline anchor cannot match it, and the
+    `isinstance(current, str)` guard keeps it out of `_merge_snapshot_entries`,
+    so the site falls through to `defer-ledger-restore-diverged` with nothing
+    merged and nothing written — the same arm a rival's deletion takes.
+
+    Ablation: revert that guard to `current is not None` and the typed answer
+    reaches `_merge_snapshot_entries`, which raises `TypeError` under the lock."""
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track deferred-work")
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = rev_parse_head(project.project)
+    task.baseline_untracked = []
+    snapshot = (
+        "# Deferred Work\n\n### DW-1: review found this\n\n"
+        "origin: review, 2026-08-26\nlocation: src.txt\nreason: needs a look.\nstatus: open\n"
+    )
+    ledger = project.deferred_work
+    ledger.write_bytes(UNDECODABLE_LEDGER_BYTES)
+
+    engine._restore_defer_ledger(task, snapshot)
+
+    assert ledger.read_bytes() == UNDECODABLE_LEDGER_BYTES  # no write
+    (event,) = [e for e in engine.journal.entries() if e["kind"] == "defer-ledger-restore-diverged"]
+    assert event["dw_ids"] == [] and event["ledger"] == str(ledger)
+    assert _degraded_sites(engine) == ["defer-ledger-restore", "defer-ledger-restore-locked"]
+
+
+def test_ledger_text_answers_a_typed_digest_of_the_raw_bytes(project):
+    """`_ledger_text`'s degraded answer carries the sha256 of the RAW bytes and the
+    attributed fault, so `_ledger_digest` keeps its equality contract exactly: no
+    `_digest_of` answer (always a valid UTF-8 encoding) can collide with it, and
+    two reads of the same undecodable bytes agree."""
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    ledger = project.deferred_work
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_bytes(UNDECODABLE_LEDGER_BYTES)
+
+    answer = engine._ledger_text(site="probe", story_key="1-1-a")
+
+    assert isinstance(answer, _UndecodableLedger)
+    assert answer.digest == hashlib.sha256(UNDECODABLE_LEDGER_BYTES).hexdigest()
+    assert "not valid UTF-8" in answer.error
+    assert answer != UNDECODABLE_LEDGER_BYTES.decode("utf-8", "replace") and answer is not None
+    assert engine._ledger_digest(task) == answer.digest
+    assert engine._ledger_digest(task) != _digest_of(UNDECODABLE_LEDGER_BYTES.decode("latin-1"))
+    row, *_ = [e for e in engine.journal.entries() if e["kind"] == "ledger-read-degraded"]
+    assert row["site"] == "probe" and row["story_key"] == "1-1-a"
+
+
+# ------------------------------------------- DW-258 engine ledger reads the OS refuses
+#
+# DW-231 caught `LedgerReadError` by name at the four sites, so a read the OS
+# refused (EACCES, EIO, ELOOP) still propagated from the first of them and ended
+# the run as `run-crash` with the completed session's work on disk. Each site now
+# routes the `OSError` the way it routes the decode fault, with one difference in
+# the typed answer: `_UnreadableLedger` carries NO digest (the branch reads
+# nothing — a `read_bytes()` would raise again), so `_ledger_digest` answers the
+# `<unreadable>` sentinel and `_ledger_changed_since_baseline` treats a sentinel
+# on either side as UNKNOWN attribution, which is never credited. The ELOOP full
+# runs live beside the `closes_deferred:` rows (`_loop_the_ledger`); these are the
+# EACCES rows, injected AFTER the session because `_refuse_gated_story`'s own
+# `read_text` would otherwise pause the run at `story-gate` before any of the
+# engine's reads (the `_corrupting_ledger` shape).
+
+
+def _refusing_ledger(effect, monkeypatch, ledger: Path):
+    """Run a scripted session, then make every `read_text` of the ledger raise
+    `PermissionError` (`conftest.fault_read_text`: selective, never `chmod`, and
+    `read_bytes` is untouched so the bytes can still be asserted unchanged)."""
+
+    def run(spec):
+        result = effect(spec)
+        fault_read_text(monkeypatch, ledger)
+        return result
+
+    return run
+
+
+def test_ledger_text_answers_a_typed_unreadable_ledger_without_a_digest(project, monkeypatch):
+    """The `OSError` branch of `_ledger_text` (DW-258). It answers the typed
+    `_UnreadableLedger` naming the path and the fault's class, journals ONE
+    `ledger-read-degraded` row for the site, and reads NOTHING from the ledger:
+    `read_bytes` is faulted too, and never fires. `_ledger_digest` answers the
+    `<unreadable>` sentinel, which no `_digest_of` answer can equal.
+
+    The compare: with the sentinel as the baseline and a readable ledger whose real
+    digest differs, `_ledger_changed_since_baseline` answers False (unknown
+    attribution is not credited); sentinel on both sides is False too; only a real
+    digest on both sides answers a plain `!=`.
+
+    Ablations: narrow `_ledger_text`'s tuple back to `LedgerReadError` and the
+    `PermissionError` escapes the direct call; make the helper a plain `!=` and the
+    sentinel-baseline-vs-real-digest assertion reds (plain `!=` answers True)."""
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    ledger = project.deferred_work
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    text = "# Deferred Work\n\n### DW-1: real entry\n\nstatus: open\n"
+    ledger.write_text(text, encoding="utf-8")
+    fault_read_text(monkeypatch, ledger)
+    real_read_bytes = Path.read_bytes
+
+    def no_bytes(self, *a, **kw):
+        if self == ledger:
+            raise AssertionError("the OSError branch must not read the ledger's bytes")
+        return real_read_bytes(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "read_bytes", no_bytes)
+
+    answer = engine._ledger_text(site="probe", story_key="1-1-a")
+
+    assert isinstance(answer, _UnreadableLedger)
+    assert str(ledger) in answer.error and "PermissionError" in answer.error
+    assert answer != text and answer is not None and answer != ""
+    (row,) = [e for e in engine.journal.entries() if e["kind"] == "ledger-read-degraded"]
+    assert row["site"] == "probe" and row["story_key"] == "1-1-a"
+    assert row["ledger"] == str(ledger) and row["error"] == answer.error
+    assert engine._ledger_digest(task) == _UNREADABLE_LEDGER_DIGEST
+    assert _UNREADABLE_LEDGER_DIGEST != _digest_of(
+        text
+    ) and _UNREADABLE_LEDGER_DIGEST != _digest_of(None)
+
+    # Real baseline, sentinel now ("readable then, refused now" — the direction
+    # the after-session compares take): unknown, not credited.
+    task.baseline_ledger_digest = _digest_of(text)
+    assert engine._ledger_changed_since_baseline(task) is False
+    # Sentinel on both sides: unknown, not credited.
+    task.baseline_ledger_digest = _UNREADABLE_LEDGER_DIGEST
+    assert engine._ledger_changed_since_baseline(task) is False
+    # Sentinel baseline, real digest now (the shape that reaches the gate after a
+    # repair): still unknown, still not credited — the ablation row.
+    monkeypatch.undo()
+    assert engine._ledger_digest(task) == _digest_of(text) != _UNREADABLE_LEDGER_DIGEST
+    assert engine._ledger_changed_since_baseline(task) is False
+    # A real digest on both sides is a plain `!=`.
+    task.baseline_ledger_digest = _digest_of(text)
+    assert engine._ledger_changed_since_baseline(task) is False
+    task.baseline_ledger_digest = _digest_of(text + "\n### DW-2: session edit\n")
+    assert engine._ledger_changed_since_baseline(task) is True
+
+
+def test_harvest_over_os_refused_ledger_pauses_and_resume_replays_the_session(project, monkeypatch):
+    """The PUBLISH arm at the spec-deferral harvest for a read the OS refuses
+    (DW-258), the EACCES twin of the DW-231 row. The dev session completes and
+    records findings; the ledger then refuses to read, so the observation reads
+    degrade and the harvest PAUSES at `escalation` — `ledger-read-refused` site
+    `spec-deferrals-harvest` naming `PermissionError`, the task left at
+    `DEV_VERIFY`, an `ACTION REQUIRED` notice naming the ledger and the resume
+    command, nothing written — instead of `run-crash`. Once the fault is lifted,
+    `resume` replays the recorded result with ZERO sessions and lands `DONE`.
+
+    Ablation: narrow the harvest's `except` tuple back to `LedgerReadError` and
+    the first half reds with `run-crash` (`PermissionError`)."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    ledger = project.deferred_work
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_bytes(b"# Deferred Work\n")  # bytes: write_text would CRLF on win32
+    engine, adapter = make_engine(
+        project,
+        [
+            _refusing_ledger(
+                dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A]),
+                monkeypatch,
+                ledger,
+            )
+        ],
+        policy=_harvest_policy(),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed and summary.done == 0
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    assert engine.state.paused_story_key == "1-1-a"
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DEV_VERIFY  # left where it was: not ESCALATED
+    assert len(adapter.sessions) == 1
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "run-crash" not in kinds and "story-escalated" not in kinds
+    assert {"ledger-digest", "pre-harvest-snapshot"} <= set(_degraded_sites(engine))
+    assert all(
+        "PermissionError" in e["error"] and str(ledger) in e["error"]
+        for e in engine.journal.entries()
+        if e["kind"] == "ledger-read-degraded"
+    )
+    (refused,) = [e for e in engine.journal.entries() if e["kind"] == "ledger-read-refused"]
+    assert refused["site"] == "spec-deferrals-harvest"
+    assert refused["story_key"] == "1-1-a" and refused["ledger"] == str(ledger)
+    assert "PermissionError" in refused["error"] and str(ledger) in refused["error"]
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert "ACTION REQUIRED" in attention
+    assert str(ledger) in attention and "`bmad-loop resume test-run`" in attention
+    assert "permissions or storage" in attention
+    assert ledger.read_bytes() == b"# Deferred Work\n"  # nothing written
+    assert task.pre_harvest_ledger_captured is False and task.post_engine_ledger_digest is None
+
+    monkeypatch.undo()
+    resumed, resumed_adapter = resume_engine(project, engine, [])
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    assert resumed_adapter.sessions == []  # ZERO sessions: the harvest was retried
+    assert resumed.state.tasks["1-1-a"].phase == Phase.DONE
+    (entry,) = _harvest_entries(project)
+    assert entry.title == HARVEST_A["summary"] and entry.open
+
+
+def test_story_over_os_refused_ledger_completes_when_the_spec_records_no_findings(
+    project, monkeypatch
+):
+    """The OBSERVATION arm on a full run for a read the OS refuses (DW-258), the
+    EACCES twin of the DW-231 row: with no `deferred:` findings the harvest never
+    reads the ledger, so every read after the session is an observation and each
+    degrades — the story lands `DONE`, the bytes are as they were, and no
+    `ledger-read-refused` row appears. Before DW-258 the first of those reads
+    ended the run as `run-crash` (`PermissionError`).
+
+    Ablation: narrow `_ledger_text`'s tuple back to `LedgerReadError` and this
+    reds with `run-crash`."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    ledger = project.deferred_work
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_bytes(b"# Deferred Work\n")  # bytes: write_text would CRLF on win32
+    engine, adapter = make_engine(
+        project,
+        [
+            _refusing_ledger(
+                dev_effect(project, "1-1-a", followup_review=False), monkeypatch, ledger
+            )
+        ],
+        policy=_harvest_policy(),
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed and not summary.paused
+    assert len(adapter.sessions) == 1
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "run-crash" not in kinds and "ledger-read-refused" not in kinds
+    assert {"ledger-digest", "pre-harvest-snapshot"} <= set(_degraded_sites(engine))
+    assert all(
+        e["ledger"] == str(ledger) and e["story_key"] == "1-1-a" and "PermissionError" in e["error"]
+        for e in engine.journal.entries()
+        if e["kind"] == "ledger-read-degraded"
+    )
+    assert ledger.read_bytes() == b"# Deferred Work\n"
+
+
+def test_in_place_defer_over_os_refused_ledger_degrades_the_snapshot(project, monkeypatch):
+    """The OBSERVATION arm at `_defer`'s in-place snapshot for a read the OS
+    refuses (DW-258): the review never converges, the defer resets the tree, and
+    the snapshot read raises `PermissionError`. It degrades to NO snapshot
+    (`ledger-read-degraded`, site `defer-snapshot`, naming `PermissionError`) so
+    the restore is skipped and the defer records normally — no
+    `defer-ledger-restore-diverged`, no `run-crash`, bytes untouched.
+
+    Ablation: narrow the snapshot's `except` tuple back to `LedgerReadError` and
+    this reds with `run-crash` after the reset."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    ledger = project.deferred_work
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_bytes(b"# Deferred Work\n")  # bytes: write_text would CRLF on win32
+    engine, _ = make_engine(
+        project,
+        [_refusing_ledger(dev_effect(project, "1-1-a"), monkeypatch, ledger)]
+        + [
+            review_effect(project, "1-1-a", clean=False, patched=1, finalized=False)
+            for _ in range(3)
+        ],
+    )
+
+    summary = engine.run()
+
+    assert summary.deferred == 1 and not summary.crashed and not summary.paused
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DEFERRED
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "story-deferred" in kinds and "run-crash" not in kinds
+    assert "defer-ledger-restore-diverged" not in kinds  # the restore never ran
+    (row,) = [
+        e
+        for e in engine.journal.entries()
+        if e["kind"] == "ledger-read-degraded" and e["site"] == "defer-snapshot"
+    ]
+    assert "PermissionError" in row["error"] and row["ledger"] == str(ledger)
+    assert ledger.read_bytes() == b"# Deferred Work\n"
+    assert (project.project / "src.txt").read_text() == "original\n"  # the reset still ran
+
+
+def test_restore_ledger_skips_a_ledger_the_os_refuses(project, monkeypatch):
+    """`_restore_ledger` over a ledger that the OS refuses to read AFTER the
+    snapshot was armed (DW-258), the twin of the undecodable row. `_ledger_text`
+    answers the typed `_UnreadableLedger`, which equals no snapshot and carries
+    no digest, so the locked read takes the `diverged` arm: no write, no unlink,
+    `ledger-restore-skipped-diverged` beside the degraded-read rows.
+
+    Ablation: narrow the locked probe's `isinstance` back to `_UndecodableLedger`
+    and the typed answer reaches `_digest_of` under the lock (`AttributeError`)."""
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    ledger = project.deferred_work
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    snapshot = "# Deferred Work\n\n## DW-1 pre-existing\n"
+    harvested = snapshot + "\n## DW-2 our harvest row\n"
+    task.post_engine_ledger_digest = _digest_of(harvested)
+    ledger.write_bytes(harvested.encode("utf-8"))  # bytes: write_text would CRLF on win32
+    fault_read_text(monkeypatch, ledger)
+
+    engine._restore_ledger(task, snapshot)
+
+    assert ledger.read_bytes() == harvested.encode("utf-8")  # no write
+    (event,) = [
+        e for e in engine.journal.entries() if e["kind"] == "ledger-restore-skipped-diverged"
+    ]
+    assert event["story_key"] == "1-1-a" and event["ledger"] == str(ledger)
+    assert _degraded_sites(engine) == ["ledger-restore", "ledger-restore-locked"]
+    assert all(
+        "PermissionError" in e["error"]
+        for e in engine.journal.entries()
+        if e["kind"] == "ledger-read-degraded"
+    )
+
+    # The None-snapshot arm is the one that could UNLINK; the typed answer never
+    # reaches it either.
+    engine._restore_ledger(task, None)
+    assert ledger.read_bytes() == harvested.encode("utf-8")
+
+
 def test_harvest_digest_is_on_disk_before_the_attempt_decision(project, monkeypatch):
     """Probe the refresh's own save before any later ambient save can mask it.
 
@@ -15138,7 +19152,7 @@ def test_harvest_digest_is_on_disk_before_the_attempt_decision(project, monkeypa
     def probing_append(kind, **fields):
         if kind == "spec-deferrals-harvested" and not seen:
             saved = load_state(engine.run_dir).tasks["1-1-a"]
-            seen.append((saved.post_engine_ledger_digest, engine._ledger_text()))
+            seen.append((saved.post_engine_ledger_digest, engine._ledger_text(site="test")))
         real_append(kind, **fields)
 
     monkeypatch.setattr(engine.journal, "append", probing_append)
@@ -15749,6 +19763,7 @@ def test_pause_disarm_is_on_disk_before_run_paused_event(project, monkeypatch):
     assert seen_before_ambient_save == [(False, None)]
 
 
+@requires_descriptor_restoration
 def test_fixable_retry_chain_snapshot_reaches_phase_baseline(project, tmp_path):
     marker = tmp_path / "fixed.marker"
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
@@ -15774,6 +19789,7 @@ def test_fixable_retry_chain_snapshot_reaches_phase_baseline(project, tmp_path):
     assert not project.deferred_work.exists()
 
 
+@requires_descriptor_restoration
 def test_nonfixable_chain_rollback_rebases_ledger_proof_reference(project, tmp_path):
     marker = tmp_path / "fixed.marker"
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
@@ -17029,36 +21045,6 @@ def test_a_park_record_rollback_refused_as_unconfined_is_journaled(project):
     assert escaped["actions"] == ACTIONS  # this run's record, NOT the prior put back
 
 
-def test_notice_reason_bound_is_an_upper_bound_not_an_equality():
-    """`NOTICE_REASON_MAX + len(" […]")` is a ceiling the return need not attain.
-
-    The sibling row pins it with `"z" * 500` — whitespace-free, so the slice never
-    rstrips and the equality holds. Two shapes make it strictly less, and the comment
-    on the constant used to state the bound as though neither existed:
-
-    * a cut landing on whitespace, since the slice is `.rstrip()`ed;
-    * ANY multi-line reason, since `trimmed` is set by the line collapse regardless of
-      length — which is the common case, `verify.verify_command_results_outcome`
-      putting its output tail under a short classification line.
-
-    Behaviour is correct in every case; what was wrong was the claim about it, and a
-    test that pins one whitespace-free instance cannot tell the claim from the truth.
-
-    Ablation: this row grades the COMMENT, so the meaningful ablation is textual —
-    restore "runs to NOTICE_REASON_MAX + len(...)" without "AT MOST" and the assertions
-    below contradict it. For the code half, delete the `.rstrip()` and the
-    whitespace-boundary assertion reddens on `len(capped) == 204`.
-    """
-    capped = _notice_reason("a" * (NOTICE_REASON_MAX - 1) + " " + "b" * 300)
-    assert capped.endswith(" […]")  # a trim happened, and is marked
-    assert len(capped) < NOTICE_REASON_MAX + len(" […]")  # yet lands BELOW the bound
-    assert not capped.startswith("a" * NOTICE_REASON_MAX)  # because the slice rstripped
-
-    short = _notice_reason("short first line\nthe evidence lives here")
-    assert short == "short first line […]"  # marked well under the cap
-    assert len(short) < NOTICE_REASON_MAX
-
-
 def test_llm_authored_preference_keys_cannot_hijack_journal_reserved_names(project):
     """`_review_and_commit` splats a review session's own `result.json` escalation
     entries into `journal.append`, so an LLM chooses the journal FIELD NAMES. Some
@@ -17133,3 +21119,2119 @@ def test_llm_authored_preference_keys_cannot_hijack_journal_reserved_names(proje
     assert "AcmeVault" not in json.dumps(pref), "an LLM-supplied log_pos reached the journal"
     # ...and the declared schema still rode through untouched
     assert pref["type"] == "preference" and pref["detail"] == "prose"
+
+
+# ---- DW-353: a hard stop landing inside a verify command or declarative hook ------
+#
+# Each row's child LODGES the hard request itself and then sleeps, so the request
+# lands while the engine is blocked on that child — the window no poller covered
+# before DW-353 (native Windows never sees SIGTERM; POSIX's SIGTERM killed only the
+# shell). The stop-aware runner must kill the tree and the engine must record a
+# `stopped` run attributed to the control file, with nothing decided on the cut-short
+# result: no commit, no repair, no veto.
+
+
+def _lodge_then_sleep_cmd(tmp: Path, run_dir: Path, *, pass_first: int = 0) -> str:
+    """A shell command whose child passes its first ``pass_first`` invocations and
+    thereafter lodges a HARD stop request for ``run_dir`` and sleeps well past any
+    test budget. Interpreter is ``sys.executable`` (no bare ``python`` under uv);
+    the double quotes are honored by both sh and cmd."""
+    counter = tmp / "lodge-then-sleep.count"
+    script = tmp / "lodge_then_sleep.py"
+    script.write_text(
+        "import json, pathlib, sys, time\n"
+        f"counter = pathlib.Path({str(counter)!r})\n"
+        "n = int(counter.read_text()) + 1 if counter.exists() else 1\n"
+        "counter.write_text(str(n))\n"
+        f"if n <= {pass_first}:\n"
+        "    sys.exit(0)\n"
+        f"run_dir = pathlib.Path({str(run_dir)!r})\n"
+        "run_dir.mkdir(parents=True, exist_ok=True)\n"
+        f"(run_dir / {STOP_REQUEST_FILE!r}).write_text(\n"
+        "    json.dumps({'requested_at': '2026-09-24T00:00:00', 'mode': 'hard'}),\n"
+        "    encoding='utf-8',\n"
+        ")\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    return f'"{sys.executable}" "{script}"'
+
+
+def _assert_stopped_via_stop_request(engine: Engine) -> list[dict]:
+    saved = load_state(engine.run_dir)
+    assert saved.stopped is True and saved.finished is False and saved.crashed is False
+    entries = engine.journal.entries()
+    kinds = [e["kind"] for e in entries]
+    assert "run-complete" not in kinds
+    stops = [e for e in entries if e["kind"] == "run-stop"]
+    assert stops and stops[-1]["via"] == "stop-request"
+    # consumed by the hard arm — not discarded as stale by run()'s finally
+    assert "stop-request-discarded" not in kinds
+    assert not graceful_stop_requested(engine.run_dir)
+    return entries
+
+
+def test_hard_stop_during_dev_verify_stops_without_commit_or_retry(project, monkeypatch, tmp_path):
+    """The dev leg's verify command is cut short by a hard stop: the pass is
+    journalled with `interrupted=True` and the run stops there — no commit on a
+    pass that never finished, and no repair session for a "failure" that is
+    really a stop.
+
+    Ablation: delete `_stop_if_verify_interrupted` in `_verify_commands_with_results`
+    and the backstop `VerifyInterrupted` crashes the run instead (`crashed` True)."""
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        scm=ScmPolicy(rollback_on_failure=True),
+        verify=VerifyPolicy(commands=(_lodge_then_sleep_cmd(tmp_path, run_dir), _OK)),
+    )
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")], policy=policy)
+
+    started = time.monotonic()
+    engine.run()
+    assert time.monotonic() - started < runs._STOP_WAIT_S
+
+    entries = _assert_stopped_via_stop_request(engine)
+    records = [e for e in entries if e["kind"] == "verify-command-result"]
+    assert [r["verification_stage"] for r in records] == ["dev", "dev"]
+    assert all(r["interrupted"] is True for r in records)
+    assert all(r["returncode"] == verify.INTERRUPTED_RC for r in records)
+    assert len(adapter.sessions) == 1  # no repair session
+    task = load_state(engine.run_dir).tasks["1-1-a"]
+    assert not task.commit_sha
+    assert task.phase != Phase.DONE
+
+
+def test_hard_stop_during_review_verify_stops_without_commit(project, monkeypatch, tmp_path):
+    """The review gate's pass is cut short: the review sink journals it with
+    `interrupted=True` and stops the run before the gate classifies it.
+
+    Ablation: delete the sink's `_stop_if_verify_interrupted` and the gate's
+    `VerifyInterrupted` backstop crashes the run instead.
+
+    The interrupted pass is also never published to `post_review_verify` (DW-357),
+    though the stage is bound. Ablation: emit from a `RunStopped` handler around
+    `_verify_review` in `Engine._review_verify_gate` and `capture.contexts` fills."""
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        verify=VerifyPolicy(commands=(_lodge_then_sleep_cmd(tmp_path, run_dir, pass_first=1),)),
+    )
+    engine, adapter = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=policy,
+    )
+    capture = _StageCaptureBus("post_review_verify")
+    engine._bus = capture
+
+    engine.run()
+
+    assert capture.contexts == []
+    entries = _assert_stopped_via_stop_request(engine)
+    records = [e for e in entries if e["kind"] == "verify-command-result"]
+    assert [r["verification_stage"] for r in records] == ["dev", "review"]
+    assert "interrupted" not in records[0]  # a pass that ran through is unchanged
+    assert records[1]["interrupted"] is True
+    assert len(adapter.sessions) == 2  # dev + review; nothing after the stop
+    task = load_state(engine.run_dir).tasks["1-1-a"]
+    assert not task.commit_sha
+    assert task.phase != Phase.DONE
+
+
+def _declarative_registry(stage: str, cmd: str, *, fail_closed: bool = False):
+    from bmad_loop.plugins import PluginManifest, PluginRegistry
+    from bmad_loop.plugins.model import HookSpec, LoadedPlugin
+
+    manifest = PluginManifest(
+        name="stopper",
+        api_version=1,
+        hooks=(HookSpec(stage=stage, cmd=cmd, blocking=True, fail_closed=fail_closed),),
+    )
+    return PluginRegistry([LoadedPlugin(manifest=manifest)])
+
+
+def test_hard_stop_during_post_session_hook_stops_the_run(project, monkeypatch, tmp_path):
+    """A blocking, fail-closed `post_session` hook cut short by a hard stop is
+    neither a hook error nor a veto: `plugin-hook-interrupted` is journalled and
+    the run stops.
+
+    Ablation: drop `_bus_emit`'s `except ChildInterrupted` and the raw
+    ChildInterrupted crashes the run (`crashed` True)."""
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    registry = _declarative_registry(
+        "post_session", _lodge_then_sleep_cmd(tmp_path, run_dir), fail_closed=True
+    )
+    engine, adapter = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        registry=registry,
+    )
+
+    engine.run()
+
+    entries = _assert_stopped_via_stop_request(engine)
+    kinds = [e["kind"] for e in entries]
+    interrupted = [e for e in entries if e["kind"] == "plugin-hook-interrupted"]
+    assert (
+        interrupted == [{**interrupted[0], "plugin": "stopper", "stage": "post_session"}]
+        and len(interrupted) == 1
+    )
+    assert "plugin-hook-error" not in kinds and "plugin-veto" not in kinds
+    assert len(adapter.sessions) == 1  # the review session never launched
+    assert not load_state(engine.run_dir).tasks["1-1-a"].commit_sha
+
+
+def test_hard_stop_during_post_run_hook_still_finishes(project, monkeypatch, tmp_path):
+    """`post_run` fires on the clean-finish path with `finished` already set: an
+    interrupted hook is journalled, and the run still records `run-complete`. The
+    lodged request is left for `run()`'s finally to discard, as it always was.
+
+    Ablation: drop the `post_run` arm in `_bus_emit` and the run records
+    `stopped` instead of `finished`."""
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    registry = _declarative_registry("post_run", _lodge_then_sleep_cmd(tmp_path, run_dir))
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        registry=registry,
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    saved = load_state(engine.run_dir)
+    assert saved.finished is True and saved.stopped is False
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "run-complete" in kinds and "run-stop" not in kinds
+    assert kinds.count("plugin-hook-interrupted") == 1
+    assert kinds.index("plugin-hook-interrupted") < kinds.index("run-complete")
+    assert "stop-request-discarded" in kinds
+    assert not graceful_stop_requested(engine.run_dir)
+
+
+def _declarative_hooks_registry(*hooks):
+    """A one-plugin registry carrying several declarative hooks (one per stage)."""
+    from bmad_loop.plugins import PluginManifest, PluginRegistry
+    from bmad_loop.plugins.model import LoadedPlugin
+
+    manifest = PluginManifest(name="stopper", api_version=1, hooks=tuple(hooks))
+    return PluginRegistry([LoadedPlugin(manifest=manifest)])
+
+
+@pytest.mark.parametrize("stage", ["pre_session", "pre_dev_session"])
+def test_hard_stop_during_a_session_gate_hook_stops_before_the_session(
+    project, monkeypatch, tmp_path, stage
+):
+    """A blocking, fail-closed declarative hook on the session gate — the generic
+    `pre_session` or the role stage `pre_dev_session`, both dispatched through
+    `_emit_session_gate`'s `_bus_emit` — is cut short by a hard stop: the run
+    records `stopped` (not `crashed`), and the session the gate guarded never
+    launches.
+
+    Ablation: route either `_emit_session_gate` dispatch back through
+    `self._bus.emit` and the raw ChildInterrupted crashes the run for that row."""
+    from bmad_loop.plugins.model import HookSpec
+
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    registry = _declarative_hooks_registry(
+        HookSpec(
+            stage=stage,
+            cmd=_lodge_then_sleep_cmd(tmp_path, run_dir),
+            blocking=True,
+            fail_closed=True,
+        )
+    )
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")], registry=registry)
+
+    engine.run()
+
+    entries = _assert_stopped_via_stop_request(engine)
+    kinds = [e["kind"] for e in entries]
+    assert "run-crash" not in kinds
+    interrupted = [e for e in entries if e["kind"] == "plugin-hook-interrupted"]
+    assert [(e["plugin"], e["stage"]) for e in interrupted] == [("stopper", stage)]
+    assert "plugin-hook-error" not in kinds and "plugin-veto" not in kinds
+    assert adapter.sessions == []  # the gated session never launched
+    assert len(adapter.script) == 1
+
+
+def _marker_cmd(tmp: Path, marker: Path) -> str:
+    """A declarative hook command that writes ``marker`` — cmd- and sh-safe."""
+    script = tmp / "write_marker.py"
+    if not script.exists():
+        script.write_text(
+            "import pathlib, sys\npathlib.Path(sys.argv[1]).write_text('ran', encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+    return f'"{sys.executable}" "{script}" "{marker}"'
+
+
+@pytest.mark.parametrize("route", ["session-abort", "verify-lodged"])
+def test_worktree_teardown_hooks_survive_a_hard_stop(project, monkeypatch, tmp_path, route):
+    """A hard stop is honored inside an isolated unit — mid-session (the adapter
+    read the lodged file and aborted) or mid-verify (the verify child lodged it and
+    was killed). Either way the stop's own unwind still runs BOTH declarative
+    teardown hooks and restores the workspace: once the engine constructed the hard
+    `RunStopped`, the request is honored and the child runner's probe is disarmed,
+    so cleanup hooks are not refused before spawn.
+
+    The `verify-lodged` row is the one that bites: raise site A consumes its file
+    before raising, but the verify conversion leaves it for `run()`'s hard arm, so
+    the file is still on disk while worktree_flow's `finally` fires the teardown.
+
+    Ablation: drop the `unwinding` latch in `RunStopped.__init__` and the
+    `verify-lodged` row fails — the still-lodged file refuses
+    `pre_worktree_teardown` before spawn, its interrupt becomes a second
+    `RunStopped` out of the `finally`, and the `post_worktree_teardown` marker is
+    missing with the workspace left unrestored."""
+    from bmad_loop.plugins.model import HookSpec
+
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "sprint")
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    pre_marker = tmp_path / "pre-teardown.marker"
+    post_marker = tmp_path / "post-teardown.marker"
+    registry = _declarative_hooks_registry(
+        HookSpec(stage="pre_worktree_teardown", cmd=_marker_cmd(tmp_path, pre_marker)),
+        HookSpec(stage="post_worktree_teardown", cmd=_marker_cmd(tmp_path, post_marker)),
+    )
+    verify_commands = (
+        (_lodge_then_sleep_cmd(tmp_path, run_dir),) if route == "verify-lodged" else ()
+    )
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        scm=ScmPolicy(isolation="worktree"),
+        verify=VerifyPolicy(commands=verify_commands),
+    )
+
+    def abort_on_hard_stop(spec):
+        # What a real adapter does when its wait loop reads the lodged hard file:
+        # tear the window down and hand back `aborted`.
+        _lodge_hard_stop_request(run_dir)
+        return SessionResult(status="aborted")
+
+    def dev_in_the_unit(spec):
+        # the dev session runs inside the unit worktree (spec.cwd)
+        return dev_effect(project.rebased(spec.cwd), "1-1-a", followup_review=False)(spec)
+
+    effect = abort_on_hard_stop if route == "session-abort" else dev_in_the_unit
+    engine, adapter = make_engine(project, [effect], policy=policy, registry=registry)
+    main_workspace = engine.workspace
+
+    engine.run()
+
+    entries = _assert_stopped_via_stop_request(engine)
+    assert pre_marker.read_text(encoding="utf-8") == "ran"
+    assert post_marker.read_text(encoding="utf-8") == "ran"
+    assert engine.workspace is main_workspace
+    kinds = [e["kind"] for e in entries]
+    assert "plugin-hook-interrupted" not in kinds
+    assert len(adapter.sessions) == 1
+    records = [e for e in entries if e["kind"] == "verify-command-result"]
+    if route == "verify-lodged":
+        assert len(records) == 1 and records[0]["interrupted"] is True
+    else:
+        assert records == []
+
+
+def test_hard_run_stopped_disarms_the_child_probe_and_graceful_does_not(tmp_path):
+    """Constructing a hard `RunStopped` is where a pending request becomes honored:
+    it latches the ambient probe's `unwinding`, after which the probe reads False
+    even with the hard file still lodged. A graceful stop leaves it armed, and with
+    no probe installed construction is a no-op."""
+    from bmad_loop import childrun
+    from bmad_loop.engine import _hard_stop_probe, _HardStopProbe
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _lodge_hard_stop_request(run_dir)
+    RunStopped()  # no probe installed: nothing to disarm, nothing raised
+
+    probe = _HardStopProbe([run_dir])
+    token = _hard_stop_probe.set(probe)
+    runner_token = childrun.install_stop_probe(probe)
+    try:
+        assert childrun.hard_stop_pending() is True
+        RunStopped(graceful=True)
+        assert probe.unwinding is False and childrun.hard_stop_pending() is True
+        RunStopped(via="stop-request")
+        assert probe.unwinding is True and childrun.hard_stop_pending() is False
+    finally:
+        childrun.reset_stop_probe(runner_token)
+        _hard_stop_probe.reset(token)
+
+
+@pytest.mark.parametrize("lodged_in", ["owner", "child"])
+def test_nested_verify_command_is_interrupted_by_owner_or_own_hard_request(
+    project, monkeypatch, tmp_path, lodged_in
+):
+    """A nested auto-sweep's verify command reads BOTH channels, like its
+    adapters: `stop <owner-id>` lodges in the owning run's dir, `stop <child-id>`
+    in the child's own. The nested engine appends its dir to the owner's probe for
+    its lifetime and removes it on the way out; either request interrupts the
+    child's verify pass, which the nested engine hands up as `RunStopped`.
+
+    The owner's `run()` frame is simulated exactly as the #319 nested rows do,
+    plus the probe the outermost `run()` installs.
+
+    Ablation: drop the nested `dirs.append` in `run()` and the `child` row's verify
+    command sleeps out its 60 s and passes (no interrupt, no RunStopped)."""
+    from bmad_loop import childrun
+    from bmad_loop.engine import _hard_stop_probe, _HardStopProbe
+
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    child_run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    owner = project.project / ".bmad-loop" / "runs" / "parent-run"
+    owner.mkdir(parents=True, exist_ok=True)
+    target = owner if lodged_in == "owner" else child_run_dir
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        scm=ScmPolicy(rollback_on_failure=True),
+        verify=VerifyPolicy(commands=(_lodge_then_sleep_cmd(tmp_path, target),)),
+    )
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")], policy=policy)
+
+    probe = _HardStopProbe([owner])
+    depth_token = _run_depth.set(1)  # simulate the parent's run() frame
+    owner_token = set_owner_run_dir(owner)
+    probe_token = _hard_stop_probe.set(probe)
+    runner_token = childrun.install_stop_probe(probe)
+    started = time.monotonic()
+    try:
+        with pytest.raises(RunStopped) as caught:
+            engine.run()
+    finally:
+        childrun.reset_stop_probe(runner_token)
+        _hard_stop_probe.reset(probe_token)
+        reset_owner_run_dir(owner_token)
+        _run_depth.reset(depth_token)
+
+    assert time.monotonic() - started < runs._STOP_WAIT_S
+    assert caught.value.via == "stop-request"
+    assert probe.dirs == [owner]  # the child's own dir was removed on the way out
+    assert probe.unwinding is True  # the stop is honored; the owner now unwinds
+    records = [e for e in engine.journal.entries() if e["kind"] == "verify-command-result"]
+    assert len(records) == 1 and records[0]["interrupted"] is True
+    assert len(adapter.sessions) == 1
+    assert not load_state(engine.run_dir).tasks["1-1-a"].commit_sha
+
+
+# ------------------------------------------------ DW-371: resume --accept-baseline
+
+
+def _restart_with_human_commit(project, *, rollback: bool, accept: bool):
+    """A DEV_RUNNING in-place task interrupted at baseline B, then a human commit C
+    landed while the run was down. Returns (resumed engine, summary, B, C)."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(rollback_on_failure=rollback),
+    )
+    engine, _ = make_engine(project, [], policy=policy)
+    repo = project.project
+    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEV_RUNNING, attempt=1)
+    task.baseline_commit = rev_parse_head(repo)
+    task.baseline_untracked = sorted(verify.untracked_files(repo))
+    engine.state.tasks[task.story_key] = task
+    engine._save()
+    baseline = task.baseline_commit
+    (repo / "human.txt").write_text("made while the run was down\n")
+    git(repo, "add", "human.txt")
+    git(repo, "commit", "-q", "-m", "human work")
+    human = rev_parse_head(repo)
+    state = load_state(engine.run_dir)
+    state.accept_baseline = accept  # what `resume --accept-baseline` persists
+    save_state(engine.run_dir, state)
+    resumed, _ = resume_engine(
+        project,
+        engine,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=policy,
+    )
+    return resumed, resumed.run(), baseline, human
+
+
+@pytest.mark.parametrize("rollback", [True, False])
+def test_resume_accept_baseline_keeps_a_human_commit(project, rollback):
+    """DW-371: with the latch set the restart arm re-stamps the baseline to HEAD
+    before its rollback, so nothing is parked or reset, no manual-recovery pause
+    fires (rollback OFF), and the human commit stays on the branch.
+
+    Ablation: delete the `self._accept_current_baseline(task)` call in the restart
+    arm and rollback ON parks + resets past the commit, rollback OFF pauses."""
+    resumed, summary, baseline, human = _restart_with_human_commit(
+        project, rollback=rollback, accept=True
+    )
+
+    assert summary.done == 1 and not summary.paused
+    entries = resumed.journal.entries()
+    kinds = [e["kind"] for e in entries]
+    accepted = next(e for e in entries if e["kind"] == "baseline-accepted")
+    assert accepted["previous_baseline"] == baseline and accepted["baseline"] == human
+    assert "attempt-commits-preserved" not in kinds
+    assert "rollback-manual-required" not in kinds
+    git(project.project, "merge-base", "--is-ancestor", human, "HEAD")  # still reachable
+    assert not git(project.project, "for-each-ref", "refs/heads/attempt-preserve/")
+    # consumed once in-flight recovery returned
+    assert load_state(resumed.run_dir).accept_baseline is False
+
+
+def test_resume_restart_park_notifies_once_without_accept(project):
+    """DW-371: a plain resume with rollback ON parks the commit above the baseline,
+    resets, and leaves ONE ATTENTION line naming the attempt-preserve ref.
+
+    Ablation: drop `restart=True` at the restart arm's `_rollback_or_pause` and the
+    ATTENTION file carries no such line."""
+    resumed, summary, baseline, human = _restart_with_human_commit(
+        project, rollback=True, accept=False
+    )
+
+    assert summary.done == 1
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "baseline-accepted" not in kinds
+    assert "attempt-commits-preserved" in kinds
+    lines = [
+        line
+        for line in (resumed.run_dir / gates.ATTENTION_FILE).read_text().splitlines()
+        if "attempt-preserve/" in line
+    ]
+    assert len(lines) == 1
+    assert baseline[:12] in lines[0] and "--accept-baseline" in lines[0]
+    parked = next(e for e in resumed.journal.entries() if e["kind"] == "attempt-commits-preserved")[
+        "ref"
+    ]
+    assert parked in lines[0]
+    git(project.project, "merge-base", "--is-ancestor", human, f"refs/heads/{parked}")
+
+
+# ------------------------------------------- auto retrospective (DW-389)
+#
+# `gates.retrospective = "auto"` dispatches one headless `/bmad-retrospective -H N`
+# session at the epic boundary, judged only by deterministic on-disk checks, and
+# commits exactly the retro's own files. Each row below is one row of the spec's
+# I/O matrix.
+
+AUTO_RETRO = Policy(gates=GatesPolicy(mode="none", retrospective="auto"), notify=QUIET)
+RETRO_DOC = "epic-1-retro-2026-09-26.md"
+
+
+def _two_epic_sprint(project, retro_status: str = "optional") -> None:
+    # Epic 2's retro reads `done` so the run-end gate (DW-488) stays silent and
+    # these rows see epic 1's boundary alone.
+    write_sprint(
+        project,
+        {
+            "epic-1": "backlog",
+            "1-1-a": "ready-for-dev",
+            "epic-1-retrospective": retro_status,
+            "epic-2": "backlog",
+            "2-1-b": "ready-for-dev",
+            "epic-2-retrospective": "done",
+        },
+    )
+
+
+def _commit_all(project) -> None:
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "seed")
+
+
+def retro_effect(
+    project,
+    epic: int = 1,
+    *,
+    board: bool = True,
+    doc: bool = True,
+    status: str = "completed",
+    rj_status: str | None = "done",
+    stray: str | None = None,
+    doc_body: str | bytes = "# retro\n",
+):
+    """Simulate a `bmad-retrospective -H` session: it writes the retro doc (body
+    `doc_body`; the default carries no frontmatter, so no verdict), flips
+    `epic-N-retrospective: done` on the board (the SKILL writes the board, never
+    the engine), optionally touches a foreign file, and returns a result whose
+    result.json carries `rj_status`."""
+
+    def effect(spec: SessionSpec) -> SessionResult:
+        if doc:
+            path = project.implementation_artifacts / f"epic-{epic}-retro-2026-09-26.md"
+            if isinstance(doc_body, bytes):
+                path.write_bytes(doc_body)
+            else:
+                path.write_text(doc_body)
+        if board:
+            set_sprint(project, f"epic-{epic}-retrospective", "done")
+        if stray is not None:
+            (project.project / stray).write_text("stray retro write\n")
+        rj = None if rj_status is None else {"workflow": "bmad-retrospective", "status": rj_status}
+        return SessionResult(status=status, result_json=rj)
+
+    return effect
+
+
+def _record_notify(monkeypatch) -> list[tuple[str, str]]:
+    sent: list[tuple[str, str]] = []
+
+    def notify(policy, run_dir, title, message, **_kw):
+        sent.append((title, message))
+
+    monkeypatch.setattr(gates, "notify", notify)
+    return sent
+
+
+def _kinds(engine) -> list[str]:
+    return [e["kind"] for e in engine.journal.entries()]
+
+
+def _only(engine, kind: str) -> dict:
+    rows = [e for e in engine.journal.entries() if e["kind"] == kind]
+    assert len(rows) == 1, (kind, rows)
+    return rows[0]
+
+
+def _commit_of(project, subject: str) -> list[str]:
+    """The files the single commit titled ``subject`` touched."""
+    log = git(project.project, "log", "--format=%H %s").splitlines()
+    shas = [line.split(" ", 1)[0] for line in log if line.split(" ", 1)[1] == subject]
+    assert len(shas) == 1, (subject, log)
+    return sorted(git(project.project, "show", "--name-only", "--format=", shas[0]).split())
+
+
+def test_auto_retro_happy_path_runs_on_the_retro_adapter_and_commits_its_files(
+    project, monkeypatch
+):
+    """Epic 1 → 2 under `auto`: the retro adapter gets exactly one session whose
+    prompt is `/bmad-retrospective -H 1` plus the result.json clause, the doc and
+    the board land in one `chore(retro)` commit holding exactly them, and epic 2
+    runs. The notify-mode nudge is NOT sent, and the synthetic task never enters
+    `state.tasks`.
+
+    Ablation: make `_maybe_auto_retro`'s `!= "auto"` guard return unconditionally
+    (no dispatch branch) and this reddens on the retro adapter's empty session
+    list."""
+    sent = _record_notify(monkeypatch)
+    _two_epic_sprint(project)
+    retro = MockAdapter([retro_effect(project)])
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=True),
+            dev_effect(project, "2-1-b"),
+            review_effect(project, "2-1-b", clean=True),
+        ],
+        policy=AUTO_RETRO,
+        retro_adapter=retro,
+    )
+    summary = engine.run()
+
+    assert summary.done == 2 and not summary.paused
+    assert len(retro.sessions) == 1
+    spec = retro.sessions[0]
+    assert spec.role == "retro"
+    assert spec.prompt.startswith("/bmad-retrospective -H 1\n")
+    assert "$BMAD_LOOP_RUN_DIR/tasks/$BMAD_LOOP_TASK_ID/result.json" in spec.prompt
+    assert '{"workflow": "bmad-retrospective", "status": "done"}' in spec.prompt
+    assert spec.prompt.rstrip().endswith("then end your turn.")
+    assert spec.task_id == _session_task_id("epic-1-retrospective", "retro", 1, 0)
+    assert all(s.role != "retro" for s in adapter.sessions)
+
+    kinds = _kinds(engine)
+    assert kinds.index("retro-auto-start") < kinds.index("retro-auto-finished")
+    assert kinds.index("retro-auto-finished") < kinds.index(
+        "story-start", kinds.index("epic-boundary")
+    )
+    assert _only(engine, "retro-auto-finished")["docs"] == [RETRO_DOC]
+    assert "retro-auto-dirty" not in kinds and "retro-auto-failed" not in kinds
+
+    rel_doc = (project.implementation_artifacts / RETRO_DOC).relative_to(project.project)
+    rel_board = project.sprint_status.relative_to(project.project)
+    assert _commit_of(project, "chore(retro): epic 1 retrospective") == sorted(
+        [rel_doc.as_posix(), rel_board.as_posix()]
+    )
+    assert worktree_clean(project.project)
+    saved = load_state(engine.run_dir)
+    assert "epic-1-retrospective" not in saved.tasks
+    assert saved.current_epic == 2
+    assert not any("retrospective suggested" in msg for _t, msg in sent)
+    assert any(title == "epic 1 retrospective done" and RETRO_DOC in msg for title, msg in sent)
+
+
+def test_auto_retro_falls_back_to_the_dev_adapter(project):
+    """No distinct retro adapter: the retro session rides the dev adapter,
+    between epic 1's review and epic 2's dev session."""
+    _two_epic_sprint(project)
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=True),
+            retro_effect(project),
+            dev_effect(project, "2-1-b"),
+            review_effect(project, "2-1-b", clean=True),
+        ],
+        policy=AUTO_RETRO,
+    )
+    summary = engine.run()
+
+    assert summary.done == 2 and not summary.paused
+    assert [s.role for s in adapter.sessions] == ["dev", "review", "retro", "dev", "review"]
+
+
+@pytest.mark.parametrize("mode", ["notify", "never"])
+def test_auto_retro_is_inert_under_notify_and_never(project, monkeypatch, mode):
+    """Only `auto` dispatches; `notify` keeps its one nudge and `never` stays
+    silent. A retro session here would exhaust the script and fail the run."""
+    sent = _record_notify(monkeypatch)
+    _two_epic_sprint(project)
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=True),
+            dev_effect(project, "2-1-b"),
+            review_effect(project, "2-1-b", clean=True),
+        ],
+        policy=Policy(gates=GatesPolicy(mode="none", retrospective=mode), notify=QUIET),
+    )
+    summary = engine.run()
+
+    assert summary.done == 2 and not summary.paused
+    assert all(s.role != "retro" for s in adapter.sessions)
+    assert not any(k.startswith("retro-auto-") for k in _kinds(engine))
+    nudges = [msg for _t, msg in sent if "retrospective suggested" in msg]
+    assert len(nudges) == (1 if mode == "notify" else 0)
+
+
+def test_auto_retro_already_done_is_skipped_silently(project, monkeypatch):
+    """The board already says `epic-1-retrospective: done` (a human, an earlier
+    attempt, a crash-resume): no session, no notify.
+
+    Ablation: delete the `already-done` guard and the retro adapter's empty script
+    raises `ScriptExhausted` inside the session, which journals `retro-auto-failed`
+    and reddens every assertion below."""
+    sent = _record_notify(monkeypatch)
+    _two_epic_sprint(project, retro_status="done")
+    retro = MockAdapter([])
+    engine, _ = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=True),
+            dev_effect(project, "2-1-b"),
+            review_effect(project, "2-1-b", clean=True),
+        ],
+        policy=AUTO_RETRO,
+        retro_adapter=retro,
+    )
+    summary = engine.run()
+
+    assert summary.done == 2 and not summary.paused
+    assert retro.sessions == []
+    row = _only(engine, "retro-auto-skipped")
+    assert row["reason"] == "already-done" and row["epic"] == 1
+    assert "retro-auto-start" not in _kinds(engine)
+    assert not any("retrospective" in title for title, _m in sent)
+
+
+def _boundary_engine(project, script=(), **kwargs):
+    """An engine poised at epic 1's boundary: board seeded and committed, so the
+    tree is clean unless the test dirties it."""
+    _two_epic_sprint(project)
+    _commit_all(project)
+    retro = MockAdapter(list(script))
+    engine, _ = make_engine(project, [], policy=AUTO_RETRO, retro_adapter=retro, **kwargs)
+    return engine, retro
+
+
+@pytest.mark.parametrize("reason", ["dirty", "git-error", "stop-requested", "skill-missing"])
+def test_auto_retro_pre_dispatch_refusals_notify_and_return(project, monkeypatch, reason):
+    """Each refusal journals `retro-auto-skipped` with its closed reason, tells the
+    operator to run the retro by hand, and returns without a session — the run
+    continues.
+
+    Ablation: delete any one refusal arm and its parametrization reddens — the
+    retro adapter's empty script raises `ScriptExhausted` in a dispatched session,
+    so the row reads `retro-auto-failed` instead."""
+    sent = _record_notify(monkeypatch)
+    engine, retro = _boundary_engine(project)
+    if reason == "dirty":
+        (project.project / "src.txt").write_text("uncommitted\n")
+    elif reason == "git-error":
+
+        def boom(*_a, **_k):
+            raise GitError("git status timed out")
+
+        monkeypatch.setattr(verify, "worktree_clean", boom)
+    elif reason == "stop-requested":
+        _lodge_stop_request(engine.run_dir)
+    else:
+        from conftest import attach_profile
+
+        attach_profile(retro, "claude", project.project)
+
+    engine._maybe_auto_retro(1)
+
+    assert retro.sessions == []
+    row = _only(engine, "retro-auto-skipped")
+    assert row["reason"] == reason and row["epic"] == 1
+    assert "retro-auto-start" not in _kinds(engine)
+    assert any(
+        "retrospective" in title and "/bmad-retrospective" in msg and reason in msg
+        for title, msg in sent
+    )
+
+
+def test_auto_retro_skill_probe_passes_when_the_skill_is_installed(project):
+    """The `skill-missing` probe looks in the retro adapter's own skill tree; with
+    `bmad-retrospective/SKILL.md` there, the session dispatches."""
+    from conftest import attach_profile
+
+    engine, retro = _boundary_engine(project, [retro_effect(project)])
+    attach_profile(retro, "claude", project.project)
+    skill = project.project / retro.profile.skill_tree / "bmad-retrospective" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("---\nname: bmad-retrospective\n---\n")
+    _commit_all(project)
+
+    engine._maybe_auto_retro(1)
+
+    assert len(retro.sessions) == 1
+    assert "retro-auto-finished" in _kinds(engine)
+
+
+def test_auto_retro_unreadable_board_is_refused(project, monkeypatch):
+    sent = _record_notify(monkeypatch)
+    engine, retro = _boundary_engine(project)
+    project.sprint_status.write_text("development_status: [not, a, mapping\n")
+    _commit_all(project)
+
+    engine._maybe_auto_retro(1)
+
+    assert retro.sessions == []
+    assert _only(engine, "retro-auto-skipped")["reason"] == "board-unreadable"
+    assert any("board-unreadable" in msg for _t, msg in sent)
+
+
+def test_auto_retro_session_not_completed_fails_and_run_continues(project, monkeypatch):
+    """A stalled session that wrote nothing is a failed retro: `retro-auto-failed`
+    plus a notify naming the manual command; the tree is clean, so epic 2 runs.
+    No retry within the boundary."""
+    sent = _record_notify(monkeypatch)
+    _two_epic_sprint(project)
+    retro = MockAdapter(
+        [retro_effect(project, board=False, doc=False, status="stalled", rj_status=None)]
+    )
+    engine, _ = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=True),
+            dev_effect(project, "2-1-b"),
+            review_effect(project, "2-1-b", clean=True),
+        ],
+        policy=AUTO_RETRO,
+        retro_adapter=retro,
+    )
+    summary = engine.run()
+
+    assert summary.done == 2 and not summary.paused
+    assert len(retro.sessions) == 1
+    errors = _only(engine, "retro-auto-failed")["errors"]
+    assert any("stalled" in e for e in errors)
+    assert "retro-auto-finished" not in _kinds(engine)
+    assert any(
+        title == "auto retrospective failed" and "/bmad-retrospective" in msg for title, msg in sent
+    )
+
+
+def test_auto_retro_incomplete_session_is_never_success_and_its_output_pauses(project):
+    """A session that did everything — doc, board, even a `done` result.json — but
+    did not COMPLETE is still a failed retro: nothing is committed, and the
+    leftover doc + board pause the run at the boundary with `current_epic`
+    unchanged, so the next story's rollback cannot destroy or absorb them."""
+    engine, _ = _boundary_engine(project, [retro_effect(project, status="timeout")])
+    engine.state.current_epic = 1
+
+    with pytest.raises(RunPaused) as exc:
+        engine._maybe_auto_retro(1)
+
+    assert exc.value.stage == PAUSE_EPIC_BOUNDARY
+    assert "timeout" in " ".join(_only(engine, "retro-auto-failed")["errors"])
+    dirty = _only(engine, "retro-auto-dirty")
+    rel_doc = (project.implementation_artifacts / RETRO_DOC).relative_to(project.project)
+    assert rel_doc.as_posix() in dirty["paths"]
+    assert rel_doc.as_posix() in exc.value.reason
+    assert "chore(retro)" not in git(project.project, "log", "--format=%s")
+    assert engine.state.current_epic == 1
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "failed_check"),
+    [
+        ({"board": False}, "sprint-status epic-1-retrospective is optional"),
+        ({"doc": False}, "no epic-1-retro-*.md retrospective doc"),
+        ({"rj_status": "blocked"}, "result.json status is not done"),
+    ],
+    ids=["board-not-done", "no-doc", "result-blocked"],
+)
+def test_auto_retro_failed_checks_are_each_listed(project, kwargs, failed_check):
+    """A completed session is judged by every check; each one that fails is its own
+    `errors` line. Nothing is committed on failure, so whatever the session did
+    write stays dirty and pauses the boundary."""
+    engine, _ = _boundary_engine(project, [retro_effect(project, **kwargs)])
+
+    with pytest.raises(RunPaused):
+        engine._maybe_auto_retro(1)
+
+    errors = _only(engine, "retro-auto-failed")["errors"]
+    assert errors == [failed_check]
+    assert "chore(retro)" not in git(project.project, "log", "--format=%s")
+
+
+def test_auto_retro_blocked_with_a_clean_tree_continues(project):
+    engine, _ = _boundary_engine(
+        project, [retro_effect(project, board=False, doc=False, rj_status="blocked")]
+    )
+
+    engine._maybe_auto_retro(1)  # no pause: nothing was written
+
+    errors = _only(engine, "retro-auto-failed")["errors"]
+    assert "result.json status is not done" in errors
+    assert "retro-auto-dirty" not in _kinds(engine)
+
+
+def test_auto_retro_session_exception_is_a_failed_retro(project):
+    """Any exception other than a stop/pause out of the session is a failed retro,
+    not a crashed run; its text rides `error`."""
+
+    def boom(_spec):
+        raise RuntimeError("transport fell over")
+
+    engine, _ = _boundary_engine(project, [boom])
+
+    engine._maybe_auto_retro(1)
+
+    row = _only(engine, "retro-auto-failed")
+    assert row["errors"][0] == "session raised RuntimeError"
+    assert "transport fell over" in row["error"]
+
+
+@pytest.mark.parametrize("exc_type", [RunStopped, KeyboardInterrupt])
+def test_auto_retro_stop_propagates(project, exc_type):
+    def stop(_spec):
+        raise exc_type()
+
+    engine, _ = _boundary_engine(project, [stop])
+
+    with pytest.raises(exc_type):
+        engine._maybe_auto_retro(1)
+
+    assert "retro-auto-failed" not in _kinds(engine)
+
+
+def test_auto_retro_foreign_dirt_commits_expected_then_pauses_and_resumes(project):
+    """The session also edits `src.txt`: the doc + board are committed, then the
+    leftover pauses the run at the boundary (`current_epic` not advanced). After
+    the operator cleans up, resume re-enters the boundary, `already-done` keeps the
+    retro from running twice, and epic 2 runs.
+
+    Ablation: commit every dirty path instead of the expected set and the commit
+    assertion reddens on `src.txt`."""
+    _two_epic_sprint(project)
+    retro = MockAdapter([retro_effect(project, stray="src.txt")])
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=AUTO_RETRO,
+        retro_adapter=retro,
+    )
+    summary = engine.run()
+
+    assert summary.paused
+    saved = load_state(engine.run_dir)
+    assert saved.paused_stage == PAUSE_EPIC_BOUNDARY
+    assert saved.current_epic == 1
+    assert "2-1-b" not in saved.tasks
+    assert _only(engine, "retro-auto-dirty")["paths"] == ["src.txt"]
+    rel_doc = (project.implementation_artifacts / RETRO_DOC).relative_to(project.project)
+    rel_board = project.sprint_status.relative_to(project.project)
+    assert _commit_of(project, "chore(retro): epic 1 retrospective") == sorted(
+        [rel_doc.as_posix(), rel_board.as_posix()]
+    )
+
+    git(project.project, "checkout", "--", "src.txt")  # the operator cleans up
+    resumed, adapter = resume_engine(
+        project,
+        engine,
+        [dev_effect(project, "2-1-b"), review_effect(project, "2-1-b", clean=True)],
+    )
+    summary2 = resumed.run()
+
+    assert summary2.done == 2 and not summary2.paused
+    assert all(s.role != "retro" for s in adapter.sessions)
+    skipped = [e for e in resumed.journal.entries() if e["kind"] == "retro-auto-skipped"]
+    assert [e["reason"] for e in skipped] == ["already-done"]
+
+
+def test_auto_retro_commit_failure_degrades_then_pauses(project, monkeypatch):
+    """A `GitError` from the commit journals `retro-auto-uncommitted`; the retro's
+    files then stay dirty and the boundary pauses on them rather than letting the
+    next story's rollback destroy them."""
+    engine, _ = _boundary_engine(project, [retro_effect(project)])
+
+    def refuse(*_a, **_k):
+        raise GitError("index.lock exists")
+
+    monkeypatch.setattr(verify, "commit_paths", refuse)
+
+    with pytest.raises(RunPaused):
+        engine._maybe_auto_retro(1)
+
+    kinds = _kinds(engine)
+    assert kinds.index("retro-auto-finished") < kinds.index("retro-auto-uncommitted")
+    assert kinds.index("retro-auto-uncommitted") < kinds.index("retro-auto-dirty")
+
+
+def test_auto_retro_unreadable_tree_after_session_pauses(project, monkeypatch):
+    """A `GitError` reading the tree after the session pauses at the boundary with
+    a `retro-auto-dirty` row carrying the error, rather than escaping as a raw
+    exception that leaves the retro's files unprotected.
+
+    Ablation: narrow `_settle_retro_tree`'s outer `except verify.GitError` to the
+    commit call and this reddens — the `GitError` escapes instead of a pause."""
+    after = retro_effect(project)
+
+    def effect(spec):
+        result = after(spec)
+
+        def unreadable(*_a, **_k):
+            raise GitError("git status timed out")
+
+        monkeypatch.setattr(verify, "dirty_paths", unreadable)
+        return result
+
+    engine, _ = _boundary_engine(project, [effect])
+    epic_before = engine.state.current_epic
+
+    with pytest.raises(RunPaused) as exc:
+        engine._maybe_auto_retro(1)
+
+    assert exc.value.stage == PAUSE_EPIC_BOUNDARY
+    assert "could not read the worktree" in exc.value.reason
+    row = _only(engine, "retro-auto-dirty")
+    assert row["paths"] == [] and "git status timed out" in row["error"]
+    assert engine.state.current_epic == epic_before
+
+
+def test_auto_retro_undecodable_board_is_a_failed_retro_not_a_crash(project):
+    """A session that leaves sprint-status as invalid UTF-8 fails the board check
+    (`sprint-status unreadable`) and the tree is still settled — the undecodable
+    board is left dirty, so the boundary pauses on it.
+
+    Ablation: drop `UnicodeDecodeError` from `_verify_retro`'s except tuple and
+    this reddens — the decode error escapes before the tree is settled."""
+    after = retro_effect(project)
+
+    def effect(spec):
+        result = after(spec)
+        project.sprint_status.write_bytes(b"development_status:\n  x: \xff\xfe\n")
+        return result
+
+    engine, _ = _boundary_engine(project, [effect])
+
+    with pytest.raises(RunPaused):
+        engine._maybe_auto_retro(1)
+
+    assert "sprint-status unreadable" in _only(engine, "retro-auto-failed")["errors"]
+    assert "retro-auto-dirty" in _kinds(engine)
+
+
+def test_auto_retro_dirty_pause_reason_caps_the_path_list(project):
+    """The pause reason names at most ten leftover paths; the journal row keeps
+    them all."""
+    strays = [f"stray-{i:02d}.txt" for i in range(12)]
+
+    def many(spec):
+        result = retro_effect(project)(spec)
+        for name in strays:
+            (project.project / name).write_text("x\n")
+        return result
+
+    engine, _ = _boundary_engine(project, [many])
+
+    with pytest.raises(RunPaused) as exc:
+        engine._maybe_auto_retro(1)
+
+    row = _only(engine, "retro-auto-dirty")
+    assert row["paths"] == strays and row["count"] == 12
+    assert "stray-09.txt" in exc.value.reason and "stray-10.txt" not in exc.value.reason
+    assert "(+2 more)" in exc.value.reason
+
+
+def test_auto_retro_runs_before_the_per_epic_sweep(project):
+    """The retro settles its tree before the per-epic sweep asks for a clean one,
+    so the sweep sees the committed retro (and its action items, DW-388)."""
+    _two_epic_sprint(project)
+    calls: list = []
+    retro = MockAdapter([retro_effect(project)])
+    engine, _ = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=True),
+            dev_effect(project, "2-1-b"),
+            review_effect(project, "2-1-b", clean=True),
+        ],
+        policy=Policy(
+            gates=GatesPolicy(mode="none", retrospective="auto"),
+            notify=QUIET,
+            sweep=SweepPolicy(auto="per-epic"),
+        ),
+        retro_adapter=retro,
+        sweep_factory=recording_factory(calls),
+    )
+    summary = engine.run()
+
+    assert summary.done == 2
+    assert calls == ["epic-1"]
+    kinds = _kinds(engine)
+    assert kinds.index("retro-auto-finished") < kinds.index("sweep-auto-trigger")
+    assert "sweep-auto-skipped-dirty" not in kinds
+
+
+# DW-487: bmad-retrospective marks the board `done` whatever the verdict, so the
+# verdict is read from the retro doc's frontmatter and surfaced, never gated.
+
+
+def _retro_doc_with(verdict_line: str) -> str:
+    return f"---\nepic: 1\ndate: 2026-09-26\n{verdict_line}headless: true\n---\n\n# retro\n"
+
+
+_REJECTED_TITLE = "epic 1 retrospective rejected"
+
+
+@pytest.mark.parametrize(
+    ("doc_body", "verdict"),
+    [
+        (_retro_doc_with("verdict: accepted\n"), "accepted"),
+        (_retro_doc_with("verdict: accepted-with-open-items\n"), "accepted-with-open-items"),
+        (_retro_doc_with("verdict: Rejected \n"), "rejected"),
+        ("# retro\n", "unknown"),
+        (_retro_doc_with(""), "unknown"),
+        (_retro_doc_with("verdict: maybe\n"), "unknown"),
+        (_retro_doc_with("verdict: [rejected]\n"), "unknown"),
+        (b"---\nverdict: rejected\n---\n\xff\xfe\n", "unknown"),
+    ],
+    ids=[
+        "accepted",
+        "accepted-with-open-items",
+        "rejected",
+        "no-frontmatter",
+        "no-verdict-key",
+        "unknown-spelling",
+        "not-a-string",
+        "undecodable",
+    ],
+)
+def test_auto_retro_surfaces_the_doc_verdict_and_the_run_continues(project, doc_body, verdict):
+    """The retro doc's frontmatter `verdict:` rides `retro-auto-finished` and the
+    done notice. Only a `rejected` verdict adds the ATTENTION line, and it names
+    the doc and says the run goes on. An absent, unknown or unreadable verdict is
+    `unknown`, never folded into an acceptance. No verdict pauses the run: epic 2
+    runs every time.
+
+    Ablation: delete the `_notify_retro_rejected` call in `_maybe_auto_retro` and
+    the `rejected` row reddens on the missing ATTENTION line."""
+    _two_epic_sprint(project)
+    retro = MockAdapter([retro_effect(project, doc_body=doc_body)])
+    engine, _ = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=True),
+            dev_effect(project, "2-1-b"),
+            review_effect(project, "2-1-b", clean=True),
+        ],
+        policy=AUTO_RETRO,
+        retro_adapter=retro,
+    )
+    summary = engine.run()
+
+    assert summary.done == 2 and not summary.paused
+    assert load_state(engine.run_dir).current_epic == 2
+    assert _only(engine, "retro-auto-finished")["verdict"] == verdict
+
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8").splitlines()
+    done = [line for line in attention if "epic 1 retrospective done: " in line]
+    assert len(done) == 1 and done[0].endswith(f"; verdict: {verdict}")
+    rejected = [line for line in attention if f"] {_REJECTED_TITLE}: " in line]
+    if verdict == "rejected":
+        assert len(rejected) == 1
+        assert RETRO_DOC in rejected[0] and "the run continues" in rejected[0]
+    else:
+        assert rejected == []
+
+
+def test_auto_retro_verdict_is_read_from_the_newest_doc(project):
+    """A leftover retro doc from an earlier attempt does not decide the verdict: the
+    newest doc (the one this session wrote) does."""
+    _two_epic_sprint(project)
+    old = project.implementation_artifacts / "epic-1-retro-2026-09-30.md"
+    old.write_text(_retro_doc_with("verdict: accepted\n"))
+    os.utime(old, ns=(1_000_000_000, 1_000_000_000))
+    _commit_all(project)
+    engine, _ = make_engine(
+        project,
+        [],
+        policy=AUTO_RETRO,
+        retro_adapter=MockAdapter(
+            [retro_effect(project, doc_body=_retro_doc_with("verdict: rejected\n"))]
+        ),
+    )
+
+    engine._maybe_auto_retro(1)
+
+    assert _only(engine, "retro-auto-finished")["verdict"] == "rejected"
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert f"] {_REJECTED_TITLE}: " in attention and RETRO_DOC in attention
+
+
+def test_auto_retro_unreadable_verdict_doc_is_unknown(project, monkeypatch):
+    """A doc that cannot be read when the verdict is parsed reads as `unknown` —
+    journaled, with no ATTENTION line — and the run still continues."""
+    engine, _ = _boundary_engine(
+        project, [retro_effect(project, doc_body=_retro_doc_with("verdict: rejected\n"))]
+    )
+
+    def unreadable(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(verify, "read_frontmatter", unreadable)
+
+    engine._maybe_auto_retro(1)
+
+    assert _only(engine, "retro-auto-finished")["verdict"] == "unknown"
+    assert _REJECTED_TITLE not in (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+
+
+# ------------------------------------ run-end retrospective (DW-488)
+#
+# The epic boundary fires only when a story of another epic is picked, so a run's
+# last epic reaches the retrospective gate at run end instead: `_loop`'s exhausted
+# queue (ahead of the run-end sweep) and its `--max-stories` return. It fires only
+# when every story of `state.current_epic` reads done and its retro is not done.
+
+
+def _one_epic_sprint(project, *, retro_status: str = "optional") -> None:
+    write_sprint(
+        project,
+        {
+            "epic-1": "backlog",
+            "1-1-a": "ready-for-dev",
+            "1-2-b": "ready-for-dev",
+            "epic-1-retrospective": retro_status,
+        },
+    )
+
+
+def _one_epic_script(project, stories=("1-1-a", "1-2-b")) -> list:
+    return [
+        effect
+        for key in stories
+        for effect in (dev_effect(project, key), review_effect(project, key, clean=True))
+    ]
+
+
+def _record_run_end_sweep(engine, monkeypatch, probe) -> list[tuple[str, object]]:
+    """Stand in for `_maybe_auto_sweep`, recording each trigger with `probe()` read
+    at call time, so a row can tell whether the retro fired before the sweep."""
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        engine, "_maybe_auto_sweep", lambda _kind, trigger: calls.append((trigger, probe()))
+    )
+    return calls
+
+
+def test_run_end_retro_auto_fires_for_a_complete_single_epic_before_the_sweep(project, monkeypatch):
+    """A single-epic run never crosses a boundary; with every story done at run
+    end, `auto` runs epic 1's retro on the retro adapter and commits it, all
+    before the run-end sweep is asked, and the run finishes.
+
+    Ablation: delete the exhausted-queue `_run_end_retrospective()` call in `_loop`
+    and this reddens on the retro adapter's empty session list."""
+    sent = _record_notify(monkeypatch)
+    _one_epic_sprint(project)
+    retro = MockAdapter([retro_effect(project)])
+    engine, adapter = make_engine(
+        project, _one_epic_script(project), policy=AUTO_RETRO, retro_adapter=retro
+    )
+    sweeps = _record_run_end_sweep(engine, monkeypatch, lambda: len(retro.sessions))
+
+    summary = engine.run()
+
+    assert summary.done == 2 and not summary.paused
+    assert engine.state.finished
+    assert [s.role for s in retro.sessions] == ["retro"]
+    assert retro.sessions[0].prompt.startswith("/bmad-retrospective -H 1\n")
+    assert all(s.role != "retro" for s in adapter.sessions)
+    assert sweeps == [("run-end", 1)]
+    assert _only(engine, "retro-run-end")["epic"] == 1
+    kinds = _kinds(engine)
+    assert "epic-boundary" not in kinds and "retro-run-end-skipped" not in kinds
+    assert kinds.index("retro-run-end") < kinds.index("retro-auto-finished")
+    assert "chore(retro): epic 1 retrospective" in git(project.project, "log", "--format=%s")
+    assert worktree_clean(project.project)
+    assert not any("retrospective suggested" in msg for _t, msg in sent)
+
+
+def test_run_end_retro_notify_nudges_a_complete_single_epic_before_the_sweep(project, monkeypatch):
+    """Under `notify` the same run end sends the boundary's one nudge, before the
+    run-end sweep, and dispatches nothing.
+
+    Ablation: delete the exhausted-queue `_run_end_retrospective()` call in `_loop`
+    and the nudge count reads 0."""
+    sent = _record_notify(monkeypatch)
+    _one_epic_sprint(project)
+    engine, adapter = make_engine(
+        project,
+        _one_epic_script(project),
+        policy=Policy(gates=GatesPolicy(mode="none", retrospective="notify"), notify=QUIET),
+    )
+
+    def nudges() -> int:
+        return sum("retrospective suggested" in msg for _t, msg in sent)
+
+    sweeps = _record_run_end_sweep(engine, monkeypatch, nudges)
+
+    summary = engine.run()
+
+    assert summary.done == 2 and not summary.paused
+    assert nudges() == 1
+    assert (
+        "epic 1 stories complete",
+        "retrospective suggested: run /bmad-retrospective when convenient",
+    ) in sent
+    assert sweeps == [("run-end", 1)]
+    assert all(s.role != "retro" for s in adapter.sessions)
+    assert not any(k.startswith("retro-auto-") for k in _kinds(engine))
+
+
+def test_run_end_retro_fires_when_max_stories_stops_on_a_complete_epic(project, monkeypatch):
+    """`--max-stories` is a run end too: a finished run has no later boundary, so an
+    epic the cap happened to complete gets its retro there.
+
+    Ablation: delete the `max-stories-reached` `_run_end_retrospective()` call and
+    this reddens on the retro adapter's empty session list."""
+    _record_notify(monkeypatch)
+    _two_epic_sprint(project, retro_status="optional")
+    retro = MockAdapter([retro_effect(project)])
+    engine, _ = make_engine(
+        project,
+        _one_epic_script(project, stories=("1-1-a",)),
+        policy=AUTO_RETRO,
+        retro_adapter=retro,
+        max_stories=1,
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1 and engine.state.finished
+    assert [s.role for s in retro.sessions] == ["retro"]
+    assert "max-stories-reached" in _kinds(engine)
+    assert _only(engine, "retro-auto-finished")["epic"] == 1
+
+
+@pytest.mark.parametrize("mode", ["auto", "notify"])
+def test_run_end_retro_truncated_run_with_stories_left_fires_nothing(project, monkeypatch, mode):
+    """`--max-stories` stops the run with epic 1's `1-2-b` still `ready-for-dev`:
+    the epic is not complete, so neither the retro nor the nudge fires. An empty
+    retro script would fail a dispatched session."""
+    sent = _record_notify(monkeypatch)
+    _one_epic_sprint(project)
+    retro = MockAdapter([])
+    engine, _ = make_engine(
+        project,
+        _one_epic_script(project, stories=("1-1-a",)),
+        policy=Policy(gates=GatesPolicy(mode="none", retrospective=mode), notify=QUIET),
+        retro_adapter=retro,
+        max_stories=1,
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1 and engine.state.finished
+    assert retro.sessions == []
+    assert _only(engine, "retro-run-end-skipped")["reason"] == "epic-incomplete"
+    assert "retro-run-end" not in _kinds(engine)
+    assert not any(k.startswith("retro-auto-") for k in _kinds(engine))
+    assert not any("retrospective" in f"{title} {msg}" for title, msg in sent)
+
+
+@pytest.mark.parametrize("mode", ["auto", "notify"])
+def test_run_end_retro_already_retrod_epic_fires_nothing(project, monkeypatch, mode):
+    """`epic-1-retrospective: done` on the board (a human ran it): the run-end gate
+    refuses before either half, so no session, no `retro-auto-skipped`, no nudge."""
+    sent = _record_notify(monkeypatch)
+    _one_epic_sprint(project, retro_status="done")
+    retro = MockAdapter([])
+    engine, _ = make_engine(
+        project,
+        _one_epic_script(project),
+        policy=Policy(gates=GatesPolicy(mode="none", retrospective=mode), notify=QUIET),
+        retro_adapter=retro,
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 2 and not summary.paused
+    assert retro.sessions == []
+    assert _only(engine, "retro-run-end-skipped")["reason"] == "already-done"
+    assert "retro-run-end" not in _kinds(engine)
+    assert not any(k.startswith("retro-auto-") for k in _kinds(engine))
+    assert not any("retrospective" in f"{title} {msg}" for title, msg in sent)
+
+
+def test_run_end_retro_never_fires_nothing_and_reads_no_board(project, monkeypatch):
+    """`never` leaves the run end silent: no session, no nudge, no run-end row."""
+    sent = _record_notify(monkeypatch)
+    _one_epic_sprint(project)
+    retro = MockAdapter([])
+    engine, _ = make_engine(
+        project,
+        _one_epic_script(project),
+        policy=Policy(gates=GatesPolicy(mode="none", retrospective="never"), notify=QUIET),
+        retro_adapter=retro,
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 2 and not summary.paused
+    assert retro.sessions == []
+    assert not any(k.startswith("retro-") for k in _kinds(engine))
+    assert not any("retrospective" in f"{title} {msg}" for title, msg in sent)
+
+
+def test_run_end_retro_unreadable_board_is_a_journaled_refusal(project, monkeypatch):
+    """An unreadable board at run end is never read as a complete epic: the gate
+    journals `board-unreadable` and fires nothing."""
+    _record_notify(monkeypatch)
+    _one_epic_sprint(project)
+    retro = MockAdapter([])
+    engine, _ = make_engine(project, [], policy=AUTO_RETRO, retro_adapter=retro)
+    engine.state.current_epic = 1
+    project.sprint_status.write_text("development_status: [not, a, mapping\n")
+
+    engine._run_end_retrospective()
+
+    assert retro.sessions == []
+    row = _only(engine, "retro-run-end-skipped")
+    assert row["reason"] == "board-unreadable" and row["error"]
+
+
+# ------------------------------------------ engine worktree-mount writer pin (DW-445)
+#
+# Under worktree isolation `self.workspace` is the unit mount, and every engine spec /
+# park-record writer confines to it. `Engine._mount_root_identity` answers the pin:
+# None for the default workspace (the operator's project), the mount's identity
+# otherwise. The swap: the mount renamed aside and a link planted at its name to an
+# outside copy carrying the same subpaths. Each row has an unpinned control
+# (`_mount_root_identity` answering None) showing the same swap really lands outside.
+
+requires_symlinked_mount_swap = pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES or sys.platform == "win32",
+    reason="dir-fd anchoring and POSIX symlinks",
+)
+
+_PIN_REFUSAL = "no longer the directory it was pinned to"
+
+
+def _unpin(monkeypatch) -> None:
+    monkeypatch.setattr(Engine, "_mount_root_identity", lambda self, task, root: None)
+
+
+# Each mount's mint-time identity record (DW-446), taken by `_mount_engine_on` before
+# any swap, as `worktree_flow.run_isolated` records it before any session runs.
+_MINT_RECORDS: dict[Path, tuple[int, int] | None] = {}
+
+
+def _mount_engine_on(project, mount: Path) -> Engine:
+    """An engine whose live workspace is a unit mount at ``mount`` (a plain copy of
+    the project's artifact tree — the writers under test never touch git)."""
+    from bmad_loop.workspace import Workspace
+
+    engine, _ = make_engine(project, [])
+    mount.mkdir(parents=True)
+    _MINT_RECORDS[mount] = platform_util.root_identity_record(mount)
+    engine.workspace = Workspace(root=mount, paths=project.rebased(mount))
+    return engine
+
+
+def _mount_task(engine: Engine, **fields) -> StoryTask:
+    """A task mounted at the engine's unit mount, carrying its mint-time record."""
+    mount = engine.workspace.root
+    return StoryTask(worktree_path=str(mount), worktree_identity=_MINT_RECORDS[mount], **fields)
+
+
+def _swap_engine_mount(engine: Engine, outside: Path) -> Path:
+    """Copy the mount to ``outside``, rename it aside and plant a link at its name.
+    Returns the mount (now the link)."""
+    mount = engine.workspace.root
+    shutil.copytree(mount, outside)
+    mount.rename(mount.with_name(mount.name + "-aside"))
+    mount.symlink_to(outside, target_is_directory=True)
+    return mount
+
+
+def _unswap_engine_mount(engine: Engine, outside: Path) -> None:
+    """Undo `_swap_engine_mount` so a control can replay the same swap."""
+    mount = engine.workspace.root
+    mount.unlink()
+    mount.with_name(mount.name + "-aside").rename(mount)
+    shutil.rmtree(outside)
+
+
+def _mount_dir(project) -> Path:
+    return project.project / ".bmad-loop" / "runs" / "test-run" / "worktrees" / "1"
+
+
+def test_engine_mount_root_identity_is_none_for_the_default_workspace(project):
+    """The default workspace is the operator's project: unpinned.
+
+    Ablation: drop the `workspace.root == paths.repo_root` arm and this reddens with
+    the project's identity."""
+    engine, _ = make_engine(project, [])
+    assert engine.workspace.root == engine.paths.repo_root  # the premise
+    task = StoryTask(story_key="1-1-a", epic=1)
+    assert engine._mount_root_identity(task, project.project) is None
+
+
+def test_engine_mount_root_identity_pins_a_unit_mount(project):
+    """A unit workspace answers the mount's own `lstat` identity for the root handed
+    in — `workspace.paths.project` or `workspace.root`, whichever the site confines to.
+
+    Ablation: answer None unconditionally and this reddens."""
+    engine = _mount_engine_on(project, _mount_dir(project))
+
+    identity = engine._mount_root_identity(
+        _mount_task(engine, story_key="1-1-a", epic=1), engine.workspace.paths.project
+    )
+
+    assert identity is not None
+    expected = os.lstat(engine.workspace.paths.project)
+    assert (identity.st_dev, identity.st_ino) == (expected.st_dev, expected.st_ino)
+
+
+def test_engine_mount_root_identity_refuses_a_unit_mount_with_no_record(project):
+    """DW-446: a unit workspace whose task carries no mint-time record answers the
+    never-matching identity — never a fresh `lstat` and never None (unpinned).
+
+    Ablation: pass ``recorded=`` a fresh `root_identity_record(workspace.root)` and
+    this reddens."""
+    engine = _mount_engine_on(project, _mount_dir(project))
+    task = StoryTask(story_key="1-1-a", epic=1)
+
+    identity = engine._mount_root_identity(task, engine.workspace.paths.project)
+
+    assert identity is not None and identity.st_ino == 0
+
+
+_MARKERLESS_DONE_SPEC = "---\nstatus: done\n---\n\n## Intent\n\nbody\n"
+_TERMINAL_SPEC = (
+    "---\nstatus: done\n---\n\n## Intent\n\nbody\n\n## Auto Run Result\n\nStatus: done\n"
+)
+
+
+def _mounted_spec(project, tmp_path, text: str):
+    """(engine, spec, the spec's path in the outside copy, task) — an engine on a
+    unit mount holding ``spec-1-1-a.md``, not yet swapped."""
+    mount = _mount_dir(project)
+    engine = _mount_engine_on(project, mount)
+    sp = spec_path(engine.workspace.paths, "1-1-a")
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    sp.write_text(text, encoding="utf-8")
+    outside_spec = tmp_path / "outside" / sp.relative_to(mount)
+    task = _mount_task(engine, story_key="1-1-a", epic=1, spec_file=str(sp))
+    return engine, sp, outside_spec, task
+
+
+@requires_symlinked_mount_swap
+def test_repair_spec_marker_refuses_a_mount_swapped_for_a_link(project, tmp_path, monkeypatch):
+    """The marker repair through a swapped mount refuses at the write and journals
+    its existing `spec-marker-repair-failed`; the outside copy is unchanged.
+
+    Ablation: drop `root_identity=` from `_repair_spec_marker`'s
+    `append_auto_run_result` call (or make `_mount_root_identity` answer None) and
+    the marker lands in the outside copy."""
+    engine, sp, outside_spec, task = _mounted_spec(project, tmp_path, _MARKERLESS_DONE_SPEC)
+    _swap_engine_mount(engine, tmp_path / "outside")
+
+    engine._repair_spec_marker(task, {"spec_file": str(sp), "status": "done"})
+
+    (failed,) = [e for e in engine.journal.entries() if e["kind"] == "spec-marker-repair-failed"]
+    assert "UnconfinedWriteError" in failed["error"]
+    assert outside_spec.read_text(encoding="utf-8") == _MARKERLESS_DONE_SPEC
+
+    _unpin(monkeypatch)  # control
+    engine._repair_spec_marker(task, {"spec_file": str(sp), "status": "done"})
+    assert "## Auto Run Result" in outside_spec.read_text(encoding="utf-8")
+
+
+@requires_symlinked_mount_swap
+@pytest.mark.parametrize("reset", ["_reset_spec_for_repair", "_reset_spec_for_review"])
+def test_spec_resets_refuse_a_mount_swapped_before_the_spec_is_resolved(
+    project, tmp_path, monkeypatch, reset
+):
+    """A mount swapped BEFORE the reset resolves the spec: the reset writes the
+    RESOLVED spelling, which lies outside the mount and takes the writers' external
+    arm. That arm's pin pre-check refuses (raised — repair-write doctrine), and the
+    outside copy is unchanged.
+
+    Ablation: drop the `require_root_pinned` pre-check from `_atomic_write_spec`'s
+    external arm (or the reset's `root_identity=`) and the reset rewrites the
+    outside copy."""
+    engine, _sp, outside_spec, task = _mounted_spec(project, tmp_path, _TERMINAL_SPEC)
+    if reset == "_reset_spec_for_review":
+        monkeypatch.setattr(Engine, "_generic_dev", lambda self: True)
+    _swap_engine_mount(engine, tmp_path / "outside")
+
+    with pytest.raises(platform_util.UnconfinedWriteError, match=_PIN_REFUSAL):
+        getattr(engine, reset)(task)
+    assert outside_spec.read_text(encoding="utf-8") == _TERMINAL_SPEC
+
+    _unpin(monkeypatch)  # control
+    getattr(engine, reset)(task)
+    assert "## Auto Run Result" not in outside_spec.read_text(encoding="utf-8")
+
+
+@requires_symlinked_mount_swap
+@pytest.mark.parametrize(
+    ("reset", "late_writer"),
+    [
+        ("_reset_spec_for_repair", "reset_spec_status"),
+        ("_reset_spec_for_repair", "strip_auto_run_result"),
+        ("_reset_spec_for_review", "strip_auto_run_result"),
+    ],
+)
+def test_spec_resets_refuse_a_mount_swapped_after_resolution(
+    project, tmp_path, monkeypatch, reset, late_writer
+):
+    """A swap landing after the reset resolved the spec, just before one of its
+    writes (for the repair's strip: after the flip already landed in the mount): the
+    pinned confined arm refuses with `UnconfinedWriteError` and the outside copy is
+    unchanged. The swap happens INSIDE the writer call, after the engine took the
+    identity beside ``confine_root`` — the race the pin exists for.
+
+    Ablation: drop that write's `root_identity=` in the reset (or make
+    `_mount_root_identity` answer None) and the write lands in the outside copy."""
+    engine, _sp, outside_spec, task = _mounted_spec(project, tmp_path, _TERMINAL_SPEC)
+    if reset == "_reset_spec_for_review":
+        monkeypatch.setattr(Engine, "_generic_dev", lambda self: True)
+    outside = tmp_path / "outside"
+    real = getattr(devcontract, late_writer)
+    swapped: list[bool] = []
+
+    def swap_then_write(path, *args, **kwargs):
+        if not swapped:
+            _swap_engine_mount(engine, outside)
+            swapped.append(True)
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(devcontract, late_writer, swap_then_write)
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        getattr(engine, reset)(task)
+    before = outside_spec.read_text(encoding="utf-8")
+    if late_writer == "reset_spec_status":
+        assert before == _TERMINAL_SPEC  # the flip never reached the outside copy
+    else:
+        assert "## Auto Run Result" in before  # the late strip never reached it
+        if reset == "_reset_spec_for_repair":
+            assert "status: in-progress" in before  # the flip landed in the mount, pre-swap
+
+    # Control: undo the swap, replay it unpinned — the write follows the link out.
+    _unswap_engine_mount(engine, outside)
+    (engine.workspace.root / _sp.relative_to(engine.workspace.root)).write_text(
+        _TERMINAL_SPEC, encoding="utf-8"
+    )
+    swapped.clear()
+    _unpin(monkeypatch)
+    getattr(engine, reset)(task)
+    after = outside_spec.read_text(encoding="utf-8")
+    if late_writer == "reset_spec_status":
+        assert "status: in-progress" in after
+    else:
+        assert "## Auto Run Result" not in after
+
+
+@requires_symlinked_mount_swap
+def test_reconcile_generic_terminal_frontmatter_refuses_a_mount_swapped_for_a_link(
+    project, tmp_path, monkeypatch
+):
+    """The generic reconcile's status flip through a swapped mount refuses (raised,
+    as its repair-write doctrine leaves it) and the outside copy keeps its status.
+
+    Ablation: drop `root_identity=` from the reconcile's `reset_spec_status` call and
+    the flip lands in the outside copy."""
+    text = "---\nstatus: in-progress\n---\n\nbody\n\n## Auto Run Result\n\nStatus: done\n"
+    engine, sp, outside_spec, task = _mounted_spec(project, tmp_path, text)
+    fm = verify.read_frontmatter(sp)
+    _swap_engine_mount(engine, tmp_path / "outside")
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        engine._reconcile_generic_terminal_frontmatter(task, None, sp, fm)
+    assert outside_spec.read_text(encoding="utf-8") == text
+
+    _unpin(monkeypatch)  # control
+    engine._reconcile_generic_terminal_frontmatter(task, None, sp, fm)
+    assert "status: in-progress" not in outside_spec.read_text(encoding="utf-8")
+
+
+@requires_symlinked_mount_swap
+def test_apply_adoption_escalates_through_a_mount_swapped_for_a_link(
+    project, tmp_path, monkeypatch
+):
+    """Adoption's status flip — confined to ``workspace.root`` and pinned there —
+    refuses through a swapped mount and escalates through its existing arm; the
+    outside copy keeps its status.
+
+    Ablation: drop `root_identity=` from `_apply_adoption`'s `set_frontmatter_status`
+    call and the adoption flips the outside copy instead of escalating."""
+    text = "---\nstatus: in-progress\n---\n\nbody\n"
+    engine, _sp, outside_spec, task = _mounted_spec(project, tmp_path, text)
+    task.phase = Phase.COMMITTING
+    engine.state.tasks[task.story_key] = task
+    _swap_engine_mount(engine, tmp_path / "outside")
+
+    with pytest.raises(RunPaused, match="UnconfinedWriteError"):
+        engine._apply_adoption(task)
+    assert outside_spec.read_text(encoding="utf-8") == text
+
+    _unpin(monkeypatch)  # control: unpinned, the flip follows the link out
+    task.phase = Phase.COMMITTING
+    monkeypatch.setattr(Engine, "_post_dev_state_sync", lambda self, t, r: None)
+    engine._apply_adoption(task)
+    assert "status: done" in outside_spec.read_text(encoding="utf-8")
+
+
+@requires_symlinked_mount_swap
+def test_write_park_record_refuses_a_mount_swapped_for_a_link(project, tmp_path, monkeypatch):
+    """The park-record write through a swapped mount refuses at `record_park`'s pin
+    pre-check and journals its existing `operator-index-failed`; nothing — record or
+    directory — lands under the link target.
+
+    Ablation: drop `root_identity=` from `_write_park_record`'s `record_park` call
+    (or make `_mount_root_identity` answer None) and the record lands outside."""
+    from bmad_loop import operatoractions
+
+    engine = _mount_engine_on(project, _mount_dir(project))
+    outside = tmp_path / "outside"
+    _swap_engine_mount(engine, outside)
+    task = _mount_task(engine, story_key="1-1-a", epic=1, operator_actions=["buy the domain"])
+
+    assert engine._write_park_record(task) is None
+    (failed,) = [e for e in engine.journal.entries() if e["kind"] == "operator-index-failed"]
+    assert _PIN_REFUSAL in failed["error"]
+    assert list(outside.iterdir()) == []
+
+    _unpin(monkeypatch)  # control
+    assert engine._write_park_record(task) is not None
+    assert operatoractions.record_path(outside, "1-1-a").is_file()
+
+
+@requires_symlinked_mount_swap
+def test_write_park_record_refuses_a_worktrees_dir_swapped_for_a_link_holding_a_real_unit(
+    project, tmp_path, monkeypatch
+):
+    """DW-446 on an engine mount writer: ``worktrees/`` swapped for a link to a tree
+    holding a REAL ``<unit>/`` — the mount path reaches a real, non-link directory,
+    which a fresh `lstat` accepted — refuses at the write because it is not the
+    mount recorded at the mint; nothing lands outside. The unpinned control shows
+    the same swap really lands outside.
+
+    Ablation: answer `pinned_root_identity` per component in
+    `runs.mount_root_identity` (the pre-DW-446 pin) and the record lands outside."""
+    from bmad_loop import operatoractions
+
+    engine = _mount_engine_on(project, _mount_dir(project))
+    task = _mount_task(engine, story_key="1-1-a", epic=1, operator_actions=["buy the domain"])
+    worktrees = engine.workspace.root.parent
+    outside = tmp_path / "outside"
+    (outside / engine.workspace.root.name).mkdir(parents=True)
+    worktrees.rename(worktrees.with_name("worktrees-aside"))
+    worktrees.symlink_to(outside, target_is_directory=True)
+
+    assert engine._write_park_record(task) is None
+    (failed,) = [e for e in engine.journal.entries() if e["kind"] == "operator-index-failed"]
+    assert _PIN_REFUSAL in failed["error"]
+    assert list((outside / engine.workspace.root.name).iterdir()) == []
+
+    _unpin(monkeypatch)  # control
+    assert engine._write_park_record(task) is not None
+    assert operatoractions.record_path(outside / engine.workspace.root.name, "1-1-a").is_file()
+
+
+def _park_record_in_mount(project, tmp_path, *, prior: str | None):
+    """(engine, record path in the mount, its path in the outside copy, the restore's
+    ``record`` tuple, task) — a record the park wrote, not yet swapped."""
+    from bmad_loop import operatoractions
+
+    engine = _mount_engine_on(project, _mount_dir(project))
+    record = operatoractions.record_path(engine.workspace.paths.project, "1-1-a")
+    record.parent.mkdir(parents=True)
+    record.write_text('{"written": "by this park"}', encoding="utf-8")
+    outside_record = tmp_path / "outside" / record.relative_to(engine.workspace.root)
+    task = _mount_task(engine, story_key="1-1-a", epic=1)
+    return engine, record, outside_record, (record, prior), task
+
+
+@requires_symlinked_mount_swap
+@pytest.mark.parametrize(
+    "prior", [None, '{"written": "by an earlier park"}'], ids=["unlink", "put-back"]
+)
+def test_restore_park_record_refuses_a_mount_swapped_for_a_link(
+    project, tmp_path, monkeypatch, prior
+):
+    """Both arms of the park rollback refuse through a swapped mount and journal
+    `park-record-rollback-failed`: the put-back through the confined writer's pin,
+    the ``prior is None`` unlink arm through its pre-check BEFORE any unlink/rmdir —
+    outside files untouched either way.
+
+    Ablation: drop the `require_root_pinned` pre-check from the unlink arm (or the
+    `root_identity=` from the put-back) and the outside record is deleted (or
+    overwritten)."""
+    engine, _record, outside_record, record, task = _park_record_in_mount(
+        project, tmp_path, prior=prior
+    )
+    _swap_engine_mount(engine, tmp_path / "outside")
+    written = outside_record.read_text(encoding="utf-8")
+
+    engine._restore_park_record(task, record)
+
+    (failed,) = [e for e in engine.journal.entries() if e["kind"] == "park-record-rollback-failed"]
+    assert "UnconfinedWriteError" in failed["error"]
+    if prior is None:
+        assert _PIN_REFUSAL in failed["error"]  # the pre-check, not a later refusal
+    assert outside_record.read_text(encoding="utf-8") == written
+
+    _unpin(monkeypatch)  # control: unpinned, the same swap reaches the outside files
+    engine._restore_park_record(task, record)
+    if prior is None:
+        assert not outside_record.exists()
+    else:
+        assert outside_record.read_text(encoding="utf-8") == prior
+
+
+@pytest.mark.parametrize(
+    "prior", [None, '{"written": "by an earlier park"}'], ids=["unlink", "put-back"]
+)
+def test_restore_park_record_on_an_intact_mount_rolls_back_under_the_pin(project, tmp_path, prior):
+    """The positive half of the park-rollback pin: on an INTACT mount, with the pin
+    live, both arms still roll back — the record is deleted (``prior is None``) or
+    holds the earlier bytes — and nothing journals `park-record-rollback-failed`.
+
+    Ablation: pin the wrong directory (e.g. `require_root_pinned(path.parent, …)` in
+    the unlink arm, or `self._mount_root_identity(task, path.parent)` for the put-back) and
+    the rollback refuses here while every swapped-mount row stays green."""
+    engine, record, _outside, restore, task = _park_record_in_mount(project, tmp_path, prior=prior)
+    assert engine._mount_root_identity(task, engine.workspace.paths.project) is not None
+
+    engine._restore_park_record(task, restore)
+
+    assert "park-record-rollback-failed" not in _kinds(engine)
+    if prior is None:
+        assert not record.exists()
+        assert not record.parent.exists()  # the emptied records dir is pruned, as before
+    else:
+        assert record.read_text(encoding="utf-8") == prior
+
+
+def _by_path_park_unlink(path: Path, **_kw) -> None:
+    """The pre-DW-497 ``prior is None`` rollback, by path — the controls' replay."""
+    path.unlink(missing_ok=True)
+    parent = path.parent
+    if parent.is_dir() and not any(parent.iterdir()):
+        parent.rmdir()
+
+
+@requires_symlinked_mount_swap
+@pytest.mark.parametrize(
+    ("link_at", "victim"),
+    [
+        (".bmad-loop", "operator/1-1-a.json"),
+        (".bmad-loop/operator", "1-1-a.json"),
+        (".bmad-loop", "operator"),
+    ],
+    ids=["bmad-loop-record", "operator-record", "bmad-loop-empty-dir"],
+)
+def test_restore_park_record_refuses_a_link_below_the_mount(
+    project, tmp_path, monkeypatch, link_at, victim
+):
+    """DW-497: the ``prior is None`` rollback through an INTACT, pinned mount with a
+    link planted below it — at `.bmad-loop/` or `.bmad-loop/operator/`, after the
+    park wrote its record — refuses and journals `park-record-rollback-failed`
+    (`UnconfinedWriteError`). The same-named record at the link's target survives,
+    and so does an EMPTY `operator/` there, which the by-path prune would have
+    removed. The root pre-check passes (the mount itself is intact), so the
+    refusal is the confined walk's. The control replays the by-path rollback and
+    shows the same link really reaches the outside entry.
+
+    Ablation: revert the unlink arm to `path.unlink(missing_ok=True)` plus the
+    `is_dir`/`iterdir`/`rmdir` prune (what `_by_path_park_unlink` replays) and the
+    record rows lose the outside record, the empty-dir row the outside `operator/`."""
+    engine, record, _outside, restore, task = _park_record_in_mount(project, tmp_path, prior=None)
+    assert engine._mount_root_identity(task, engine.workspace.paths.project) is not None
+    outside = tmp_path / "outside"
+    target = outside / victim
+    if victim.endswith(".json"):
+        target.parent.mkdir(parents=True)
+        target.write_text('{"written": "elsewhere"}', encoding="utf-8")
+    else:
+        target.mkdir(parents=True)
+    planted = engine.workspace.paths.project / link_at
+    planted.rename(planted.with_name(planted.name + "-aside"))
+    planted.symlink_to(outside, target_is_directory=True)
+    assert record.exists() or victim == "operator"  # the record path reaches the victim
+
+    engine._restore_park_record(task, restore)
+
+    (failed,) = [e for e in engine.journal.entries() if e["kind"] == "park-record-rollback-failed"]
+    assert "UnconfinedWriteError" in failed["error"]
+    assert _PIN_REFUSAL not in failed["error"]  # not the root pre-check
+    assert target.exists()
+    if victim.endswith(".json"):
+        assert target.read_text(encoding="utf-8") == '{"written": "elsewhere"}'
+
+    # Control: the by-path rollback follows the same link out.
+    monkeypatch.setattr("bmad_loop.engine.unlink_confined", _by_path_park_unlink)
+    engine._restore_park_record(task, restore)
+    assert not target.exists()
+
+
+# ------------------------------------ engine deferred-work ledger restore pin (DW-498)
+#
+# `_restore_ledger` and `_restore_defer_ledger` write (and `_restore_ledger` unlinks)
+# `workspace.paths.deferred_work`, which under worktree isolation lies in the unit
+# mount: they pin it as DW-445's writers do. The ownership probes are stubbed — the
+# mounts here are plain copies, not checkouts — so each row reaches the arm it names.
+
+_DW1_ENTRY = (
+    "### DW-1: review found this\n\n"
+    "origin: review, 2026-08-26\nlocation: src.txt\nreason: needs a look.\nstatus: open\n"
+)
+_DW3_ENTRY = (
+    "### DW-3: a rival filed this\n\n"
+    "origin: review, 2026-08-27\nlocation: other.txt\nreason: elsewhere.\nstatus: open\n"
+)
+_LEDGER_SNAPSHOT = "# Deferred Work\n\n" + _DW1_ENTRY
+_LEDGER_HARVESTED = _LEDGER_SNAPSHOT + "\n" + _DW3_ENTRY.replace("DW-3", "DW-2")
+
+# arm -> (ledger text on disk, snapshot handed to the restore, text it lands — None:
+# the ledger is removed)
+_LEDGER_RESTORE_ARMS = {
+    "restore-write": (_LEDGER_HARVESTED, _LEDGER_SNAPSHOT, _LEDGER_SNAPSHOT),
+    "restore-unlink": (_LEDGER_HARVESTED, None, None),
+    "defer-overwrite": ("# Deferred Work\n", _LEDGER_SNAPSHOT, _LEDGER_SNAPSHOT),
+    "defer-merge": (
+        "# Deferred Work\n\n" + _DW3_ENTRY,
+        _LEDGER_SNAPSHOT,
+        "# Deferred Work\n\n" + _DW3_ENTRY + "\n" + _DW1_ENTRY,
+    ),
+}
+
+
+def _arm_ledger_restore(monkeypatch, engine: Engine, task: StoryTask, arm: str):
+    """Stub the ownership probes so ``arm`` is the branch the restore takes, and
+    answer a thunk that runs it."""
+    on_disk, snapshot, _lands = _LEDGER_RESTORE_ARMS[arm]
+    if arm.startswith("restore-"):
+        # untracked, and the bytes on disk are this engine's own harvest
+        monkeypatch.setattr(Engine, "_ledger_is_gits_to_restore", lambda self, task: False)
+        task.post_engine_ledger_digest = _digest_of(on_disk)
+        return lambda: engine._restore_ledger(task, snapshot)
+    assert snapshot is not None
+    monkeypatch.setattr(Engine, "_ledger_is_gits_to_restore", lambda self, task: True)
+    anchor = (
+        (_LedgerAnchor.BASELINE, on_disk)
+        if arm == "defer-overwrite"
+        else (_LedgerAnchor.NONE, None)
+    )
+    monkeypatch.setattr(Engine, "_ledger_baseline_text", lambda self, task: anchor)
+    return lambda: engine._restore_defer_ledger(task, snapshot)
+
+
+def _ledger_in_mount(project, tmp_path, arm: str):
+    """(engine, ledger in the mount, its path in the outside copy, task) — a ledger
+    holding ``arm``'s on-disk text in an engine's unit mount, not yet swapped."""
+    engine = _mount_engine_on(project, _mount_dir(project))
+    ledger = engine.workspace.paths.deferred_work
+    assert ledger.is_relative_to(engine.workspace.paths.project)  # the confined arm
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text(_LEDGER_RESTORE_ARMS[arm][0], encoding="utf-8")
+    outside = tmp_path / "outside" / ledger.relative_to(engine.workspace.root)
+    return engine, ledger, outside, _mount_task(engine, story_key="1-1-a", epic=1)
+
+
+@requires_symlinked_mount_swap
+@pytest.mark.parametrize("arm", list(_LEDGER_RESTORE_ARMS))
+def test_ledger_restores_refuse_a_mount_swapped_for_a_link(project, tmp_path, monkeypatch, arm):
+    """Each ledger restore through a mount swapped for a link refuses at the pin
+    pre-check — raised, the restores' repair-write doctrine — and the outside copy's
+    ledger is neither rewritten nor deleted. The unpinned control shows the same
+    swap really lands outside.
+
+    Ablation: revert `_publish_restored_ledger` (the write and merge arms) or
+    `_retract_ledger` (the unlink arm) to the plain `mkdir` + `atomic_write_text` /
+    `ledger.unlink` and that arm's row lands outside instead of raising."""
+    engine, _ledger, outside, task = _ledger_in_mount(project, tmp_path, arm)
+    restore = _arm_ledger_restore(monkeypatch, engine, task, arm)
+    _swap_engine_mount(engine, tmp_path / "outside")
+    written = outside.read_text(encoding="utf-8")
+
+    with pytest.raises(platform_util.UnconfinedWriteError, match=_PIN_REFUSAL):
+        restore()
+
+    assert outside.read_text(encoding="utf-8") == written
+
+    _unpin(monkeypatch)  # control: unpinned, the same swap reaches the outside ledger
+    restore()
+    lands = _LEDGER_RESTORE_ARMS[arm][2]
+    if lands is None:
+        assert not outside.exists()
+    else:
+        assert outside.read_text(encoding="utf-8") == lands
+
+
+@pytest.mark.parametrize("arm", list(_LEDGER_RESTORE_ARMS))
+def test_ledger_restores_on_an_intact_mount_land_under_the_pin(project, tmp_path, monkeypatch, arm):
+    """The positive half: on an INTACT mount, with the pin live, each restore lands
+    in the mount — the ledger rewritten, merged or removed — with nothing raised.
+
+    Ablation: pin the wrong directory (``self._mount_root_identity(task,
+    ledger.parent)``) and every row here refuses while the swapped-mount rows stay
+    green."""
+    engine, ledger, _outside, task = _ledger_in_mount(project, tmp_path, arm)
+    assert engine._mount_root_identity(task, engine.workspace.paths.project) is not None
+    restore = _arm_ledger_restore(monkeypatch, engine, task, arm)
+
+    restore()
+
+    lands = _LEDGER_RESTORE_ARMS[arm][2]
+    if lands is None:
+        assert not ledger.exists()
+    else:
+        assert ledger.read_text(encoding="utf-8") == lands
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_ledger_restore_without_a_mount_still_writes_through_a_symlinked_ledger(
+    project, tmp_path, monkeypatch
+):
+    """Isolation ``none``: the operator's project is unpinned, and the restore keeps
+    `atomic_write_text`'s symlink-following default — a ledger symlinked into the
+    project stays a link and its TARGET is rewritten, as before DW-498.
+
+    Ablation: send the unmounted arm through `atomic_write_text_confined` and the
+    link is replaced by a regular file, the target left holding the harvest."""
+    engine, _ = make_engine(project, [])
+    assert (
+        engine._mount_root_identity(StoryTask(story_key="1-1-a", epic=1), project.project) is None
+    )
+    target = tmp_path / "shared" / "deferred-work.md"
+    target.parent.mkdir(parents=True)
+    target.write_text(_LEDGER_HARVESTED, encoding="utf-8")
+    ledger = engine.workspace.paths.deferred_work
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.unlink(missing_ok=True)
+    ledger.symlink_to(target)
+    task = StoryTask(story_key="1-1-a", epic=1)
+    restore = _arm_ledger_restore(monkeypatch, engine, task, "restore-write")
+
+    restore()
+
+    assert ledger.is_symlink()
+    assert target.read_text(encoding="utf-8") == _LEDGER_SNAPSHOT
+
+
+def _by_path_ledger_writers(monkeypatch) -> None:
+    """Replay the pre-DW-498 by-path ledger writes behind the pin pre-check — the
+    parent-link rows' control."""
+    monkeypatch.setattr(
+        "bmad_loop.engine.make_dirs_confined",
+        lambda path, **_kw: path.mkdir(parents=True, exist_ok=True),
+    )
+    monkeypatch.setattr(
+        "bmad_loop.engine.atomic_write_text_confined",
+        lambda path, text, **_kw: platform_util.atomic_write_text(path, text),
+    )
+    monkeypatch.setattr(
+        "bmad_loop.engine.unlink_confined",
+        lambda path, *, missing_ok=False, **_kw: path.unlink(missing_ok=missing_ok),
+    )
+
+
+@requires_symlinked_mount_swap
+@pytest.mark.parametrize("arm", list(_LEDGER_RESTORE_ARMS))
+def test_ledger_restores_refuse_a_link_at_the_ledger_parent_below_the_mount(
+    project, tmp_path, monkeypatch, arm
+):
+    """Each ledger restore through an INTACT, pinned mount whose ledger PARENT dir
+    was swapped for a link refuses with `UnconfinedWriteError` — the root pre-check
+    passes, so the refusal is the confined walk's — and the ledger at the link's
+    target is neither rewritten nor deleted. The control replays the by-path writes
+    behind the same pre-check and shows the same link really reaches the outside
+    ledger.
+
+    Ablation: keep `require_root_pinned` but let `_publish_restored_ledger` (the
+    write and merge arms) or `_retract_ledger` (the unlink arm) fall through to the
+    plain `mkdir` + `atomic_write_text` / `ledger.unlink` and that arm's row rewrites
+    or deletes the outside ledger instead of raising — the mount-swap rows above stay
+    green under it."""
+    engine, ledger, _outside, task = _ledger_in_mount(project, tmp_path, arm)
+    assert engine._mount_root_identity(task, engine.workspace.paths.project) is not None
+    restore = _arm_ledger_restore(monkeypatch, engine, task, arm)
+    parent = ledger.parent
+    outside_dir = tmp_path / "outside-parent"
+    shutil.copytree(parent, outside_dir)
+    parent.rename(parent.with_name(parent.name + "-aside"))
+    parent.symlink_to(outside_dir, target_is_directory=True)
+    outside_ledger = outside_dir / ledger.name
+    written = outside_ledger.read_text(encoding="utf-8")
+    assert ledger.read_text(encoding="utf-8") == written  # the ledger path reaches it
+
+    with pytest.raises(platform_util.UnconfinedWriteError) as refused:
+        restore()
+
+    assert _PIN_REFUSAL not in str(refused.value)  # not the root pre-check
+    assert outside_ledger.read_text(encoding="utf-8") == written
+
+    _by_path_ledger_writers(monkeypatch)  # control: by path, the link is followed out
+    restore()
+    lands = _LEDGER_RESTORE_ARMS[arm][2]
+    if lands is None:
+        assert not outside_ledger.exists()
+    else:
+        assert outside_ledger.read_text(encoding="utf-8") == lands

@@ -33,12 +33,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import sys
 import time
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from . import bmadconfig
 from . import policy as policy_mod
@@ -46,7 +47,7 @@ from . import runs
 from .checks import Finding
 from .journal import Journal, save_state, state_lock
 from .model import RunState
-from .platform_util import atomic_replace, is_wsl_unc_path
+from .platform_util import atomic_replace, is_link_like, is_wsl_unc_path
 from .runs import RUNS_DIR
 
 if TYPE_CHECKING:
@@ -77,10 +78,14 @@ if TYPE_CHECKING:
         ) -> dict[str, CodingCLIAdapter]: ...
 
 
-# The three adapter roles a run wires. Defined here (the composition layer that
+# The adapter roles a run wires. Defined here (the composition layer that
 # actually builds them) and re-exported as ``cli.ROLES``, which `cmd_validate`
-# and the test suite resolve.
-ROLES = ("dev", "review", "triage")
+# and the test suite resolve. ``retro`` drives the headless epic-boundary
+# retrospective (`gates.retrospective = "auto"`, DW-389); like ``triage`` it is a
+# plain adapter that reads the session's own result.json.
+ROLES = ("dev", "review", "triage", "retro")
+SWEEP_OPTIONS_VERSION = 2
+_MAX_SWEEP_OPTIONS_BYTES = 64 * 1024
 
 
 def resolve_profiles(policy: Policy, project: Path) -> dict[str, CLIProfile]:
@@ -117,7 +122,7 @@ def resolve_profiles(policy: Policy, project: Path) -> dict[str, CLIProfile]:
     and the composition. Profiles were the only surface read twice.
 
     Deduplicated by profile name, so the common single-CLI policy touches disk
-    once rather than three times. ``ProfileError`` propagates.
+    once rather than once per role. ``ProfileError`` propagates.
     """
     from .adapters.profile import get_profile
 
@@ -156,8 +161,8 @@ def config_digest(
       ``binary`` / ``launch_args`` / ``bypass_args`` / ``model_flag`` /
       ``prompt_template`` / ``env`` on the *resolved* profile, or to
       ``extra_args`` on the resolved adapter. The opencode-http builder reads a
-      strict SUBSET of those — ``_serve_argv`` takes ``binary`` and the adapter's
-      ``extra_args`` and nothing else, and ``_session_env`` layers
+      strict SUBSET of those — ``_serve_argv`` takes ``binary``, ``launch_args``
+      and the adapter's ``extra_args`` and nothing else, and ``_session_env`` layers
       ``profile.env`` plus one *generated* variable, which the ``skill_tree``
       bullet below accounts for. See the union paragraph on why the subset does
       not narrow what is hashed.
@@ -192,12 +197,14 @@ def config_digest(
     the argument for ``adapter``, since ``hookless`` selected the builder only
     until the registry took that job over: *a hard-coded argv token is not the
     same thing as a safe one.* Flipping ``hooks.dialect`` to ``"none"``
-    does not add a token — it swaps the whole builder, dropping ``launch_args``,
-    the prompt and the ``bypass_args`` fallback and putting the literal ``"serve"``
-    at argv[1], which ``_spawn_server`` then runs with ``cwd`` at the workspace
-    root. To a CLI that is a subcommand and a bad one dies in the health poll. To
-    an *interpreter* — a profile whose ``binary`` is ``python``/``sh``/``node``
-    with the real program in ``launch_args``, which nothing forbids — argv[1] is a
+    does not add a token — it swaps the whole builder, dropping the prompt and
+    the ``bypass_args`` fallback and putting the literal ``"serve"`` right after
+    ``binary`` + ``launch_args``, which ``_spawn_server`` then runs with ``cwd`` at
+    the workspace root. To a CLI that is a subcommand and a bad one dies in the
+    health poll. To an *interpreter* ``binary`` (``python``/``sh``/``node``) with
+    an empty or options-only ``launch_args`` (e.g. ``python3 -u``) — which nothing
+    forbids; validate only warns (``adapter.launch-args-unservable``) —
+    ``"serve"`` lands in the script slot as a
     **script path resolved against the agent-writable tree**, and the exec happens
     before the health poll it fails (three times: ``SPAWN_ATTEMPTS``). ``binary``
     being pinned does not save it: the attacker inherits whichever binary the
@@ -211,8 +218,9 @@ def config_digest(
     ``adapter.extra_args`` REPLACES ``bypass_args`` rather than extending it, so
     for a role that sets it the hashed ``bypass_args`` is dead, and rewriting the
     dead field alone moves this digest without moving one token of the launched
-    argv. Under ``hookless``, ``bypass_args`` / ``launch_args`` / ``model_flag``
-    are dead the same way. Hashing the effective projection instead means
+    argv. Under ``hookless``, ``bypass_args`` / ``model_flag`` are dead the same
+    way (``launch_args`` is not: the opencode builder places it before
+    ``serve``). Hashing the effective projection instead means
     restating two builders' precedence rules inside the control that polices
     them, where drift is silent and lands in the UNDER-covering direction — the
     failure this function has already made four times by reasoning from one
@@ -264,7 +272,7 @@ def config_digest(
       ``seed_files``) all reject absolute and parent refs.
 
       NOT excluded on "the parent execs it too" — that defence is false for the
-      ``triage`` role. Base ``Engine`` wires only dev+review; ``sweep.py`` holds
+      ``triage`` role. Base ``Engine`` wires only dev+review+retro; ``sweep.py`` holds
       the only ``adapters["triage"]`` assignment and the only two ``role="triage"``
       dispatches, so a ``[adapter.triage]`` profile override's target is exec'd by
       a sweep and by nothing else. ``sweep.auto = "run-end"`` and worktree
@@ -394,10 +402,11 @@ def config_digest(
             "adapter": prof.adapter,
             # The transport. It no longer selects the builder (`adapter` does),
             # but it still rewrites what the opencode builder emits WHOLESALE
-            # rather than adding a token: hookless drops launch_args/prompt/
-            # bypass_args and substitutes `serve --port … --print-logs`, whose
-            # literal "serve" an interpreter binary reads as a cwd-relative
-            # script path.
+            # rather than adding a token: hookless drops prompt/bypass_args and
+            # appends `serve --port … --print-logs` after binary + launch_args,
+            # whose literal "serve" an interpreter binary with an empty or
+            # options-only launch_args (e.g. `python3 -u`) reads as a
+            # cwd-relative script path.
             "hookless": prof.hookless,
             # None (inherit profile.bypass_args) is NOT the same state as () (an
             # explicit override to no flags at all); json.dumps keeps them apart.
@@ -689,6 +698,20 @@ def platform_preflight(project: Path) -> list[Finding]:
                 },
             )
         )
+    # Not gated on the backend count like the listing above: an "(unavailable)"
+    # that a raising probe forced is a fold, not the host's answer, and a lone
+    # backend is the one an operator most needs told about (DW-464). A warning —
+    # selection already degraded past it, as for a failed external.
+    for i in infos:
+        if i.probe_error:
+            found.append(
+                Finding(
+                    "mux.backend-probe",
+                    "warning",
+                    f"mux backend {i.name} probe failed: {i.probe_error}",
+                    {"backend": i.name, "error": i.probe_error},
+                )
+            )
     chosen = next((i for i in infos if i.selected), None)
     if chosen:
         # Emitted for EVERY reason, not just the forced ones (#332): the reason that
@@ -782,6 +805,7 @@ def build_run_state(
     stories_on: bool,
     spec_folder: str,
     trusted_config_digest: str,
+    run_dir_identity: tuple[int, int] | None,
 ) -> RunState:
     """Assemble the launch-time :class:`RunState` for a fresh run.
 
@@ -798,11 +822,16 @@ def build_run_state(
     ``repo_root`` records the git root code work happens in (``paths.repo_root``),
     which equals ``project`` unless the BMAD config sets a `repo_root:` override.
     ``runs.rearm_escalation`` runs out of process and reads it back to advance the
-    attempt baseline in the tree the proof-of-work gate actually measures."""
+    attempt baseline in the tree the proof-of-work gate actually measures.
+
+    ``run_dir_identity`` is the run dir's mint-time identity
+    (:func:`_claim_identity` of the composer's claim, DW-446) — what the verify
+    stream's pin compares the run dir it opens against."""
     return RunState(
         run_id=run_id,
         project=str(project),
         repo_root=str(repo_root),
+        run_dir_identity=run_dir_identity,
         started_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
         policy_snapshot=policy.to_dict(),
         epic_filter=epic_filter,
@@ -829,6 +858,169 @@ class ComposedRun:
     run_dir: Path
     state: RunState
     journal: Journal
+
+
+class SweepOptionsError(ValueError):
+    """Persisted selector-bearing sweep options are unsafe to resume."""
+
+
+@dataclass(frozen=True)
+class SweepResumeOptions:
+    values: dict[str, Any]
+    only_ids: tuple[str, ...] | None
+    min_severity: str | None
+    digest: str | None = None
+
+
+def load_sweep_resume_options(
+    run_dir: Path,
+    *,
+    required: bool = False,
+    expected_digest: str | None = None,
+) -> SweepResumeOptions:
+    """Load bounded, non-redirected sweep.json bytes and validate selectors."""
+
+    def corrupt(message: str, *, cause: BaseException | None = None) -> SweepResumeOptions:
+        # Runs from before the selector marker deliberately treated a missing or
+        # malformed options file as the legacy unrestricted shape.  Keep that
+        # compatibility while current selector-capable runs fail closed.
+        if not required:
+            return SweepResumeOptions({}, None, None)
+        error = SweepOptionsError(message)
+        if cause is not None:
+            raise error from cause
+        raise error
+
+    opts_path = run_dir / "sweep.json"
+    if is_link_like(opts_path):
+        raise SweepOptionsError("sweep.json must not be a link-like path")
+    # Windows refuses opening a directory before fstat can classify it.  Keep
+    # nonregular paths on the fail-closed boundary rather than misclassifying
+    # that open error as a tolerant legacy-file read failure.
+    if opts_path.exists() and not opts_path.is_file():
+        raise SweepOptionsError("sweep.json must be a regular file")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(opts_path, flags)
+    except FileNotFoundError:
+        if required:
+            raise SweepOptionsError("sweep.json is missing for this selector-capable run")
+        return SweepResumeOptions({}, None, None)
+    except OSError as exc:
+        return corrupt(f"sweep.json cannot be opened: {exc}", cause=exc)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise SweepOptionsError("sweep.json must be a regular file")
+        if opened.st_size > _MAX_SWEEP_OPTIONS_BYTES:
+            raise SweepOptionsError(f"sweep.json exceeds {_MAX_SWEEP_OPTIONS_BYTES} bytes")
+        chunks: list[bytes] = []
+        remaining = _MAX_SWEEP_OPTIONS_BYTES + 1
+        while remaining:
+            chunk = os.read(fd, min(8192, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    except OSError as exc:
+        return corrupt(f"sweep.json cannot be read: {exc}", cause=exc)
+    finally:
+        os.close(fd)
+    data = b"".join(chunks)
+    if len(data) > _MAX_SWEEP_OPTIONS_BYTES:
+        raise SweepOptionsError(f"sweep.json exceeds {_MAX_SWEEP_OPTIONS_BYTES} bytes")
+    digest = hashlib.sha256(data).hexdigest()
+    if expected_digest is not None and digest != expected_digest:
+        raise SweepOptionsError("sweep.json no longer matches the options bound at launch")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return corrupt("sweep.json is not valid UTF-8", cause=exc)
+    try:
+        loaded = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return corrupt("sweep.json is not valid JSON", cause=exc)
+    if not isinstance(loaded, dict):
+        return corrupt("sweep.json must contain a JSON object")
+    opts: dict[str, Any] = loaded
+    if required:
+        missing = [key for key in ("only", "min_severity") if key not in opts]
+        if missing:
+            raise SweepOptionsError(
+                "sweep.json is missing current selector field(s): " + ", ".join(missing)
+            )
+    raw_only = opts.get("only")
+    only_present = "only" in opts
+    only_valid = (
+        isinstance(raw_only, list)
+        and bool(raw_only)
+        and all(
+            isinstance(value, str)
+            and value.startswith("DW-")
+            and value.removeprefix("DW-").isdecimal()
+            for value in raw_only
+        )
+    )
+    if raw_only is None:
+        only_ids = None
+    elif only_valid:
+        assert isinstance(raw_only, list)
+        only_ids = tuple(dict.fromkeys(str(value) for value in raw_only))
+    else:
+        return corrupt("sweep.json has a malformed 'only' selector")
+
+    raw_min = opts.get("min_severity")
+    min_present = "min_severity" in opts
+    if raw_min is None:
+        min_severity = None
+    elif raw_min in ("low", "medium", "high", "critical"):
+        assert isinstance(raw_min, str)
+        min_severity = raw_min
+    else:
+        return corrupt("sweep.json has an invalid 'min_severity' selector")
+
+    if only_ids is not None and min_severity is not None:
+        return corrupt("sweep.json cannot contain both 'only' and 'min_severity'")
+    # Version-zero callers predate selectors and must never inherit selector-
+    # shaped keys from a stray or replaced options file.  Current callers pass
+    # ``required=True`` and bind these exact bytes through RunState.
+    if not required or not only_present:
+        only_ids = None
+    if not required or not min_present:
+        min_severity = None
+    return SweepResumeOptions(opts, only_ids, min_severity, digest)
+
+
+def validate_sweep_options_version(version: int) -> None:
+    """Refuse state whose sweep options semantics this binary cannot interpret."""
+    if version not in (0, SWEEP_OPTIONS_VERSION):
+        raise SweepOptionsError(
+            f"unsupported sweep options version {version}; this binary supports legacy 0 "
+            f"or current {SWEEP_OPTIONS_VERSION}"
+        )
+
+
+def validate_sweep_options_binding(
+    version: int, expected_digest: str, options: SweepResumeOptions
+) -> None:
+    """Bind current sweep options to the exact bytes published at launch."""
+    if version == SWEEP_OPTIONS_VERSION and options.digest != expected_digest:
+        raise SweepOptionsError("sweep.json no longer matches the options bound at launch")
+
+
+def _claim_identity(claim: os.stat_result) -> tuple[int, int] | None:
+    """The run dir's mint-time identity record (DW-446) from the composer's claim —
+    the ``lstat`` of the directory this process just created, before any session
+    can reach it — or None for a zero inode, which carries no identity, so every
+    pin compared against it refuses. On the dir-fd verify-stream arm and for the
+    mount writers that is no change (a zero inode never matched), but the win32
+    verify-stream arm, which before DW-446 wrote through a zero-inode run dir, now
+    REFUSES it (accepted 2026-09-27): each lost log tail is journaled as the
+    verify record's ``capture_error`` and verification proceeds without it."""
+    if claim.st_ino == 0:
+        return None
+    return (claim.st_dev, claim.st_ino)
 
 
 def _claim_run_dir(run_dir: Path) -> os.stat_result:
@@ -1044,6 +1236,7 @@ def compose_run(
             stories_on=stories_on,
             spec_folder=spec_folder,
             trusted_config_digest=trusted_config_digest,
+            run_dir_identity=_claim_identity(composer_claim),
         )
         # State becoming resumable and the pid making this process live are one
         # publication.  An explicit-id resume waits for the pid rather than entering
@@ -1069,6 +1262,7 @@ def compose_run(
             policy=policy,
             adapter=adapters["dev"],
             review_adapter=adapters["review"],
+            retro_adapter=adapters["retro"],
             run_dir=run_dir,
             journal=journal,
             state=state,
@@ -1104,6 +1298,8 @@ def compose_sweep(
     make_adapters: MakeAdapters,
     sweep_engine_cls: type[SweepEngine],
     trusted_config_digest: str,
+    only_ids: tuple[str, ...] | None = None,
+    min_severity: str | None = None,
     profiles: dict[str, CLIProfile] | None = None,
     on_started: Callable[[], None] | None = None,
 ) -> ComposedRun:
@@ -1164,6 +1360,28 @@ def compose_sweep(
     it refuses a child that left nothing behind; under the refused unwind above it
     refuses one that is composed and resumable, which is the better of the two.
     Neither is a second launch, and that is the safe direction for a launcher."""
+    # Validate the typed seam as well as argparse callers: frontends and auto
+    # sweeps call this composer directly, and an invalid or unresumably large
+    # selector must fail before a run directory is published.
+    from .sweep import select_entries
+
+    select_entries((), only_ids=only_ids, min_severity=min_severity)
+    options = {
+        "prompting": prompting,
+        "decisions_only": decisions_only,
+        "max_bundles": max_bundles,
+        "repeat": repeat,
+        "max_cycles": max_cycles,
+        "only": list(only_ids) if only_ids is not None else None,
+        "min_severity": min_severity,
+        "trigger": trigger,
+    }
+    options_text = json.dumps(options, indent=2)
+    options_bytes = options_text.encode("utf-8")
+    options_digest = hashlib.sha256(options_bytes).hexdigest()
+    if len(options_bytes) > _MAX_SWEEP_OPTIONS_BYTES:
+        raise SweepOptionsError(f"sweep options exceed {_MAX_SWEEP_OPTIONS_BYTES} bytes")
+
     run_id = run_id or runs.new_run_id()
     run_dir = project / RUNS_DIR / run_id
     # Same claim, same reason, same placement outside the try as in `compose_run`.
@@ -1178,32 +1396,30 @@ def compose_sweep(
             run_id=run_id,
             project=str(project),
             repo_root=str(paths.repo_root),
+            run_dir_identity=_claim_identity(composer_claim),
             started_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
             policy_snapshot=policy.to_dict(),
             run_type="sweep",
+            sweep_options_version=SWEEP_OPTIONS_VERSION,
+            sweep_options_digest=options_digest,
             trusted_config_digest=trusted_config_digest,
         )
-        # Same indivisible state/pid publication as compose_run.
-        with state_lock(run_dir):
-            save_state(run_dir, state)
-            # Out of the tree, same ordering and same reason as compose_run's stamp.
-            runs.write_trusted_config_digest(project, run_id, trusted_config_digest)
-            runs.write_pid(run_dir)
-        options = {
-            "prompting": prompting,
-            "decisions_only": decisions_only,
-            "max_bundles": max_bundles,
-            "repeat": repeat,
-            "max_cycles": max_cycles,
-            "trigger": trigger,
-        }
         # Persist the sweep options atomically (tmp + os.replace), the way save_state
         # writes state.json: a resume reads this back to rebuild the SweepEngine, so a
         # crash mid-write must not leave a torn file the recovery path then chokes on.
         sweep_path = run_dir / "sweep.json"
         sweep_tmp = sweep_path.with_suffix(".json.tmp")
-        sweep_tmp.write_text(json.dumps(options, indent=2), encoding="utf-8")
+        sweep_tmp.write_bytes(options_bytes)
         atomic_replace(sweep_tmp, sweep_path)
+        # Publish selector-capable state only after its required options file is
+        # complete. The state lock keeps state.json + pid indivisible to resume;
+        # ordering sweep.json ahead of both closes the kill window where a marked
+        # run was visible but could never be resumed without widening its scope.
+        with state_lock(run_dir):
+            save_state(run_dir, state)
+            # Out of the tree, same ordering and same reason as compose_run's stamp.
+            runs.write_trusted_config_digest(project, run_id, trusted_config_digest)
+            runs.write_pid(run_dir)
         adapters = make_adapters(project, run_dir, policy, profiles=profiles)
         journal.append("run-start", run_id=run_id, run_type="sweep", trigger=trigger)
         engine: Engine = sweep_engine_cls(
@@ -1220,6 +1436,8 @@ def compose_sweep(
             max_bundles=max_bundles,
             repeat=repeat,
             max_cycles=max_cycles,
+            only_ids=only_ids,
+            min_severity=min_severity,
         )
         if on_started is not None:
             on_started()
@@ -1243,6 +1461,7 @@ def compose_resume(
     stories_engine_cls: type[StoriesEngine],
     sweep_engine_cls: type[SweepEngine],
     profiles: dict[str, CLIProfile] | None = None,
+    sweep_options: SweepResumeOptions | None = None,
 ) -> ComposedRun:
     """Rebuild the engine for a paused/interrupted run and return it ready to
     :meth:`run` — the adapter build + engine selection ``cli._resume_paused_run``
@@ -1263,19 +1482,39 @@ def compose_resume(
     the new baseline describes the bytes these adapters are built from rather than
     a second read of an agent-writable file (#461 point 4). ``None`` resolves
     fresh."""
+    if state.run_type == "sweep":
+        validate_sweep_options_version(state.sweep_options_version)
+    resolved_sweep_options = (
+        sweep_options
+        if sweep_options is not None
+        else (
+            load_sweep_resume_options(
+                run_dir,
+                required=state.sweep_options_version >= SWEEP_OPTIONS_VERSION,
+                expected_digest=(
+                    state.sweep_options_digest
+                    if state.sweep_options_version == SWEEP_OPTIONS_VERSION
+                    else None
+                ),
+            )
+            if state.run_type == "sweep"
+            else None
+        )
+    )
+    if state.run_type == "sweep":
+        assert resolved_sweep_options is not None
+        validate_sweep_options_binding(
+            state.sweep_options_version,
+            state.sweep_options_digest,
+            resolved_sweep_options,
+        )
     # drop any stale agent session so the run spins up a fresh one (a stopped or
     # interrupted run can leave a lingering bmad-loop-<id> session behind).
     runs.kill_session(run_dir.name)
     adapters = make_adapters(project, run_dir, policy, profiles=profiles)
     if state.run_type == "sweep":
-        opts_path = run_dir / "sweep.json"
-        try:
-            opts = json.loads(opts_path.read_text(encoding="utf-8")) if opts_path.is_file() else {}
-        except (OSError, json.JSONDecodeError):
-            # A torn/corrupt sweep.json (crash mid-write on an older run) must not
-            # abort the recovery path — fall back to the same launch defaults as
-            # the missing-file arm, mirroring tui.data's tolerant run-dir reads.
-            opts = {}
+        assert resolved_sweep_options is not None
+        opts = resolved_sweep_options.values
         engine: Engine = sweep_engine_cls(
             paths=paths,
             policy=policy,
@@ -1290,6 +1529,8 @@ def compose_resume(
             max_bundles=opts.get("max_bundles"),
             repeat=opts.get("repeat"),
             max_cycles=opts.get("max_cycles"),
+            only_ids=resolved_sweep_options.only_ids,
+            min_severity=resolved_sweep_options.min_severity,
         )
     else:
         story_common = dict(
@@ -1297,6 +1538,7 @@ def compose_resume(
             policy=policy,
             adapter=adapters["dev"],
             review_adapter=adapters["review"],
+            retro_adapter=adapters["retro"],
             run_dir=run_dir,
             journal=journal,
             state=state,

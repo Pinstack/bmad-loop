@@ -109,6 +109,8 @@ def _run_tool(
             timeout=timeout_ms / 1000.0 + _SUBPROC_MARGIN_SEC,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
     except subprocess.TimeoutExpired:
         return 1, f"run-tool {tool} timed out"

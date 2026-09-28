@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 
 import pytest
-from conftest import UNRESOLVABLE, fault_read_text, refuse_to_resolve
+from conftest import NUL_PATH_RESOLVE_FAULTS, UNRESOLVABLE, fault_read_text, refuse_to_resolve
 
 from bmad_loop import stories
 
@@ -670,6 +670,24 @@ def test_relativize_spec_folder_refuses_unresolvable_spec_folder(tmp_path, monke
     assert isinstance(excinfo.value.__cause__, OSError)
 
 
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+@pytest.mark.parametrize("refused_operand", ["project", "spec-folder"])
+def test_relativize_spec_folder_translates_value_error_family_from_either_resolve(
+    tmp_path, monkeypatch, resolve_fault, refused_operand
+):
+    project = tmp_path / "proj"
+    spec_folder = project / "specs" / "s1"
+    spec_folder.mkdir(parents=True)
+    refused = project if refused_operand == "project" else spec_folder
+    refuse_to_resolve(monkeypatch, refused, error=resolve_fault)
+
+    with pytest.raises(stories.StoriesError) as excinfo:
+        stories.relativize_spec_folder(project, str(spec_folder))
+
+    assert isinstance(excinfo.value.__cause__, type(resolve_fault))
+    assert excinfo.value.__cause__.args == resolve_fault.args
+
+
 def _symlinked_project_root(tmp_path: Path) -> Path:
     """A project root reached through a symlink, so its lexical and canonical
     spellings really are different strings.
@@ -677,8 +695,9 @@ def _symlinked_project_root(tmp_path: Path) -> Path:
     The two rows above cannot see a mixed-spelling message on their own: measured
     here, `tmp_path.resolve() == tmp_path`, so a raw operand and a dereferenced one
     are the same text and every spelling assertion passes either way.
-    Follows `test_bmadconfig.py`'s `worktree_isolation_conflict` symlink row,
-    including its skip for a Windows host without SeCreateSymbolicLink."""
+    Follows `test_bmadconfig.py`'s symlink row for `worktree_isolation_conflict`
+    (the disjoint-layout refusal's raw-equality fast path), including its skip for a
+    Windows host without SeCreateSymbolicLink."""
     target = tmp_path / "target"
     target.mkdir()
     root = tmp_path / "p"

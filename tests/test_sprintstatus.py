@@ -1,5 +1,5 @@
 import pytest
-from conftest import write_sprint
+from conftest import fault_metadata_probe, write_sprint
 
 from bmad_loop import sprintstatus
 
@@ -321,3 +321,200 @@ def test_missing_map_raises(project):
     project.sprint_status.write_text("project: x\n")
     with pytest.raises(sprintstatus.SprintStatusError, match="development_status"):
         sprintstatus.load(project.sprint_status)
+
+
+# ---------------------------------------------------------------- action_items (DW-388)
+
+_BOARD_WITH_ITEMS = """\
+development_status:
+  epic-1: done
+  1-1-user-auth: done
+  epic-1-retrospective: done
+  epic-1-retro-item-1-test-design: backlog
+
+action_items:
+  - id: "epic-1-retro-item-1-add-x"
+    epic: 1
+    action: "Add X to the checklist"
+    owner: "Amelia"
+    status: open
+    ref: "docs/retro-epic-1.md"
+  - epic: 1
+    action: "legacy item without an id"
+    owner: "Charlie"
+    status: open
+  - "not a mapping"
+  - id: "   "
+    action: "blank id"
+  - id: 7
+    action: "non-string id"
+  - id: "  epic-1-retro-item-2-done-thing  "
+    epic: "1"
+    action: 42
+    owner: ""
+    status: done
+    ref: ""
+  - id: epic-2-retro-item-1-bare
+  - id: epic-3-retro-item-1-superscript
+    epic: "²"
+  - id: epic-3-retro-item-2-bool
+    epic: true
+"""
+
+
+def test_load_action_items_reads_id_keyed_items_in_file_order(project):
+    """The happy path, plus every skip rule and normalization in one board.
+
+    Ablation: drop the `if item_id is None: continue` skip and the legacy row (and
+    the blank/non-string ids) appear, reddening the id list."""
+    project.sprint_status.write_text(_BOARD_WITH_ITEMS, encoding="utf-8")
+    items = sprintstatus.load_action_items(project.sprint_status)
+    assert items is not None
+    assert [i.id for i in items] == [
+        "epic-1-retro-item-1-add-x",
+        "epic-1-retro-item-2-done-thing",  # stripped
+        "epic-2-retro-item-1-bare",
+        "epic-3-retro-item-1-superscript",
+        "epic-3-retro-item-2-bool",
+    ]
+    first, done, bare, superscript, boolean = items
+    assert first == sprintstatus.ActionItem(
+        id="epic-1-retro-item-1-add-x",
+        epic=1,
+        action="Add X to the checklist",
+        owner="Amelia",
+        status="open",
+        ref="docs/retro-epic-1.md",
+    )
+    # a digit-string epic is read as a number; a non-string action is None, and a
+    # blank owner / ref is absent rather than an empty string
+    assert (done.epic, done.action, done.owner, done.status, done.ref) == (
+        1,
+        None,
+        None,
+        "done",
+        None,
+    )
+    # nothing but an id: everything optional absent, the status empty
+    assert (bare.epic, bare.action, bare.owner, bare.status, bare.ref) == (
+        None,
+        None,
+        None,
+        "",
+        None,
+    )
+    # "²" is a digit to `isdigit` but not a decimal `int()` accepts, and `true`
+    # is an `int` subclass that names no epic: neither may raise or become a number
+    assert superscript.epic is None
+    assert boolean.epic is None
+
+
+def test_load_action_items_absent_board_is_none(project):
+    """Absence is not a fault: no board means nothing to ingest.
+
+    Ablation: drop the `FileNotFoundError` arm and this raises
+    `SprintStatusError` instead of answering None."""
+    project.sprint_status.unlink(missing_ok=True)
+    assert sprintstatus.load_action_items(project.sprint_status) is None
+
+
+@pytest.mark.parametrize(
+    "board",
+    [
+        "development_status:\n  epic-1: backlog\n",
+        # no development_status either: the retro list is read independently of it
+        "project: x\n",
+        # an empty `action_items:` is what the retrospective's own writer treats as []
+        "development_status:\n  epic-1: backlog\naction_items:\n",
+        "action_items: []\n",
+    ],
+    ids=["no-key", "no-dev-status", "null-value", "empty-list"],
+)
+def test_load_action_items_without_items_is_empty(project, board):
+    project.sprint_status.write_text(board, encoding="utf-8")
+    assert sprintstatus.load_action_items(project.sprint_status) == ()
+
+
+@pytest.mark.parametrize(
+    "board",
+    ["action_items: {id: x}\n", "action_items: just text\n", "action_items: 3\n"],
+    ids=["mapping", "scalar", "number"],
+)
+def test_load_action_items_non_list_raises_malformed(project, board):
+    """Ablation: drop the `isinstance(listed, list)` check and the mapping row
+    iterates its keys (skipping them all) and returns `()` silently, the scalar
+    row iterates characters — none raise."""
+    project.sprint_status.write_text(board, encoding="utf-8")
+    with pytest.raises(sprintstatus.ActionItemsMalformed, match="not a list"):
+        sprintstatus.load_action_items(project.sprint_status)
+
+
+def test_action_items_malformed_is_a_sprint_status_error():
+    # one `except SprintStatusError` still catches every reader fault
+    assert issubclass(sprintstatus.ActionItemsMalformed, sprintstatus.SprintStatusError)
+
+
+@pytest.mark.parametrize(
+    ("raw", "match"),
+    [
+        (b"action_items: [unclosed", "not valid YAML"),
+        (b"- a\n- b\n", "no top-level mapping"),
+        (b"", "no top-level mapping"),
+        (b'action_items:\n  - id: "bad \xff byte"\n', "could not be read"),
+    ],
+    ids=["bad-yaml", "top-level-list", "empty-file", "undecodable"],
+)
+def test_load_action_items_unreadable_board_raises(project, raw, match):
+    """Every board-level fault is a typed `SprintStatusError` — including an
+    undecodable file, which `read_text` raises as `UnicodeDecodeError` (a
+    `ValueError`, not an `OSError`).
+
+    Ablation: drop `UnicodeDecodeError` from the read's except tuple and the
+    undecodable row escapes untyped."""
+    project.sprint_status.write_bytes(raw)
+    with pytest.raises(sprintstatus.SprintStatusError, match=match) as exc_info:
+        sprintstatus.load_action_items(project.sprint_status)
+    assert not isinstance(exc_info.value, sprintstatus.ActionItemsMalformed)
+
+
+def test_load_is_unaffected_by_action_items(project):
+    """`load()` stays byte-for-byte behaviourally identical: the retro list is
+    neither a key it classifies nor a shape it validates — a malformed one
+    included, which only `load_action_items` refuses."""
+    write_sprint(project, {"epic-1": "in-progress", "1-1-user-auth": "done"})
+    baseline = sprintstatus.load(project.sprint_status)
+    text = project.sprint_status.read_text(encoding="utf-8")
+    for tail in (_BOARD_WITH_ITEMS.split("\naction_items:", 1)[1], " not-a-list\n"):
+        project.sprint_status.write_text(text + "action_items:" + tail, encoding="utf-8")
+        ss = sprintstatus.load(project.sprint_status)
+        assert (ss.epics, ss.stories, ss.retros, ss.retro_items, ss.unknown_keys) == (
+            baseline.epics,
+            baseline.stories,
+            baseline.retros,
+            baseline.retro_items,
+            baseline.unknown_keys,
+        )
+
+
+def test_load_action_items_non_regular_board_raises(project):
+    """A board path that exists but is not a file is a fault, not absence.
+
+    Ablation: restore `return None` for the non-`S_ISREG` arm and this answers
+    None — indistinguishable from "no board"."""
+    project.sprint_status.unlink(missing_ok=True)
+    project.sprint_status.mkdir()
+    with pytest.raises(sprintstatus.SprintStatusError, match="not a regular file"):
+        sprintstatus.load_action_items(project.sprint_status)
+
+
+def test_load_action_items_metadata_fault_raises_typed(project, monkeypatch):
+    """A `stat` refusal is a `SprintStatusError` (not the malformed-list
+    subclass), never a bare OSError and never "no board".
+
+    Ablation: drop the `except OSError` arm around `stat()` and the
+    PermissionError escapes untyped."""
+    project.sprint_status.write_text("action_items: []\n", encoding="utf-8")
+    fault_metadata_probe(monkeypatch, project.sprint_status, "stat")
+    with pytest.raises(sprintstatus.SprintStatusError, match="could not be read") as exc_info:
+        sprintstatus.load_action_items(project.sprint_status)
+    assert not isinstance(exc_info.value, sprintstatus.ActionItemsMalformed)

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
 import sys
 import time
+from pathlib import Path, PureWindowsPath
 
 import pytest
 
@@ -357,23 +359,136 @@ def test_shell_quote_posix_uses_shlex():
     assert PosixProcessHost().shell_quote("/a b/c.py") == "'/a b/c.py'"
 
 
-def test_shell_quote_windows_uses_list2cmdline():
-    # Windows quoting double-quotes a path with spaces (subprocess.list2cmdline),
-    # never single-quoting — POSIX single-quotes would mangle a Windows command.
-    quoted = WindowsProcessHost().shell_quote(r"C:\a b\c.py")
-    assert quoted == '"C:\\a b\\c.py"'
+@pytest.mark.parametrize(
+    "path,quoted",
+    [
+        (r"C:\Users\me\.local\bin\bmad-loop.exe", "C:/Users/me/.local/bin/bmad-loop.exe"),
+        (r"C:\Program Files\x y\bmad-loop.exe", '"C:/Program Files/x y/bmad-loop.exe"'),
+    ],
+    ids=["no-spaces", "spaces"],
+)
+def test_shell_quote_windows_forward_slashes_then_list2cmdline(path, quoted):
+    # Hook runners run these under Git Bash, which eats unquoted backslashes
+    # (#773): separators become forward slashes, and a path with spaces is still
+    # double-quoted (subprocess.list2cmdline), never POSIX single-quoted.
+    assert WindowsProcessHost().shell_quote(path) == quoted
 
 
-def test_hook_interpreter_is_python3_on_posix(host):
-    # Hook registrations (install/probe) interpolate this prefix; POSIX keeps the
-    # historical `python3` byte-for-byte so existing configs stay valid.
-    assert PosixProcessHost().hook_interpreter() == "python3"
+_UNSAFE_MATRIX = [
+    ("C:/a&b/bmad-loop.exe", ("&",)),
+    ("C:/x%y^z/bmad-loop.exe", ("%", "^")),
+    ("C:/x%y%z/bmad-loop.exe", ("%",)),
+    ("C:/Program Files (x86)/a&b/bmad-loop.exe", ()),
+    ("C:/my $dir/bmad-loop.exe", ("$",)),
+    ("C:/50% off/bmad-loop.exe", ("%",)),
+    ("C:/Users/me/.venv/Scripts/bmad-loop.exe", ()),
+    (r"C:\a&b\bmad-loop.exe", ("&",)),
+    ("C:/a{b,c}/bmad-loop.exe", (",", "{", "}")),
+]
+_UNSAFE_IDS = [
+    "bare-amp",
+    "bare-sorted-several",
+    "bare-deduped",
+    "quoted-harmless",
+    "quoted-dollar",
+    "quoted-percent",
+    "clean",
+    "backslashes",
+    "brace-expansion",
+]
 
 
-def test_hook_interpreter_windows_resolves_without_project_venv():
-    # Windows has no `python3` launcher — `uv run` resolves an interpreter, and
-    # `--no-project` keeps it from activating a project venv for a detached hook.
-    assert WindowsProcessHost().hook_interpreter() == "uv run --no-project python"
+@pytest.mark.parametrize("path,chars", _UNSAFE_MATRIX, ids=_UNSAFE_IDS)
+def test_unsafe_shell_chars_windows(path, chars):
+    """DW-346: the Windows host scans its OWN quoted output — list2cmdline quotes
+    only on whitespace, so an unspaced path leaves every metacharacter bare, while
+    a quoted one leaves only the in-quote expanders live. Ablation: an override
+    returning `()` fails every non-empty row."""
+    assert WindowsProcessHost().unsafe_shell_chars(path) == chars
+
+
+@pytest.mark.parametrize("path", [p for p, _ in _UNSAFE_MATRIX] + ["/opt/a&b;c$`'/bmad-loop"])
+def test_unsafe_shell_chars_posix_never_flags(path):
+    # shlex.quote single-quotes every sh metacharacter; nothing expands inside.
+    assert PosixProcessHost().unsafe_shell_chars(path) == ()
+
+
+def test_hook_interpreter_is_absolute_on_posix(host):
+    import sys
+
+    assert PosixProcessHost().hook_interpreter() == PosixProcessHost().shell_quote(
+        str(Path(sys.executable).absolute())
+    )
+
+
+def test_hook_interpreter_windows_uses_absolute_path():
+    import sys
+
+    assert WindowsProcessHost().hook_interpreter() == WindowsProcessHost().shell_quote(
+        str(Path(sys.executable).absolute())
+    )
+
+
+def test_hook_interpreter_windows_uses_forward_slashes(monkeypatch):
+    class _Absolute:
+        def __init__(self, raw):
+            self._raw = raw
+
+        def absolute(self):
+            return PureWindowsPath(self._raw)
+
+    monkeypatch.setattr(process_host, "Path", _Absolute)
+    monkeypatch.setattr(process_host.sys, "executable", r"C:\Program Files\Py 3\python.exe")
+    assert WindowsProcessHost().hook_interpreter() == '"C:/Program Files/Py 3/python.exe"'
+    monkeypatch.setattr(process_host.sys, "executable", r"C:\Py\python.exe")
+    assert WindowsProcessHost().hook_interpreter() == "C:/Py/python.exe"
+
+
+def _git_bash() -> str | None:
+    """Git for Windows' bash — never System32's WSL launcher, which PATH may
+    list first."""
+    git = shutil.which("git")
+    if git:
+        bash = Path(git).resolve().parent.parent / "bin" / "bash.exe"
+        if bash.is_file():
+            return str(bash)
+    bash = shutil.which("bash")
+    return bash if bash and "system32" not in bash.lower() else None
+
+
+def _windows_relay_shaped_command() -> str:
+    # A real .exe at a backslash path standing where the relay executable goes.
+    if " " in sys.executable:
+        pytest.skip("paths with spaces are unsupported on the PowerShell fallback")
+    quoted = WindowsProcessHost().shell_quote(sys.executable)
+    return f'{quoted} -c "import sys; print(sys.argv[1:])" relay Stop'
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="executes a Windows hook command")
+def test_windows_hook_command_runs_under_git_bash():
+    bash = _git_bash()
+    if bash is None:
+        pytest.skip("Git Bash is not installed")
+    command = _windows_relay_shaped_command()
+    ran = subprocess.run([bash, "-c", command], capture_output=True, text=True, timeout=60)
+    assert ran.returncode == 0, ran.stderr
+    assert "['relay', 'Stop']" in ran.stdout
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="executes a Windows hook command")
+def test_windows_hook_command_runs_under_powershell():
+    shell = shutil.which("powershell") or shutil.which("pwsh")
+    if shell is None:
+        pytest.skip("PowerShell is not installed")
+    command = _windows_relay_shaped_command()
+    ran = subprocess.run(
+        [shell, "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert ran.returncode == 0, ran.stderr
+    assert "['relay', 'Stop']" in ran.stdout
 
 
 def test_hook_interpreter_routed_through_selected_host(monkeypatch):
@@ -381,4 +496,8 @@ def test_hook_interpreter_routed_through_selected_host(monkeypatch):
     # registered hook command with no `sys.platform` branch at the call site.
     monkeypatch.setenv("BMAD_LOOP_PROCESS_HOST", "windows")
     get_process_host.cache_clear()
-    assert get_process_host().hook_interpreter() == "uv run --no-project python"
+    import sys
+
+    assert get_process_host().hook_interpreter() == WindowsProcessHost().shell_quote(
+        str(Path(sys.executable).absolute())
+    )

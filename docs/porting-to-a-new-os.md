@@ -298,28 +298,29 @@ register_process_host("windows", lambda platform: platform == "win32", WindowsPr
   `None` where the platform can't provide one — callers then **refuse to
   force-kill** rather than risk an unrelated process that inherited the pid.
 - `hook_interpreter()` — seam 3, below.
+- `unsafe_shell_chars(path)` — the shell metacharacters `shell_quote()` leaves
+  exposed in `path`; `init` and `validate` warn on them (DW-346). The default
+  `()` suits hosts that always quote; override it alongside `shell_quote()`
+  when the host's quoting is conditional (Windows' list2cmdline quotes only on
+  whitespace).
 
 ---
 
 ## Seam 3 — hook interpreter
 
-`ProcessHost.hook_interpreter()` is the command prefix that `install` / `probe`
-interpolate into the hook registrations they write (the script path and canonical
-event are appended by the caller). It exists so hook registration never branches
-on `sys.platform` at the call site:
-
-- POSIX returns `"python3"` (the interpreter on PATH).
-- `WindowsProcessHost` returns `"uv run --no-project python"` — Windows ships no
-  `python3` launcher, and `--no-project` resolves an interpreter without activating
-  a project venv (hooks fire detached).
-
-A new OS overrides this on its `ProcessHost`; nothing else changes.
+`ProcessHost.hook_interpreter()` supplies an absolute, host-quoted
+`sys.executable` path for temporary Python hook scripts, such as the live probe
+capture hook. Both POSIX and Windows use that interpreter directly. `init` and
+worktree provisioning register the installed `bmad-loop relay <Event>` console
+script by absolute path instead of invoking a Python script in the workspace.
+A new OS overrides the quoting behavior on its `ProcessHost` as needed.
 
 ---
 
 ## Seam 4 — validate preflight
 
-`_platform_preflight(project)` (`src/bmad_loop/cli.py`, called from `cmd_validate`)
+`platform_preflight(project)` (`src/bmad_loop/runsetup.py`, imported into `cli.py` as
+`_platform_preflight` and called from `cmd_validate`)
 asks the selected multiplexer for its `available()` / `version()` and names the
 selected process host. A new OS therefore surfaces its readiness in `bmad-loop
 validate` **by registering** (seams 1–2) — not by adding a `win32` block to
@@ -466,7 +467,7 @@ Concretely, a native-Windows port is:
    its `register_multiplexer("psmux", …)`.
 2. `WindowsProcessHost` — **already shipped** — needs only its registration, which
    is **already present** in `_load_builtin_hosts`. Its `hook_interpreter()`
-   (`uv run --no-project python`) is in place too.
+   (an absolute, host-quoted interpreter path) is in place too.
 3. A CI runner on Windows to exercise the above.
 
 No edits to the adapters, `runs.py`, `tui/launch.py`, `probe.py`, `tui/data.py`,

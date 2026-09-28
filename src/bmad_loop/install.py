@@ -1,6 +1,6 @@
 """`bmad-loop init`: make a target project orchestratable.
 
-- copies the hook relay script to <project>/.bmad-loop/bmad_loop_hook.py
+- registers the installed bmad-loop relay console script by absolute path
 - idempotently merges hook registrations into each selected CLI's hook config
   (dialect + native->canonical event map come from the CLI profile)
 - installs the bundled bmad-loop-* skills into each selected CLI's skill tree
@@ -9,44 +9,42 @@
 - gitignores generated dirs: .bmad-loop/runs/ (per-run state) and
   .bmad-loop/cache/ (engine plugins' rebuildable caches, e.g. the Unity Library)
 
-Every dialect registers the same relay script under the CLI's native event
-names while passing the canonical event name as the script argument, so the
+Every dialect registers the same installed relay under the CLI's native event
+names while passing the canonical event name as an argument, so the
 orchestrator's signal watcher is CLI-agnostic.
 """
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import json
 import os
 import re
+import shlex
 import shutil
+import subprocess
+import sys
+import tempfile
 import tomllib
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack
 from importlib import resources
 from importlib.resources.abc import Traversable
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, NamedTuple
 
-from .adapters.profile import ALIASES, CLIProfile, ProfileError, load_profiles
+from . import childrun
+from .adapters.profile import ALIASES, CANONICAL_EVENTS, CLIProfile, ProfileError, load_profiles
 from .checks import Finding
 from .platform_util import atomic_write_bytes, atomic_write_text, file_lock
 from .policy import POLICY_TEMPLATE
-from .process_host import get_process_host
+from .process_host import ProcessHostError, get_process_host
 from .verify import GitError, git_below_floor, git_bytes, git_floor_text, git_version_at_least
 
-HOOK_SCRIPT_REL = ".bmad-loop/bmad_loop_hook.py"
-# Markers for bmad-loop-managed hook commands. RELAY_MARKER is shared by
-# merge_hooks' dedup and validate/probe detection (via relay_registered) so init
-# and the preflight can never disagree about whether the relay is installed. It
-# matches the relay script name specifically: a hook command whose path merely
-# contains "bmad_loop" can't read as a registration — or suppress one.
-RELAY_MARKER = "bmad_loop_hook"
 # The probe-adapter capture hook participates in merge_hooks' dedup only (a
 # probe re-merge must stay idempotent) and never counts as a relay
-# registration. Disjoint from RELAY_MARKER: "bmad_loop_probe_hook" does not
-# contain the substring "bmad_loop_hook".
+# registration. Probe capture has a separate command shape.
 PROBE_MARKER = "bmad_loop_probe_hook"
 GEMINI_HOOK_TIMEOUT_MS = 60_000
 COPILOT_HOOK_TIMEOUT_SEC = 60
@@ -664,6 +662,78 @@ def missing_stories_support(project: Path, trees: Sequence[str]) -> list[Finding
     return problems
 
 
+# The one bundled skill a triage session dispatches (`/bmad-loop-sweep`). Named
+# here so the triage-tree preflight (:func:`missing_sweep_skill`) and its callers
+# spell it once; it is also a MODULE_SKILLS member, which is how `init` lays it down.
+SWEEP_SKILL = "bmad-loop-sweep"
+# `init --force-skills` rmtree's and re-copies every MODULE_SKILLS dir (`_copy_skills`),
+# so the remediation says so rather than silently costing the operator local edits.
+_SWEEP_REMEDIATION = (
+    "run `bmad-loop init --force-skills` (it re-copies every bmad-loop-* skill in the "
+    "tree, overwriting local edits)"
+)
+
+
+def bundled_skill_files(skill: str) -> tuple[str, ...]:
+    """The POSIX rels of every file the wheel bundles under ``skills/<skill>/``.
+
+    Read from the installed package rather than restated as a literal, so a mode
+    file added to the bundled skill is required by the preflight the moment it
+    ships — a hand-kept list would silently stop checking it. Sorted and
+    deterministic (the walk itself sorts)."""
+    root = resources.files("bmad_loop.data").joinpath("skills").joinpath(skill)
+    return tuple(rel for rel, entry in _walk_traversable_files(root) if rel and _is_file(entry))
+
+
+def missing_sweep_skill(project: Path, trees: Sequence[str]) -> list[Finding]:
+    """Problems for the triage skill tree(s) a sweep dispatches ``/bmad-loop-sweep`` into.
+
+    Triage is deliberately outside :data:`DEV_PRIMITIVE_ROLES` (see that comment):
+    its whole prompt surface is :data:`SWEEP_SKILL`, which `bmad-loop init` lays
+    down. That exclusion left the skill itself unchecked, so a deleted or partial
+    copy stalled every triage session at ``Unknown command`` until timeout. For
+    every distinct ``trees`` entry — callers pass the triage profile's tree only —
+    confirm each file the wheel bundles for the skill (:func:`bundled_skill_files`)
+    exists, via the fault-total :func:`_is_file`. Existence only: content is the
+    operator's (a local edit to a mode file is theirs to make).
+
+    Two check ids, one per condition: ``skills.sweep-missing`` (no skill directory
+    at all) and ``skills.sweep-incomplete`` (present, but some bundled file absent —
+    ``missing_files`` carries exactly the absent rels, as a list). Both share the
+    single remediation, ``bmad-loop init --force-skills``. Empty list means OK."""
+    required = bundled_skill_files(SWEEP_SKILL)
+    problems: list[Finding] = []
+    for tree in dict.fromkeys(trees):
+        skill_dir = project / tree / SWEEP_SKILL
+        missing = [rel for rel in required if not _is_file(skill_dir.joinpath(*rel.split("/")))]
+        if not missing:
+            continue
+        detail: dict[str, object] = {"tree": tree, "skill": SWEEP_SKILL}
+        if not _is_dir(skill_dir):
+            problems.append(
+                Finding(
+                    "skills.sweep-missing",
+                    "problem",
+                    f"{tree}/{SWEEP_SKILL} not found — triage sessions would stall at an "
+                    f"unknown /{SWEEP_SKILL}; {_SWEEP_REMEDIATION}",
+                    detail,
+                )
+            )
+            continue
+        problems.append(
+            Finding(
+                "skills.sweep-incomplete",
+                "problem",
+                f"{tree}/{SWEEP_SKILL} is incomplete (missing {', '.join(missing)}: "
+                f"deleted or partial, or laid down by an older bmad-loop release) — "
+                f"triage sessions would stall at an unknown or broken /{SWEEP_SKILL}; "
+                f"{_SWEEP_REMEDIATION}",
+                {**detail, "missing_files": missing},
+            )
+        )
+    return problems
+
+
 def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
     """Problems for the upstream skills the orchestrator drives but doesn't bundle.
 
@@ -830,6 +900,293 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
             )
         )
     return problems
+
+
+RENDER_PROBE_CHECK = "skills.dev-render-probe"
+# Wall-clock budget for one render. The stub's launcher is typically
+# `uv run --no-cache`, which fetches the renderer's inline-script deps on every
+# probe (so the probe needs network access) before rendering.
+RENDER_PROBE_TIMEOUT_S = 120.0
+# The two placeholders a renderer stub's command names; the session substitutes
+# the absolute project root and skill dir for them before running it.
+RENDER_PROJECT_ROOT_PLACEHOLDER = "{project-root}"
+RENDER_SKILL_ROOT_PLACEHOLDER = "{skill-root}"
+# render_skill.py's stdout contract (`main()`): success prints the entry to follow
+# at rc 0; every handled failure prints one HALT line at rc 1.
+_RENDER_OK_PREFIX = "read and follow "
+_RENDER_HALT_PREFIX = "HALT: "
+_FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+
+
+def dev_renderer_probe(project: Path, trees: Sequence[str]) -> list[Finding]:
+    """Execute each renderer stub's own render command in a throwaway copy.
+
+    The ``skills.dev-renderer*`` checks in :func:`missing_base_skills` prove the
+    renderer's files exist; they cannot see a render that HALTs on a missing or
+    ambiguous config value, a bad ``customize.toml``, an import error or a launcher
+    that fails. Those surface in a run only as a result-less dev session. This probe
+    answers the session's first question — does the stub's render command succeed —
+    before a session is spent on it. One ``skills.dev-render-probe`` finding per
+    deduplicated tree whose dev primitive resolves to a renderer stub (``detail``
+    carries ``tree`` and ``skill``); when none does, a single ``ok`` saying there is
+    nothing to render (``detail["trees"]``).
+
+    Contract:
+
+    - The command is the first line inside a fenced code block of the stub's
+      SKILL.md that names ``render_skill.py``, split with :func:`shlex.split`
+      (posix). ``{project-root}`` / ``{skill-root}`` are replaced per argv element
+      with the temp project root / temp skill dir. No such line, a line that does
+      not split, or one missing either placeholder is a problem — never a
+      hand-built fallback argv, which would test a command no session runs. No
+      ``--set`` is appended: the engine's dev prompt names no route or review.
+    - The render runs in a :class:`tempfile.TemporaryDirectory` holding a copy of
+      ``<project>/_bmad/`` (minus its top-level ``render/``, per
+      :data:`BMAD_SEED_EXCLUDES`) and of ``<project>/<tree>/<skill>``, with that
+      temp dir as cwd. Render failures are path-independent, so the copy answers
+      the session's question while ``validate`` stays a non-writer: the project,
+      including ``_bmad/render/``, is never touched, and the temp dir is removed.
+    - rc 0 plus a stdout line starting ``read and follow `` is ``ok``; a stdout
+      ``HALT: `` line is a problem carrying the halt text (``detail["halt"]``);
+      anything else (e.g. a bare traceback) is a problem naming the rc and the last
+      stderr/stdout line. A launcher (argv[0]) absent from PATH, a spawn
+      ``OSError``, a timeout (:data:`RENDER_PROBE_TIMEOUT_S`) and a staging
+      ``OSError`` are each a problem.
+    - Every message and detail maps the temp root back to the project path.
+
+    Never raises: ``validate`` has no error path of its own, its rc is purely the
+    verdict (see :func:`bmad_loop.probe.binary_runs`).
+
+    Opt-in (``validate --render-probe``) because it executes project-controlled
+    content — the stub's argv and ``render_skill.py``, the same content a run
+    executes. Plain ``validate`` must stay non-executing for a fresh clone, as the
+    provenance note on the ``adapter.binary`` probe in ``cmd_validate`` records.
+    No coding CLI is launched and no prompt is sent.
+    """
+    unique = list(dict.fromkeys(trees))
+    findings: list[Finding] = []
+    for tree in unique:
+        resolved = resolve_dev_primitive(project, tree)
+        if resolved is None or not _is_renderer_stub(project / tree / resolved):
+            continue
+        findings.append(_probe_render(project, tree, resolved))
+    if not findings:
+        findings.append(
+            Finding(
+                RENDER_PROBE_CHECK,
+                "ok",
+                "no dev tree resolves a renderer stub — nothing to render",
+                {"trees": unique},
+            )
+        )
+    return findings
+
+
+def _render_command_line(skill_md: str) -> str | None:
+    """The first line inside a fenced code block that names the renderer script."""
+    fence: str | None = None
+    for line in skill_md.splitlines():
+        if fence is None:
+            opened = _FENCE_OPEN_RE.match(line)
+            if opened is not None:
+                fence = opened.group(1)
+            continue
+        stripped = line.strip()
+        if len(stripped) >= len(fence) and set(stripped) == {fence[0]}:
+            fence = None
+            continue
+        if RENDERER_SCRIPT_MARKER in line:
+            return stripped
+    return None
+
+
+def _render_path_unmapper(tmp_root: Path, project: Path) -> Callable[[str], str]:
+    """A ``str -> str`` that rewrites the temp root (every spelling) to the project."""
+    forms = {tmp_root}
+    try:
+        forms.add(tmp_root.resolve())
+    except (OSError, RuntimeError):
+        pass
+    pairs: dict[str, str] = {}
+    for form in forms:
+        pairs[str(form)] = str(project)
+        pairs[form.as_posix()] = project.as_posix()
+    ordered = sorted(pairs.items(), key=lambda pair: len(pair[0]), reverse=True)
+
+    def unmap(text: str) -> str:
+        for src, dst in ordered:
+            text = text.replace(src, dst)
+        return text
+
+    return unmap
+
+
+def _stage_render_copy(project: Path, skill_dir: Path, root: Path, tmp_skill: Path) -> None:
+    """Copy ``_bmad/`` (minus top-level ``render/``) and the skill dir under ``root``.
+
+    An absent ``_bmad/`` is not staged: the render then fails exactly as the
+    session's would, and the presence checks already name the missing files.
+    """
+    bmad_src = project / BMAD_DIR
+    if bmad_src.is_dir():
+        top = os.fspath(bmad_src)
+
+        def ignore(directory: str, names: list[str]) -> list[str]:
+            if directory != top:
+                return []
+            return [name for name in names if name in BMAD_SEED_EXCLUDES]
+
+        shutil.copytree(bmad_src, root / BMAD_DIR, symlinks=True, ignore=ignore)
+    tmp_skill.parent.mkdir(parents=True, exist_ok=True)
+    # dirs_exist_ok: a skill tree under `_bmad/` was already copied with it.
+    shutil.copytree(skill_dir, tmp_skill, symlinks=True, dirs_exist_ok=True)
+
+
+def _last_line(text: str) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return lines[-1] if lines else ""
+
+
+def _probe_render(project: Path, tree: str, skill: str) -> Finding:
+    """One tree's render verdict; see :func:`dev_renderer_probe` for the contract."""
+    rel = f"{tree}/{skill}"
+    detail: dict[str, Any] = {"tree": tree, "skill": skill}
+
+    def problem(message: str) -> Finding:
+        return _render_problem(detail, message)
+
+    skill_dir = project / tree / skill
+    unparsed = f"{rel}/SKILL.md: the render command could not be parsed"
+    try:
+        skill_md = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return problem(f"{unparsed} ({exc}); nothing was executed")
+    line = _render_command_line(skill_md)
+    if line is None:
+        return problem(
+            f"{unparsed} (no fenced code line names {RENDERER_SCRIPT_MARKER}); "
+            "nothing was executed"
+        )
+    detail["command"] = line
+    try:
+        template = shlex.split(line, posix=True)
+    except ValueError as exc:
+        return problem(f"{unparsed} ({exc}): {line}; nothing was executed")
+    absent = [
+        token
+        for token in (RENDER_PROJECT_ROOT_PLACEHOLDER, RENDER_SKILL_ROOT_PLACEHOLDER)
+        if not any(token in arg for arg in template)
+    ]
+    if absent:
+        return problem(
+            f"{unparsed} (it does not name {' or '.join(absent)}): {line}; nothing was executed"
+        )
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="bmad-loop-render-probe-", ignore_cleanup_errors=True
+        ) as tmp:
+            return _render_in(project, Path(tmp), template, detail)
+    except OSError as exc:
+        return problem(f"{rel}: could not create a throwaway render directory ({exc})")
+
+
+def _render_problem(detail: Mapping[str, Any], message: str, **extra: Any) -> Finding:
+    return Finding(RENDER_PROBE_CHECK, "problem", message, {**detail, **extra})
+
+
+def _render_in(
+    project: Path, root: Path, template: Sequence[str], detail: Mapping[str, Any]
+) -> Finding:
+    """Stage the copy under ``root``, run the substituted command there, classify it."""
+    tree, skill = str(detail["tree"]), str(detail["skill"])
+    rel = f"{tree}/{skill}"
+
+    def problem(message: str, **extra: Any) -> Finding:
+        return _render_problem(detail, message, **extra)
+
+    unmap = _render_path_unmapper(root, project)
+    tmp_skill = root / tree / skill
+    try:
+        _stage_render_copy(project, project / tree / skill, root, tmp_skill)
+    except OSError as exc:
+        return problem(f"{rel}: could not stage the throwaway render copy ({unmap(str(exc))})")
+    argv = [
+        arg.replace(RENDER_PROJECT_ROOT_PLACEHOLDER, str(root)).replace(
+            RENDER_SKILL_ROOT_PLACEHOLDER, str(tmp_skill)
+        )
+        for arg in template
+    ]
+    try:
+        launcher = shutil.which(argv[0])
+    except ValueError as exc:  # e.g. a NUL byte read from SKILL.md
+        return problem(f"{rel}: render launcher {unmap(argv[0])!r} is unusable ({exc})")
+    if launcher is None:
+        searched = os.environ.get("PATH", "")
+        shown = unmap(argv[0])
+        return problem(
+            f"{rel}: render launcher {shown!r} not found on PATH ({searched}) — a dev "
+            "session could not run the render command either",
+            launcher=shown,
+            path=searched,
+        )
+    try:
+        # Popen + tree kill, not subprocess.run(timeout=): run kills only the direct
+        # child, orphaning `uv run`'s renderer grandchild (POSIX) or blocking its
+        # post-kill drain on the pipes that grandchild still holds (Windows).
+        proc = subprocess.Popen(
+            [launcher, *argv[1:]],
+            cwd=root,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return problem(f"{rel}: render command could not be launched ({unmap(str(exc))})")
+    try:
+        raw_out, raw_err = proc.communicate(timeout=RENDER_PROBE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessHostError, OSError):
+            childrun.kill_tree(proc)
+        # Bounded drain: a straggler the tree kill could not reach may hold the pipes.
+        with contextlib.suppress(subprocess.TimeoutExpired, OSError, ValueError):
+            proc.communicate(timeout=childrun.DRAIN_S)
+        return problem(
+            f"{rel}: render command did not finish within {RENDER_PROBE_TIMEOUT_S:g}s",
+            timeout_s=RENDER_PROBE_TIMEOUT_S,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        with contextlib.suppress(ProcessHostError, OSError):
+            childrun.kill_tree(proc)
+        return problem(f"{rel}: render command output could not be read ({unmap(str(exc))})")
+    stdout = unmap(raw_out or "")
+    stderr = unmap(raw_err or "")
+    out_lines = stdout.splitlines()
+    halt = next((ln for ln in out_lines if ln.startswith(_RENDER_HALT_PREFIX)), None)
+    if halt is not None:
+        text = halt[len(_RENDER_HALT_PREFIX) :].strip()
+        return problem(
+            f"{rel}: render HALTs: {text} — a dev session would stop here without "
+            "writing a spec",
+            rc=proc.returncode,
+            halt=text,
+        )
+    entry = next((ln for ln in out_lines if ln.startswith(_RENDER_OK_PREFIX)), None)
+    if proc.returncode == 0 and entry is not None:
+        return Finding(
+            RENDER_PROBE_CHECK,
+            "ok",
+            f"{rel} renders cleanly (render command run in a throwaway copy; project untouched)",
+            {**detail, "rc": proc.returncode},
+        )
+    last = _last_line(stderr) or _last_line(stdout) or "(no output)"
+    return problem(
+        f"{rel}: render failed with rc {proc.returncode} and no HALT line (last output: "
+        f"{last}) — a dev session would stop without writing a spec",
+        rc=proc.returncode,
+        last_line=last,
+    )
 
 
 def dev_primitive_warnings(project: Path, trees: Sequence[str]) -> list[Finding]:
@@ -1016,52 +1373,175 @@ def _review_findings(project: Path, tree: str) -> list[Finding]:
     return findings
 
 
-def hook_script_current(project: Path) -> bool | None:
-    """Does the project's installed relay match the one this wheel would write?
-
-    ``True`` yes, ``False`` stale (or otherwise divergent), ``None`` unknowable —
-    the installed copy or the packaged source could not be read as text. The
-    unknown arm is a third state and not a coerced ``False`` on purpose: the sole
-    caller (``cmd_validate``'s ``hooks.relay-stale``) reports what it knows, and
-    "I could not look" is not "your relay is out of date".
-
-    Lives here, beside :func:`install_into`'s write of the same two paths, so the
-    reader and the writer of the relay stay in one module and one reviewer's view
-    — a comparison that resolved the source differently from the writer would
-    answer a different question.
-
-    Compared as TEXT read with universal newlines, not as raw bytes. That is
-    precisely the round trip ``install_into`` performs (``read_text`` then
-    ``write_text``), and ``write_text`` translates ``\\n`` to ``os.linesep`` — so
-    on Windows every freshly-installed relay differs from the packaged source
-    byte-for-byte while being exactly what ``init`` writes. A byte compare would
-    call those installs permanently stale.
-    """
-    try:
-        installed = (project / HOOK_SCRIPT_REL).read_text(encoding="utf-8")
-        packaged = (
-            resources.files("bmad_loop.data")
-            .joinpath("bmad_loop_hook.py")
-            .read_text(encoding="utf-8")
-        )
-    except (OSError, ValueError):
-        # ValueError covers UnicodeDecodeError (a relay overwritten with non-UTF-8
-        # bytes); OSError covers missing/unreadable on either side. Observation
-        # degrades — the missing and unreadable cases already have their own
-        # finding (`hooks.relay-present`), and a packaged source this process
-        # cannot read is a broken wheel, not a stale project.
-        return None
-    return installed == packaged
+def _relay_executable() -> Path:
+    """This installation's console entry point, independent of PATH: the invoked
+    launcher when it is the ``bmad-loop`` script itself, else the sibling of the
+    running interpreter. Raises ``ProfileError`` when it is not a readable,
+    executable file."""
+    name = "bmad-loop.exe" if os.name == "nt" else "bmad-loop"
+    invoked = Path(sys.argv[0]).absolute()
+    executable = invoked if invoked.name == name else Path(sys.executable).absolute().parent / name
+    if not executable.is_file() or not os.access(executable, os.R_OK | os.X_OK):
+        raise ProfileError(f"installed bmad-loop command is unavailable: {executable}")
+    return executable
 
 
 def _hook_command(project: Path, profile: CLIProfile, canonical_event: str) -> str:
-    host = get_process_host()
-    interp = host.hook_interpreter()
-    if profile.hooks.dialect == "claude-settings-json":
-        return f'{interp} "$CLAUDE_PROJECT_DIR"/{HOOK_SCRIPT_REL} {canonical_event}'
-    # Codex/Gemini expose no $CLAUDE_PROJECT_DIR equivalent to hook commands;
-    # bake the absolute path at init time.
-    return f"{interp} {host.shell_quote(str(project / HOOK_SCRIPT_REL))} {canonical_event}"
+    """Command for this installation's console entry point, independent of PATH."""
+    del project, profile
+    return f"{get_process_host().shell_quote(str(_relay_executable()))} relay {canonical_event}"
+
+
+def _warn_unsafe_relay_path() -> None:
+    """DW-346: print one advisory line when the relay executable ``init`` just
+    registered carries shell metacharacters this host's hook quoting leaves
+    exposed. Warn only — the registered command is unchanged and ``init`` still
+    succeeds; ``validate`` repeats the check as ``hooks.relay-path-unsafe``."""
+    try:
+        executable = str(_relay_executable())
+    except ProfileError:
+        return  # registration would already have failed on this; nothing to add
+    chars = get_process_host().unsafe_shell_chars(executable)
+    if chars:
+        print(
+            f"  warning: installed relay path {executable} contains shell "
+            f"metacharacter(s) {' '.join(chars)} this host's hook quoting leaves "
+            f"unsafe — hook runs may fail; reinstall bmad-loop under a path without them"
+        )
+
+
+def relay_executable(command: str) -> Path | None:
+    """Return the executable in an absolute POSIX or Windows relay command.
+
+    A foreign path remains unusable on this host, but must still be recognized
+    as managed so init and worktree provisioning replace its stale hook.
+    """
+    text = relay_executable_text(command)
+    return Path(text) if text is not None else None
+
+
+def relay_executable_text(command: str) -> str | None:
+    """Return a relay command's executable exactly as registered.
+
+    `Path` normalizes the spelling (on Windows it treats `\\` and `/` alike), so
+    callers asking "would init write something different" compare this text.
+    """
+    parts = _installed_relay_parts(command)
+    return parts[0] if parts is not None else None
+
+
+# Canonical events an installed `bmad-loop relay <kind>` command may report — a
+# command naming one of these is managed (deduped, stripped, replaced by init).
+# Every canonical event, so the parked kinds (DW-348) a profile may map a native
+# event straight to stay managed too; claude reaches them through `Notification`.
+_RELAY_CANONICAL_EVENTS = frozenset(CANONICAL_EVENTS)
+
+
+def _installed_relay_parts(command: str) -> tuple[str, str] | None:
+    """`(executable text, canonical event)` of an installed console relay command."""
+    for posix in (os.name != "nt", os.name == "nt"):
+        try:
+            parts = shlex.split(command, posix=posix)
+        except ValueError:
+            continue
+        if len(parts) != 3 or parts[1] != "relay" or parts[2] not in _RELAY_CANONICAL_EVENTS:
+            continue
+        raw = parts[0].strip('"')
+        for flavor in (PurePosixPath, PureWindowsPath):
+            executable = flavor(raw)
+            if executable.name in {"bmad-loop", "bmad-loop.exe"} and executable.is_absolute():
+                return raw, parts[2]
+    return None
+
+
+def _legacy_relay_script(command: str) -> str | None:
+    """Recognize only the Python command that old init actually registered."""
+    parts = _legacy_relay_parts(command)
+    return parts[0] if parts is not None else None
+
+
+def _legacy_relay_parts(command: str) -> tuple[str, str, str] | None:
+    """`(script, canonical event, interpreter token)` of an old copied-script relay.
+
+    The interpreter is the command's FIRST token only (`python3`, `uv`, or an
+    absolute path to either): `uv run --no-project python` resolves its `python`
+    itself, so the word after it is not a PATH lookup this command makes.
+    """
+    for posix in (True, False):
+        try:
+            parts = shlex.split(command, posix=posix)
+        except ValueError:
+            continue
+        if len(parts) < 3 or not parts[-1].isidentifier():
+            continue
+        script = parts[-2].strip('"')
+        prefix = parts[:-2]
+        # Non-POSIX shlex splits the historical Claude variable from its suffix.
+        if script.startswith("/.bmad-loop/") and prefix[-1:] == ['"$CLAUDE_PROJECT_DIR"']:
+            script = "$CLAUDE_PROJECT_DIR" + script
+            prefix = prefix[:-1]
+        if not prefix:
+            continue
+        normalized = script.replace("\\", "/")
+        if PurePosixPath(normalized).parts[-2:] != (".bmad-loop", "bmad_loop_hook.py"):
+            continue
+        token = prefix[0].strip('"')
+        interpreter = PurePosixPath(token.replace("\\", "/")).name.lower()
+        if interpreter.startswith("python") and len(prefix) == 1:
+            return script, parts[-1], token
+        if interpreter in {"uv", "uv.exe"} and prefix[1:] == ["run", "--no-project", "python"]:
+            return script, parts[-1], token
+    return None
+
+
+def _relay_canonical_event(command: str) -> str | None:
+    """The canonical event a managed relay command reports, or None if unmanaged."""
+    installed = _installed_relay_parts(command)
+    if installed is not None:
+        return installed[1]
+    legacy = _legacy_relay_parts(command)
+    return legacy[1] if legacy is not None else None
+
+
+def _relay_command(command: object) -> bool:
+    return isinstance(command, str) and (
+        relay_executable(command) is not None or _legacy_relay_script(command) is not None
+    )
+
+
+def _commands_in_handler(handler: object) -> Iterator[str]:
+    if not isinstance(handler, dict):
+        return
+    nested = handler.get("hooks")
+    if isinstance(nested, list):
+        for item in nested:
+            if isinstance(item, dict) and isinstance(item.get("command"), str):
+                yield item["command"]
+    elif isinstance(handler.get("command"), str):
+        yield handler["command"]
+
+
+def _executed_commands_in_handler(handler: object) -> Iterator[str]:
+    """Like `_commands_in_handler`, but only commands a CLI actually runs.
+
+    A `type: prompt` (or any non-`command`) handler carrying a relay `command`
+    never executes it, so it must not count as a registration. Nested
+    (claude/codex/gemini) and flat (copilot/agy) shapes alike. Stripping keeps the
+    any-shape `_commands_in_handler`: a managed command is removed wherever it sits.
+    """
+    if not isinstance(handler, dict):
+        return
+    nested = handler.get("hooks")
+    if isinstance(nested, list):
+        for item in nested:
+            if (
+                isinstance(item, dict)
+                and item.get("type") == "command"
+                and isinstance(item.get("command"), str)
+            ):
+                yield item["command"]
+    elif handler.get("type") == "command" and isinstance(handler.get("command"), str):
+        yield handler["command"]
 
 
 def _hook_entry(dialect: str, command: str) -> dict:
@@ -1098,43 +1578,57 @@ def hook_event_container(config: dict, dialect: str) -> dict:
 
 
 def _relay_in_handlers(handlers) -> bool:
-    """True if any handler in a native-event list carries the relay command."""
-    return RELAY_MARKER in json.dumps(handlers)
+    """True if any handler in a native-event list executes the relay command."""
+    return isinstance(handlers, list) and any(
+        _relay_command(command)
+        for handler in handlers
+        for command in _executed_commands_in_handler(handler)
+    )
 
 
 def _managed_hook_in_handlers(handlers) -> bool:
     """merge_hooks' dedup: a relay OR probe-capture command is already present."""
-    dumped = json.dumps(handlers)
-    return RELAY_MARKER in dumped or PROBE_MARKER in dumped
+    return _relay_in_handlers(handlers) or PROBE_MARKER in json.dumps(handlers)
 
 
 def strip_relay_hooks(config: dict, dialect: str) -> bool:
     """Drop every relay registration from a parsed hook config. True if any went.
 
-    The inverse of :func:`merge_hooks`, for the one caller that needs its own
-    registration to be authoritative rather than additive: a worktree seeded with
-    the main repo's hook config (``provision_worktree``). That config already
-    carries a relay command written for the main repo — `$CLAUDE_PROJECT_DIR`-relative
-    for the claude dialect, which resolves inside the worktree, where no relay
-    exists. `merge_hooks` will not replace it, since `_managed_hook_in_handlers`
-    reports the event as already registered, so the stale command has to go first.
+    Worktree provisioning uses this on its first encounter with a config file.
+    It removes both legacy copied-script commands and installed relay commands
+    while preserving user handlers and temporary probe handlers.
 
-    Only RELAY_MARKER commands are removed, at command granularity: a matcher
+    Only managed relay commands are removed, at command granularity: a matcher
     entry whose nested list holds a project command beside the relay keeps the
     entry and loses only the relay command. A probe-capture hook is a deliberate,
     temporary registration that no worktree seeding produces, and is left alone.
     Empty event lists are dropped; an empty container is left in place for
     `merge_hooks` to refill.
     """
-    container = hook_event_container(config, dialect)
+    return _strip_commands(hook_event_container(config, dialect), _relay_command)
+
+
+def _strip_commands(
+    container: dict,
+    predicate: Callable[[object], bool],
+    native_events: Iterable[str] | None = None,
+) -> bool:
+    """Drop every command `predicate` selects from a `native event -> handlers` map.
+
+    `native_events` limits the visit (default: every event in `container`). A
+    non-list event value is not ours and is skipped. Removal is at command
+    granularity for nested entries and whole-entry for flat ones; empty event lists
+    are dropped. True if anything went. The predicate alone decides what is
+    stripped, in both shapes.
+    """
     removed = False
-    for native_event in list(container):
+    for native_event in list(container if native_events is None else native_events):
         handlers = container.get(native_event)
         if not isinstance(handlers, list):
             continue
         kept = []
         for handler in handlers:
-            if RELAY_MARKER not in json.dumps(handler):
+            if not any(predicate(c) for c in _commands_in_handler(handler)):
                 kept.append(handler)
                 continue
             # claude/codex/gemini wrap commands in a nested "hooks" list, and a
@@ -1144,7 +1638,9 @@ def strip_relay_hooks(config: dict, dialect: str) -> bool:
             # match means the entry IS the relay and it drops whole.
             nested = handler.get("hooks") if isinstance(handler, dict) else None
             if isinstance(nested, list):
-                surviving = [c for c in nested if RELAY_MARKER not in json.dumps(c)]
+                surviving = [
+                    c for c in nested if not (isinstance(c, dict) and predicate(c.get("command")))
+                ]
                 if surviving:
                     if len(surviving) != len(nested):
                         handler["hooks"] = surviving
@@ -1160,10 +1656,173 @@ def strip_relay_hooks(config: dict, dialect: str) -> bool:
     return removed
 
 
-def relay_registered(config: dict, dialect: str, events: Iterable[str]) -> bool:
-    """True if the bmad-loop relay is registered for any of `events`."""
+def _strip_hazardous_unmapped_relays(container: dict, registrations: Mapping[str, str]) -> bool:
+    """Strip managed relays under natives outside `registrations` that would lie.
+
+    A relay under an unregistered native event is hazardous when the canonical
+    event it reports is `Stop` (it would complete sessions early) or one the
+    registrations report from a different native event (the two disagree). For
+    every profile that maps Stop (all that can complete) this is the same set
+    `relay_registered` refuses. Any other relay there is left alone: it
+    may belong to an alias profile sharing this config file (DW-409).
+
+    `Stop` joins the set only through a registration reporting it, which every
+    profile that can complete has. A Stop-less registration set (an alias mapping
+    only `Notification`, or probe-capture commands, which parse to None) must not
+    strip another alias's `Stop` relay from the native it legitimately sits under.
+    `relay_registered` needs no such guard: it refuses a Stop-less map outright.
+    """
+    hazardous = {
+        canonical
+        for command in registrations.values()
+        if (canonical := _relay_canonical_event(command)) is not None
+    }
+
+    def hazardous_relay(command: object) -> bool:
+        return isinstance(command, str) and _relay_canonical_event(command) in hazardous
+
+    unmapped = [native for native in container if native not in registrations]
+    return _strip_commands(container, hazardous_relay, unmapped)
+
+
+def relay_registered(config: dict, dialect: str, events: Mapping[str, str]) -> bool:
+    """True if the relay is truthfully registered for a profile's `events`.
+
+    `events` maps each native event to the canonical event it reports. Only
+    executed (`type: command`) handlers count. Registered means every native event
+    mapped to Stop — the completion signal — runs a relay reporting `Stop`, and no
+    mapped native event runs a relay reporting a DIFFERENT canonical event: a
+    SessionStart firing `relay Stop` would complete every session at launch, and a
+    Stop firing `relay SessionEnd` never completes one. Other events need not be
+    present.
+
+    The same hazard reaches native events OUTSIDE `events` (DW-409): a claude
+    `SubagentStop` firing `relay Stop` completes a session when a subagent ends. So
+    a relay under an unmapped native that reports `Stop`, or a canonical event the
+    map reports from a different native, is refused too. A relay there reporting a
+    canonical event the map never names is accepted: profiles can share a config
+    file, and it may be an alias profile's registration. For agy the same refusal
+    covers every other top-level group, since agy runs them all (DW-490,
+    `foreign_group_relay_hazards`).
+    """
     container = hook_event_container(config, dialect)
-    return any(_relay_in_handlers(container.get(event, [])) for event in events)
+    stop_natives = [native for native, canonical in events.items() if canonical == "Stop"]
+    if not stop_natives:
+        return False
+    satisfied: set[str] = set()
+    for native, canonical in events.items():
+        handlers = container.get(native)
+        if not isinstance(handlers, list):
+            continue
+        for handler in handlers:
+            for command in _executed_commands_in_handler(handler):
+                reported = _relay_canonical_event(command)
+                if reported is None:
+                    continue
+                if reported != canonical:
+                    return False
+                satisfied.add(native)
+    hazardous = {"Stop", *events.values()}
+    for native, handlers in container.items():
+        if native in events or not isinstance(handlers, list):
+            continue
+        for handler in handlers:
+            for command in _executed_commands_in_handler(handler):
+                if _relay_canonical_event(command) in hazardous:
+                    return False
+    if foreign_group_relay_hazards(config, dialect, events):
+        return False
+    return all(native in satisfied for native in stop_natives)
+
+
+def foreign_group_relay_hazards(
+    config: dict, dialect: str, events: Mapping[str, str]
+) -> list[tuple[str, str]]:
+    """`(group, native)` for each agy top-level group other than ours that lies.
+
+    agy runs the hooks of EVERY top-level group, not only ANTIGRAVITY_HOOK_GROUP,
+    so a relay hand-added to a user group fires as surely as ours (DW-490). A
+    group's native event lies under the same rules `relay_registered` applies to
+    the managed group: a mapped native whose executed relay reports a different
+    canonical event, or an unmapped one whose relay reports `Stop` or a canonical
+    event the map reports elsewhere. A truthful relay there is accepted but never
+    satisfies registration. Other dialects have one container: always [].
+
+    These groups are the operator's, so this only reports: `merge_hooks` never
+    writes outside the managed group, and `init` warns instead of repairing.
+    """
+    if dialect != "antigravity-hooks-json":
+        return []
+    unmapped_hazardous = {"Stop", *events.values()}
+    found: list[tuple[str, str]] = []
+    for group, container in config.items():
+        if group == ANTIGRAVITY_HOOK_GROUP or not isinstance(container, dict):
+            continue
+        for native, handlers in container.items():
+            if not isinstance(handlers, list):
+                continue
+            expected = events.get(native)
+            for command in (c for h in handlers for c in _executed_commands_in_handler(h)):
+                reported = _relay_canonical_event(command)
+                if reported is None:
+                    continue
+                lies = (
+                    (reported != expected) if native in events else (reported in unmapped_hazardous)
+                )
+                if lies:
+                    found.append((group, native))
+                    break
+    return found
+
+
+def registered_relay_paths(
+    config: dict, dialect: str, events: Iterable[str], project: Path
+) -> list[tuple[Path, str]]:
+    """Paths invoked by the actual managed commands in a hook config.
+
+    Each path is paired with its registered spelling: the console relay's
+    executable text as written in the command, or the legacy script path with
+    the project directory substituted. The `Path` answers presence questions;
+    the spelling answers whether init would now write something different.
+    Only executed (`type: command`) handlers are read — nothing else runs.
+    """
+    container = hook_event_container(config, dialect)
+    paths: list[tuple[Path, str]] = []
+    for event in events:
+        handlers = container.get(event)
+        if not isinstance(handlers, list):
+            continue
+        for handler in handlers:
+            for command in _executed_commands_in_handler(handler):
+                executable = relay_executable_text(command)
+                if executable is not None:
+                    paths.append((Path(executable), executable))
+                else:
+                    script = _legacy_relay_script(command)
+                    if script is not None:
+                        path = Path(script.replace("$CLAUDE_PROJECT_DIR", str(project)))
+                        paths.append((path, str(path)))
+    return paths
+
+
+def registered_relay_interpreters(config: dict, dialect: str, events: Iterable[str]) -> list[str]:
+    """Interpreter tokens (`python3`, `uv`, ...) that legacy relay commands name.
+
+    Only the command's first token, as registered, from executed handlers: an old
+    copied-script relay whose interpreter cannot be found fails every hook run.
+    """
+    container = hook_event_container(config, dialect)
+    interpreters: list[str] = []
+    for event in events:
+        handlers = container.get(event)
+        if not isinstance(handlers, list):
+            continue
+        for handler in handlers:
+            for command in _executed_commands_in_handler(handler):
+                legacy = _legacy_relay_parts(command)
+                if legacy is not None:
+                    interpreters.append(legacy[2])
+    return interpreters
 
 
 def merge_hooks(config: dict, registrations: dict[str, str], dialect: str) -> tuple[dict, bool]:
@@ -1186,21 +1845,55 @@ def merge_hooks(config: dict, registrations: dict[str, str], dialect: str) -> tu
                     f"hook event {native_event!r} under {ANTIGRAVITY_HOOK_GROUP!r} "
                     "is not a list; fix the hooks file before re-running init"
                 )
+            if any(
+                _relay_command(existing) and command != existing
+                for h in handlers
+                for existing in _commands_in_handler(h)
+            ):
+                scoped = {ANTIGRAVITY_HOOK_GROUP: {native_event: handlers}}
+                changed |= strip_relay_hooks(scoped, dialect)
+                if native_event in scoped[ANTIGRAVITY_HOOK_GROUP]:
+                    group[native_event] = scoped[ANTIGRAVITY_HOOK_GROUP][native_event]
+                else:
+                    del group[native_event]
+                handlers = group.setdefault(native_event, [])
             if not _managed_hook_in_handlers(handlers):
                 handlers.append(_hook_entry(dialect, command))
                 changed = True
+        changed |= _strip_hazardous_unmapped_relays(group, registrations)
         return config, changed
     if dialect == "copilot-settings-json":
         config.setdefault("version", 1)  # Copilot hook configs are versioned
     hooks = config.setdefault("hooks", {})
     for native_event, command in registrations.items():
         matchers = hooks.setdefault(native_event, [])
+        if any(
+            _relay_command(existing) and command != existing
+            for h in matchers
+            for existing in _commands_in_handler(h)
+        ):
+            # Scope the strip to this event. Profiles may share a config file;
+            # their disjoint events must survive later registrations. (The
+            # unmapped-event strip below is scoped the same way: it removes only
+            # relays reporting Stop or a canonical event registered here from
+            # another native. A Stop relay under an unmapped native completes
+            # this profile's sessions early. Aliases whose maps put one canonical
+            # event on different natives are contradictory for one CLI, so the
+            # last merge wins: an accepted tradeoff — DW-409.)
+            scoped = {"hooks": {native_event: matchers}}
+            changed |= strip_relay_hooks(scoped, dialect)
+            if native_event in scoped["hooks"]:
+                hooks[native_event] = scoped["hooks"][native_event]
+            else:
+                del hooks[native_event]
+            matchers = hooks.setdefault(native_event, [])
         # claude/codex/gemini nest handlers under "hooks"; copilot stores the
         # handler dict directly in the event list — the serialized scan covers
         # both shapes so a re-run stays idempotent for every dialect.
         if not _managed_hook_in_handlers(matchers):
             matchers.append(_hook_entry(dialect, command))
             changed = True
+    changed |= _strip_hazardous_unmapped_relays(hooks, registrations)
     return config, changed
 
 
@@ -1246,10 +1939,14 @@ def _register_hooks(project: Path, profile: CLIProfile) -> int:
         except json.JSONDecodeError:
             print(f"FAIL: {config_path} is not valid JSON; fix it and re-run init")
             return 1
-    registrations = {
-        native: _hook_command(project, profile, canonical)
-        for native, canonical in profile.hooks.events.items()
-    }
+    try:
+        registrations = {
+            native: _hook_command(project, profile, canonical)
+            for native, canonical in profile.hooks.events.items()
+        }
+    except ProfileError as e:
+        print(f"FAIL: {e}")
+        return 1
     config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
     if changed:
         # atomic_write_text, never write_text (#379), the same rule
@@ -1283,6 +1980,15 @@ def _register_hooks(project: Path, profile: CLIProfile) -> int:
         print(f"  hooks registered ({profile.name}): {config_path}")
     else:
         print(f"  hooks already registered ({profile.name})")
+    # DW-490: a lying relay in a group init does not own stays; say where it is.
+    for group, native in foreign_group_relay_hazards(
+        config, profile.hooks.dialect, profile.hooks.events
+    ):
+        print(
+            f"  warning: {config_path} group {group!r} runs a bmad-loop relay under "
+            f"{native!r} that reports the wrong event — init leaves groups it does not "
+            f"own alone; remove that relay by hand"
+        )
     return 0
 
 
@@ -1314,7 +2020,7 @@ def _walk_traversable_files(
     if _is_dir(src):
         try:
             real = str(src.resolve()) if isinstance(src, Path) else None
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             if not _suppress_errors:
                 raise
             yield rel, src
@@ -1425,9 +2131,9 @@ def _copy_traversable(
     """Recursively copy a Traversable tree, optionally confined to a worktree.
 
     ``skip_existing`` remains the install helper's opt-in per-file no-clobber mode.
-    Supplying ``worktree`` makes no-clobber mandatory and adds destination
-    containment plus per-entry OSError degradation: provisioning never escapes the
-    worktree through a link or crashes the run because one entry cannot be read.
+    Supplying ``worktree`` makes no-clobber mandatory, confines destinations,
+    preserves the existing per-entry ``OSError`` handling for filesystem operations,
+    and degrades resolve-time invalid paths at containment observers.
     ``repo_root`` additionally refuses real source entries resolving outside the main
     checkout. Wheel Traversables have no source containment leg.
 
@@ -1455,7 +2161,7 @@ def _copy_traversable(
             return True
         try:
             return entry.resolve().is_relative_to(repo_root)
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             return False
 
     def target_for(rel: str) -> Path:
@@ -1466,7 +2172,7 @@ def _copy_traversable(
             return True
         try:
             return target.resolve().is_relative_to(worktree)
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             return False
 
     def should_descend(rel: str, entry) -> bool:
@@ -2850,18 +3556,30 @@ def install_into(
         return 1
 
     bmad_loop_dir = project / ".bmad-loop"
+    policy_path = bmad_loop_dir / "policy.toml"
+    gitignore = project / ".gitignore"
+    # 0. confinement, before the FIRST write (#771). `_register_hooks` and
+    # `_copy_skills` guard their own destinations, but these three were written
+    # through whatever link sat at the name — a `.bmad-loop` or `.gitignore`
+    # symlink (a junction on Windows) out of the tree, or a dangling `policy.toml`
+    # link that fails `is_file()` below and is then written through. Checked up
+    # front, not at each write, so a refusal leaves no hook config or skills behind
+    # either. Strictly-below is right for all three: none may BE the project root —
+    # a `.bmad-loop` resolving to the root would drop policy.toml at top level, and
+    # the other two are files, which the root never is. An in-project link still
+    # passes and is written through, as before.
+    for target in (bmad_loop_dir, policy_path, gitignore):
+        if not _confined_to(target, project):
+            print(f"FAIL: init target escapes the project: {target}")
+            return 1
     bmad_loop_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. hook relay script (shared by all CLIs)
-    script_target = project / HOOK_SCRIPT_REL
-    script_source = resources.files("bmad_loop.data").joinpath("bmad_loop_hook.py")
-    script_target.write_text(script_source.read_text(encoding="utf-8"), encoding="utf-8")
-    print(f"  hook script: {script_target}")
-
-    # 2. per-CLI hook registration
+    # 1. per-CLI hook registration
     for profile in profiles:
         if _register_hooks(project, profile) != 0:
             return 1
+    if any(not profile.hookless for profile in profiles):
+        _warn_unsafe_relay_path()
 
     # 3. bundled skills into each CLI's skill tree (deduped: codex+gemini share
     #    .agents/skills)
@@ -2875,10 +3593,15 @@ def install_into(
             return 1
 
     # 4. policy template
-    policy_path = bmad_loop_dir / "policy.toml"
     if policy_path.is_file():
         print("  policy exists, leaving untouched")
     else:
+        # write_text, not atomic_write_text: #379 is about a truncating REWRITE of
+        # contents someone owns, and this branch only runs when no regular file is
+        # there — a short write loses nothing but our own template, and the torn
+        # TOML fails loudly at the next policy load. atomic_write_text would also
+        # mint the new file mkstemp's 0600 instead of the umask default, a mode
+        # change nothing asked for.
         policy_path.write_text(POLICY_TEMPLATE, encoding="utf-8")
         print(f"  policy written: {policy_path}")
 
@@ -2887,7 +3610,6 @@ def install_into(
     # Library (.bmad-loop/cache/), and the policy file itself — policy.toml is
     # per-machine-per-repo (it carries this machine's [mux] backend choice, and
     # the TUI settings editor rewrites it), so it must never travel to teammates.
-    gitignore = project / ".gitignore"
     existing = gitignore.read_text(encoding="utf-8") if gitignore.is_file() else ""
     have = set(existing.splitlines())
     to_add = [
@@ -2901,7 +3623,9 @@ def install_into(
         if line not in have
     ]
     if to_add:
-        with gitignore.open("a", encoding="utf-8") as f:
+        # An append, never a replace: it keeps the operator's file mode and an
+        # in-project link a link. Opened by its resolved name, the one step 0 confined.
+        with gitignore.resolve().open("a", encoding="utf-8") as f:
             if existing and not existing.endswith("\n"):
                 f.write("\n")
             f.write("\n".join(to_add) + "\n")

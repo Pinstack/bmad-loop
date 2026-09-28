@@ -27,18 +27,46 @@ runs on the *repair* path and does the opposite — when it can see a status it
 cannot safely rewrite, it RAISES `FrontmatterWriteError`. That is AGENTS.md's
 "observation may degrade, repair writes must raise", and it is what makes a
 ``False`` return mean one thing only: there was nothing to change.
+
+TWO status writers share that edit, and they differ only in how they reach the
+file. `set_frontmatter_status` is PATH-BASED: ``read_bytes`` in, a confined (or,
+outside the project, plain no-follow) atomic write out, each step naming the path
+again. `set_frontmatter_status_anchored` is DESCRIPTOR-ANCHORED (DW-319/DW-323):
+it reaches the parent once, reads the target through that handle, and binds one
+`FileIdentity` from the read through staging, publication and acceptance, raising
+`FrontmatterTargetChangedError` rather than writing over a target that changed
+underneath it. Recovery's attempt-owned spec normalization uses the second; every
+other caller keeps the first.
 """
 
 from __future__ import annotations
 
+import errno
+import os
 import re
+import stat
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from .platform_util import atomic_write_bytes, atomic_write_bytes_confined
+from .platform_util import (
+    AT_NOFOLLOW,
+    AT_NONBLOCK,
+    HANDLE_ANCHORED_WRITES,
+    UnconfinedWriteError,
+    atomic_write_bytes,
+    atomic_write_bytes_at,
+    atomic_write_bytes_confined,
+    has_parent_ref,
+    is_link_like,
+    open_at,
+    open_dir_confined,
+    require_root_pinned,
+    stat_at,
+)
 
 
 def _split_frontmatter(text: str) -> tuple[str, str, str] | None:
@@ -429,7 +457,13 @@ def _verified(candidate: str, key: str, value: str, rest: dict[str, Any]) -> str
     return candidate
 
 
-def set_frontmatter_status(path: Path, status: str, *, confine_root: Path) -> bool:
+def set_frontmatter_status(
+    path: Path,
+    status: str,
+    *,
+    confine_root: Path,
+    root_identity: os.stat_result | None = None,
+) -> bool:
     """Rewrite the `status:` field in a spec's `---`…`---` frontmatter block.
 
     A minimal in-place line replacement (not a YAML round-trip) so the spec's
@@ -455,11 +489,13 @@ def set_frontmatter_status(path: Path, status: str, *, confine_root: Path) -> bo
     46-byte spec to 12.
 
     The write is CONFINED, and this is the canonical statement of the rule the
-    FOUR writers of a spec's bytes share (`verify.set_frontmatter_field` and
+    FOUR path-based writers of a spec's bytes share (`verify.set_frontmatter_field` and
     `devcontract._atomic_write_spec` restate it by reference; `runs._restore_rearmed_spec`
     — the re-arm transaction's UNDO — implements it so it can put back exactly what the
     other three published, and a spec they can write but it refuses is the transaction's
-    write set going unhonoured):
+    write set going unhonoured). A FIFTH writer, `set_frontmatter_status_anchored`
+    (recovery's attempt-owned normalization), shares the in-project arm below but
+    not the external one — see the second bullet:
 
     * A spec path under ``confine_root`` goes through
       `platform_util.atomic_write_bytes_confined`, which walks the components
@@ -474,7 +510,9 @@ def set_frontmatter_status(path: Path, status: str, *, confine_root: Path) -> bo
       artifacts folder configured outside the checkout is real, supported
       configuration (`bmadconfig` resolves one; `verify.spec_within_roots` trusts
       it), and a confined writer cannot vouch for a tree it was not given — so
-      refusing there would break working setups rather than close a hole.
+      refusing there would break working setups rather than close a hole. The
+      anchored fifth writer differs here: it reaches an external parent by a
+      canonical filesystem-root walk and writes through that handle instead.
 
     ``follow_symlinks=False`` on that second arm matches the name-replacing
     `atomic_replace` this writer's `devcontract` sibling always had. A spec path
@@ -485,6 +523,31 @@ def set_frontmatter_status(path: Path, status: str, *, confine_root: Path) -> bo
     ``confine_root`` is a REQUIRED keyword: a caller that has not decided which
     checkout the spec belongs to is a pyright error rather than an unconfined
     write, which is how every call site of this and its two siblings was found.
+
+    ``root_identity`` pins ``confine_root`` (DW-423): on the confined arm it is
+    forwarded to `platform_util.atomic_write_bytes_confined`, and on the external
+    arm it is pre-checked (`platform_util.require_root_pinned`, DW-445) before
+    anything is written, so a path resolved through a mount swapped for a link —
+    which lands it outside ``confine_root`` — refuses with `UnconfinedWriteError`
+    while that swap still stands at the write, and an intact mount whose
+    ``_bmad-output`` is a link resolving outside it writes as before. A swap
+    reverted between resolution and the pre-check passes it: the documented
+    check-then-write residual. ``None`` (the default) is the
+    unpinned write on both arms. The pin rule: a caller pins only an
+    ORCHESTRATOR-MINTED worktree mount (``<project>/.bmad-loop/runs/<id>/
+    worktrees/<unit>``, or ``<worktree>/<offset>`` under a nested project), whose
+    parent is session-writable, so a mount swapped for a link would otherwise
+    carry the write outside the repository; the project root the operator chose
+    stays unpinned. `runs.mount_root_identity` answers the identity — through
+    `runs.live_spec_root_identity` for the re-arm/replan writers (DW-423), and
+    directly for the engine's and `recovery_flow`'s writers when their workspace
+    is a unit mount (DW-445; under isolation ``workspace.paths.project`` IS the
+    mount project) — pinned to the mount's MINT-TIME identity
+    (``StoryTask.worktree_identity``, DW-446) with an ``O_NOFOLLOW`` walk down to
+    the pinned root, so a swapped parent directory ABOVE the worktree
+    (``worktrees/``, ``runs/<id>/``) refuses too.
+    `verify.set_frontmatter_field`, `devcontract._atomic_write_spec` and
+    `set_frontmatter_status_anchored` take the keyword on the same terms.
 
     ``require_writable_target=True`` on both arms (#597): a spec is
     operator-editable, and a temp-and-replace write needs write permission on the
@@ -522,8 +585,346 @@ def set_frontmatter_status(path: Path, status: str, *, confine_root: Path) -> bo
     payload = (before + edited + after).encode("utf-8")
     if path.is_relative_to(confine_root):
         atomic_write_bytes_confined(
-            path, payload, confine_root=confine_root, require_writable_target=True
+            path,
+            payload,
+            confine_root=confine_root,
+            require_writable_target=True,
+            root_identity=root_identity,
         )
     else:
+        require_root_pinned(confine_root, root_identity)
         atomic_write_bytes(path, payload, follow_symlinks=False, require_writable_target=True)
     return True
+
+
+@dataclass(frozen=True)
+class FileIdentity:
+    """One regular file as a descriptor-anchored read observed it: the inode's
+    ``stat`` (from ``os.fstat`` of the open descriptor) and the exact ``data`` it
+    held.
+
+    Equality for this module's purposes is `_same_identity`, not ``==``: the
+    same inode (``os.path.samestat``), the same mutation-sensitive version
+    ``(st_size, st_mtime_ns, st_ctime_ns)``, AND the same bytes. Stat equality
+    alone is not enough — two writes inside one mtime tick leave the version
+    unchanged — so the bytes are compared too."""
+
+    stat: os.stat_result
+    data: bytes
+
+
+class FrontmatterTargetChangedError(FrontmatterWriteError):
+    """`set_frontmatter_status_anchored` refused because its target is not the
+    file it bound: missing, a link or other non-regular entry at the final name,
+    a different inode, or the same inode with different contents — whether
+    against the caller's ``expected`` identity or between the writer's own read
+    and publication. Nothing is published when this is raised before the
+    replace; raised after it, the published inode failed acceptance. Never
+    retried: the change is someone else's write, and the right response is to
+    leave it alone and escalate."""
+
+
+# `open_at` errnos that mean "the final name is not the plain regular file we
+# bound": a link (ELOOP), gone (ENOENT/ENOTDIR), or a special file a nonblocking
+# open refuses (ENXIO for a reader-less FIFO, ENODEV). The same set the owned-spec
+# restoration in `recovery_flow` translates to an authority error.
+_CHANGED_OPEN_ERRNOS = frozenset(
+    {errno.ELOOP, errno.ENOENT, errno.ENOTDIR, errno.ENXIO, errno.ENODEV}
+)
+
+
+def _stat_version(observed: os.stat_result) -> tuple[int, int, int]:
+    return observed.st_size, observed.st_mtime_ns, observed.st_ctime_ns
+
+
+def _same_identity(a: FileIdentity, b: FileIdentity) -> bool:
+    return (
+        os.path.samestat(a.stat, b.stat)
+        and _stat_version(a.stat) == _stat_version(b.stat)
+        and a.data == b.data
+    )
+
+
+def _read_fd_exactly(fd: int, size: int) -> bytes:
+    """Up to ``size + 1`` bytes from offset 0 — one past the stat'd size so a
+    file that grew while being read shows up as a length mismatch."""
+    os.lseek(fd, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    remaining = size + 1
+    while remaining:
+        chunk = os.read(fd, min(1024 * 1024, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _open_target_at(dir_fd: int, name: str, path: Path) -> int:
+    try:
+        return open_at(dir_fd, name, os.O_RDONLY | AT_NOFOLLOW | AT_NONBLOCK)
+    except OSError as exc:
+        if exc.errno in _CHANGED_OPEN_ERRNOS:
+            raise FrontmatterTargetChangedError(
+                f"{path} is no longer a regular file this writer can bind"
+            ) from exc
+        raise
+
+
+def _named_regular_stat(dir_fd: int, name: str, path: Path) -> os.stat_result:
+    try:
+        observed = stat_at(dir_fd, name)
+    except OSError as exc:
+        if exc.errno in _CHANGED_OPEN_ERRNOS:
+            raise FrontmatterTargetChangedError(f"{path} is missing") from exc
+        raise
+    if not stat.S_ISREG(observed.st_mode):
+        raise FrontmatterTargetChangedError(f"{path} is not a regular file")
+    return observed
+
+
+def _read_bound(dir_fd: int, name: str, path: Path) -> FileIdentity:
+    """A stable, descriptor-anchored read of ``name`` under ``dir_fd``.
+
+    The name is stat'd no-follow, opened ``AT_NOFOLLOW | AT_NONBLOCK`` (a link
+    fails the open, a planted FIFO answers ``ENXIO`` instead of blocking), and the
+    read is bracketed by ``os.fstat`` on the descriptor plus a final name stat:
+    the named entry, the opened inode before the read, and the same inode after
+    it must all be one inode at one version, and the bytes must be exactly the
+    stat'd size. Anything else is a concurrent change and raises
+    `FrontmatterTargetChangedError`."""
+    observed = _named_regular_stat(dir_fd, name, path)
+    fd = _open_target_at(dir_fd, name, path)
+    try:
+        before = os.fstat(fd)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or not os.path.samestat(observed, before)
+            or _stat_version(observed) != _stat_version(before)
+        ):
+            raise FrontmatterTargetChangedError(f"{path} changed while it was opened")
+        data = _read_fd_exactly(fd, before.st_size)
+        after = os.fstat(fd)
+        named = _named_regular_stat(dir_fd, name, path)
+        if (
+            len(data) != before.st_size
+            or not os.path.samestat(before, after)
+            or _stat_version(before) != _stat_version(after)
+            or not os.path.samestat(after, named)
+            or _stat_version(after) != _stat_version(named)
+        ):
+            raise FrontmatterTargetChangedError(f"{path} changed while it was read")
+        return FileIdentity(after, data)
+    finally:
+        os.close(fd)
+
+
+def _open_anchored_parent(
+    path: Path, confine_root: Path, root_identity: os.stat_result | None = None
+) -> tuple[int, bool]:
+    """The parent directory handle ``path`` is written through, and whether it
+    was reached by the EXTERNAL arm.
+
+    In-project (``path`` lexically under ``confine_root``): exactly the gates of
+    `platform_util._atomic_write_confined` — no ``..`` below the root, then
+    `open_dir_confined(confine_root, path.parent)`, which refuses a link at any
+    component below the root. ``root_identity`` pins ``confine_root`` there
+    (DW-445), forwarded to `open_dir_confined`: a root that is not that same
+    directory refuses like any other unreachable parent.
+
+    External (a configured artifacts folder outside the project): no root
+    vouches for that tree, so the parent must be spelled canonically
+    (``path.parent.resolve(strict=True) == path.parent``, which also rejects any
+    ``..`` and any link along the way), the final name must not be a link, and
+    the walk starts at the filesystem root with ``search_only=True`` — the model
+    `recovery_flow`'s owned-spec restoration established. A given
+    ``root_identity`` is pre-checked first (`platform_util.require_root_pinned`,
+    DW-445): a path bound through a mount swapped before binding is canonical
+    OUTSIDE the mount, and only the root no longer being the pinned directory
+    tells it apart from a legitimately external artifacts folder. It refuses while
+    the swap still stands at this check; a swap reverted in between passes — the
+    check-then-write residual `platform_util.require_root_pinned` documents.
+
+    A parent either arm cannot reach raises `platform_util.UnconfinedWriteError`,
+    as the confined path writer does, so a caller's existing handling of that
+    refusal is kept; a link at the external final name is a changed target."""
+    if path.is_relative_to(confine_root):
+        if has_parent_ref(path.relative_to(confine_root)):
+            raise UnconfinedWriteError(f"{path} climbs back out of {confine_root} through '..'")
+        dir_fd = open_dir_confined(confine_root, path.parent, root_identity=root_identity)
+        if dir_fd is None:
+            raise UnconfinedWriteError(
+                f"cannot reach {path.parent} from {confine_root} without a redirect"
+            )
+        return dir_fd, False
+    require_root_pinned(confine_root, root_identity)
+    unsafe = f"cannot reach external target {path} by its canonical spelling"
+    try:
+        canonical = path.is_absolute() and path.parent.resolve(strict=True) == path.parent
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise UnconfinedWriteError(unsafe) from exc
+    if not canonical:
+        raise UnconfinedWriteError(unsafe)
+    if is_link_like(path):
+        # The descriptor read refuses a link too; saying so by name first keeps
+        # the external arm from even opening a parent it would write through
+        # for a target that is not the file it was handed.
+        raise FrontmatterTargetChangedError(f"{path} is a link, not the spec it names")
+    dir_fd = open_dir_confined(Path(path.anchor), path.parent, search_only=True)
+    if dir_fd is None:
+        raise UnconfinedWriteError(unsafe)
+    return dir_fd, True
+
+
+def _require_parent_authority(path: Path, parent_fd: int) -> None:
+    """A fresh filesystem-root walk to ``path.parent`` still reaches the directory
+    ``parent_fd`` holds — the external arm's last acceptance step."""
+    probe_fd = open_dir_confined(Path(path.anchor), path.parent, search_only=True)
+    if probe_fd is None:
+        raise FrontmatterTargetChangedError(f"{path.parent} no longer resolves canonically")
+    try:
+        if not os.path.samestat(os.fstat(parent_fd), os.fstat(probe_fd)):
+            raise FrontmatterTargetChangedError(f"{path.parent} now names another directory")
+    finally:
+        os.close(probe_fd)
+
+
+def _accept_published(
+    dir_fd: int, name: str, path: Path, published_fd: int, payload: bytes
+) -> FileIdentity:
+    """Post-publication acceptance: the live name (opened no-follow) is the inode
+    the writer staged and still holds, that inode is stable across a read, and
+    it holds exactly ``payload``. Returns the published identity."""
+    live_fd = _open_target_at(dir_fd, name, path)
+    try:
+        before = os.fstat(published_fd)
+        live = os.fstat(live_fd)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or not stat.S_ISREG(live.st_mode)
+            or not os.path.samestat(before, live)
+        ):
+            raise FrontmatterTargetChangedError(f"{path} does not name the published inode")
+        data = _read_fd_exactly(published_fd, len(payload))
+        after = os.fstat(published_fd)
+        if not os.path.samestat(before, after) or _stat_version(before) != _stat_version(after):
+            raise FrontmatterTargetChangedError(f"{path} changed while it was accepted")
+        named = _named_regular_stat(dir_fd, name, path)
+        if not os.path.samestat(live, named):
+            raise FrontmatterTargetChangedError(f"{path} does not name the published inode")
+    finally:
+        os.close(live_fd)
+    if data != payload:
+        raise FrontmatterTargetChangedError(f"{path} does not hold the bytes just published")
+    return FileIdentity(after, data)
+
+
+def set_frontmatter_status_anchored(
+    path: Path,
+    status: str,
+    *,
+    confine_root: Path,
+    expected: FileIdentity | None = None,
+    root_identity: os.stat_result | None = None,
+) -> FileIdentity:
+    """`set_frontmatter_status`'s edit, as ONE descriptor-anchored transaction
+    over one bound inode (DW-319/DW-323). Returns the identity the name holds
+    afterwards: the published file's, or — when there was nothing to change —
+    the file as read, untouched.
+
+    The EDIT is exactly `set_frontmatter_status`'s: `_split_frontmatter` plus
+    `_edit_frontmatter_block` on `_STATUS_KEY_RE`, byte-verbatim (every line
+    ending kept), `FrontmatterWriteError` on a status no line edit can safely
+    move, and ``require_writable_target`` so a ``0444`` spec raises the kernel's
+    `PermissionError`. No frontmatter block, no top-level status, or already at
+    the target writes nothing.
+
+    What differs is the AUTHORITY. The parent is reached once
+    (`_open_anchored_parent`: the confined walk in-project, a canonical
+    filesystem-root walk for a configured external artifacts folder) and every
+    later step is relative to that handle:
+
+    * the read binds a `FileIdentity` (inode, ``(size, mtime_ns, ctime_ns)``,
+      bytes) through `_read_bound`, which never follows a link and never blocks
+      on a FIFO;
+    * ``expected``, when given, must be that same identity — the caller's proof
+      that nothing touched the file since IT last established it (restoration
+      hands in what it just published);
+    * `platform_util.atomic_write_bytes_at`'s ``_before_staging`` and
+      ``_before_replace`` hooks re-read and require the bound identity again,
+      so a swap or edit caught by either re-check leaves nothing published and
+      the temp removed. The ``_before_replace`` re-check is the LAST comparison
+      against the bound identity and it is not a compare-and-swap: an in-place
+      edit of the old inode in the instant between it and the replace is not
+      detected, and that edit is replaced;
+    * ``_after_replace`` accepts the publication — it checks the PUBLISHED
+      inode, not the bound one: the live name is the staged inode, stable,
+      holding exactly the payload — and on the external arm a fresh root walk
+      still reaches the held parent. The identity returned is one more
+      `_read_bound` once the writer has closed the inode, required to be that
+      inode with those bytes.
+
+    Every identity mismatch raises `FrontmatterTargetChangedError` and is never
+    retried. A parent that cannot be reached without a redirect raises
+    `platform_util.UnconfinedWriteError`, as the confined path writer does.
+
+    ``root_identity`` pins ``confine_root`` exactly as `set_frontmatter_status`
+    pins it (DW-445) — forwarded to the in-project walk, pre-checked on the
+    external arm: recovery's attempt-owned normalization passes
+    `runs.mount_root_identity` of the unit mount project it confines to, so a
+    mount swapped for a link refuses with `UnconfinedWriteError`, whether the
+    path was bound before or after the swap. ``None`` (the default) is the
+    unpinned walk.
+
+    No path-based fallback: without handle-anchored writes
+    (`platform_util.HANDLE_ANCHORED_WRITES` False) this raises
+    `FrontmatterWriteError` before reading anything."""
+    if not HANDLE_ANCHORED_WRITES:
+        raise FrontmatterWriteError(
+            f"cannot rewrite {path}: descriptor-anchored writes are unavailable on this host"
+        )
+    dir_fd, external = _open_anchored_parent(path, confine_root, root_identity)
+    name = path.name
+    try:
+        current = _read_bound(dir_fd, name, path)
+        if expected is not None and not _same_identity(expected, current):
+            raise FrontmatterTargetChangedError(f"{path} changed since it was last established")
+        split = _split_frontmatter(current.data.decode("utf-8"))
+        if split is None:
+            return current
+        before, block, after = split
+        edited = _edit_frontmatter_block(block, "status", status, pattern=_STATUS_KEY_RE)
+        if edited is None:
+            return current
+        payload = (before + edited + after).encode("utf-8")
+
+        def revalidate() -> None:
+            if not _same_identity(current, _read_bound(dir_fd, name, path)):
+                raise FrontmatterTargetChangedError(f"{path} changed before publication")
+
+        published: list[FileIdentity] = []
+
+        def accept(published_fd: int) -> None:
+            published.append(_accept_published(dir_fd, name, path, published_fd, payload))
+            if external:
+                _require_parent_authority(path, dir_fd)
+
+        atomic_write_bytes_at(
+            dir_fd,
+            name,
+            payload,
+            _require_writable_target=True,
+            _before_staging=revalidate,
+            _before_replace=revalidate,
+            _after_replace=accept,
+        )
+        # The returned identity is read back after the writer released the
+        # inode, through the same `_read_bound` a later caller's `expected`
+        # check uses, so it compares like with like even if a host settles
+        # timestamps when the writing handle closes.
+        settled = _read_bound(dir_fd, name, path)
+        if not os.path.samestat(settled.stat, published[0].stat) or settled.data != payload:
+            raise FrontmatterTargetChangedError(f"{path} changed right after publication")
+        return settled
+    finally:
+        os.close(dir_fd)

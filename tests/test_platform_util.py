@@ -8,6 +8,7 @@ the legacy ``platform_util`` entry points still delegate, plus the real
 from __future__ import annotations
 
 import errno
+import functools
 import ntpath
 import os
 import stat
@@ -19,6 +20,7 @@ from contextlib import contextmanager
 from pathlib import Path, PureWindowsPath
 
 import pytest
+from conftest import NUL_PATH_RESOLVE_FAULTS, refuse_to_resolve
 
 from bmad_loop import platform_util
 
@@ -1654,6 +1656,28 @@ def test_resolve_or_lexical_degrades_when_the_os_refuses(exc, monkeypatch, capsy
     assert "cannot canonicalize" in captured.err
 
 
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+def test_resolve_or_lexical_handles_value_error_family_with_safe_stderr(
+    resolve_fault, monkeypatch, tmp_path
+):
+    """The fallback note must remain encodable when the path itself is not."""
+    import io
+
+    path = tmp_path / "caf\xe9-\ud800-path"
+    refuse_to_resolve(monkeypatch, path, error=resolve_fault)
+    stderr_bytes = io.BytesIO()
+    stderr = io.TextIOWrapper(stderr_bytes, encoding="ascii", errors="strict")
+    monkeypatch.setattr(sys, "stderr", stderr)
+
+    assert platform_util.resolve_or_lexical(path) == path.absolute()
+
+    stderr.flush()
+    note = stderr_bytes.getvalue().decode("ascii")
+    assert "cannot canonicalize" in note
+    assert "caf\\xe9-\\ud800-path" in note
+    assert str(resolve_fault) in note
+
+
 def test_resolve_or_lexical_keeps_a_relative_path_relative_to_the_cwd(monkeypatch, capsys, unnoted):
     """`--project` defaults to `"."`, so the degraded path is the common case, not an
     edge one. `absolute()` is what supplies the root that `resolve()` would have."""
@@ -1814,9 +1838,16 @@ def test_walk_files_unlinked_refuses_a_link_like_top(tmp_path, monkeypatch):
 DIR_FD = pytest.mark.skipif(
     not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
 )
+# The rows below that need only what BOTH anchored arms provide — a confined
+# directory handle, the ``*_at`` writers, the confined writers — run on Windows
+# too, through ``win32_at``; ``DIR_FD`` stays on the rows that also need
+# ``scandir(fd)``, mode bits, or a symlink the runner may not be allowed to plant.
+ANCHORED = pytest.mark.skipif(
+    not platform_util.HANDLE_ANCHORED_WRITES, reason="needs a handle-anchored write arm"
+)
 
 
-@DIR_FD
+@ANCHORED
 def test_open_dir_confined_returns_a_descriptor_for_a_clean_chain(tmp_path):
     """The positive control the refusals below need: an unplanted chain hands back
     a descriptor for the directory that was asked for, not merely a non-None int.
@@ -1852,7 +1883,7 @@ def test_open_dir_confined_refuses_a_symlinked_component(tmp_path):
     assert platform_util.open_dir_confined(root, root / ".bmad-loop" / "runs") is None
 
 
-@DIR_FD
+@ANCHORED
 def test_open_dir_confined_refuses_a_target_outside_the_root(tmp_path):
     """Confinement is refused before a single directory is opened: a target that is
     not under the root has no chain to walk, however clean its own ancestry is."""
@@ -1864,7 +1895,7 @@ def test_open_dir_confined_refuses_a_target_outside_the_root(tmp_path):
     assert platform_util.open_dir_confined(root, elsewhere) is None
 
 
-@DIR_FD
+@ANCHORED
 def test_open_dir_confined_refuses_a_missing_component(tmp_path):
     """An absent directory is refused rather than created. The confined writers
     lean on this: they require the parent to EXIST, because a walk cannot vouch
@@ -1900,13 +1931,432 @@ def test_open_dir_confined_accepts_a_root_behind_a_link(tmp_path):
         os.close(fd)
 
 
+# ------------------------------------------- open_dir_confined root pin (DW-338)
+#
+# `root_identity=` pins a root the orchestrator minted or validated inside the
+# checkout to the `lstat` identity the caller accepted. The threat: a writer that
+# can reach the checkout replaces such a root (`implementation_artifacts`, a run
+# dir) with a link between the caller's predicate and the root open, and every
+# later confined read or write follows it out of the repository.
+
+
+def _swap_root_for_link(root: Path, outside: Path, sub: str) -> None:
+    """Rename ``root`` aside and plant a link at its name to an outside tree
+    carrying the same subpath, so the walk below the root still succeeds."""
+    (outside / sub).mkdir(parents=True, exist_ok=True)
+    root.rename(root.with_name(root.name + "-aside"))
+    root.symlink_to(outside, target_is_directory=True)
+
+
+@DIR_FD
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_open_dir_confined_pinned_root_refuses_a_root_swapped_for_a_link(tmp_path):
+    """The DW-338 swap: identity taken by `lstat`, root then replaced by a link to
+    an outside tree with the same subpath — the pinned walk refuses.
+
+    Ablation: remove the identity compare in `open_dir_confined` and this fails —
+    the pinned call returns a descriptor into `outside` exactly as the unpinned
+    control below does."""
+    root = tmp_path / "project" / "artifacts"
+    (root / "specs").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    identity = os.lstat(root)
+
+    _swap_root_for_link(root, outside, "specs")
+
+    assert platform_util.open_dir_confined(root, root / "specs", root_identity=identity) is None
+    # Control: the swap really redirects an unpinned walk into `outside`.
+    fd = platform_util.open_dir_confined(root, root / "specs")
+    assert fd is not None
+    try:
+        assert os.fstat(fd).st_ino == (outside / "specs").stat().st_ino
+    finally:
+        os.close(fd)
+
+
+@DIR_FD
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_open_dir_confined_pinned_root_refuses_an_ancestor_swapped_for_a_link(tmp_path):
+    """The compare also catches an ANCESTOR of the root swapped between the
+    caller's predicate and the open: root's parent replaced by a link to an
+    outside tree holding the same subpath reaches a different directory, which
+    `O_NOFOLLOW` on the root alone would never notice.
+
+    Ablation: remove the identity compare in `open_dir_confined` and this fails —
+    the walk returns a descriptor into `outside/artifacts/specs`."""
+    project = tmp_path / "project"
+    root = project / "artifacts"
+    (root / "specs").mkdir(parents=True)
+    identity = os.lstat(root)
+    outside = tmp_path / "outside"
+    (outside / "artifacts" / "specs").mkdir(parents=True)
+
+    project.rename(tmp_path / "project-aside")
+    project.symlink_to(outside, target_is_directory=True)
+
+    assert platform_util.open_dir_confined(root, root / "specs", root_identity=identity) is None
+
+
+@ANCHORED
+def test_open_dir_confined_pin_refuses_a_non_directory_identity(tmp_path):
+    """An identity carrying the root's real `(st_dev, st_ino)` but a regular-file
+    mode is refused: only a DIRECTORY identity can pin a directory root.
+
+    Ablation: drop the `S_ISDIR` half of `_same_dir_identity` and this fails —
+    the matching device and inode alone would admit the walk."""
+    root = tmp_path / "artifacts"
+    (root / "specs").mkdir(parents=True)
+    fields = list(os.lstat(root)[:10])
+    fields[0] = stat.S_IFREG | 0o644  # st_mode
+    not_a_dir = os.stat_result(fields)
+
+    assert platform_util.open_dir_confined(root, root / "specs", root_identity=not_a_dir) is None
+
+
+@ANCHORED
+def test_open_dir_confined_pinned_root_unchanged_returns_the_descriptor(tmp_path):
+    """Positive control for the pin: an untouched root whose identity was taken by
+    `lstat` (or `pinned_root_identity`) walks exactly as an unpinned one does."""
+    root = tmp_path / "project" / "artifacts"
+    nested = root / "specs"
+    nested.mkdir(parents=True)
+
+    for identity in (os.lstat(root), platform_util.pinned_root_identity(root)):
+        assert identity is not None
+        fd = platform_util.open_dir_confined(root, nested, root_identity=identity)
+        assert fd is not None
+        try:
+            assert os.fstat(fd).st_ino == nested.stat().st_ino
+        finally:
+            os.close(fd)
+
+
+@DIR_FD
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_open_dir_confined_pin_refuses_a_link_lstat_identity(tmp_path):
+    """An identity that is a link's own `lstat` never matches the directory the
+    open reaches through it: the pin refuses rather than degrading to "unpinned".
+
+    Ablation: drop the `S_ISDIR` requirement from `_same_dir_identity` and compare
+    only `(st_dev, st_ino)` — still refused (a link's inode is its own); drop the
+    compare altogether and this fails."""
+    real = tmp_path / "real"
+    (real / "specs").mkdir(parents=True)
+    root = tmp_path / "artifacts"
+    root.symlink_to(real, target_is_directory=True)
+
+    assert (
+        platform_util.open_dir_confined(root, root / "specs", root_identity=os.lstat(root)) is None
+    )
+
+
+@ANCHORED
+def test_open_dir_confined_pin_refuses_a_zero_inode_identity(tmp_path):
+    """A synthetic identity with `st_ino == 0` carries no identity at all; even
+    with a matching `st_dev` and mode it refuses. And the same root with its real
+    inode walks, so the refusal is the zero, not the synthetic stat itself.
+
+    Ablation: drop the nonzero-inode requirement from `_same_dir_identity` and the
+    `_same_dir_identity(zero, zero)` assert fails — two identity-less stats would
+    otherwise "match" each other. (The seam assert alone would still pass on the
+    inode mismatch, which is why the helper is asserted directly.)"""
+    root = tmp_path / "artifacts"
+    (root / "specs").mkdir(parents=True)
+    real = os.lstat(root)
+    fields = list(real[:10])
+    fields[1] = 0  # st_ino
+    zero = os.stat_result(fields)
+
+    assert platform_util.open_dir_confined(root, root / "specs", root_identity=zero) is None
+    assert not platform_util._same_dir_identity(zero, zero)
+    assert platform_util._same_dir_identity(real, real)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("writer", ["text", "bytes", "exclusive"])
+def test_confined_writer_fallback_refuses_a_swapped_pinned_root(tmp_path, monkeypatch, writer):
+    """No-handle fallback (`HANDLE_ANCHORED_WRITES` False): `path_is_confined`
+    checks only components BELOW the root, so a root swapped for a link to a tree
+    with the same subpath passes it — the pin's `lstat` compare is what refuses.
+    Check-then-write; the residual (DW-295) is unchanged otherwise.
+
+    Ablation: delete the `_root_still_pinned` check in `_atomic_write_confined` /
+    `create_exclusive_confined` and this fails `DID NOT RAISE`, with the file
+    landing in `outside/specs/`."""
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+    root = tmp_path / "project" / "artifacts"
+    (root / "specs").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    identity = platform_util.pinned_root_identity(root)
+    assert identity is not None
+    target = root / "specs" / "record.md"
+
+    def write() -> None:
+        if writer == "text":
+            platform_util.atomic_write_text_confined(
+                target, "x\n", confine_root=root, root_identity=identity
+            )
+        elif writer == "bytes":
+            platform_util.atomic_write_bytes_confined(
+                target, b"x\n", confine_root=root, root_identity=identity
+            )
+        else:
+            os.close(
+                platform_util.create_exclusive_confined(
+                    target, confine_root=root, root_identity=identity
+                )
+            )
+
+    _swap_root_for_link(root, outside, "specs")
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        write()
+    assert list((outside / "specs").iterdir()) == []
+
+    # Positive control: the same fallback writes through the unswapped root.
+    root.unlink()
+    root.with_name(root.name + "-aside").rename(root)
+    write()
+    assert target.exists()
+
+
+@DIR_FD
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("writer", ["text", "bytes", "exclusive"])
+def test_confined_writer_anchored_refuses_a_swapped_pinned_root(tmp_path, writer):
+    """The anchored arm forwards `root_identity` to `open_dir_confined`, so a root
+    swapped for a link after the caller accepted it raises and nothing lands
+    outside.
+
+    Ablation: stop forwarding `root_identity` from the writer (or remove the
+    compare in `open_dir_confined`) and this fails `DID NOT RAISE`."""
+    root = tmp_path / "project" / "artifacts"
+    (root / "specs").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    identity = platform_util.pinned_root_identity(root)
+    assert identity is not None
+    target = root / "specs" / "record.md"
+
+    _swap_root_for_link(root, outside, "specs")
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        if writer == "text":
+            platform_util.atomic_write_text_confined(
+                target, "x\n", confine_root=root, root_identity=identity
+            )
+        elif writer == "bytes":
+            platform_util.atomic_write_bytes_confined(
+                target, b"x\n", confine_root=root, root_identity=identity
+            )
+        else:
+            platform_util.create_exclusive_confined(
+                target, confine_root=root, root_identity=identity
+            )
+    assert list((outside / "specs").iterdir()) == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_pinned_root_identity_refuses_links_files_and_missing_roots(tmp_path):
+    """A pinned caller treats None as a refusal, so every root it cannot vouch for
+    must answer None: a symlinked root, a file, a missing path. A real directory
+    answers its own `lstat`."""
+    real = tmp_path / "real"
+    real.mkdir()
+    linked = tmp_path / "linked"
+    linked.symlink_to(real, target_is_directory=True)
+    a_file = tmp_path / "file"
+    a_file.write_text("x", encoding="utf-8")
+
+    assert platform_util.pinned_root_identity(linked) is None
+    assert platform_util.pinned_root_identity(a_file) is None
+    assert platform_util.pinned_root_identity(tmp_path / "absent") is None
+    identity = platform_util.pinned_root_identity(real)
+    assert identity is not None
+    assert identity.st_ino == os.lstat(real).st_ino
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_root_identity_record_is_the_pinned_dev_and_ino_or_none(tmp_path, monkeypatch):
+    """DW-446: the mint-time record is `pinned_root_identity`'s ``(st_dev, st_ino)``
+    for a real directory, and None for anything a pin could not vouch for — a link,
+    a file, a missing path, or a zero inode (no identity to hold a root to).
+
+    Ablation: drop the ``st_ino == 0`` check and the zero-inode row answers
+    ``(dev, 0)``."""
+    real = tmp_path / "real"
+    real.mkdir()
+    linked = tmp_path / "linked"
+    linked.symlink_to(real, target_is_directory=True)
+    a_file = tmp_path / "file"
+    a_file.write_text("x", encoding="utf-8")
+
+    own = os.lstat(real)
+    assert platform_util.root_identity_record(real) == (own.st_dev, own.st_ino)
+    for unpinnable in (linked, a_file, tmp_path / "absent"):
+        assert platform_util.root_identity_record(unpinnable) is None
+
+    zero = tmp_path / "zero"
+    zero.mkdir()
+    real_lstat = os.lstat
+    zero_stat = os.stat_result((stat.S_IFDIR, 0, own.st_dev, 1, 0, 0, 0, 0, 0, 0))
+    monkeypatch.setattr(
+        os, "lstat", lambda p, *a, **k: zero_stat if str(p) == str(zero) else real_lstat(p, *a, **k)
+    )
+    assert platform_util.root_identity_record(zero) is None
+
+
+def test_recorded_root_identity_carries_the_record_in_stat_field_order(tmp_path):
+    """DW-446: the synthetic identity built from a record is a DIRECTORY stat whose
+    ``st_dev``/``st_ino`` are the record's (`os.stat_result` takes mode, ino, dev in
+    that order), so it matches the recorded directory's own stat; a None record is
+    the never-matching identity.
+
+    Ablation: swap ``ino``/``dev`` in the tuple `recorded_root_identity` builds and
+    the field and match rows redden."""
+    real = tmp_path / "real"
+    real.mkdir()
+    own = os.lstat(real)
+    identity = platform_util.recorded_root_identity((own.st_dev, own.st_ino))
+
+    assert (identity.st_dev, identity.st_ino) == (own.st_dev, own.st_ino)
+    assert stat.S_ISDIR(identity.st_mode)
+    assert platform_util._same_dir_identity(identity, own)
+    never = platform_util.recorded_root_identity(None)
+    assert never is platform_util.NEVER_MATCHING_IDENTITY
+    assert not platform_util._same_dir_identity(never, own)
+    assert not platform_util._same_dir_identity(never, never)
+
+
+def test_pinned_root_identity_refuses_a_reparse_tagged_dir(tmp_path, monkeypatch):
+    """A win32 junction `lstat`s as a DIRECTORY with a nonzero inode, so only the
+    reparse-tag check stands between it and a pinned identity; drive that
+    Windows-only branch here (the tuple is substituted, as the neighbours do).
+
+    Ablation: delete the `st_reparse_tag` check in `pinned_root_identity` and
+    this fails — the junction's own directory stat is returned as the pin."""
+
+    class _IdentifiedReparseStat(_ReparseStat):
+        st_dev = 1
+        st_ino = 4242
+
+    junction = tmp_path / "junction"
+    junction.mkdir()
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    monkeypatch.setattr(platform_util, "_LINK_REPARSE_TAGS", (_ReparseStat.st_reparse_tag,))
+    real_lstat = os.lstat
+    monkeypatch.setattr(
+        platform_util.os,
+        "lstat",
+        lambda p, *a, **k: _IdentifiedReparseStat() if str(p) == str(junction) else real_lstat(p),
+    )
+
+    assert platform_util.pinned_root_identity(junction) is None
+    identity = platform_util.pinned_root_identity(plain)
+    assert identity is not None
+    assert identity.st_ino == real_lstat(plain).st_ino
+
+
+@DIR_FD
+def test_open_dir_confined_readable_default_supports_scandir(tmp_path):
+    root = tmp_path / "project"
+    nested = root / "artifacts"
+    nested.mkdir(parents=True)
+    (nested / "owned.md").write_bytes(b"x")
+
+    fd = platform_util.open_dir_confined(root, nested)
+
+    assert fd is not None
+    try:
+        with os.scandir(fd) as entries:
+            assert [entry.name for entry in entries] == ["owned.md"]
+    finally:
+        os.close(fd)
+
+
+@DIR_FD
+@pytest.mark.skipif(
+    not (getattr(os, "O_SEARCH", 0) or getattr(os, "O_PATH", 0)),
+    reason="host has no search-only directory-open flag",
+)
+def test_open_dir_confined_search_only_applies_to_root_intermediate_and_final(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "project"
+    final = root / "intermediate" / "artifacts"
+    final.mkdir(parents=True)
+    search_flag = getattr(os, "O_SEARCH", 0) or getattr(os, "O_PATH", 0)
+    real_open = os.open
+    observed_flags: list[int] = []
+
+    def record_open(path, flags, *args, **kwargs):
+        observed_flags.append(flags)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(platform_util.os, "open", record_open)
+    fd = platform_util.open_dir_confined(root, final, search_only=True)
+
+    assert fd is not None
+    try:
+        assert os.path.samestat(os.fstat(fd), final.stat())
+    finally:
+        os.close(fd)
+    assert len(observed_flags) == 3
+    assert all(flags & search_flag for flags in observed_flags)
+    assert all(flags & os.O_DIRECTORY for flags in observed_flags)
+
+
+@DIR_FD
+@pytest.mark.skipif(
+    not (getattr(os, "O_SEARCH", 0) or getattr(os, "O_PATH", 0)),
+    reason="host has no search-only directory-open flag",
+)
+def test_open_dir_confined_search_only_accepts_execute_only_final_directory(tmp_path):
+    root = tmp_path / "project"
+    final = root / "artifacts"
+    final.mkdir(parents=True)
+    final.chmod(0o100)
+    try:
+        fd = platform_util.open_dir_confined(root, final, search_only=True)
+        assert fd is not None
+        os.close(fd)
+    finally:
+        final.chmod(0o700)
+
+
+@DIR_FD
+@pytest.mark.skipif(
+    not (getattr(os, "O_SEARCH", 0) or getattr(os, "O_PATH", 0)),
+    reason="host has no search-only directory-open flag",
+)
+def test_open_dir_confined_search_only_crosses_execute_only_intermediate_directory(tmp_path):
+    root = tmp_path / "project"
+    intermediate = root / "execute-only"
+    final = intermediate / "artifacts"
+    final.mkdir(parents=True)
+    intermediate.chmod(0o100)
+    try:
+        fd = platform_util.open_dir_confined(root, final, search_only=True)
+        assert fd is not None
+        try:
+            assert os.path.samestat(os.fstat(fd), final.stat())
+        finally:
+            os.close(fd)
+    finally:
+        intermediate.chmod(0o700)
+
+
 # -------------------------------------------------- anchored atomic writes (#593)
 
 
 @contextmanager
 def _dir_fd(directory: Path):
-    """The descriptor the anchored helpers take, closed on the way out."""
-    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    """The descriptor the anchored helpers take, closed on the way out — the
+    ``O_DIRECTORY`` open on POSIX, a directory handle through ``win32_at`` on
+    Windows, exactly as `open_dir_confined` anchors on each arm."""
+    if platform_util.DIR_FD_ANCHORED_WRITES:
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    else:
+        fd = platform_util.win32_at.open_directory(directory)
     try:
         yield fd
     finally:
@@ -1958,7 +2408,7 @@ def test_atomic_write_bytes_at_lands_a_private_mode(tmp_path):
     assert stat.S_IMODE(landed.stat().st_mode) == 0o600, oct(landed.stat().st_mode)
 
 
-@DIR_FD
+@ANCHORED
 def test_atomic_write_bytes_at_preserves_crlf_verbatim(tmp_path):
     """The reason a bytes-anchored variant had to exist at all (#593).
 
@@ -1983,7 +2433,7 @@ def test_atomic_write_bytes_at_preserves_crlf_verbatim(tmp_path):
     assert (tmp_path / "spec.md").read_bytes() == payload
 
 
-@DIR_FD
+@ANCHORED
 def test_atomic_write_text_at_removes_its_temp_when_the_write_fails(tmp_path, monkeypatch):
     """A failed anchored write leaves the directory as it found it.
 
@@ -2005,7 +2455,7 @@ def test_atomic_write_text_at_removes_its_temp_when_the_write_fails(tmp_path, mo
     assert list(tmp_path.glob("*.tmp")) == []  # and nothing was stranded beside it
 
 
-@DIR_FD
+@ANCHORED
 def test_atomic_write_bytes_at_removes_its_temp_when_the_write_fails(tmp_path, monkeypatch):
     """The bytes arm's own cleanup pin — mirrored, per the banner's reasoning."""
     target = tmp_path / "policy.toml"
@@ -2019,6 +2469,64 @@ def test_atomic_write_bytes_at_removes_its_temp_when_the_write_fails(tmp_path, m
         with pytest.raises(OSError, match="No space left"):
             platform_util.atomic_write_bytes_at(fd, "policy.toml", b"after")
 
+    assert target.read_bytes() == b"before"
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+@ANCHORED
+def test_atomic_write_bytes_at_writable_refusal_precedes_staging(tmp_path, monkeypatch):
+    target = tmp_path / "owned.md"
+    target.write_bytes(b"before")
+    failure = PermissionError("read only")
+    calls: list[str] = []
+
+    def refuse(_dir_fd: int, _name: str) -> None:
+        calls.append("probe")
+        raise failure
+
+    def unexpected_stage(*_args, **_kwargs):
+        calls.append("stage")
+        raise AssertionError("staged before writable refusal")
+
+    monkeypatch.setattr(platform_util, "_refuse_unwritable_target_at", refuse)
+    monkeypatch.setattr(platform_util, "_open_exclusive_at", unexpected_stage)
+    with _dir_fd(tmp_path) as fd:
+        with pytest.raises(PermissionError) as excinfo:
+            platform_util.atomic_write_bytes_at(
+                fd, target.name, b"after", _require_writable_target=True
+            )
+
+    assert excinfo.value is failure
+    assert calls == ["probe"]
+    assert target.read_bytes() == b"before"
+
+
+@ANCHORED
+def test_atomic_write_bytes_at_does_not_verify_after_prepublication_failure(tmp_path):
+    target = tmp_path / "owned.md"
+    target.write_bytes(b"before")
+    failure = RuntimeError("target changed before replace")
+    verified = False
+
+    def fail_before_replace() -> None:
+        raise failure
+
+    def verify_after_replace(_published_fd: int) -> None:
+        nonlocal verified
+        verified = True
+
+    with _dir_fd(tmp_path) as fd:
+        with pytest.raises(RuntimeError) as excinfo:
+            platform_util.atomic_write_bytes_at(
+                fd,
+                target.name,
+                b"after",
+                _before_replace=fail_before_replace,
+                _after_replace=verify_after_replace,
+            )
+
+    assert excinfo.value is failure
+    assert verified is False
     assert target.read_bytes() == b"before"
     assert list(tmp_path.glob("*.tmp")) == []
 
@@ -2160,6 +2668,24 @@ def test_atomic_write_text_confined_writes_a_clean_tree(tmp_path):
     assert (parent / "policy.toml").read_text(encoding="utf-8") == "x = 1\n"
 
 
+def test_atomic_write_text_confined_lands_the_platform_line_ending(tmp_path):
+    """The confined TEXT writer keeps `atomic_write_text`'s translating newline
+    default on every arm — LF on POSIX, CRLF on Windows — so anchoring the write
+    through `win32_at` changed no byte a ledger or decisions file lands there.
+    `atomic_write_text_at` (records, POSIX-only callers) is the one that never
+    translates; the confined writer is what the operator-edited cohort uses.
+
+    Ablation: drop the `newline=None` the confined arm passes `_atomic_write_at`
+    and this reddens on Windows with LF where the path writer landed CRLF."""
+    root = tmp_path / "project"
+    parent = root / ".bmad-loop"
+    parent.mkdir(parents=True)
+
+    platform_util.atomic_write_text_confined(parent / "ledger.md", "a\nb\n", confine_root=root)
+
+    assert (parent / "ledger.md").read_bytes() == f"a{os.linesep}b{os.linesep}".encode()
+
+
 def test_atomic_write_confined_refuses_a_parent_ref_below_the_root(tmp_path):
     """`is_relative_to` is a lexical PREFIX test, so `root/specs/../../outside/f`
     passes it while naming a path outside the root — and `..` is a real directory
@@ -2209,6 +2735,7 @@ def test_atomic_write_confined_refuses_a_parent_ref_on_the_fallback_arm(tmp_path
     Ablation: delete the `has_parent_ref` gate and this fails `DID NOT RAISE`,
     with the payload landing over `outside/victim.md` through the plain no-follow
     write."""
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
     monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
     root = tmp_path / "project"
     (root / "specs").mkdir(parents=True)
@@ -2299,6 +2826,7 @@ def test_create_exclusive_confined_refuses_a_symlinked_parent(tmp_path, monkeypa
         platform_util.create_exclusive_confined(target, confine_root=root)
     assert list(outside.iterdir()) == []  # nothing landed outside
 
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
     monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
     with pytest.raises(platform_util.UnconfinedWriteError, match="without a redirect"):
         platform_util.create_exclusive_confined(target, confine_root=root)
@@ -2308,6 +2836,138 @@ def test_create_exclusive_confined_refuses_a_symlinked_parent(tmp_path, monkeypa
     fd = platform_util.create_exclusive_confined(root / ".bmad-loop" / "ok.json", confine_root=root)
     os.close(fd)
     assert (root / ".bmad-loop" / "ok.json").exists()
+
+
+# ------------------------- confined mkdir / unlink below a root (DW-497)
+
+
+def _both_confined_arms(monkeypatch):
+    """Yield once per arm: the host's anchored arm, then the no-handle fallback."""
+    yield "anchored"
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+    yield "fallback"
+
+
+def test_make_dirs_confined_creates_missing_parents_idempotently(tmp_path, monkeypatch):
+    """The positive half on both arms: every missing component is created, an
+    existing chain is accepted, and a pinned intact root binds nothing extra."""
+    for arm in _both_confined_arms(monkeypatch):
+        root = tmp_path / arm
+        root.mkdir()
+        target = root / ".bmad-loop" / "operator"
+        platform_util.make_dirs_confined(target, confine_root=root, root_identity=os.lstat(root))
+        platform_util.make_dirs_confined(target, confine_root=root)
+        assert target.is_dir(), arm
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("link_at", [".bmad-loop", ".bmad-loop/operator"])
+def test_make_dirs_confined_refuses_a_link_below_the_root(tmp_path, monkeypatch, link_at):
+    """A link at any component below the root refuses on both arms before
+    anything is created through it; the link's target stays empty.
+
+    Ablation: replace the body with `target.mkdir(parents=True, exist_ok=True)` and
+    the `.bmad-loop` row grows `outside/operator/` while neither row raises."""
+    for arm in _both_confined_arms(monkeypatch):
+        root = tmp_path / arm
+        (root / link_at).parent.mkdir(parents=True, exist_ok=True)
+        outside = tmp_path / f"outside-{arm}"
+        outside.mkdir()
+        (root / link_at).symlink_to(outside, target_is_directory=True)
+
+        with pytest.raises(platform_util.UnconfinedWriteError):
+            platform_util.make_dirs_confined(root / ".bmad-loop" / "operator", confine_root=root)
+        assert list(outside.iterdir()) == [], arm
+
+
+def test_unlink_confined_prunes_only_an_emptied_parent(tmp_path, monkeypatch):
+    """The positive half on both arms: the file goes, a parent still holding
+    another entry stays, the last unlink prunes it, and ``missing_ok`` tolerates a
+    missing file and a missing directory alike — without it, absence raises."""
+    for arm in _both_confined_arms(monkeypatch):
+        root = tmp_path / arm
+        records = root / ".bmad-loop" / "operator"
+        records.mkdir(parents=True)
+        (records / "a.json").write_text("a", encoding="utf-8")
+        (records / "b.json").write_text("b", encoding="utf-8")
+        unlink = functools.partial(
+            platform_util.unlink_confined,
+            confine_root=root,
+            root_identity=os.lstat(root),
+            prune_empty_parent=True,
+        )
+
+        unlink(records / "a.json")
+        assert [p.name for p in records.iterdir()] == ["b.json"], arm
+        unlink(records / "b.json")
+        assert not records.exists(), arm
+        unlink(records / "b.json", missing_ok=True)  # the directory is gone
+        (root / ".bmad-loop").rmdir()
+        unlink(records / "b.json", missing_ok=True)  # and its parent too
+        with pytest.raises(FileNotFoundError):
+            unlink(records / "b.json")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("link_at", [".bmad-loop", ".bmad-loop/operator"])
+def test_unlink_confined_refuses_a_link_below_the_root(tmp_path, monkeypatch, link_at):
+    """A link below the root refuses on both arms — ``missing_ok`` included, since
+    the walk meets the link before anything missing — and the same-named file at
+    its target survives.
+
+    Ablation: replace the body with `path.unlink(missing_ok=missing_ok)` and the
+    outside file is deleted on both arms."""
+    for arm in _both_confined_arms(monkeypatch):
+        root = tmp_path / arm
+        (root / link_at).parent.mkdir(parents=True, exist_ok=True)
+        outside = tmp_path / f"outside-{arm}"
+        victim = outside / Path(".bmad-loop/operator/r.json").relative_to(link_at)
+        victim.parent.mkdir(parents=True)
+        victim.write_text("theirs", encoding="utf-8")
+        (root / link_at).symlink_to(outside, target_is_directory=True)
+
+        with pytest.raises(platform_util.UnconfinedWriteError):
+            platform_util.unlink_confined(
+                root / ".bmad-loop" / "operator" / "r.json",
+                confine_root=root,
+                missing_ok=True,
+                prune_empty_parent=True,
+            )
+        assert victim.read_text(encoding="utf-8") == "theirs", arm
+
+
+@pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES or sys.platform == "win32",
+    reason="dir-fd anchoring and POSIX symlinks",
+)
+def test_unlink_confined_prunes_through_the_walked_descriptor(tmp_path, monkeypatch):
+    """The POSIX prune is relative to the descriptor the walk produced, so an
+    ancestor swapped for a link AFTER the walk — between the unlink and the
+    prune — steers nothing: the real (renamed-aside) directory is pruned and an
+    empty same-named directory at the link's target survives.
+
+    Ablation: prune with `_rmdir_if_empty(parent)` (by path) instead of the
+    `os.rmdir(..., dir_fd=...)` and the outside directory is removed."""
+    root = tmp_path / "project"
+    records = root / ".bmad-loop" / "operator"
+    records.mkdir(parents=True)
+    (records / "r.json").write_text("mine", encoding="utf-8")
+    outside = tmp_path / "outside"
+    (outside / "operator").mkdir(parents=True)
+    real_unlink_at = platform_util.unlink_at
+
+    def unlink_then_swap(dir_fd, name):
+        real_unlink_at(dir_fd, name)
+        (root / ".bmad-loop").rename(root / ".bmad-loop-aside")
+        (root / ".bmad-loop").symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr(platform_util, "unlink_at", unlink_then_swap)
+
+    platform_util.unlink_confined(records / "r.json", confine_root=root, prune_empty_parent=True)
+
+    assert (outside / "operator").is_dir()
+    assert list((root / ".bmad-loop-aside").iterdir()) == []
 
 
 def test_create_exclusive_confined_refuses_out_of_root_and_parent_refs(tmp_path):
@@ -2407,6 +3067,116 @@ def test_atomic_write_bytes_confined_preserves_crlf_verbatim(tmp_path):
     assert (parent / "story.md").read_bytes() == payload
 
 
+@ANCHORED
+def test_atomic_write_bytes_confined_runs_callback_with_live_published_fd(tmp_path):
+    root = tmp_path / "project"
+    parent = root / "specs"
+    parent.mkdir(parents=True)
+    target = parent / "story.md"
+    observed: list[tuple[int, bytes]] = []
+
+    def verify_after_publish(published_fd: int | None) -> None:
+        assert published_fd is not None
+        assert stat.S_ISREG(os.fstat(published_fd).st_mode)
+        os.lseek(published_fd, 0, os.SEEK_SET)
+        observed.append((published_fd, os.read(published_fd, 100)))
+
+    platform_util.atomic_write_bytes_confined(
+        target, b"published", confine_root=root, _after_replace=verify_after_publish
+    )
+
+    assert observed and observed[0][1] == b"published"
+    with pytest.raises(OSError) as closed:  # EBADF: "Bad file descriptor" on POSIX,
+        os.fstat(observed[0][0])  # "Invalid handle" on Windows
+    assert closed.value.errno == errno.EBADF
+
+
+def test_atomic_write_bytes_confined_fallback_post_callback_receives_no_fd(tmp_path, monkeypatch):
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+    root = tmp_path / "project"
+    parent = root / "specs"
+    parent.mkdir(parents=True)
+    target = parent / "story.md"
+    observed: list[int | None] = []
+
+    def verify_after_publish(dir_fd: int | None) -> None:
+        observed.append(dir_fd)
+        assert target.read_bytes() == b"published"
+
+    platform_util.atomic_write_bytes_confined(
+        target, b"published", confine_root=root, _after_replace=verify_after_publish
+    )
+
+    assert observed == [None]
+
+
+def test_confined_fallback_callback_failure_does_not_unlink_reused_temp_name(tmp_path, monkeypatch):
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+    root = tmp_path / "project"
+    parent = root / "specs"
+    parent.mkdir(parents=True)
+    target = parent / "story.md"
+    reused = parent / "fixed.tmp"
+    failure = RuntimeError("post-publication verification failed")
+
+    def fixed_temp(_target: Path) -> tuple[int, str]:
+        fd = os.open(reused, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        return fd, str(reused)
+
+    def fail_after_publish(dir_fd: int | None) -> None:
+        assert dir_fd is None
+        reused.write_bytes(b"another writer")
+        raise failure
+
+    monkeypatch.setattr(platform_util, "_mkstemp_beside", fixed_temp)
+    with pytest.raises(RuntimeError) as excinfo:
+        platform_util.atomic_write_bytes_confined(
+            target, b"published", confine_root=root, _after_replace=fail_after_publish
+        )
+
+    assert excinfo.value is failure
+    assert target.read_bytes() == b"published"
+    assert reused.read_bytes() == b"another writer"
+
+
+@ANCHORED
+def test_confined_anchored_callback_failure_does_not_unlink_reused_temp_name(tmp_path, monkeypatch):
+    root = tmp_path / "project"
+    parent = root / "specs"
+    parent.mkdir(parents=True)
+    target = parent / "story.md"
+    reused = parent / "fixed.tmp"
+    failure = RuntimeError("post-publication verification failed")
+
+    def fixed_temp(dir_fd: int, _prefix: str, _name: str) -> tuple[int, str]:
+        fd = platform_util.open_at(dir_fd, reused.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        return fd, reused.name
+
+    published_fds: list[int] = []
+
+    def fail_after_publish(published_fd: int | None) -> None:
+        assert published_fd is not None
+        os.fstat(published_fd)
+        published_fds.append(published_fd)
+        reused.write_bytes(b"another writer")
+        raise failure
+
+    monkeypatch.setattr(platform_util, "_open_exclusive_at", fixed_temp)
+    with pytest.raises(RuntimeError) as excinfo:
+        platform_util.atomic_write_bytes_confined(
+            target, b"published", confine_root=root, _after_replace=fail_after_publish
+        )
+
+    assert excinfo.value is failure
+    assert target.read_bytes() == b"published"
+    assert reused.read_bytes() == b"another writer"
+    with pytest.raises(OSError) as closed:  # EBADF: "Bad file descriptor" on POSIX,
+        os.fstat(published_fds[0])  # "Invalid handle" on Windows
+    assert closed.value.errno == errno.EBADF
+
+
 @DIR_FD
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_atomic_write_confined_is_anchored_against_an_ancestor_swap(tmp_path, monkeypatch):
@@ -2428,8 +3198,8 @@ def test_atomic_write_confined_is_anchored_against_an_ancestor_swap(tmp_path, mo
     outside.mkdir()
     real_open = platform_util.open_dir_confined
 
-    def swap_after_the_walk(confine_root: Path, target: Path):
-        fd = real_open(confine_root, target)
+    def swap_after_the_walk(confine_root: Path, target: Path, **kwargs):
+        fd = real_open(confine_root, target, **kwargs)
         # attacker wins: the name now points outside, the fd still points home
         target.rename(tmp_path / "moved-aside")
         target.symlink_to(outside, target_is_directory=True)
@@ -2452,6 +3222,7 @@ def test_atomic_write_text_confined_falls_back_without_dir_fd(tmp_path, monkeypa
 
     Ablation: delete the `path_is_confined` check and this fails `DID NOT RAISE`,
     with the file landing in `outside/` exactly as the unguarded POSIX path did."""
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
     monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
     root = tmp_path / "project"
     root.mkdir()
@@ -2475,6 +3246,45 @@ def test_atomic_write_text_confined_falls_back_without_dir_fd(tmp_path, monkeypa
         root / ".bmad-loop" / "policy.toml", "x = 1\n", confine_root=root
     )
     assert (root / ".bmad-loop" / "policy.toml").read_text(encoding="utf-8") == "x = 1\n"
+
+
+def test_confined_fallback_rejects_before_writable_probe_and_staging(tmp_path, monkeypatch):
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+    root = tmp_path / "project"
+    parent = root / "specs"
+    parent.mkdir(parents=True)
+    target = parent / "owned.md"
+    target.write_bytes(b"before")
+    failure = RuntimeError("pre-staging authority loss")
+    calls: list[str] = []
+
+    def refuse_before_staging() -> None:
+        calls.append("predicate")
+        raise failure
+
+    def unexpected_probe(*_args, **_kwargs) -> None:
+        calls.append("writable-probe")
+
+    def unexpected_temp(_target: Path):
+        calls.append("temp")
+        raise AssertionError("staged after pre-staging refusal")
+
+    monkeypatch.setattr(platform_util, "_refuse_unwritable_target", unexpected_probe)
+    monkeypatch.setattr(platform_util, "_mkstemp_beside", unexpected_temp)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        platform_util.atomic_write_bytes_confined(
+            target,
+            b"after",
+            confine_root=root,
+            require_writable_target=True,
+            _before_staging=refuse_before_staging,
+        )
+
+    assert excinfo.value is failure
+    assert calls == ["predicate"]
+    assert target.read_bytes() == b"before"
 
 
 # ------------------------------------------------- require_writable_target (#597)
@@ -2797,3 +3607,60 @@ def test_confined_writable_target_probe_answers_a_planted_fifo_without_blocking(
     assert failures == []
     assert stat.S_ISREG(target.lstat().st_mode)  # the FIFO name was replaced
     assert target.read_bytes() == b"payload"
+
+
+# ------------------------------------------------------------ filesystem_name
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the non-win32 arm")
+def test_filesystem_name_off_win32_is_unknown_with_the_platform(tmp_path):
+    """DW-444: off win32 the label is `unknown (<platform>)` — no mount-table
+    arm, because the only caller is the path-based fallback no POSIX host takes
+    (every one has `O_DIRECTORY`). Never `""`.
+
+    Ablation: return `""` (or restore a `/proc/self/mounts` arm) and this fails."""
+    assert platform_util.filesystem_name(tmp_path) == f"unknown ({sys.platform})"
+
+
+def test_filesystem_name_reports_a_ctypes_fault_as_unknown(tmp_path, monkeypatch):
+    """Never `""` and never a raise: a fault inside the win32 volume query
+    (here a ctypes failure, on any host) becomes an `unknown (<reason>)` label a
+    reader can tell from a real answer.
+
+    Ablation: drop the `except` in `filesystem_name` and this raises."""
+    import ctypes
+
+    def refuse(*_args, **_kwargs):
+        raise OSError("simulated ctypes fault")
+
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    monkeypatch.setattr(ctypes, "WinDLL", refuse, raising=False)
+    label = platform_util.filesystem_name(tmp_path)
+    assert label.startswith("unknown (") and "simulated ctypes fault" in label
+    assert platform_util.filesystem_type(label) == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("label", "expected"),
+    [
+        ("NTFS at C:\\", "NTFS"),
+        ("ReFS at D:\\mnt\\vol\\", "ReFS"),
+        ("unknown (linux)", "unknown"),
+        ("unknown (GetVolumeInformationW failed on C:\\: winerror 5)", "unknown"),
+    ],
+)
+def test_filesystem_type_strips_the_volume_path(label, expected):
+    """DW-444: the diagnostics-safe type of a label — the volume path (and any
+    reason an `unknown` label quotes) never survives."""
+    assert platform_util.filesystem_type(label) == expected
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="win32 volume information")
+def test_filesystem_name_labels_a_win32_volume(tmp_path):
+    """DW-444's host: `GetVolumePathNameW` + `GetVolumeInformationW` name the
+    volume's filesystem (`NTFS at C:\\`, `ReFS at D:\\`, ...)."""
+    label = platform_util.filesystem_name(tmp_path)
+    assert not label.startswith("unknown"), label
+    fs_name, sep, volume = label.partition(" at ")
+    assert sep and fs_name and volume.endswith("\\")
+    assert str(tmp_path).casefold().startswith(volume.casefold().rstrip("\\"))

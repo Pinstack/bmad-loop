@@ -118,8 +118,9 @@ def test_notify_macos_runs_osascript_via_env(monkeypatch, tmp_path):
     assert argv[0] == "osascript"
     # untrusted text travels through env, never interpolated into the command string
     assert kwargs["env"][gates._TITLE_ENV] == title
-    assert kwargs["env"][gates._MESSAGE_ENV] == message
-    assert not any(message in part for part in argv)
+    # the newline is folded by the shaping chokepoint before it reaches the toast
+    assert kwargs["env"][gates._MESSAGE_ENV] == 'he said "done" ⏎ now'
+    assert not any("done" in part for part in argv)
     assert not any("1-2-a" in part for part in argv)
 
 
@@ -220,3 +221,209 @@ def test_notify_desktop_swallows_errors(monkeypatch, tmp_path):
     monkeypatch.setattr(gates.subprocess, "run", boom)
     # best-effort: a failing notifier must not propagate out of notify()
     gates.notify(_policy(desktop=True, file=False), tmp_path, "title", "message")
+
+
+# ----------------------------------------------- notice shaping (DW-13/DW-332)
+
+_ONE_LINE_ROWS = [
+    pytest.param("story gated: x", "story gated: x", id="plain-line-unchanged"),
+    pytest.param(
+        "verify command failed (rc=1): pytest\nFAILED a\n\n  FAILED b\n",
+        "verify command failed (rc=1): pytest ⏎ FAILED a ⏎ FAILED b",
+        id="multi-line-reason-folds",
+    ),
+    pytest.param("a\r\nb\rc\vd\fe", "a ⏎ b ⏎ c ⏎ d ⏎ e", id="crlf-cr-vt-ff"),
+    pytest.param("a\x1cb\x1dc\x1ed", "a ⏎ b ⏎ c ⏎ d", id="file-group-record-separators"),
+    pytest.param("a\x85b\u2028c\u2029d", "a ⏎ b ⏎ c ⏎ d", id="nel-ls-ps"),
+    pytest.param("\x1b[31mred\x1b[0m", "\\x1b[31mred\\x1b[0m", id="esc"),
+    pytest.param("ding\x07", "ding\\x07", id="bel"),
+    pytest.param("mid\x00nul", "mid\\x00nul", id="nul"),
+    pytest.param("del\x7f", "del\\x7f", id="del"),
+    pytest.param("csi\x9b", "csi\\x9b", id="c1-csi"),
+    pytest.param("col\tumn", "col umn", id="tab-to-space"),
+    pytest.param("bad \udcff path", "bad \\udcff path", id="lone-low-surrogate"),
+    pytest.param("hi\ud800gh", "hi\\ud800gh", id="lone-high-surrogate"),
+    pytest.param("", "", id="empty"),
+    pytest.param(" \n ", "", id="blank"),
+]
+
+
+@pytest.mark.parametrize(("raw", "shaped"), _ONE_LINE_ROWS)
+def test_notice_line_matrix(raw, shaped):
+    assert gates.notice_line(raw) == shaped
+
+
+def test_notice_line_leaves_a_clean_line_byte_for_byte():
+    """No line break, no control character, under the cap: returned as-is —
+    leading/trailing spaces and non-ASCII included."""
+    for text in ("  padded  ", "unicodé — ok […]", "x" * gates.NOTICE_LINE_MAX):
+        assert gates.notice_line(text) == text
+
+
+def test_notice_line_caps_with_the_journal_naming_marker():
+    """Over the backstop cap the line is cut, rstripped and marked; the marker
+    names where the full text lives and is the one escalation's CRITICAL display
+    truncation uses."""
+    capped = gates.notice_line("y" * (gates.NOTICE_LINE_MAX + 1))
+    assert len(capped) == gates.NOTICE_LINE_MAX
+    assert capped.endswith(gates.NOTICE_TRUNCATION_MARKER)
+    assert "journal.jsonl" in gates.NOTICE_TRUNCATION_MARKER
+    assert capped == "y" * (gates.NOTICE_LINE_MAX - len(gates.NOTICE_TRUNCATION_MARKER)) + (
+        gates.NOTICE_TRUNCATION_MARKER
+    )
+    # the cut lands on whitespace: rstripped, so the total stays under the cap
+    spaced = gates.notice_line("a " * gates.NOTICE_LINE_MAX)
+    assert len(spaced) <= gates.NOTICE_LINE_MAX
+    assert spaced.endswith("a" + gates.NOTICE_TRUNCATION_MARKER)
+    # the cap applies to the FOLDED text, not to any one segment
+    folded = gates.notice_line(("z" * 100 + "\n") * 60)
+    assert len(folded) <= gates.NOTICE_LINE_MAX
+    assert folded.endswith(gates.NOTICE_TRUNCATION_MARKER)
+
+
+def test_notice_line_cap_holds_a_full_critical_display_whole():
+    """The backstop sits above the CRITICAL display budget, so a maximal plain
+    Wave 3 display (display cap, recovery hint included) is not re-cut. Only
+    control- or line-dense text, inflated past the budget by escapes and folds,
+    can reach the cap."""
+    from bmad_loop import escalation
+
+    shown = escalation.display_critical_reason("r" * 10_000, "s" * 10_000)
+    assert len(shown) < gates.NOTICE_LINE_MAX
+    assert gates.notice_line(shown) == shown
+    assert escalation._CRITICAL_TRUNCATION_MARKER is gates.NOTICE_TRUNCATION_MARKER
+    assert escalation.CRITICAL_FALLBACK_SOURCE == gates.NOTICE_FULL_DETAIL_SOURCE
+
+
+def test_notice_block_keeps_lines_and_escapes_controls():
+    assert gates.notice_block("head\n  1. a\x1b\n") == "head\n  1. a\\x1b"
+    assert gates.notice_block("a\r\nb\rc\n\n\n") == "a\nb\nc"
+    assert gates.notice_block("") == ""
+    assert gates.notice_block(" \n ") == ""
+    assert gates.notice_block("head\n  1. bad \udcff path") == "head\n  1. bad \\udcff path"
+    # no cap on the block path: operator action lists are carried whole
+    long = "\n".join("q" * 100 for _ in range(60))
+    assert gates.notice_block(long) == long
+
+
+def _attention_and_argv(monkeypatch, tmp_path, title, message, **kwargs):
+    """Run `notify` on BOTH channels (file + Linux notify-send) and return the
+    ATTENTION text and the positional SUMMARY/BODY notify-send received."""
+    monkeypatch.setattr(gates.sys, "platform", "linux")
+    monkeypatch.setattr(
+        gates.shutil, "which", lambda cmd: "/usr/bin/notify-send" if cmd == "notify-send" else None
+    )
+    calls = _capture_run(monkeypatch)
+    gates.notify(_policy(desktop=True, file=True), tmp_path, title, message, **kwargs)
+    assert len(calls) == 1
+    argv, _kwargs = calls[0]
+    assert argv[:3] == ["notify-send", "--app-name=bmad-loop", "--"]
+    attention = (tmp_path / gates.ATTENTION_FILE).read_text(encoding="utf-8")
+    return attention, argv[3], argv[4]
+
+
+@pytest.mark.parametrize(("raw", "shaped"), _ONE_LINE_ROWS)
+def test_notify_shapes_the_message_on_both_channels(monkeypatch, tmp_path, raw, shaped):
+    """Every matrix row, through the chokepoint: the ATTENTION record is exactly
+    one line carrying the shaped message, and notify-send's BODY is the same
+    shaped text.
+
+    Ablation: write/pass the raw `message` in `notify` (skip `notice_line`) and the
+    fold and control-character rows redden on both channels."""
+    attention, summary, body = _attention_and_argv(monkeypatch, tmp_path, "t", raw)
+    assert attention.count("\n") == 1 and attention.endswith("\n")
+    assert attention.rstrip("\n").endswith(f"] t: {shaped}")
+    assert summary == "t"
+    assert body == shaped
+
+
+def test_notify_shapes_the_title_too(monkeypatch, tmp_path):
+    """Titles carry untrusted text (story keys, plugin names) and are always
+    shaped one-line, on the multiline path as well.
+
+    Ablation: skip `notice_line(title)` and the raw ESC/newline reach both sinks."""
+    for multiline in (False, True):
+        (tmp_path / gates.ATTENTION_FILE).unlink(missing_ok=True)
+        attention, summary, _ = _attention_and_argv(
+            monkeypatch, tmp_path, "story\x1b[2J\nkey", "m", multiline=multiline
+        )
+        assert summary == "story\\x1b[2J ⏎ key"
+        assert "\x1b" not in attention and attention.count("\n") == 1
+
+
+def test_notify_nul_no_longer_reaches_the_notifier(monkeypatch, tmp_path):
+    """A NUL used to reach argv/env and make `subprocess.run` raise `ValueError:
+    embedded null byte` — swallowed, so the toast was silently lost. Shaping
+    escapes it first, so the notifier is actually invoked with visible text.
+
+    Ablation: skip `notice_line` in `notify` and the raw NUL reaches argv."""
+    attention, summary, body = _attention_and_argv(monkeypatch, tmp_path, "ti\x00tle", "mid\x00nul")
+    assert summary == "ti\\x00tle" and body == "mid\\x00nul"
+    assert "\x00" not in attention and "\x00" not in summary + body
+
+
+def test_notify_multiline_keeps_lines_and_escapes_controls(monkeypatch, tmp_path):
+    """`multiline=True` (operator action lists): lines stay separate in ATTENTION
+    and in the toast body; control characters are still escaped.
+
+    Ablation: route the multiline path through `notice_line` and the lines fold;
+    skip shaping entirely and the raw ESC survives."""
+    message = "committed, but 2 action(s) are owed:\n  1. a\x1b[0m\n  2. b\n"
+    attention, _, body = _attention_and_argv(
+        monkeypatch, tmp_path, "story awaiting operator: 1-1-a", message, multiline=True
+    )
+    assert body == "committed, but 2 action(s) are owed:\n  1. a\\x1b[0m\n  2. b"
+    lines = attention.splitlines()
+    assert lines[0].endswith("story awaiting operator: 1-1-a: committed, but 2 action(s) are owed:")
+    assert lines[1:] == ["  1. a\\x1b[0m", "  2. b"]
+    assert "\x1b" not in attention
+
+
+def test_notify_desktop_shapes_env_payloads(monkeypatch, tmp_path):
+    """osascript/PowerShell carry title/message via env: those values are the
+    shaped text too."""
+    monkeypatch.setattr(gates.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        gates.shutil, "which", lambda cmd: "/usr/bin/osascript" if cmd == "osascript" else None
+    )
+    calls = _capture_run(monkeypatch)
+    gates.notify(_policy(desktop=True, file=False), tmp_path, "t\x07", "a\nb\x00")
+    ((_argv, kwargs),) = calls
+    assert kwargs["env"][gates._TITLE_ENV] == "t\\x07"
+    assert kwargs["env"][gates._MESSAGE_ENV] == "a ⏎ b\\x00"
+
+
+# ------------------------------------------------ lone surrogates (DW-419)
+
+
+def test_notify_survives_a_lone_surrogate_on_both_channels(monkeypatch, tmp_path):
+    """A lone surrogate (a ``surrogateescape``'d path byte in ``str(e)``) is not
+    UTF-8 encodable: it used to raise ``UnicodeEncodeError`` out of the ATTENTION
+    write, breaking the never-raises contract. Shaping now escapes it visibly, so
+    both channels carry the same ``\\udcff`` text and ``notify`` returns.
+
+    Ablation: drop the surrogate branch in ``_escape_controls`` and the argv keeps
+    the raw surrogate; drop it AND ``errors="backslashreplace"`` and ``notify``
+    raises ``UnicodeEncodeError``."""
+    for multiline in (False, True):
+        (tmp_path / gates.ATTENTION_FILE).unlink(missing_ok=True)
+        attention, summary, body = _attention_and_argv(
+            monkeypatch, tmp_path, "ti\udcfftle", "bad \udcff path", multiline=multiline
+        )
+        assert summary == "ti\\udcfftle"
+        assert body == "bad \\udcff path"
+        assert attention.count("\n") == 1
+        assert attention.rstrip("\n").endswith("] ti\\udcfftle: bad \\udcff path")
+
+
+def test_notify_attention_write_backstops_an_unencodable_payload(monkeypatch, tmp_path):
+    """``errors="backslashreplace"`` on the ATTENTION open is a backstop behind the
+    shaping: even text that reaches the write unshaped cannot raise.
+
+    Ablation: drop ``errors="backslashreplace"`` and this raises
+    ``UnicodeEncodeError``."""
+    monkeypatch.setattr(gates, "notice_line", lambda text: text)
+    monkeypatch.setattr(gates, "notice_block", lambda text: text)
+    gates.notify(_policy(desktop=False, file=True), tmp_path, "t", "bad \udcff path")
+    attention = (tmp_path / gates.ATTENTION_FILE).read_text(encoding="utf-8")
+    assert attention.rstrip("\n").endswith("] t: bad \\udcff path")

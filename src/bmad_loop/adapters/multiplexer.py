@@ -144,6 +144,34 @@ class TerminalMultiplexer(ABC):
     def list_sessions(self) -> list[str]:
         """Names of all live sessions."""
 
+    def list_sessions_reporting(
+        self, *, on_fault: Callable[[str], None] | None = None
+    ) -> list[str]:
+        """:meth:`list_sessions`, with a fault the listing folds into ``[]``
+        handed to ``on_fault`` instead of the backend's own channel.
+
+        A backend that answers a failed listing with ``[]`` — the bundled
+        tmux family does, warning on stderr (DW-458) — makes that fault look
+        like "no live session" to a caller that cannot read stderr: the TUI,
+        where Textual captures it for the app's whole run, and whose removal
+        guard reads the listing (DW-466). Given a sink, such a backend calls it
+        with a one-line description of the fault (no ``warning:`` prefix, no
+        consequence clause — the caller states its own) and does NOT also warn
+        on its own channel: one route per frontend. ``None`` keeps the
+        backend's own channel, so ``list_sessions()`` and
+        ``list_sessions_reporting()`` answer and warn alike. An answer —
+        a missing multiplexer, no server running — is not a fault and reaches
+        neither.
+
+        Non-abstract, and a method of its own rather than a keyword on
+        :meth:`list_sessions`, so released out-of-tree backends keep working
+        unchanged: an override declared ``list_sessions(self)`` cannot take a
+        keyword core would pass it, and this default never passes one. It
+        reports nothing, which is right for a backend that raises
+        :class:`MultiplexerError` on a failed listing (the caller hears it as
+        the raise). A backend that folds a fault into ``[]`` overrides this."""
+        return self.list_sessions()
+
     @abstractmethod
     def session_options(self, option: str) -> dict[str, str]:
         """Map of session name -> value of ``option`` across all sessions."""
@@ -216,17 +244,30 @@ class TerminalMultiplexer(ABC):
         that diverges remains usable, but falls back to the ambiguous by-name
         lookup whenever several kinds share a run id.
 
-        Raises :class:`MultiplexerError` if the transport itself fails (timeout /
-        missing binary): an empty list means "no windows" and must not be
-        conflated with "couldn't ask" — this op backs the engine's liveness
-        probe (:meth:`window_alive`)."""
+        Raises :class:`MultiplexerError` whenever the listing could not be TAKEN
+        — a transport failure (timeout / missing binary) or a query that failed
+        without proving the session gone: an empty list means "no windows" and
+        must not be conflated with "couldn't ask", because this op backs the
+        engine's liveness probe (:meth:`window_alive`).
+
+        So ``[]`` carries a positive claim, not a shrug: the backend either
+        listed the session's windows and found none, or established that the
+        session no longer exists. A backend answering over a server therefore
+        owes callers a discrimination — a server that errors while its windows
+        are alive must not answer ``[]`` (#525). Which conditions PROVE absence
+        is the backend's own question: the exit code alone does not decide it,
+        and neither does a confirming :meth:`has_session`, whose False is
+        weaker than it looks (see its note)."""
 
     @abstractmethod
     def list_windows(self, session: str, fields: list[str]) -> list[tuple[str, ...]]:
         """One tuple per window in ``session``, each holding the requested
         backend fields in order. Best-effort: returns ``[]`` on a transport
-        failure (unlike :meth:`list_window_ids`, this is metadata, not a liveness
-        probe, so a sentinel is safe).
+        failure OR a failed query (unlike :meth:`list_window_ids`, this is
+        metadata, not a liveness probe, so a sentinel is safe — the answer
+        degrades toward doing nothing, never toward claiming a death or a
+        kill). A backend SHOULD still say on stderr when the failure did not
+        prove the session gone, so an every-call failure is not silent (#525).
 
         A ``window_id`` column carries the same id form :meth:`current_window_id`
         AND :meth:`list_window_ids` return; core compares all three directly. The
@@ -241,10 +282,13 @@ class TerminalMultiplexer(ABC):
     def window_alive(self, session: str, window_id: str) -> bool:
         """True iff ``window_id`` is still a window of ``session``.
 
-        May raise :class:`MultiplexerError` when liveness is unknowable (a
-        transport timeout / missing binary) — callers must treat that as "don't
-        know", not "dead", and must not tear down a possibly-working session on
-        it."""
+        May raise :class:`MultiplexerError` when liveness is unknowable — a
+        transport timeout / missing binary, or any other failure to take the
+        listing this membership test reads (see :meth:`list_window_ids`).
+        Callers must treat that as "don't know", not "dead", and must not tear
+        down a possibly-working session on it. Reachable in ordinary operation,
+        not only under a hung binary: a live server that refuses or drops the
+        query answers here (#525)."""
 
     @abstractmethod
     def kill_window(self, target: str) -> None:
@@ -291,6 +335,22 @@ class TerminalMultiplexer(ABC):
     @abstractmethod
     def send_text(self, window_id: str, text: str) -> None:
         """Send ``text`` literally to the window, then submit it (Enter)."""
+
+    def capture_pane(self, window_id: str) -> str:
+        """The window's VISIBLE screen as plain text, one line per row — what an
+        operator attached to it would see right now, not its scrollback.
+
+        Read by the generic adapter only at the instant a stall wake nudge is
+        about to be typed (DW-350): a screen showing a prompt only a human should
+        answer withholds the nudge, whose trailing Enter could confirm it. Pure
+        observation — any failure there degrades to "no match" and the nudge
+        goes out as it always did.
+
+        NON-abstract so released out-of-tree backends keep working unchanged:
+        the default raises :class:`MultiplexerError` ("cannot capture"), which
+        the caller treats exactly like a clean screen. A backend that can read
+        its pane overrides this."""
+        raise MultiplexerError(f"{type(self).__name__} cannot capture a pane's visible screen")
 
     # ----------------------------------------------------- client / attach
 
@@ -700,13 +760,40 @@ def _factory_by_name(name: str) -> Callable[[], TerminalMultiplexer] | None:
     return None
 
 
+def _raised(what: str, exc: BaseException) -> str:
+    # One wording for every probe fault this module folds, stderr and row alike.
+    return f"{what} raised {type(exc).__name__}: {exc}"
+
+
+def _probe_available(backend: TerminalMultiplexer) -> tuple[bool, str | None]:
+    """``available()`` read through a guard, keeping the fault it folds: the
+    verdict, and ``None`` or the raise that forced it to False."""
+    try:
+        return bool(backend.available()), None
+    except Exception as exc:
+        return False, _raised("available()", exc)
+
+
+_PROBE_FAULTS_WARNED: set[tuple[str, str]] = set()
+
+
 def _usable(backend: TerminalMultiplexer) -> bool:
     """``available()`` read through a guard: selection must never crash on a
-    backend's host probe, so a missing or raising probe reads as unavailable."""
-    try:
-        return bool(backend.available())
-    except Exception:
-        return False
+    backend's host probe, so a missing or raising probe reads as unavailable.
+
+    That False is a fold, not an answer, so it says so on stderr (DW-464) —
+    once per process per distinct fault, like :func:`mux_usable`'s warning:
+    the TUI's observers re-probe through here on every poll."""
+    usable, fault = _probe_available(backend)
+    if fault is not None:
+        key = (type(backend).__name__, fault)
+        if key not in _PROBE_FAULTS_WARNED:
+            _PROBE_FAULTS_WARNED.add(key)
+            print(
+                f"warning: multiplexer backend {key[0]} {fault}; reading it as unavailable",
+                file=sys.stderr,
+            )
+    return usable
 
 
 def backend_forced() -> bool:
@@ -849,15 +936,27 @@ class MuxBackendInfo:
     # present (TerminalMultiplexer.version_error). Defaulted so it is additive
     # for anyone constructing this row positionally.
     version_error: str | None = None
+    # Why ``matches_platform`` or ``available`` reads False when it is a fold,
+    # not an answer: the platform predicate, the factory or ``available()``
+    # raised (DW-464). ``"; "``-joined when more than one did. Appended with a
+    # default for the same reason as version_error.
+    probe_error: str | None = None
 
 
 def detect_multiplexers() -> list[MuxBackendInfo]:
     """Probe every registered backend: availability, version, platform match,
     and which one :func:`_select` would pick (with its reason).
 
-    Never raises — this feeds diagnostics, which must work on a misconfigured
-    host: a forced unknown name yields rows with no selected mark, and a
-    backend whose factory or probes blow up reads as unavailable. Constructs
+    Every per-backend probe in the row loop is guarded — this feeds diagnostics,
+    which must work on a misconfigured host: a forced unknown name yields rows
+    with no selected mark, and a backend whose factory or probes blow up there
+    reads as unavailable, naming the raise in ``probe_error`` (or, for
+    ``version()``, ``version_error``). Two steps ahead of that loop are NOT fully guarded, so
+    this function can raise: the registry loads (a broken third-party entry point
+    is recorded, not raised — :func:`_load_external_backends` — but a failed
+    import of a bundled backend, i.e. a broken install, propagates), and the
+    :func:`_select` call, which catches only :class:`MultiplexerError` — a factory
+    or platform predicate that raises while selection runs it propagates. Constructs
     every registered backend, so factories must stay cheap, side-effect-free
     constructors (true of the tmux family)."""
     _load_builtin_backends()
@@ -872,29 +971,41 @@ def detect_multiplexers() -> list[MuxBackendInfo]:
         if name in seen:  # duplicate registrations: only the selectable (first) one is shown
             continue
         seen.add(name)
+        # A raising probe still reads False/None as before, but the row keeps
+        # its identity (DW-464) — the #428 blindness version_error fixed for
+        # version(), here for the probes that decide the other two columns.
+        faults: list[str] = []
         try:
             matches_platform = bool(matches(sys.platform))
-        except Exception:
+        except Exception as exc:
             matches_platform = False
+            faults.append(_raised("platform predicate", exc))
         version: str | None = None
         version_error: str | None = None
         try:
             backend = factory()
-            available = _usable(backend)
-        except Exception:
+        except Exception as exc:
             available = False
+            faults.append(_raised("factory", exc))
         else:
+            # The row carries this fault, so it takes the quiet probe, not
+            # _usable's stderr warning.
+            available, fault = _probe_available(backend)
+            if fault is not None:
+                faults.append(fault)
             # version() is cosmetic: its failure must not overwrite the
             # already-computed availability (a selected backend would
-            # otherwise show a contradictory available=False row).
+            # otherwise show a contradictory available=False row). It is
+            # named in version_error, whose question — why is there no
+            # version — a raise answers too.
             try:
                 version = fold_version(backend.version())
-            except Exception:
-                version = None
-            if version is None:
+            except Exception as exc:
+                version, version_error = None, _raised("version()", exc)
+            if version is None and version_error is None:
                 # Read only after version(), which is what it describes, and
                 # only when there is a None to explain. Guarded like every other
-                # probe here — this function never raises.
+                # probe in this loop — none of them may raise out of it.
                 try:
                     version_error = backend.version_error()
                 except Exception:
@@ -909,6 +1020,7 @@ def detect_multiplexers() -> list[MuxBackendInfo]:
                 selected=selected,
                 reason=reason if selected else "",
                 version_error=version_error,
+                probe_error="; ".join(faults) or None,
             )
         )
     return rows

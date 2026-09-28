@@ -27,12 +27,12 @@ import stat
 import sys
 import tarfile
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from . import devcontract, envvars, verify
+from . import bmadconfig, deferredwork, devcontract, envvars, platform_util, verify
 from .adapters.multiplexer import (
     MultiplexerError,
     TerminalMultiplexer,
@@ -42,8 +42,11 @@ from .adapters.multiplexer import (
 from .frontmatter import auto_dev_baseline_of, parse_frontmatter, status_of
 from .journal import STATE_FILE, VERIFY_DIR, Journal, load_state, save_state, state_lock
 from .model import PAUSE_ESCALATION, Phase, RunState, StoryTask
+from .mountpaths import project_offset
 from .platform_util import (
     MAX_SEGMENT,
+    NEVER_MATCHING_IDENTITY,
+    RootIdentityRecord,
     UnconfinedWriteError,
     _mkstemp_beside,
     atomic_replace,
@@ -55,7 +58,11 @@ from .platform_util import (
     is_absolute_path,
     is_link_like,
     names_tree_root,
+    pinned_root_identity,
+    recorded_root_identity,
+    require_root_pinned,
     retrying_unlink,
+    root_identity_record,
     safe_segment,
 )
 from .process_host import ProcessHostError, get_process_host
@@ -101,6 +108,13 @@ CONFIG_DIGEST_FILE = "config-digest"
 # see `read_trusted_config_digest` on why a bound, not a bigger buffer.
 _MAX_DIGEST_BYTES = 256
 _INVALID_PID_IDENTITY = -1.0  # impossible process start/create time; forces "not ours"
+# The identity half of ``(None, _PID_FILE_UNREADABLE)``: a pid file that could not
+# be proved absent but could not be read either (DW-465). Paired with a ``None``
+# pid, so every caller that gates on ``pid is None`` first keeps its "no pid to act
+# on" behaviour; only `engine_liveness`, which must tell the fault from absence,
+# looks at it. Deliberately a finite float, never NaN: `stop_run` compares pid-file
+# tuples for equality, and an unreadable file read twice must compare equal.
+_PID_FILE_UNREADABLE = -2.0
 
 
 class StopRunError(Exception):
@@ -271,13 +285,62 @@ def is_parsable_run_id(value: str) -> bool:
     return _wellformed_run_id(value) and not run_id_aliases_control_session(value)
 
 
-def list_run_dirs(project: Path) -> list[Path]:
-    """All run dirs containing a state.json, oldest first (run ids sort
-    chronologically)."""
+def list_run_dirs(project: Path) -> tuple[list[Path], str | None]:
+    """``(dirs, fault)``: all run dirs containing a state.json, oldest first (run
+    ids sort chronologically), paired with ``None`` — or with an operator-facing
+    description of what could not be read, when the listing is incomplete.
+
+    **Only genuine absence is silent** (DW-468). A missing runs dir (or a
+    non-directory component above it) is a real "no runs"; a runs dir that cannot
+    be stat'd or listed, or a run dir whose ``state.json`` cannot be stat'd, is
+    not — and it used to read exactly like one on 3.14, whose ``is_dir`` and
+    ``is_file`` swallow every ``OSError`` as False, while 3.11-3.13 raised out of
+    this function. ``stat()`` + ``S_ISDIR``/``S_ISREG`` (the DW-224 shape) gives
+    every runtime the same answer, and the fault travels in the return value
+    because every caller is an observation surface that degrades: `list`, the
+    TUI, `status`/`attach`/`diagnose`'s latest-run pick, and ref resolution,
+    which names it instead of answering "no such run" (see
+    :func:`resolve_run_dir`). An unreadable entry is left out of ``dirs`` and
+    named in ``fault``; the rest of the listing stands."""
+    dirs, _unreadable, fault = _scan_run_dirs(project)
+    return dirs, fault
+
+
+def _scan_run_dirs(project: Path) -> tuple[list[Path], list[str], str | None]:
+    """:func:`list_run_dirs` plus the NAMES of the entries it could not read, which
+    :func:`resolve_run_dir` matches a partial ref against: an unreadable run dir
+    is still a candidate the ref may mean, so resolving past it would pick the
+    wrong run without a word."""
     runs = project / RUNS_DIR
-    if not runs.is_dir():
-        return []
-    return sorted(d for d in runs.iterdir() if (d / "state.json").is_file())
+    try:
+        mode = runs.stat().st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return [], [], None
+    except OSError as exc:
+        return [], [], f"{runs}: cannot stat the runs dir: {type(exc).__name__}: {exc}"
+    if not stat.S_ISDIR(mode):
+        return [], [], None
+    try:
+        entries = sorted(runs.iterdir())
+    except OSError as exc:
+        return [], [], f"{runs}: cannot list the runs dir: {type(exc).__name__}: {exc}"
+    dirs: list[Path] = []
+    unreadable: list[str] = []
+    detail: list[str] = []
+    for d in entries:
+        try:
+            mode = (d / STATE_FILE).stat().st_mode
+        except (FileNotFoundError, NotADirectoryError):
+            continue  # not a run dir (or not a dir at all)
+        except OSError as exc:
+            unreadable.append(d.name)
+            detail.append(f"{d.name} ({type(exc).__name__}: {exc})")
+            continue
+        if stat.S_ISREG(mode):
+            dirs.append(d)
+    if not unreadable:
+        return dirs, [], None
+    return dirs, unreadable, f"{runs}: cannot read run dir(s): " + "; ".join(detail)
 
 
 def all_run_dirs(project: Path) -> list[Path] | None:
@@ -295,16 +358,19 @@ def all_run_dirs(project: Path) -> list[Path] | None:
     not the same answer as the empty list a missing root gives. Callers that act
     on "no live runs" have to tell those apart; see :func:`_run_dir_names`.
     """
-    names = _run_dir_names(project)
+    names, _fault = _run_dir_names(project)
     if names is None:
         return None
     root = project / RUNS_DIR
     return sorted(root / name for name in names)
 
 
-def latest_run_dir(project: Path) -> Path | None:
-    candidates = list_run_dirs(project)
-    return candidates[-1] if candidates else None
+def latest_run_dir(project: Path) -> tuple[Path | None, str | None]:
+    """``(newest run dir or None, fault)`` — :func:`list_run_dirs`' fault passed
+    through, since "newest" over an incomplete listing is only the newest
+    readable one, and ``None`` with a fault is "could not list", not "no runs"."""
+    candidates, fault = list_run_dirs(project)
+    return (candidates[-1] if candidates else None), fault
 
 
 def write_named_pid(pidfile: Path, pid: int) -> None:
@@ -754,9 +820,10 @@ def config_digest_path_for(project: Path, run_id: str) -> Path:
     return state_dir_for(project, run_id) / CONFIG_DIGEST_FILE
 
 
-def read_trusted_config_digest(project: Path, run_id: str) -> str | None:
-    """This run's persisted host-exec baseline, or ``None`` when the state root
-    holds none for it.
+def read_trusted_config_digest(project: Path, run_id: str) -> tuple[str | None, str | None]:
+    """``(digest, fault)``: this run's persisted host-exec baseline, or ``None``
+    when the state root holds none for it — paired with ``None``, or with an
+    operator-facing description of why the baseline could not be read.
 
     ``None`` is "ask the in-tree copy", not "no pin" — the two are different
     answers and the caller acts on the difference (see
@@ -780,7 +847,17 @@ def read_trusted_config_digest(project: Path, run_id: str) -> str | None:
 
     Pure observation, so it degrades rather than raising: a state root this host
     cannot name, or a file it cannot read, both answer ``None`` and hand the
-    decision to the in-tree copy. The write half raises — see
+    decision to the in-tree copy. **Only genuine absence is silent** (DW-467):
+    every other ``None`` comes with a ``fault`` naming the path and what went
+    wrong, which the resume prints. Without it a planted FIFO, a link, an
+    unreadable file or undecodable bytes each read as "paused before #498" and
+    fell back to the session-writable ``state.json`` copy with nothing said — the
+    very silencing #498 closed, reopened through the error arms. The decision is
+    unchanged (the caller still falls back); what changed is that the operator
+    is told the trusted baseline was not read. Absence is ``FileNotFoundError``
+    alone: ``NotADirectoryError`` there means a file stands where a state-dir
+    component belongs, which is a tampered path, not an unstamped one. The write
+    half raises — see
     :func:`write_trusted_config_digest` — and the split is the standard one
     (``platform_util.resolve_or_lexical`` states the doctrine). Degrading here
     costs at most one advisory warning; a resume that *aborts* because an
@@ -818,26 +895,28 @@ def read_trusted_config_digest(project: Path, run_id: str) -> str | None:
     exhausting the orchestrator, which is a different and fixable harm."""
     try:
         path = config_digest_path_for(project, run_id)
-    except (StateRootError, OSError, RuntimeError):
-        return None
+    except (StateRootError, OSError, RuntimeError) as exc:
+        return None, f"cannot name its path in the state root: {type(exc).__name__}: {exc}"
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     flags |= getattr(os, "O_BINARY", 0)  # win32: no CRLF translation on the raw fd
     try:
         fd = os.open(path, flags)
-    except OSError:
-        return None
+    except FileNotFoundError:
+        return None, None  # never stamped: the legacy case, and the only silent one
+    except OSError as exc:
+        return None, f"{path}: cannot open: {type(exc).__name__}: {exc}"
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return None
+            return None, f"{path}: not a regular file"
         data = os.read(fd, _MAX_DIGEST_BYTES)
-    except OSError:
-        return None
+    except OSError as exc:
+        return None, f"{path}: cannot read: {type(exc).__name__}: {exc}"
     finally:
         os.close(fd)
     try:
-        return data.decode("utf-8").strip()
+        return data.decode("utf-8").strip(), None
     except UnicodeDecodeError:
-        return None
+        return None, f"{path}: not UTF-8 text"
 
 
 def write_trusted_config_digest(project: Path, run_id: str, digest: str) -> None:
@@ -950,18 +1029,35 @@ def resolve_run_dir(project: Path, ref: str) -> Path:
     project, which handed `bmad-loop delete ""` that run. No addressability is
     lost (no directory can be named `""`); every other escape spelling keeps the
     partial fallback so a legacy dir named `"..."` stays matchable by its own
-    spelling."""
+    spelling.
+
+    An incomplete listing (:func:`list_run_dirs`' fault, DW-468) refuses by
+    naming the fault wherever it could change the answer: when nothing matched
+    (an unreadable runs dir is not "no such run") and when an unreadable run
+    dir's name matches the ref too (a unique readable match is then not proven
+    unique). A unique match that no unreadable name could rival still resolves."""
     if not ref:
         raise RunRefError("empty run ref: it would match every run, never name one")
     if not _is_path_escape(ref):
         exact = run_dir_for(project, ref)
-        if is_run(exact):
-            return exact
-    matches = [
-        d
-        for d in list_run_dirs(project)
-        if short_ref(d.name).startswith(ref) or d.name.endswith(ref)
-    ]
+        # stat + S_ISREG rather than `is_run`: a fault here (3.11-3.13 raise it
+        # from `is_file`, 3.14 swallows it) is not proof either way, so it falls
+        # through to the listing below, which names it.
+        try:
+            if stat.S_ISREG((exact / STATE_FILE).stat().st_mode):
+                return exact
+        except OSError:
+            pass
+
+    def _matches(name: str) -> bool:
+        return short_ref(name).startswith(ref) or name.endswith(ref)
+
+    listed, unreadable, fault = _scan_run_dirs(project)
+    matches = [d for d in listed if _matches(d.name)]
+    if fault is not None and (not matches or any(_matches(n) for n in unreadable)):
+        raise RunRefError(
+            f"cannot resolve run ref {ref!r}: the run listing is incomplete — {fault}"
+        )
     if not matches:
         raise RunRefError(f"no such run: {ref}")
     if len(matches) > 1:
@@ -989,11 +1085,27 @@ def read_named_pid_identity(pidfile: Path) -> tuple[int | None, float | None]:
     when the file is missing or the pid is unparseable; identity ``None`` for a legacy
     pid-only file (callers then degrade to a bare existence check). A malformed
     second token is not legacy: it returns an impossible identity so reuse guards
-    fail closed. First token is the pid, an optional second token the identity float."""
+    fail closed. First token is the pid, an optional second token the identity float.
+
+    A read fault other than absence answers ``(None, _PID_FILE_UNREADABLE)`` (DW-465).
+    It used to answer ``(None, None)``, so an EACCES/EIO/EISDIR read looked exactly
+    like "no pid file" and :func:`engine_liveness` called a possibly-live engine
+    ``'dead'`` — `clean` and `cleanup` then reclaimed past it without the
+    unverifiable-pid warning they owe. The pid stays ``None``, so a caller that only
+    asks "is there a pid to act on" (the Unity dialog-probe reaps, :func:`read_pid`)
+    is unchanged; :func:`engine_liveness` routes the sentinel to ``'unknown'``.
+    Absence is ``FileNotFoundError`` and ``NotADirectoryError`` — the latter when a
+    path component above the file is not a directory (a stray file where a run dir
+    would be), which holds no pid file just as surely. Non-UTF-8 bytes (a torn
+    write, a planted file) are a read fault too: ``UnicodeDecodeError`` used to
+    escape and abort every command that iterates runs. Only that error is caught —
+    the int/float parse arms below keep their own ``ValueError`` semantics."""
     try:
         tokens = pidfile.read_text(encoding="utf-8").split()
-    except OSError:
+    except (FileNotFoundError, NotADirectoryError):
         return None, None
+    except (OSError, UnicodeDecodeError):
+        return None, _PID_FILE_UNREADABLE
     if not tokens:
         return None, None
     try:
@@ -1016,7 +1128,10 @@ def engine_alive(run_dir: Path) -> bool:
     """True only when a local engine pid is provably alive **and still our engine**
     (identity-checked, so a reused pid reads as dead). Mirrors :func:`liveness`
     minus the tmux fallback — callers here want a definite 'is something running'
-    answer, and 'unknown' must not block stop/delete."""
+    answer, and 'unknown' must not block stop/delete. That includes an unreadable pid
+    file (DW-465): False here, but the frontends that report liveness read
+    :func:`engine_liveness`, which answers ``'unknown'`` for it rather than
+    ``'dead'``."""
     pid, identity = read_pid_identity(run_dir)
     if pid is None:
         return False
@@ -1027,10 +1142,13 @@ def engine_liveness(run_dir: Path) -> str:
     """Tri-state read of the local engine: ``'alive'`` | ``'dead'`` | ``'unknown'``.
     Wraps :meth:`ProcessHost.liveness_of` so a live-but-unreadable pid (win32
     ``ERROR_ACCESS_DENIED``) reads ``'unknown'``, not a false ``'dead'``. No pid →
-    ``'dead'`` (the session fallback lives in the TUI layer)."""
+    ``'dead'`` (the session fallback lives in the TUI layer). A pid file that exists
+    but cannot be read → ``'unknown'`` as well (DW-465): the pid in it cannot be
+    probed, which is the same verdict as a pid whose identity cannot be, and every
+    frontend already reports ``'unknown'`` as an unverifiable pid."""
     pid, identity = read_pid_identity(run_dir)
     if pid is None:
-        return "dead"
+        return "unknown" if identity == _PID_FILE_UNREADABLE else "dead"
     return probe_liveness(pid, identity)
 
 
@@ -1149,15 +1267,19 @@ _HeaderFields = tuple[str, str, bool, bool, bool, bool, str]
 _header_cache: dict[Path, tuple[_StatSig, _HeaderFields]] = {}
 
 
-def discover_runs(project: Path) -> list[RunInfo]:
-    """One RunInfo per run dir, oldest first; [] when the runs dir is missing.
+def discover_runs(project: Path) -> tuple[list[RunInfo], str | None]:
+    """``(infos, fault)``: one RunInfo per run dir, oldest first; ``[]`` when the
+    runs dir is missing. ``fault`` is :func:`list_run_dirs`' — ``None`` for a
+    complete listing, else what could not be read (DW-468), which `list` and the
+    TUI report so an unreadable runs dir never reads as "no runs".
 
     Parses only the state.json header fields (cached on stat); a state file
     that fails to parse yields status 'unknown' rather than crashing — it is
     transient, the engine writes atomically.
     """
     out: list[RunInfo] = []
-    for run_dir in list_run_dirs(project):
+    run_dirs, fault = list_run_dirs(project)
+    for run_dir in run_dirs:
         state_path = run_dir / STATE_FILE
         sig = _stat_sig(state_path)
         cached = _header_cache.get(state_path)
@@ -1192,7 +1314,7 @@ def discover_runs(project: Path) -> list[RunInfo]:
         # STOPPED/FINISHED/CRASHED classify before liveness, so they never read UNKNOWN.
         stopping = status in (RUNNING, UNKNOWN) and (run_dir / STOP_REQUEST_FILE).is_file()
         out.append(RunInfo(run_dir.name, run_dir, run_type, started_at, status, stage, stopping))
-    return out
+    return out, fault
 
 
 # ----------------------------------------------------------- stop / delete / archive
@@ -1422,10 +1544,12 @@ def lock_path_for(data_path: Path, *, follow_final_symlink: bool = True) -> Path
     return state_root() / "locks" / f"{digest}-{resolved.name}.lock"
 
 
-def mux_sessions() -> list[str]:
+def mux_sessions(*, on_fault: Callable[[str], None] | None = None) -> list[str]:
     """All live session names, or [] when the multiplexer is missing, no server
-    is running, or the query fails."""
-    return get_multiplexer().list_sessions()
+    is running, or the query fails. ``on_fault`` receives a failed query's
+    description in place of the backend's own stderr warning (see
+    :meth:`~.adapters.multiplexer.TerminalMultiplexer.list_sessions_reporting`)."""
+    return get_multiplexer().list_sessions_reporting(on_fault=on_fault)
 
 
 def session_project_tags() -> dict[str, str]:
@@ -1614,7 +1738,14 @@ def prune_sessions(
     if not dry_run:
         for run_id in prunable:
             kill_session(run_id)
-    for legacy in _legacy_registries():
+    try:
+        legacies = _legacy_registries()
+    except MultiplexerError:
+        # Not reported here: the (killed, live, unknown) tuple is a contract, and
+        # `legacy_registry_leftovers`, which every cleanup frontend reads right
+        # after this, asks the same question and carries the fault (DW-469).
+        legacies = []
+    for legacy in legacies:
         extra, extra_live, extra_unknown = prunable_sessions(project, legacy, require_tag=True)
         if not dry_run:
             for run_id in extra:
@@ -1634,11 +1765,20 @@ DEFAULT_REGISTRY_LABEL = "the multiplexer's own default registry"
 
 def legacy_registry_leftovers(
     project: Path, *, announced: Iterable[str] = ()
-) -> dict[str, list[str]]:
-    """Session names a legacy registry **still holds** after :func:`prune_sessions`
-    ran — the migration's honest remainder, for the cleanup frontends to print.
-    ``{}`` when there is no legacy registry, when they hold nothing, or when
-    every listing fails.
+) -> tuple[dict[str, list[str]], list[str]]:
+    """``(grouped, faults)``: session names a legacy registry **still holds** after
+    :func:`prune_sessions` ran — the migration's honest remainder, for the cleanup
+    frontends to print — and one operator-facing line per registry that could not
+    be asked. ``({}, [])`` when there is no legacy registry or they hold nothing.
+
+    **An unanswerable registry is a fault, not an empty one** (DW-469). A backend
+    that cannot be selected (so no legacy registry could even be named) or a
+    registry whose listing raises used to answer ``{}`` — exactly what a clean
+    migration answers, so `cleanup` printed no leftovers line and the TUI no
+    toast: the silence this function exists to remove. Each now lands in
+    ``faults`` (labelled like ``grouped``'s keys), and the frontends print it
+    beside the leftovers. A registry that faults contributes nothing to
+    ``grouped``; the others still do.
 
     **Grouped by registry, and that is load-bearing.** There is more than one
     legacy registry now (:meth:`~.adapters.psmux_backend.PsmuxMultiplexer.legacy_registries`
@@ -1738,12 +1878,21 @@ def legacy_registry_leftovers(
     # names at most one session anywhere — the same collapse that makes its own
     # "killed" count one per id.
     excluded = {session_name(run_id) for run_id in announced}
-    for legacy in _legacy_registries():
+    faults: list[str] = []
+    try:
+        legacies = _legacy_registries()
+    except MultiplexerError as exc:
+        return grouped, [f"no legacy registry could be checked: backend selection failed: {exc}"]
+    for legacy in legacies:
         try:
             names = legacy.list_sessions()
             tags = legacy.session_options(PROJECT_OPTION) if names else {}
-        except MultiplexerError:
-            continue  # observation degrades; the sweep's own report still stands
+        except MultiplexerError as exc:
+            # Observation degrades — the sweep's own report still stands — but
+            # visibly: this registry's remainder is unknown, not empty.
+            label = legacy.registry_root() or DEFAULT_REGISTRY_LABEL
+            faults.append(f"{label}: could not be listed: {exc}")
+            continue
         here: list[str] = []
         for name in names:
             if is_ctl_session_name(legacy.session_name_key(name)):
@@ -1769,7 +1918,7 @@ def legacy_registry_leftovers(
             # rows are merged rather than overwritten.
             label = legacy.registry_root() or DEFAULT_REGISTRY_LABEL
             grouped[label] = sorted(set(grouped.get(label, []) + here))
-    return grouped
+    return grouped, faults
 
 
 def _legacy_registries() -> list[TerminalMultiplexer]:
@@ -1777,13 +1926,13 @@ def _legacy_registries() -> list[TerminalMultiplexer]:
     (see :meth:`~.multiplexer.TerminalMultiplexer.legacy_registries`, which owns
     the concept and every backend's answer).
 
-    Degrades to [] rather than raising: a backend that cannot even be selected
-    has no legacy registry to offer, and a cleanup that already swept the primary
-    registry must report that work rather than die on the migration pass."""
-    try:
-        return list(get_multiplexer().legacy_registries())
-    except MultiplexerError:
-        return []
+    Raises :class:`MultiplexerError` when no backend can be selected, and each
+    caller degrades on its own terms (DW-469): :func:`prune_sessions` skips the
+    migration pass, since a cleanup that already swept the primary registry must
+    report that work rather than die on it, and :func:`legacy_registry_leftovers`
+    reports the fault. Answering ``[]`` made "could not ask" read as "no legacy
+    registry", so cleanup said nothing about sessions it never looked for."""
+    return list(get_multiplexer().legacy_registries())
 
 
 # The run dir of the OUTERMOST engine in this call stack (#319). A nested auto-sweep
@@ -2374,7 +2523,9 @@ def _stop_run_once(run_dir: Path) -> bool | None:
     return True
 
 
-def live_session_may_be_ours(project: Path, run_id: str) -> bool:
+def live_session_may_be_ours(
+    project: Path, run_id: str, *, warn: Callable[[str], None] | None = None
+) -> bool:
     """True when a live ``bmad-loop-<id>`` session exists that this project cannot
     prove belongs to another one — the precondition of the removal guard below.
 
@@ -2406,10 +2557,73 @@ def live_session_may_be_ours(project: Path, run_id: str) -> bool:
     reaped port file on a 5 s tick, source-read at v3.3.8), a binary's PATH
     presence is per-process while the server is not, and the listing is
     load-sensitive; so a "proof of absence" either wedges every removal behind
-    `--force` or quietly accepts a refutable proof. The degrade above is the
-    guard's owner's documented trade, kept deliberately; the measured cost of
-    the unobservable-multiplexer window is filed for that owner to revisit
-    rather than overturned here.
+    `--force` or quietly accepts a refutable proof.
+
+    Revisited with the cost measured (#732), and the degrade is KEPT — not for
+    want of a stronger read, but because the more dangerous of the two costs
+    reaches this function as an ordinary answer. On psmux 3.3.8 a live session's
+    registry entry is reaped by any `has-session` whose 500 ms connect does not
+    land, and until the server's registry maintenance re-writes it the listing
+    does not name that session while reporting no fault at all: exit **0**, no
+    stderr (measured; the listing empty in that run because the session was the
+    only one, the server pid alive throughout, the entry back 1.7 s later).
+    That maintenance runs when the server's own loop notices 5 s have elapsed —
+    a nominal interval, not a scheduling guarantee, so 1.7 s is a sample and 5 s
+    is not a bound. The listing therefore does not fail, it answers wrongly —
+    and the read this guard makes is the one with no discrimination in it at
+    all. ``mux_sessions()`` lands on ``BaseTmuxBackend.list_sessions``, which
+    returns ``[]`` under the three conditions its own comment names — the binary
+    is missing, no server is running, or the query itself fails — and returns
+    nothing to say which. None of the three raises: the bundled backend folds
+    ``SubprocessError`` and ``OSError`` into that same sentinel, and only an
+    out-of-tree backend raises ``MultiplexerError`` here. A failed query does
+    now say so (DW-458, ``_warn_unproven_listing`` — on stderr, or through
+    ``warn`` below), but a report is not a signal this function conditions on
+    — and the reap reaches none of
+    those branches anyway, because its exit is 0. So it leaves neither a
+    signal nor a word on stderr.
+
+    The second cost lasts as long as its cause: a process whose PATH lacks the
+    binary reads every session as absent for as long as that PATH does (measured
+    through the seam — the sessions reappear when PATH is restored), because the
+    binary is per-process while the server is not. That one is no mystery to the
+    transport: ``list_sessions`` decides it from ``shutil.which`` on purpose,
+    being one of the two methods that report what exists, and folds it into the
+    same ``[]`` deliberately (its own comment: the absence of sessions and the
+    absence of the multiplexer are indistinguishable here). The fold is the
+    seam's decision; what reaches this function is its result.
+
+    What the two costs share is not a shape but a verdict. A reap takes one
+    session's entry, so its listing may still name every other session on the
+    box; a missing binary yields nothing at all. Both arrive as the same
+    *negative membership* — this run's name is not in the listing — which is
+    exactly what a genuinely dead session produces, and there is no fourth
+    answer to distinguish them by.
+
+    The named alternatives were weighed and refused. Retry-with-delay, in the
+    shape this guard could hold, pays a delay on every removal that finds no
+    session — the common case — once per run inside `clean`; a retry hoisted to
+    command scope would pay it once, but neither can bound a window whose close
+    is a nominal tick rather than a deadline. A tag-first read draws on the same
+    listing and is blind in exactly the same window. Warning whenever the
+    multiplexer is unusable fires on every box that simply has no multiplexer,
+    which is the noise ``BaseTmuxBackend._warn_unproven_listing`` already stays
+    silent about. What is left is the accepted ceiling, written down here and in
+    docs/FEATURES.md so an operator meets it as a documented limit rather than a
+    surprise.
+
+    The psmux half is a *defect*, not a design: four sibling reap sites in that
+    binary gate on `ConnectionRefused` precisely because "a timeout means
+    busy-but-alive and must not be deleted" (its own comment), the `has-session`
+    site does not, and tmux 3.4 blocks rather than reaps under the same
+    treatment (measured). Reported as psmux/psmux#622, which is the thing to
+    watch. Retiring it takes two parties, though, and an upstream fix alone is
+    not enough: the reap window closes for this project once a psmux release
+    repairs that site AND the supported floor is raised to that release or
+    later, since an installed 3.3.8 keeps reaping whatever master does. And it
+    retires only itself — the PATH case is ours, and so are the two arms above
+    it, a backend that cannot be selected and a listing that raises. What that
+    fix removes is one measured case, not the ceiling.
 
     Two registry-root-era additions on that unchanged contract:
 
@@ -2440,10 +2654,39 @@ def live_session_may_be_ours(project: Path, run_id: str) -> bool:
     listing read — :func:`mux_sessions` selects inside the caught call — so it
     degrades the listing's way: a transport that cannot even be chosen (a
     persisted `[mux] backend` naming a backend no longer registered) reports
-    no live session rather than aborting every removal path."""
+    no live session rather than aborting every removal path.
+
+    **Those two degrades are signalled (DW-466).** A selection or listing that
+    raises :class:`MultiplexerError` still answers False, but reports a warning
+    naming the run and the error, since the removal it licenses then went ahead
+    without the multiplexer ever being asked. Through ``warn``, not the return
+    value: the answer is a bool read by `clean` and by
+    :func:`_refuse_live_session` under every delete/archive path (CLI, TUI and
+    ``runsetup``'s launch-failure cleanup), and widening it would move every one
+    of them for a warning. ``warn`` receives the operator-facing line; left
+    ``None`` it is printed on stderr as a ``warning:``, which is the CLI's
+    channel. A frontend that owns stderr passes its own sink instead — the TUI,
+    where Textual captures stderr for the app's whole run and a print would
+    reach nobody — and then the print does not also fire: one route per
+    frontend. No double report: the bundled backends never raise here —
+    ``BaseTmuxBackend.list_sessions`` folds its own faults into ``[]`` and warns
+    for them itself (DW-458) — so the exception this arm catches comes only
+    from an out-of-tree backend or from selection, and no layer below has said
+    anything about it. The bundled fold reaches ``warn`` too: given a sink, the
+    listing is read through
+    :meth:`~.adapters.multiplexer.TerminalMultiplexer.list_sessions_reporting`,
+    which hands this function the fault its DW-458 warning would have printed
+    instead of printing it, and the fault is reported here in the same words
+    as the raise. Left ``None``, the listing keeps its own stderr warning and
+    this function adds nothing: still exactly one line per fault on each route.
+    The ``ctl_session_for`` and tag-read arms stay silent on
+    purpose: both degrade toward refusal, the safe direction."""
     try:
         mux = get_multiplexer()
-    except MultiplexerError:
+    except MultiplexerError as exc:
+        _warn_unasked_session_guard(
+            run_id, "the multiplexer backend could not be selected", exc, warn
+        )
         return False
     key = mux.session_name_key
     name = session_name(run_id)
@@ -2454,10 +2697,16 @@ def live_session_may_be_ours(project: Path, run_id: str) -> bool:
         pass  # namespace unanswerable: only the fixed name is knowable
     if key(name) in {key(c) for c in control}:
         return False
+
+    def folded(fault: str) -> None:
+        _warn_unasked_session_guard(run_id, "the session listing failed", fault, warn)
+
     try:
-        if key(name) not in {key(s) for s in mux_sessions()}:
+        listing = mux_sessions(on_fault=folded if warn is not None else None)
+        if key(name) not in {key(s) for s in listing}:
             return False
-    except MultiplexerError:
+    except MultiplexerError as exc:
+        _warn_unasked_session_guard(run_id, "the session listing raised", exc, warn)
         return False
     try:
         tags = session_project_tags()
@@ -2467,7 +2716,23 @@ def live_session_may_be_ours(project: Path, run_id: str) -> bool:
     return not tag or tag in accepted_tags(project)
 
 
-def _refuse_live_session(project: Path, run_id: str, verb: str) -> None:
+def _warn_unasked_session_guard(
+    run_id: str, what: str, exc: MultiplexerError | str, warn: Callable[[str], None] | None
+) -> None:
+    # The removal guard's one I/O edge (see live_session_may_be_ours, DW-466).
+    note = (
+        f"run {run_id}: could not check for a live agent session — {what}: "
+        f"{exc}; proceeding as if none is live"
+    )
+    if warn is None:
+        print(f"warning: {note}", file=sys.stderr)
+    else:
+        warn(note)
+
+
+def _refuse_live_session(
+    project: Path, run_id: str, verb: str, *, warn: Callable[[str], None] | None = None
+) -> None:
     """Backstop for #419: refuse to remove a run dir out from under a live session.
 
     Every caller's live guard is keyed on *engine pid* liveness, so an orphan —
@@ -2495,7 +2760,7 @@ def _refuse_live_session(project: Path, run_id: str, verb: str) -> None:
     Hence the message asks the operator to confirm first: nothing available here can
     prove the session ours, and minting a proof that outlives the run dir is #419
     direction (2), not this guard."""
-    if live_session_may_be_ours(project, run_id):
+    if live_session_may_be_ours(project, run_id, warn=warn):
         raise LiveSessionError(
             f"run {run_id}: refusing to {verb} its directory while its agent session is "
             f"still live — for an untagged session this directory is the only ownership "
@@ -2606,6 +2871,7 @@ def delete_run(
     *,
     force: bool = False,
     wait_for_lock: bool = True,
+    warn: Callable[[str], None] | None = None,
     _expected_composer_pid: int | None = None,
     _expected_composer_claim: os.stat_result | None = None,
 ) -> None:
@@ -2637,7 +2903,11 @@ def delete_run(
     a held lock already means what that caller reports anyway ("in use, left
     alone"), and because waiting is unbounded on POSIX where ``fcntl.flock`` never
     times out. The default waits, which is what a single-run operator command
-    wants: there, giving up would turn a brief overlap into a failed command."""
+    wants: there, giving up would turn a brief overlap into a failed command.
+
+    ``warn`` is where the session guard reports that it could not ask the
+    multiplexer and let the removal proceed anyway (DW-466); ``None`` prints it
+    on stderr. See :func:`live_session_may_be_ours`."""
     _refuse_uncontained_run_dir(project, run_dir, "delete")
     with state_lock(run_dir, blocking=wait_for_lock):
         if _expected_composer_claim is not None:
@@ -2665,7 +2935,7 @@ def delete_run(
                 f"run {run_dir.name} is still live — refusing to delete it; stop it first"
             )
         if not force:
-            _refuse_live_session(project, run_dir.name, "delete")
+            _refuse_live_session(project, run_dir.name, "delete", warn=warn)
         shutil.rmtree(run_dir)
         # after the run dir, never before: a raise above leaves the run whole, and a
         # whole run keeps its control plane (see _discard_state_dir).
@@ -2673,7 +2943,12 @@ def delete_run(
 
 
 def archive_run(
-    project: Path, run_dir: Path, *, force: bool = False, wait_for_lock: bool = True
+    project: Path,
+    run_dir: Path,
+    *,
+    force: bool = False,
+    wait_for_lock: bool = True,
+    warn: Callable[[str], None] | None = None,
 ) -> Path:
     """Compress a run dir into .bmad-loop/archive/<id>.tar.gz and remove the
     original. The tarball is written to a temp path then atomically replaced into
@@ -2697,7 +2972,8 @@ def archive_run(
     ``wait_for_lock`` carries the meaning it has on :func:`delete_run`: ``False``
     declines a contended run with :class:`platform_util.LockUnavailableError`
     rather than queueing behind its holder, and refuses before the tarball is
-    written, so a decline — like the guards above it — leaves nothing behind."""
+    written, so a decline — like the guards above it — leaves nothing behind.
+    ``warn`` carries the session guard's degrade as on :func:`delete_run`."""
     _refuse_uncontained_run_dir(project, run_dir, "archive")
     with state_lock(run_dir, blocking=wait_for_lock):
         if engine_liveness(run_dir) == "alive":
@@ -2705,7 +2981,7 @@ def archive_run(
                 f"run {run_dir.name} is still live — refusing to archive it; stop it first"
             )
         if not force:
-            _refuse_live_session(project, run_dir.name, "archive")
+            _refuse_live_session(project, run_dir.name, "archive", warn=warn)
         return _archive_run_locked(project, run_dir)
 
 
@@ -2818,52 +3094,82 @@ def reclaimable(run_dir: Path) -> bool:
     return bool(state and (state.finished or state.stopped))
 
 
-def reconcile_orphan_worktrees(repo: Path, run_dir: Path, *, dry_run: bool = False) -> list[Path]:
+def reconcile_orphan_worktrees(
+    repo: Path, run_dir: Path, *, dry_run: bool = False
+) -> tuple[list[Path], str | None]:
     """Force-remove every git worktree whose path lies under ``run_dir``, then
     prune git's admin entries. Reconciles from ``git worktree list`` (on-disk
     truth), NOT from policy — orphans created under a previous isolation=worktree
-    config persist after a switch back to isolation=none. Returns the worktree
-    paths handled (or that would be, under dry_run). Callers gate on
-    ``reclaimable``; the main checkout is never under a run dir, so it is safe."""
+    config persist after a switch back to isolation=none. Callers gate on
+    ``reclaimable``; the main checkout is never under a run dir, so it is safe.
+
+    ``(handled, fault)``: the worktree paths removed (or that would be, under
+    dry_run), and ``None`` — or an operator-facing line when the reconcile is
+    incomplete (DW-470). Non-raising, since `clean` must still run its other
+    passes, but a listing that failed is not "nothing orphaned": ``[]`` over an
+    unlisted repo let `clean` go on to trim the run's ``worktrees/`` tree with
+    git's admin entries for it still registered, and say nothing. A worktree
+    whose fallback ``rmtree`` left it on disk is named too, and is not in
+    ``handled`` — reporting it removed would be false."""
     run_res = run_dir.resolve()
     try:
         worktrees = verify.worktree_list(repo)
-    except verify.GitError:
-        return []
+    except verify.GitError as exc:
+        return [], f"cannot list git worktrees, so none were reconciled: {exc}"
     handled: list[Path] = []
+    left: list[str] = []
     for wt in worktrees:
         try:
             wt.resolve().relative_to(run_res)
         except (ValueError, OSError):
             continue  # not this run's worktree (incl. the main checkout)
-        handled.append(wt)
         if not dry_run:
             try:
                 verify.worktree_remove(repo, wt, force=True)
             except verify.GitError:
                 shutil.rmtree(wt, ignore_errors=True)
-    if handled and not dry_run:
+                if os.path.lexists(wt):
+                    left.append(str(wt))
+                    continue
+        handled.append(wt)
+    if (handled or left) and not dry_run:
         verify.worktree_prune(repo)
-    return handled
+    if left:
+        return handled, "worktree(s) still on disk after a failed removal: " + ", ".join(left)
+    return handled, None
 
 
-def reconcile_stale_worktrees(repo: Path, project: Path, *, dry_run: bool = False) -> list[Path]:
+def reconcile_stale_worktrees(
+    repo: Path, project: Path, *, dry_run: bool = False
+) -> tuple[list[Path], str | None]:
     """Safety net for the automatic paths (run/sweep start): tear down worktrees
     left behind by a *finished* run whose clean-finish GC didn't complete (e.g. a
     crash between merge and teardown). Deliberately finished-ONLY — a stopped run
     is still resumable, so its worktree is left for `resume`/`clean` to handle and
-    never stranded out from under the operator."""
+    never stranded out from under the operator.
+
+    ``(handled, fault)``: ``fault`` joins :func:`list_run_dirs`' (DW-468) — a run
+    the listing could not read was not reconciled — with each distinct
+    :func:`reconcile_orphan_worktrees` fault (DW-470), so the caller says so
+    rather than letting "reclaimed nothing" stand for either."""
     handled: list[Path] = []
-    for run_dir in list_run_dirs(project):
+    run_dirs, fault = list_run_dirs(project)
+    faults = [fault] if fault is not None else []
+    for run_dir in run_dirs:
         if not is_finished(run_dir):
             continue
-        handled += reconcile_orphan_worktrees(repo, run_dir, dry_run=dry_run)
-    return handled
+        run_handled, run_fault = reconcile_orphan_worktrees(repo, run_dir, dry_run=dry_run)
+        handled += run_handled
+        # A listing fault is repo-wide and repeats per run verbatim; say it once.
+        if run_fault is not None and run_fault not in faults:
+            faults.append(run_fault)
+    return handled, "; ".join(faults) or None
 
 
-def _run_dir_names(project: Path) -> set[str] | None:
-    """Every *directory name* under the runs dir, or ``None`` when that listing
-    could not be taken.
+def _run_dir_names(project: Path) -> tuple[set[str] | None, str | None]:
+    """``(names, fault)``: every *directory name* under the runs dir, or ``None``
+    — paired with an operator-facing ``fault`` — when that listing could not be
+    taken.
 
     Deliberately not :func:`list_run_dirs`, which is ``state.json``-gated: this
     answers "does a run dir by this name exist", and a run whose ``state.json`` is
@@ -2876,15 +3182,18 @@ def _run_dir_names(project: Path) -> set[str] | None:
     unreadable one answers nothing at all, and a sweep run against "no live names"
     would remove every state dir this project has. ``None`` is that second case.
     """
+    runs_dir = project / RUNS_DIR
     try:
-        return {entry.name for entry in os.scandir(project / RUNS_DIR) if entry.is_dir()}
+        return {entry.name for entry in os.scandir(runs_dir) if entry.is_dir()}, None
     except FileNotFoundError:
-        return set()
-    except OSError:
-        return None
+        return set(), None
+    except OSError as exc:
+        return None, f"{runs_dir}: cannot list the runs dir: {type(exc).__name__}: {exc}"
 
 
-def reconcile_orphan_state_dirs(project: Path, *, dry_run: bool = False) -> list[Path]:
+def reconcile_orphan_state_dirs(
+    project: Path, *, dry_run: bool = False
+) -> tuple[list[Path], str | None]:
     """Remove this project's out-of-tree control-plane dirs whose run dir is gone.
 
     The GC backstop for the events channel (#494). :func:`_discard_state_dir`
@@ -2895,8 +3204,9 @@ def reconcile_orphan_state_dirs(project: Path, *, dry_run: bool = False) -> list
     forever, on a path outside the project that no operator thinks to look at.
 
     Shaped like :func:`reconcile_orphan_worktrees`: enumerate on-disk truth,
-    containment-test each path, remove with failures tolerated. Returns what was
-    removed (or, under ``dry_run``, what would be).
+    containment-test each path, remove with failures tolerated. Returns
+    ``(handled, fault)``: what was removed (or, under ``dry_run``, what would be),
+    and ``None`` or an operator-facing line saying why the sweep is incomplete.
 
     Every path is built from an entry name this function itself enumerated —
     never from a caller-supplied ref, which is what :func:`_is_path_escape`
@@ -2911,7 +3221,12 @@ def reconcile_orphan_state_dirs(project: Path, *, dry_run: bool = False) -> list
     Degrades to no-op rather than raising, in either direction: an underivable
     state root, an unreadable root, or an unreadable runs dir all sweep nothing.
     This is reclamation, not repair — leaving disk behind is the cheap outcome,
-    and removing a live run's control plane is not.
+    and removing a live run's control plane is not. **But visibly** (DW-470): each
+    of those answers ``([], fault)``, so `clean` reports "could not sweep" rather
+    than "swept 0". So does an entry the containment test could not resolve, or
+    one ``rmtree`` left on disk (which is kept out of ``handled``); the rest of the
+    sweep stands. Only a missing state root is silent — nothing was ever minted
+    there, so nothing is orphaned.
 
     Both guards hold ``RuntimeError`` alongside ``OSError`` for the same reason
     :func:`_discard_state_dir` does: every path here is resolved (the project by
@@ -2939,14 +3254,20 @@ def reconcile_orphan_state_dirs(project: Path, *, dry_run: bool = False) -> list
     """
     try:
         root = project_state_root(project)
+    except (StateRootError, OSError, RuntimeError) as exc:
+        return [], f"cannot name this project's state root: {type(exc).__name__}: {exc}"
+    try:
         entries = sorted(root.iterdir())
         root_res = root.resolve()
-    except (StateRootError, OSError, RuntimeError):
-        return []
-    live = _run_dir_names(project)
+    except (FileNotFoundError, NotADirectoryError):
+        return [], None
+    except (OSError, RuntimeError) as exc:
+        return [], f"{root}: cannot list the state root: {type(exc).__name__}: {exc}"
+    live, live_fault = _run_dir_names(project)
     if live is None:
-        return []
+        return [], f"{live_fault} — no state dir could be proven orphaned"
     handled: list[Path] = []
+    skipped: list[str] = []
     for entry in entries:
         if entry.name in live or entry.is_symlink() or not entry.is_dir():
             continue
@@ -2966,12 +3287,20 @@ def reconcile_orphan_state_dirs(project: Path, *, dry_run: bool = False) -> list
             continue
         try:
             entry.resolve().relative_to(root_res)
-        except (OSError, RuntimeError, ValueError):
+        except ValueError:
+            continue  # resolves outside the root (a junction): not ours to reap
+        except (OSError, RuntimeError) as exc:
+            skipped.append(f"{entry.name} (cannot resolve: {type(exc).__name__}: {exc})")
             continue
-        handled.append(entry)
         if not dry_run:
             shutil.rmtree(entry, ignore_errors=True)
-    return handled
+            if os.path.lexists(entry):
+                skipped.append(f"{entry.name} (still on disk after removal)")
+                continue
+        handled.append(entry)
+    if skipped:
+        return handled, f"{root}: state dir(s) not swept: " + "; ".join(skipped)
+    return handled, None
 
 
 def _unlink_redirect(p: Path) -> None:
@@ -3043,6 +3372,211 @@ def runs_past_retention(
         cutoff = (time.time() if now is None else now) - keep_days * 86400
         return [rd for rd in candidates if (_run_started_epoch(rd) or 0.0) < cutoff]
     return candidates
+
+
+# ------------------------------------------------------- resume-entry ledger gate
+
+
+def unreadable_sweep_ledger(project: Path, run_dir: Path) -> str | None:
+    """The refusal a resume-shaped entry point owes a sweep run whose ledger cannot
+    be read — bytes that do not decode (DW-204) or a read the OS refuses (DW-234).
+
+    Returns the operator-facing message, or None to decline (DW-204).
+
+    A sweep run's whole job is reading and rewriting the deferred-work ledger, so
+    resuming one over a ledger nobody can read arms the run — pid publication,
+    policy re-stamp, a `run-resume` journal row — and only then meets the ledger.
+    The run's own read degrades rather than raising (`sweep._read_cycle_ledger`,
+    DW-197), so the cost is not a crash but a wasted arm and a stop whose repair
+    route this surface never offered: every repair steer in the product
+    (`sweep._notify_ledger_repair`, the ATTENTION line, docs/FEATURES.md) routes to
+    a fresh `bmad-loop sweep`, and `resume` was the one that silently accepted the
+    attempt instead.
+
+    Reachable domain — narrower than it looks. A sweep ENDED by a ledger fault
+    returns from `SweepEngine._loop`, and `Engine._run_inner` sets
+    `state.finished = True` on that return, so DW-204's own literal end state is
+    persisted finished and is refused by `_prepare_resume_locked`'s `already
+    finished`, which this gate declines to re-word. What is left, and what this
+    gate is for, is the UN-finished sweep runs — paused at an escalation, the
+    migrate gate or an in-flight bundle's intent-regeneration refusal (DW-243: the
+    recovery pass pauses at the story gate rather than stopping, precisely so the
+    task is re-driven by a resume this gate fronts), operator-stopped, or crashed
+    — whose ledger is unreadable at the moment someone resumes them.
+
+    Scope, all deliberate:
+
+    * `read_for_write`, never `read_for_observation` — this gates a run that will
+      WRITE the ledger, so it must ask the arm that refuses to publish from a text
+      nobody could read.
+    * `LedgerReadError` is caught BY NAME. It is a plain `Exception` on purpose
+      (DW-146) so that no OSError handler can swallow it; the flip side is that
+      nothing catches it implicitly either.
+    * `OSError` IS caught here too, with its own permissions-or-storage repair —
+      the RECORDED REVERSAL (DW-234). The arm was first written at `e609604c`,
+      then struck by the DW-204 human resolution on SCOPE grounds: that resolution
+      froze this gate to the decode fault so DW-204 could ship without
+      re-litigating the DW-146 reader contract, and two propagation rows pinned
+      the exclusion. The steer the exclusion lost was real — before this gate, an
+      OS-refused ledger armed the run and stopped through `_read_cycle_ledger`'s
+      `ledger-inaccessible` arm WITH `_notify_ledger_repair`'s route, and the gate
+      then let the same fault reach `main`'s tail as a routeless
+      `error: [Errno 13] …` naming no repair at all. DW-204 has shipped, DW-234
+      carries the accepted 2026-09-09 decision to add the arm back, and this is
+      that arm: it shares the `bmad-loop sweep` + clean-worktree ROUTE
+      `sweep._notify_ledger_repair` already gives the sweep run for the same
+      fault (that notice names the route and nothing about the fault's class),
+      and the permissions-or-storage attribution is this arm's own. The arm is a
+      CALLER's: since DW-279, `deferredwork.read_for_write` wraps OS failures
+      as `LedgerReadFault`, handled before the decode parent here to preserve
+      the original OS attribution. `tui.app._do_rearm` no longer wraps the probe
+      in its own `except OSError` — with the arm here the probe cannot raise one, so that
+      stopgap was dead code.
+    * Absence is NOT a refusal. `read_for_write` answers None, and `open_ids("")`
+      / `parse_ledger("")` answer identically for absent and empty — a resumed
+      sweep on an absent ledger ends cleanly at `sweep-nothing-open`, unless it
+      holds an in-flight bundle whose intent document must be regenerated: that
+      run re-pauses at the story gate under `sweep-intent-regen-refused`
+      `reason="ledger-absent"` (DW-243/252) before any cycle runs. A bundle close
+      paused at the same gate under `sweep-bundle-close-refused` — the mutator's
+      own locked read at the accepted-dev close, review-leg reclose or isolated
+      close carry (DW-280), plus either read site in the terminal post-merge
+      harvested append (DW-286) — resumes the same way once the ledger reads.
+      This gate fronts that resume for the MAIN checkout's ledger (the terminal
+      carry and the in-place close sites), and the existing recovery arms then
+      re-drive the write. Under `scm.isolation = "worktree"` the two in-worktree
+      close sites write the unit worktree's copy, which the pause notice names
+      and this gate does not probe, so an unrepaired copy simply re-pauses on
+      resume.
+    * Story runs are out of scope, and since DW-231 (undecodable bytes) and
+      DW-258 (a read the OS refuses) that is SAFE rather than merely decided at
+      the engine's four direct `read_for_write` sites. Its observation reads
+      (`_ledger_digest`, the pre-harvest and defer snapshots, the two restores)
+      degrade to a typed answer nothing can write back and journal
+      `ledger-read-degraded`; its two publish reads (the spec-deferral harvest
+      and the isolated carry) pause the run with an `ACTION REQUIRED` repair
+      notice and no phase change, so `bmad-loop resume` after the repair retries
+      the write — replaying the recorded session result where one exists,
+      re-driving the leg otherwise. The exception is a sweep's terminal
+      post-merge harvest carry: its caller-sensitive dispatch uses the sweep
+      story gate above, while a direct pre-terminal sweep defer carry retains the
+      engine escalation route. At those four sites a story run over an
+      undecodable OR OS-refused ledger therefore no longer dies as `run-crash`.
+      Since DW-259 the mutators' locked re-reads route the same way for decode
+      faults, and DW-279 extends that route to OS metadata/text-read faults:
+      every `deferredwork` mutator takes its own locked
+      `read_for_write` — after a routed pre-read at the harvest and the harvest
+      carry, after an observation snapshot at the commit-boundary close, and with
+      no pre-read at all at the review-timeout salvage refile
+      (`deferredwork.append_entry` in `engine._salvage_review_timeout`) and the
+      isolated close carry — so a `LedgerReadError` raised from the mutator call
+      itself (the harvest's mark and append, the commit-boundary close, the
+      salvage refile, the isolated carries' append and close) now pauses through
+      the same `ledger-read-refused` route under a site name ending in `-locked`,
+      with the phase untouched. `LedgerReadFault(LedgerReadError)` identifies
+      OS read failures with the original `OSError` chained; pre-lock presence
+      probes, lock acquisition and writes keep their raw `OSError` behavior.
+
+    Timing — a best-effort ENTRY SNAPSHOT, never a guarantee about the inputs the
+    run actually arms. The probe reads `load_state` / `bmadconfig.load_paths` at its
+    caller's entry, ahead of `_resume_paused_run`'s `state_lock`;
+    `_prepare_resume_locked` re-loads both UNDER that lock and publishes the pid
+    from ITS reads, so a config change landing in that window selects a ledger this
+    probe never saw. That race is ACCEPTED rather than closed, and the reason it
+    can be: its outcome is exactly pre-DW-204 behavior — the run arms and its own
+    read degrades to a `sweep-repeat-done` stop (DW-197) — so an entry snapshot can
+    only improve on what this surface did before, never regress it. **No under-lock
+    re-probe may be added**, and not for cost: `_prepare_resume_locked` /
+    `_resume_paused_run` are also `resolve`'s re-arm path, so a refusal sited there
+    lands after resolve's interactive session has run and its escalation is spent —
+    exactly the failure `cmd_resolve`'s own entry gate exists to prevent. That
+    deferral is now settled (DW-229, DW-230), and settled at the callers rather
+    than here: `cli.cmd_resolve` and the TUI's `_do_rearm` call THIS function at
+    their own entries — resolve at the end of its pre-side-effect gate block,
+    ahead of the interactive session and `rearm_escalation`; the TUI beside
+    its alias/liveness gates, ahead of the same re-arm and of the detached resume
+    whose refusal would land in a pane nobody opens. Three entry points, one
+    implementation, and still no probe under the lock: this function lives in
+    `runs` (the CLI+TUI shared-helper module) precisely so a second surface takes
+    the gate by CALLING it rather than by copying it or by sinking it into shared
+    machinery that runs too late. Each caller owns its own channel — stderr plus
+    `ExitCode.FAILURE` in the CLI, an error toast in the TUI — which is why the
+    probe stays pure `(project, run_dir) -> str | None` and answers with the
+    operator-facing string or declines.
+
+    What this gate defers to, precisely. It declines for a `finished` run and for a
+    control-session-alias id, so `_prepare_resume_locked` keeps `already finished`
+    and its "recover by hand, then `bmad-loop delete`" verbatim. It PRECEDES
+    `_reject_under_floor_git`, `_reject_isolation_conflict`, `_require_base_skills`
+    and the under-lock `runs.is_run` -> `no such run`, so a sweep run blocked by one
+    of those AND holding an undecodable ledger is told to fix the ledger first. That
+    ordering is deliberate and pinned by a row, not an accident of placement: this
+    refusal is the cheapest to produce and the most actionable of the set, and every
+    refusal it displaces is reachable again on the retry after the repair.
+    Reproducing those checks here would mean spawning git from a probe, which is why
+    they are not. At the `cmd_resolve` call site the displacement set is larger,
+    because the gate sits at the end of that command's pre-side-effect block: it
+    also precedes `policy_mod.load` and the whole `--restore-patch` validation, so
+    an operator who passes a bad patch path AND holds an undecodable ledger is told
+    about the ledger and only learns about the path on the retry. Same rationale —
+    the ledger blocks the gesture outright, while the patch path is only reportable
+    once the gesture can run at all.
+    """
+    try:
+        state = load_state(run_dir)
+        paths = bmadconfig.load_paths(project)
+    except Exception:
+        # Broad on purpose: a missing/corrupt state.json, a missing BMAD config and
+        # a run cleanup removed mid-command all already have owners downstream
+        # (`runs.is_run`, `_prepare_resume_locked`, `main`'s tail). The gate hands
+        # control on so the fault's own owner answers for it, instead of reporting a
+        # ledger this probe never managed to locate.
+        return None
+    if state.run_type != "sweep":
+        return None
+    if state.finished or run_id_aliases_control_session(run_dir.name):
+        return None  # `_prepare_resume_locked` owns these two refusals verbatim
+
+    ledger = paths.deferred_work
+    try:
+        deferredwork.read_for_write(ledger)
+    except (OSError, deferredwork.LedgerReadFault) as e:
+        if isinstance(e, deferredwork.LedgerReadFault) and isinstance(e.__cause__, OSError):
+            e = e.__cause__  # Preserve the original OS attribution.
+        # The OS refused the read (DW-234): a permissions or storage fault, not
+        # bytes that failed to decode. The class NAME rides along because the errno
+        # text alone ("[Errno 13] Permission denied") does not say what kind of
+        # refusal it was. The ROUTE (`bmad-loop sweep` in a clean worktree) is the
+        # one `sweep._notify_ledger_repair` gives the sweep run for the same fault;
+        # the permissions-or-storage attribution is this arm's own — that notice
+        # names the route and nothing about the fault's class. Every other clause
+        # is the decode refusal's, verbatim, for the same reasons.
+        return (
+            f"run {run_dir.name}: cannot resume this sweep — the deferred-work ledger "
+            f"{ledger} could not be read ({e.__class__.__name__}: {e}). Repair the "
+            "ledger's permissions or storage so it reads, then commit or stash any "
+            f"changes in {paths.repo_root} and run `bmad-loop sweep` (which requires "
+            "that worktree to be clean). This run stays resumable: `bmad-loop resume` "
+            "it again once the ledger reads, which keeps its in-flight bundle recovery "
+            "instead of starting the cycle over"
+        )
+    except deferredwork.LedgerReadError as e:
+        # `e` already names the file AND the codec fault; repeating either would only
+        # drift from it. The clean-worktree precondition rides along because
+        # `cmd_sweep` enforces it and this fault leaves the ledger DIRTY, so an
+        # unqualified "run `bmad-loop sweep`" sends the human into an exit-1 nobody
+        # warned them about. And this run is still resumable by construction (the
+        # gate declines for finished runs), so the message says so: following the
+        # sweep steer alone would abandon the paused run's in-flight bundle state,
+        # whose recovery includes a ledger restore.
+        return (
+            f"run {run_dir.name}: cannot resume this sweep — {e}. Repair the ledger by "
+            f"hand, then commit or stash any changes in {paths.repo_root} and run "
+            "`bmad-loop sweep` (which requires that worktree to be clean). This run "
+            "stays resumable: `bmad-loop resume` it again once the ledger reads, which "
+            "keeps its in-flight bundle recovery instead of starting the cycle over"
+        )
+    return None
 
 
 # ----------------------------------------------------------- escalation resolution
@@ -3165,7 +3699,9 @@ def task_spec_path(task: StoryTask, state: RunState) -> Path:
     file exists.
 
     `StoryTask._serialized_worktree_path` (`model.py`) persists a worktree-local spec
-    RELATIVE to the mounted worktree root, and `from_dict` reads it back raw. Resolving
+    RELATIVE to the mount project (`RunState.mount_project`: the mounted worktree root
+    unless the project is nested inside the code root, DW-379), and `from_dict` reads
+    it back raw. Resolving
     that against the process cwd is not merely unreachable — it is actively wrong:
     `bmad-loop resolve` runs from the project root, where the MAIN CHECKOUT carries the
     same implementation-artifacts-relative path, so a bare `Path(task.spec_file)` names
@@ -3191,6 +3727,10 @@ def task_spec_path(task: StoryTask, state: RunState) -> Path:
 
 def task_spec_root(task: StoryTask, state: RunState) -> Path:
     """The tree a `task.spec_file` is anchored on — and confined to.
+
+    For a mounted task that tree is the MOUNT PROJECT (`RunState.mount_project`): the
+    worktree root in the default config, ``<worktree>/<offset>`` for a project nested
+    in the code root (DW-379). "Worktree" and "mount" below mean that tree.
 
     One definition backs both halves because they must not disagree: the root
     `task_spec_path` resolves against and the `confine_root` the writers validate the
@@ -3256,18 +3796,20 @@ def task_spec_root(task: StoryTask, state: RunState) -> Path:
     it, but matching that here would diverge from the gate this value is measured
     against and change writes that are correct today.
     """
-    worktree = task.worktree_path
-    if not worktree:
+    mount_project = state.mount_project(task)
+    if mount_project is None:
         return Path(state.project)
     raw = Path(task.spec_file or "")
-    if raw.is_absolute() and not raw.is_relative_to(worktree):
+    if raw.is_absolute() and not raw.is_relative_to(mount_project):
         return Path(state.project)
-    return Path(worktree)
+    return mount_project
 
 
 def task_stories_root(task: StoryTask | None, state: RunState) -> Path:
-    """The tree this run's STORIES FOLDER lives in — the workspace root, not a
-    confinement root.
+    """The tree this run's STORIES FOLDER lives in — the workspace's PROJECT (the
+    mount project for a mounted task, `RunState.mount_project`: the mount root in the
+    default config, ``<mount>/<offset>`` for a nested project, DW-379), not a
+    confinement root. "Mount" below means that tree.
 
     Deliberately NOT `task_spec_root`, which the sentinel and stories-block readers
     used to borrow. That function answers "which tree can CONFINE a write to
@@ -3312,7 +3854,9 @@ def task_stories_root(task: StoryTask | None, state: RunState) -> Path:
             return Path(state.project)
     except OSError:
         return Path(state.project)
-    return mount
+    # The mount's PROJECT, as `_stories_folder` joins on `workspace.paths.project`
+    # (DW-379): the mount itself unless the project is nested in the code root.
+    return state.mount_project(task) or mount
 
 
 def live_spec_path(task: StoryTask, state: RunState, project_root: Path) -> Path:
@@ -3337,6 +3881,263 @@ def live_spec_root(task: StoryTask, state: RunState, project_root: Path) -> Path
     return rebase_recorded_project_path(task_spec_root(task, state), state, project_root)
 
 
+# An identity no directory can match (`platform_util.NEVER_MATCHING_IDENTITY`): mode 0
+# is not S_ISDIR and inode 0 carries no identity, so the write refuses. Kept as an
+# alias for the mount-writer callers and tests that name it here.
+_UNPINNABLE_MOUNT = NEVER_MATCHING_IDENTITY
+
+
+def live_spec_root_identity(
+    task: StoryTask, state: RunState, project_root: Path
+) -> os.stat_result | None:
+    """The ``root_identity`` a spec writer confined to `live_spec_root` pins it with
+    (DW-423) — take it fresh at each write, beside the ``confine_root`` it pins.
+
+    ``None`` (unpinned) whenever that root is the PROJECT: no mount, or a spec the
+    mount cannot confine (`task_spec_root`'s out-of-mount arm). The operator chose
+    the project checkout and may keep it behind a link — the pin rule in
+    `platform_util.open_dir_confined` leaves it unpinned.
+
+    Otherwise `mount_root_identity` of that root, with the rebased
+    ``task.worktree_path`` — the unit worktree the root sits in — as ``mount`` and
+    ``task.worktree_identity`` — the mount's MINT-TIME record (DW-446) — as
+    ``recorded``. The root is the mount's PROJECT: the mount itself, or
+    ``<mount>/<offset>`` under a nested project (DW-379). The pin is the recorded
+    mount plus an ``O_NOFOLLOW`` walk down to that project (DW-486), so a mount —
+    or any ancestor above it (``worktrees/``, ``runs/<id>/``) — swapped for a link
+    to a tree holding a real ``<unit>``, or a ``<mount>`` swapped for one holding a
+    real ``<offset>``, would otherwise carry the flip, strip, re-stamp, undo and
+    the TUI replan outside the repository, since the confined writers open their
+    root following links (DW-338 class). An unpinnable mount or a missing record
+    answers the never-matching identity, so the refusal happens AT THE WRITE:
+    every re-arm writer answers a missing spec with ``False`` before any open, and
+    a gone mount keeps that no-op rather than becoming an abort here. A legacy
+    paused run whose state predates the record refuses these writes until a
+    resume or re-arm backfills it (`reconcile_root_identities`)."""
+    if not task.worktree_path or task_spec_root(task, state) != state.mount_project(task):
+        return None
+    mount = rebase_recorded_project_path(Path(task.worktree_path), state, project_root)
+    return mount_root_identity(
+        live_spec_root(task, state, project_root), mount=mount, recorded=task.worktree_identity
+    )
+
+
+def _below_mount(root: Path, mount: Path) -> tuple[str, ...] | None:
+    """``root``'s components below ``mount`` (``()`` for ``mount`` itself), or None
+    when ``root`` is not lexically at or under ``mount`` or climbs through ``..``."""
+    try:
+        parts = root.relative_to(mount).parts
+    except ValueError:
+        return None
+    return None if ".." in parts else parts
+
+
+def mount_root_identity(
+    root: Path, *, mount: Path, recorded: RootIdentityRecord | None
+) -> os.stat_result:
+    """The ``root_identity`` pinning ``root``, the ``confine_root`` a writer is about
+    to open inside the unit worktree ``mount`` — the TRUE identity of ``root`` as
+    reached from the mount recorded at its mint, else `_UNPINNABLE_MOUNT`, never
+    ``None`` and never a raise. Take it fresh at each write, beside the
+    ``confine_root`` it pins, and pass the SAME root that write opens: an identity
+    for another directory would refuse every legitimate write.
+
+    The one pin primitive for worktree-mount writers: `live_spec_root_identity`
+    answers it for the re-arm/replan writers (DW-423), and the engine's
+    repair/reset/review, marker-repair, reconcile, adoption and park-record writers
+    plus ``recovery_flow``'s attempt-owned status normalization and snapshot restore
+    answer it for their ``workspace.paths.project``/``workspace.root`` when that
+    workspace is a unit mount (DW-445), as do the engine's deferred-work ledger
+    restores (DW-498). The caller decides mountedness; this only
+    pins — an operator-chosen project root is never handed here.
+
+    ``recorded`` is ``StoryTask.worktree_identity``, the mount's ``(st_dev,
+    st_ino)`` taken by `worktree_flow` when it minted the mount (DW-446). A
+    ``None`` record REFUSES — never a fallback to a fresh ``lstat``, which refuses
+    a link only at the final component and would accept ``worktrees/`` (or
+    ``runs/<id>/``) swapped for a link to a tree holding a real ``<unit>``.
+
+    With handle-anchored writes, ``mount`` is opened (following links) and its
+    ``fstat`` must equal the record, so a swapped mount or ancestor refuses; the
+    components down to ``root`` are then walked ``O_NOFOLLOW`` from that handle
+    (`platform_util.open_dir_confined`), and the ``fstat`` of the directory reached
+    is the answer. A nested project (DW-379, DW-486) therefore pins the real
+    ``<mount>/<offset>`` of the minted mount, not whatever the path resolves to: a
+    ``<mount>`` — or any directory between it and ``<offset>`` — swapped for a link
+    to a tree holding a real ``<offset>`` answers the never-matching identity.
+    Every writer re-opens ``root`` by path and compares against this (``fstat`` of
+    the opened root on the handle arm, a re-``lstat`` on the no-handle fallback and
+    on every writer's external-arm pre-check), so a path that resolves anywhere
+    else refuses. Hosts with no handle arm check ``os.lstat(mount)`` against the
+    record, then ``lstat`` each component down to ``root`` as a non-link directory
+    (check-then-write, `platform_util.path_is_confined`'s residual).
+
+    A ``root`` spelled through a resolved parent (``ProjectPaths.rebased`` resolves
+    the mount it rebases onto) is compared against ``mount``'s own name under its
+    resolved parent: resolving the parent follows only the ancestors above the
+    unit worktree, never the worktree itself — and the record then holds the mount
+    reached that way to its mint.
+
+    A mount that is a link, a reparse point, not a directory, gone, or no longer the
+    recorded directory answers the never-matching identity so the refusal lands AT
+    THE WRITE: a writer's own missing-file no-op still runs first, and a root
+    reached through a link cannot be written through.
+
+    Within a live engine the compare is full ``(st_dev, st_ino)``: a record is
+    never re-taken here. Only a locked resume/re-arm (`reconcile_root_identities`)
+    backfills a missing record or re-binds an ``st_dev`` a reboot/remount
+    renumbered under a still-matching inode.
+
+    Accepted residuals: the record is trust-on-first-use (whatever sat at the mount
+    path when it was minted); the locked ``st_dev`` re-bind trusts an inode-only
+    match; a ``state.json`` edited during a crash window can forge a record; and a
+    cross-filesystem project copy changes inodes, so its pinned writes refuse — the
+    "refuse on mismatch" the decision asks for."""
+    if recorded is None:
+        return _UNPINNABLE_MOUNT
+    parts = _below_mount(root, mount)
+    if parts is None:
+        try:
+            mount = mount.parent.resolve() / mount.name
+        except (OSError, RuntimeError):
+            return _UNPINNABLE_MOUNT
+        parts = _below_mount(root, mount)
+        if parts is None:
+            return _UNPINNABLE_MOUNT
+    expected = recorded_root_identity(recorded)
+    if platform_util.HANDLE_ANCHORED_WRITES:
+        fd = platform_util.open_dir_confined(mount, mount.joinpath(*parts), root_identity=expected)
+        if fd is None:
+            return _UNPINNABLE_MOUNT
+        try:
+            return os.fstat(fd)
+        except OSError:
+            return _UNPINNABLE_MOUNT
+        finally:
+            os.close(fd)
+    try:
+        require_root_pinned(mount, expected)
+    except UnconfinedWriteError:
+        return _UNPINNABLE_MOUNT
+    cursor = mount
+    identity = pinned_root_identity(cursor)
+    for part in parts:
+        if identity is None:
+            break
+        cursor = cursor / part
+        identity = pinned_root_identity(cursor)
+    return _UNPINNABLE_MOUNT if identity is None else identity
+
+
+def _reconcile_one_root(
+    record: RootIdentityRecord | None, path: Path
+) -> tuple[RootIdentityRecord | None, Literal["recorded", "rebound"] | None]:
+    """One root's `reconcile_root_identities` step: ``(the record it should now hold,
+    what changed)``.
+
+    ``None`` → today's identity when ``path`` is pinnable (``"recorded"``), else
+    ``None`` unchanged. A non-``None`` record → re-bound to today's ``st_dev`` ONLY
+    when ``path`` is pinnable (`pinned_root_identity`: a real directory, not a link
+    or a win32 link reparse point), reports a nonzero ``st_ino`` equal to the
+    record's, and a different ``st_dev`` (``"rebound"``). Anything else — an inode
+    mismatch, a link, a non-directory, a gone root, an unchanged record — returns
+    the record untouched."""
+    if record is None:
+        fresh = root_identity_record(path)
+        return fresh, (None if fresh is None else "recorded")
+    info = pinned_root_identity(path)
+    old_dev, ino = record
+    if info is None or info.st_ino == 0 or info.st_ino != ino or info.st_dev == old_dev:
+        return record, None
+    return (info.st_dev, ino), "rebound"
+
+
+def reconcile_root_identities(
+    state: RunState, run_dir: Path, journal: Journal, project_root: Path
+) -> bool:
+    """Reconcile the persisted mint-time root identities (DW-446) at a LOCKED load —
+    `cli._prepare_resume_locked` and `_rearm_escalation_locked`, before any pinned
+    write. Returns whether anything changed; the CALLER persists the state under
+    the run lock it already holds.
+
+    The roots are ``state.run_dir_identity`` (``run_dir``) and the
+    ``worktree_identity`` of each task with a recorded mount (``worktree_path``,
+    rebased onto ``project_root``). Two repairs, nothing else:
+
+    * **Backfill** — a ``None`` record (a ``state.json`` written before DW-446) is
+      taken from today's root and journals ``root-identity-recorded`` (``root``
+      = ``"run-dir"`` | ``"worktree"``, ``path``, ``story_key`` for a worktree,
+      ``dev``, ``ino``). Trust-on-first-use for a legacy run: a swap made while
+      it was paused under an older version is not seen.
+    * **``st_dev`` re-bind** — ``st_dev`` is not stable across a reboot or
+      remount (btrfs subvolume device numbers, NFS, overlay/container remounts),
+      and a run paused across one would otherwise refuse every pinned write
+      forever. A record whose root still ``lstat``s as a real directory (not a
+      link or reparse point) with the SAME ``st_ino`` and a different ``st_dev``
+      has its ``st_dev`` rewritten and journals ``root-identity-rebound``
+      (``root``, ``path``, ``story_key`` for a worktree, ``old_dev``, ``dev``,
+      ``ino``). Accepted residual: at this locked boundary the match is
+      inode-only, so a swap made during the pause to a real directory with the
+      same inode number on another filesystem would be re-bound. The live
+      engine never re-binds — its compare stays full ``(st_dev, st_ino)``, and
+      the swap threat (a coding session) exists only while an engine is live.
+
+    Any other mismatch — a different ``st_ino``, a link, a non-directory, a gone
+    root — is NEVER re-recorded: the record stays and its pinned writes keep
+    refusing. An unpinnable or zero-inode root with no record records nothing and
+    journals nothing. Only the locked resume and re-arm call this — including a
+    TUI-launched re-arm (`_do_rearm` → `rearm_escalation`), which reconciles like
+    any re-arm; the TUI's replan pin (the observer path) never does."""
+    changed = False
+    old = state.run_dir_identity
+    new, what = _reconcile_one_root(old, run_dir)
+    if what == "recorded" and new is not None:
+        journal.append(
+            "root-identity-recorded", root="run-dir", path=str(run_dir), dev=new[0], ino=new[1]
+        )
+    elif what == "rebound" and new is not None and old is not None:
+        journal.append(
+            "root-identity-rebound",
+            root="run-dir",
+            path=str(run_dir),
+            old_dev=old[0],
+            dev=new[0],
+            ino=new[1],
+        )
+    if what is not None:
+        state.run_dir_identity = new
+        changed = True
+    for task in state.tasks.values():
+        if not task.worktree_path:
+            continue
+        mount = rebase_recorded_project_path(Path(task.worktree_path), state, project_root)
+        old = task.worktree_identity
+        new, what = _reconcile_one_root(old, mount)
+        if what == "recorded" and new is not None:
+            journal.append(
+                "root-identity-recorded",
+                root="worktree",
+                path=str(mount),
+                story_key=task.story_key,
+                dev=new[0],
+                ino=new[1],
+            )
+        elif what == "rebound" and new is not None and old is not None:
+            journal.append(
+                "root-identity-rebound",
+                root="worktree",
+                path=str(mount),
+                story_key=task.story_key,
+                old_dev=old[0],
+                dev=new[0],
+                ino=new[1],
+            )
+        if what is not None:
+            task.worktree_identity = new
+            changed = True
+    return changed
+
+
 def live_stories_root(task: StoryTask | None, state: RunState, project_root: Path) -> Path:
     """`task_stories_root` carried onto the tree the caller is acting in — the root
     the stories folder is located from by the READ side of the re-arm gesture.
@@ -3346,6 +4147,10 @@ def live_stories_root(task: StoryTask | None, state: RunState, project_root: Pat
     locator answering the recorded `state.project` after a project move reads the
     manifest from a tree the re-arm no longer writes: absent once the old tree is
     gone, stale while it lingers.
+
+    "Mount" here is the recorded mount's PROJECT (`RunState.mount_project`), as in
+    `task_stories_root` — ``<mount>/<offset>`` for a project nested in the code root
+    (DW-379).
 
     The mount is probed on its REBASED spelling FIRST, and that ordering is the whole
     content of this function. `RUNS_DIR` is ``.bmad-loop/runs``, so a mount is spelled
@@ -3366,7 +4171,8 @@ def live_stories_root(task: StoryTask | None, state: RunState, project_root: Pat
     tree that always exists.
     """
     if task is not None and task.worktree_path:
-        recorded_mount = Path(task.worktree_path)
+        # The mount's project, for `task_stories_root`'s reason (DW-379).
+        recorded_mount = state.mount_project(task) or Path(task.worktree_path)
         live_mount = rebase_recorded_project_path(recorded_mount, state, project_root)
         if live_mount != recorded_mount:
             try:
@@ -3462,8 +4268,9 @@ def _spec_is_inside_the_mount(task: StoryTask) -> bool:
     project can see it reaches. Only the mount is out of reach.
 
     A relative spelling beside a recorded mount is inside it BY CONSTRUCTION —
-    `_serialized_worktree_path` relativizes exactly when `relative_to(worktree_path)`
-    succeeds — so it needs no filesystem probe and gets none. Absolute spellings are
+    `_serialized_worktree_path` relativizes exactly when `relative_to(<mount project>)`
+    succeeds, and the mount project lies inside the mount (DW-379) — so it needs no
+    filesystem probe and gets none. Absolute spellings are
     canonicalized for the same reason the shared test does it (a `..` segment or a
     symlinked component puts a physically-inside path outside lexically), and a host
     that cannot canonicalize degrades to "inside": the safe direction here is the one
@@ -3787,6 +4594,9 @@ def _restore_rearmed_spec(
     otherwise identical (right file, right bytes, `rollback="restored"`), which is why
     nothing downstream could catch it and why the parity is asserted at this seam. The
     arm-selection RULE above is unchanged; only the root it compares against is corrected.
+    Both arms also pin that root with `live_spec_root_identity`, as the three forward
+    writers do (DW-423; the external arm's pre-check is DW-445's): a worktree mount
+    swapped for a link raises here, the same refusal the forward writes hit.
 
     Calling the confined helper unconditionally looked stricter and was strictly
     worse — an artifacts folder configured OUTSIDE both the mount and the project is
@@ -3827,11 +4637,17 @@ def _restore_rearmed_spec(
         pass
     confine_root = live_spec_root(task, state, live_project)
     try:
+        root_identity = live_spec_root_identity(task, state, live_project)
         if spec_path.is_relative_to(confine_root):
             atomic_write_bytes_confined(
-                spec_path, original, confine_root=confine_root, require_writable_target=True
+                spec_path,
+                original,
+                confine_root=confine_root,
+                require_writable_target=True,
+                root_identity=root_identity,
             )
         else:
+            require_root_pinned(confine_root, root_identity)
             atomic_write_bytes(
                 spec_path, original, follow_symlinks=False, require_writable_target=True
             )
@@ -4034,7 +4850,9 @@ def _redrive_spec_status(state: RunState, task: StoryTask, *, isolated_redrive: 
     this task once `release_mount_owned_state` runs.
 
     Degrades to ``""`` on every uncertainty: a spec recorded absolute (nothing names
-    its position in the tree), an absent or non-blob path at that ref, a non-UTF-8 blob,
+    its position in the tree), an absent or non-blob path at that ref (including a
+    recorded pair that looks disjoint — a moved default-config project, read at the raw
+    spelling — whose spec is not at that spelling in the code root), a non-UTF-8 blob,
     or any `GitError` — which includes the project simply not being a repository, and a
     `target_branch` the code root no longer carries. ``""`` never equals a target
     status, so the caller's record still fires. Suppression therefore requires PROOF
@@ -4058,11 +4876,18 @@ def _redrive_spec_status(state: RunState, task: StoryTask, *, isolated_redrive: 
         except (OSError, UnicodeDecodeError):
             return ""
         return status_of(parse_frontmatter(text))
+    # The blob path is REPO-relative while `spec_file` is project-relative, so the
+    # project's offset inside the code root is prefixed (DW-379) — `app/...` for a
+    # project nested at `<repo>/app`, nothing in the default config. A pair that looks
+    # disjoint takes the raw spelling, as `RunState.mount_project` anchors on the
+    # mount: no mount is made for a disjoint layout, so such a pair is a default-config
+    # project that moved after launch (`state.project` stale, `repo_root` re-stamped).
+    offset = project_offset(Path(state.project), state.code_root) or "."
     try:
         blob = verify.file_bytes_at_revision(
             state.code_root,
             redrive_base_ref(state, isolated_redrive=isolated_redrive),
-            raw.as_posix(),
+            raw.as_posix() if offset == "." else f"{offset}/{raw.as_posix()}",
         )
     except verify.GitError:
         return ""
@@ -4078,8 +4903,9 @@ def _redrive_spec_status(state: RunState, task: StoryTask, *, isolated_redrive: 
 def restamp_code_root(run_dir: Path, repo_root: Path) -> str | None:
     """Re-point a paused run's persisted code-root mirror at `repo_root` — the tree
     the caller is about to act in — and return the warning an operator must see when
-    that MOVED a root the run had recorded (`None` when it already agreed, or when the
-    run predates the field).
+    that MOVED a root the run had recorded (`None` when it already agreed, when the run
+    predates the field, or when this call only discharged a record an earlier call's
+    move still owed).
 
     Exists because `rearm_escalation` reads that mirror OUT OF PROCESS
     (`RunState.code_root`) and has no `ProjectPaths` to consult, while `repo_root:` is
@@ -4097,13 +4923,22 @@ def restamp_code_root(run_dir: Path, repo_root: Path) -> str | None:
 
     The message names neither tree, like resume's: what an operator needs is that the
     run has changed repositories, and the paths are the half that would put an
-    attacker-controlled string on their terminal.
+    attacker-controlled string on their terminal. It names a move THIS call made, never
+    a record merely owed by an earlier one — `cli._prepare_resume_locked` draws the same
+    line on the same seam, so the re-arm surfaces and plain `resume` agree about when an
+    operator is warned.
     """
     with state_lock(run_dir):
         state = load_state(run_dir)
         new = str(repo_root)
         if state.repo_root == new and not state.code_root_restamp_pending:
             return None
+        # Whether THIS call re-pointed a root the run had RECORDED — deliberately not
+        # "re-pointed the field", which the empty→`new` legacy migration below also
+        # does: `bool(state.repo_root)` excludes that migration by design, because a
+        # missing value is not a divergent one. Distinct from the marker below, which
+        # only says a record is OWED — for this call's move or an earlier one's.
+        moved = False
         if state.repo_root != new:
             # Discharge an OWED record before the root it names is overwritten.
             # The marker is a bare bool, so the only surviving description of the
@@ -4146,29 +4981,64 @@ def restamp_code_root(run_dir: Path, repo_root: Path) -> str | None:
         # diagnose registry (`diagnostics._JOURNAL_DROP_FIELDS`), so the path never
         # reaches a dump.
         #
+        # This line is ALSO reached with nothing moved, discharging a record owed by an
+        # EARLIER call's move whose own append failed. Two booleans, because one cannot
+        # say both things: `code_root_changed` keeps its THIS-CALL meaning on THIS append
+        # (so it writes `false` here, agreeing with resume's `run-resume` boolean in the
+        # same state — the two sibling discharge appends are a different shape and
+        # hardcode `true`), while `discharged_owed_move` carries the EARLIER move the row
+        # is settling. That path's row is the only durable trace that move ever leaves —
+        # call one raised instead of returning the warning, this call returns `None`,
+        # and a later plain `resume` computes `code_root_changed=false` too because the
+        # mirror already agrees — so without the second boolean the record reads as
+        # "nothing moved" (DW-128). Together the two make it complete.
+        #
+        # Stamped on THIS append alone, never on the two sibling discharge rows
+        # (`runs.py`'s pre-move discharge above, `cli._prepare_resume_locked`'s): those
+        # assert `code_root_changed=true` outright, so the move they settle is already
+        # named and a second boolean would be redundant. A consumer must therefore read
+        # an ABSENT key as "not stated", never as `false` — the kind has three producers
+        # and only one of them speaks to this.
+        #
         # AFTER the persisted move, never before it: a record written first would
         # assert a completed move that a failed save then never made. And the
         # marker is cleared only once the append has returned: an append that
         # fails leaves it set, so the retry re-enters here and writes the record
         # the move still owes — or, when the operator runs plain `resume` instead,
-        # `cli._prepare_resume_locked` reads the marker as a move, journals it on
-        # its own `run-resume` line and clears it on the same write that persists
-        # the resume. The one residual is a clearing save that fails after
-        # a successful append, which costs a duplicate — true — record on the
-        # retry; a duplicate is recoverable from the journal, a missing record and a
-        # false one are not.
+        # `cli._prepare_resume_locked` discharges it the same way this call does:
+        # its own `rearm-code-root-restamped` append naming the root the marker
+        # still describes, ahead of the re-stamp that overwrites it, cleared on the
+        # same write that persists the resume. The one residual is a clearing save
+        # that fails after a successful append, which costs a duplicate — true —
+        # record on the retry; a duplicate is recoverable from the journal, a
+        # missing record and a false one are not.
+        #
+        # `code_root_restamp_pending` is written `True` in exactly one place
+        # (`= moved`, off `bool(state.repo_root)`), so it is only ever opened by a
+        # genuine move; this append is reached only with it set. Hence `not moved`
+        # here is precisely "a record owed by an EARLIER call's real move" — no new
+        # state and no new read.
+        discharged_owed_move = not moved
         Journal(run_dir).append(
             "rearm-code-root-restamped",
             repo=new,
-            code_root_changed=True,
+            code_root_changed=moved,
+            discharged_owed_move=discharged_owed_move,
         )
         state.code_root_restamp_pending = False
         save_state(run_dir, state)
+    # Sits with the existing return below so the two exits read as one decision about
+    # what the caller is told. Reached only via the discharge above: the record was
+    # owed by an EARLIER call's move and has now landed, but nothing moved here, so
+    # there is nothing to warn an operator about — the same answer
+    # `cli._prepare_resume_locked` gives.
+    if not moved:
+        return None
     return (
-        f"run {run_dir.name}: the code root in _bmad/bmm/config.yaml has changed since "
+        f"run {run_dir.name}: the code root in the BMAD config has changed since "
         "this run started — the re-drive works in the tree configured now, while the "
         "baselines, preserve refs and branches this run already recorded name objects "
-        "in the previous one. Restore the previous `repo_root:` value if you did not "
+        "in the previous one. Restore the previous `repo_root` value if you did not "
         "intend the move."
     )
 
@@ -4251,6 +5121,79 @@ def rearm_escalation(
             resolution_recorded=resolution_recorded,
             project_root=project_root,
         )
+
+
+def adopt_refusal(state: RunState, task: StoryTask, story_key: str) -> str | None:
+    """Why `resolve --adopt-branch` cannot adopt this ESCALATED task's kept branch,
+    or None when it can (DW-386).
+
+    Shared by `cli.cmd_resolve`'s early exit and `adopt_escalated_branch`'s locked
+    re-check, so the two cannot drift. Only the kept-work preconditions: the
+    pause/phase checks stay with each caller, which words them for its surface."""
+    if state.run_type == "sweep":
+        return (
+            f"--adopt-branch is not supported for sweep runs ({story_key}); re-arm it "
+            f"with `bmad-loop resolve {state.run_id}` instead"
+        )
+    rearm_hint = f"; re-arm it for a fresh re-drive with `bmad-loop resolve {state.run_id}`"
+    if not task.worktree_path or not task.branch:
+        return f"story {story_key} has no kept worktree branch to adopt{rearm_hint}"
+    if not Path(task.worktree_path).is_dir():
+        return (
+            f"the kept worktree for {story_key} ({task.worktree_path}) is gone, so there "
+            f"is no branch to adopt{rearm_hint}"
+        )
+    if not task.spec_file:
+        return f"story {story_key} has no story spec to finish, so it cannot be adopted{rearm_hint}"
+    return None
+
+
+def adopt_escalated_branch(run_dir: Path, story_key: str | None = None) -> str:
+    """Adopt an escalation-paused story's kept worktree branch (DW-386), under the
+    run lock (reentrant, so a caller already holding it may call this).
+
+    The operator vouches that the escalated attempt's work is finished, so the task
+    moves straight from ESCALATED to COMMITTING and `adopt_pending` is latched. The
+    next resume's `Engine._finish_inflight` COMMITTING arm then reopens the kept
+    worktree, flips the spec to its terminal status and mirrors the board
+    (`Engine._apply_adoption`), squashes and marks the task DONE, and merges it —
+    the existing commit-window recovery path, so no session runs and review is
+    deliberately NOT re-run. Does not clear the pause; the caller resumes.
+
+    Returns the adopted branch. Raises RearmError, with state untouched, when the
+    run is not paused at an escalation, the story is not ESCALATED, or
+    `adopt_refusal` names a reason."""
+    with state_lock(run_dir):
+        state = load_state(run_dir)
+        if state.paused_stage != PAUSE_ESCALATION:
+            raise RearmError(
+                f"run {run_dir.name} is not paused at an escalation "
+                f"(stage: {state.paused_stage or 'none'})"
+            )
+        key = story_key or state.paused_story_key
+        if key is None:
+            raise RearmError(f"run {run_dir.name} has no escalated story to resolve")
+        task = state.tasks.get(key)
+        if task is None:
+            raise RearmError(f"run {run_dir.name} has no task for story {key}")
+        if task.phase != Phase.ESCALATED:
+            raise RearmError(f"story {key} is not escalated (phase: {task.phase})")
+        if (refusal := adopt_refusal(state, task, key)) is not None:
+            raise RearmError(refusal)
+        # Deliberate direct assignment, not a state-machine transition: ESCALATED has
+        # no legal exit (mirrors `_rearm_escalation_locked` and `escalate_unit`), and
+        # COMMITTING is the persisted "verified work, finish the commit" phase the
+        # engine's resume arm already completes without re-running any gate.
+        task.phase = Phase.COMMITTING
+        task.adopt_pending = True
+        save_state(run_dir, state)
+        Journal(run_dir).append(
+            "escalation-adopted",
+            story_key=key,
+            branch=task.branch,
+            worktree=task.worktree_path,
+        )
+        return task.branch
 
 
 def _rearm_escalation_locked(
@@ -4411,6 +5354,12 @@ def _rearm_escalation_locked(
     live_project = project_root if project_root is not None else Path(state.project)
 
     journal = _RearmJournal(run_dir)
+    # DW-446: reconcile the mint-time root identities before the first pinned write
+    # below — backfill a state.json written before they existed, and re-bind an
+    # `st_dev` a reboot/remount renumbered under a still-matching inode — so the
+    # mount writers have a current record to compare against (persisted by the
+    # `save_state` that commits this re-arm). Never re-records an inode mismatch.
+    reconcile_root_identities(state, run_dir, journal, live_project)
     # Read before the unconditional overwrite below: they describe the restore
     # attempt this re-arm is abandoning, and the residue block needs both.
     old_latch = task.restore_patch
@@ -4446,6 +5395,9 @@ def _rearm_escalation_locked(
     # Always (re)assign the latch: a None restore_patch clears a stale one left by
     # a prior restore attempt the human then chose to redo from scratch.
     task.restore_patch = restore_patch
+    # A re-arm abandons any adoption a prior `resolve --adopt-branch` latched (DW-386):
+    # the re-drive re-implements from the baseline, so no adopt leg may fire on it.
+    task.adopt_pending = False
 
     # The spec this re-arm writes to and the bytes it FOUND there — the two inputs the
     # rollback below needs. Declared out here because their consumers sit past every
@@ -4697,6 +5649,7 @@ def _rearm_escalation_locked(
                         spec_path,
                         target_status,
                         confine_root=live_spec_root(task, state, live_project),
+                        root_identity=live_spec_root_identity(task, state, live_project),
                     )
                     # `set_frontmatter_status` answers "nothing to change" with `False`
                     # for FOUR causes, not three — its own docstring lists them: no file,
@@ -4827,7 +5780,9 @@ def _rearm_escalation_locked(
                     # as it found it — a stripped result section on a spec the re-arm then
                     # refused would be the one edit nothing else records.
                     devcontract.strip_auto_run_result(
-                        spec_path, confine_root=live_spec_root(task, state, live_project)
+                        spec_path,
+                        confine_root=live_spec_root(task, state, live_project),
+                        root_identity=live_spec_root_identity(task, state, live_project),
                     )
                 except verify.FrontmatterWriteError as e:
                     # The spec reads fine but carries `status:` in a shape no line
@@ -4887,20 +5842,20 @@ def _rearm_escalation_locked(
         # it, so under `isolation = "worktree"` the run-level `repo_root` is the main
         # checkout and the baseline is stamped in the worktree.
         #
-        # `bmadconfig.worktree_isolation_conflict` refuses worktree isolation beside a
-        # `repo_root:` OVERRIDE — a narrower fact than it looks. It forces
-        # `repo_root == project`; it says nothing about `repo_root` vs `workspace.root`.
-        # Under plain isolation with NO override those two still diverge and isolation is
-        # ON, so "wherever the roots could diverge, isolation is off" is false, and a rule
-        # built on it licenses treating `state.code_root` as the tree the dev writer
-        # stamped — which under isolation it is not.
+        # Nothing forces `repo_root == project`: since DW-379 a `repo_root:` override
+        # that CONTAINS the project may sit beside either isolation mode
+        # (`bmadconfig.worktree_isolation_conflict` refuses only a disjoint layout under
+        # worktree isolation). And nothing forces `repo_root == workspace.root` either:
+        # under isolation the two diverge, so a rule treating `state.code_root` as the
+        # tree the dev writer stamped is false there.
         #
-        # What is true, and the only claim to carry forward: `repo_root == project` in
-        # every reachable configuration, so reading HEAD here is right for the in-place
-        # case; and under isolation this value is deliberately SUPERSEDED rather than
-        # relied on — `engine._finish_inflight` discards the worktree and `_dev_phase`
-        # re-stamps `task.baseline_commit` from the fresh worktree's HEAD before any gate
-        # reads it. Do not carry an identity into new code; carry this argument.
+        # What is true, and the only claim to carry forward: in place,
+        # `workspace.root == paths.repo_root == state.code_root`, so reading HEAD here is
+        # right for the in-place case; and under isolation this value is deliberately
+        # SUPERSEDED rather than relied on — `engine._finish_inflight` discards the
+        # worktree and `_dev_phase` re-stamps `task.baseline_commit` from the fresh
+        # worktree's HEAD before any gate reads it. Do not carry an identity into new
+        # code; carry this argument.
         #
         # A pre-upgrade state.json with no recorded root degrades to `project` exactly as
         # before.
@@ -5031,6 +5986,7 @@ def _rearm_escalation_locked(
                         "baseline_revision",
                         task.baseline_commit,
                         confine_root=live_spec_root(task, state, live_project),
+                        root_identity=live_spec_root_identity(task, state, live_project),
                     )
                 except (OSError, UnicodeDecodeError, verify.FrontmatterWriteError) as e:
                     # FrontmatterWriteError joins the tuple rather than getting its own
@@ -5705,19 +6661,24 @@ def _clear_sentinel(
     breadcrumb of what blocked planning), journal ``sentinel-cleared`` — carrying
     both the fixed slug (``sentinel_kind``) and the *recorded blocking condition*
     parsed from the sentinel's ``## Auto Run Result`` (the reason planning halted) —
-    then delete the sentinel so the next dispatch is clean."""
+    then delete the sentinel so the next dispatch is clean.
+
+    A sentinel whose text cannot be read still gets preserved and deleted, so the
+    re-arm completes, but its row says so (DW-471): ``condition_unreadable=true``
+    and the fault in ``error``, beside the empty ``condition``. Without them the
+    row read exactly like a sentinel that recorded no blocking condition. A
+    readable sentinel's row is unchanged — neither key is written."""
     from .stories import recorded_blocking_condition
 
     dest_dir = run_dir / "sentinels"
     dest_dir.mkdir(parents=True, exist_ok=True)
     condition = ""
+    read_fault: dict[str, object] = {}
     if spec_path.is_file():
         try:
             condition = recorded_blocking_condition(spec_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError):
-            # An unreadable/binary sentinel still gets preserved+deleted so re-arm
-            # completes; we just journal an empty blocking condition.
-            condition = ""
+        except (OSError, UnicodeDecodeError) as exc:
+            read_fault = {"condition_unreadable": True, "error": f"{type(exc).__name__}: {exc}"}
         shutil.copy2(spec_path, dest_dir / spec_path.name)
         spec_path.unlink()
     journal.append(
@@ -5726,4 +6687,5 @@ def _clear_sentinel(
         sentinel_kind=sentinel_kind,
         condition=condition,
         sentinel=spec_path.name,
+        **read_fault,
     )

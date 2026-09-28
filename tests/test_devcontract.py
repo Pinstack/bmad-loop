@@ -78,6 +78,66 @@ def test_parse_bold_status():
     assert arr.status == "blocked"
 
 
+def test_parse_independently_bold_status_value():
+    arr = devcontract.parse_auto_run_result(
+        "## Auto Run Result\n\n**Status:** **done**\n\nsummary\n"
+    )
+    assert arr.status == "done"
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("Status: done", "done"),
+        ("- Status: blocked", "blocked"),
+        ("**Status:** in-review", "in-review"),
+        ("Status: **done**", "done"),
+        ("**Status**: **done**", "done"),
+        ("- **Status: done**", "done"),
+        ("\t*\tStAtUs\u00a0:\u00a0DoNe trailing prose", "done"),
+    ],
+)
+def test_parse_status_preserves_existing_line_shapes(line, expected):
+    arr = devcontract.parse_auto_run_result(f"## Auto Run Result\n\n{line}\n")
+    assert arr.status == expected
+
+
+def test_parse_bare_status_label_does_not_consume_next_line():
+    r"""Ablation: restoring ``\s*`` to the post-colon structural gaps makes this
+    capture ``done`` from the next line instead of failing closed."""
+    arr = devcontract.parse_auto_run_result("## Auto Run Result\n\nStatus:\ndone\n")
+    assert arr.present and arr.status == ""
+
+
+@pytest.mark.parametrize(
+    "separator",
+    ["\r", "\n", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"],
+    ids=["cr", "lf", "vt", "ff", "fs", "gs", "rs", "nel", "ls", "ps"],
+)
+def test_parse_bare_status_label_rejects_vertical_separators(separator):
+    r"""Ablation: ``[^\S\r\n]`` still admits every row after LF, allowing
+    those split-line separators to join the bare label to ``done``."""
+    arr = devcontract.parse_auto_run_result(f"## Auto Run Result\n\nStatus:{separator}done\n")
+    assert arr.present and arr.status == ""
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["Status\n: done", "**Status\n:** done", "**Status**\n: **done**"],
+)
+def test_parse_status_colon_must_share_label_line(line):
+    r"""Ablation: restoring ``\s*`` before the colon makes both plain and
+    bold labels consume punctuation and values from the following line."""
+    arr = devcontract.parse_auto_run_result(f"## Auto Run Result\n\n{line}\n")
+    assert arr.present and arr.status == ""
+
+
+def test_parse_skips_bold_status_inside_fenced_marker_detail():
+    text = "## Auto Run Result\n\n" "```md\n**Status:** **blocked**\n```\n\n" "Status: done\n"
+    arr = devcontract.parse_auto_run_result(text)
+    assert arr.status == "done"
+
+
 def test_parse_last_section_wins():
     text = (
         "## Auto Run Result\n\nStatus: blocked\n\n"
@@ -257,6 +317,20 @@ def test_synth_blocked_frontmatter_becomes_critical(tmp_path):
     assert crits[0]["type"] == "blocked"
 
 
+def test_synth_blocked_preserves_full_detail_and_attaches_its_spec(tmp_path):
+    tail = "RECOVERY-TAIL"
+    detail = "x" * 2500 + tail
+    sp = _spec(tmp_path / "s.md", status="blocked", auto_run=None)
+    with sp.open("a", encoding="utf-8") as f:
+        f.write(f"\n## Auto Run Result\n\nStatus: blocked\n\n{detail}\n")
+
+    rj = devcontract.synthesize_result(sp, story_key="1-1-a").result_json
+    (critical,) = rj["escalations"]
+    assert critical["detail"].endswith(tail)
+    assert len(critical["detail"]) > 2000
+    assert critical["spec_file"] == str(sp)
+
+
 def test_synth_blocked_prose_only_still_escalates(tmp_path):
     # frontmatter not yet flipped, but the prose says blocked: still PAUSE-worthy
     sp = _spec(tmp_path / "s.md", status="in-progress", auto_run="blocked")
@@ -275,6 +349,34 @@ def test_synth_status_inconsistent_flagged(tmp_path):
     sp = _spec(tmp_path / "s.md", status="done", auto_run="blocked")
     out = devcontract.synthesize_result(sp, story_key="1-1-a")
     assert out.status_consistent is False
+
+
+def test_synth_bold_marker_mismatch_keeps_frontmatter_authoritative(tmp_path):
+    """Ablation: removing the value-bold opener makes the marker unreadable, so
+    the mismatch disappears and ``status_consistent`` incorrectly becomes true."""
+    sp = _spec(
+        tmp_path / "s.md",
+        status="done",
+        auto_run=None,
+        body_extra="\n## Auto Run Result\n\n**Status:** **blocked**\n",
+    )
+    out = devcontract.synthesize_result(sp, story_key="1-1-a")
+
+    assert out.result_json["status"] == "done"
+    assert out.status_consistent is False
+
+
+def test_synth_bare_status_label_does_not_consume_next_line(tmp_path):
+    sp = _spec(
+        tmp_path / "s.md",
+        status="blocked",
+        auto_run=None,
+        body_extra="\n## Auto Run Result\n\nStatus:\ndone\n",
+    )
+    out = devcontract.synthesize_result(sp, story_key="1-1-a")
+
+    assert out.result_json["status"] == "blocked"
+    assert out.status_consistent is True
 
 
 def test_synth_blank_frontmatter_status_falls_back_to_prose_done(tmp_path):
@@ -437,6 +539,275 @@ def test_synth_genuine_park_marker_defaults_to_unasserted_without_session_proven
     rj = devcontract.synthesize_result(sp, story_key="1-1-a").result_json
 
     assert rj["park_asserted"] is False
+
+
+# ------------------------------------- the bundle's artifact-only mint (DW-273)
+
+
+def _artifact_only_spec(tmp_path, *, line: str | None = "Artifact only: true", extra: str = ""):
+    """A done spec whose genuine marker carries (or omits) the artifact-only line."""
+    marker = "\n## Auto Run Result\n\n- Status: done\n"
+    if line is not None:
+        marker += f"- {line}\n"
+    marker += extra
+    return _spec(tmp_path / "s.md", status="done", auto_run=None, body_extra=marker)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Artifact only: true",
+        "artifact_only: true",
+        "**Artifact only:** TRUE",
+        "Artifact-only: true",
+        "**Artifact only:** **true**",
+        "**Artifact only: true**",
+        "Artifact only: **true**",
+        "Artifact only:\u00a0true",  # a non-ASCII horizontal space, as `Status:` tolerates
+    ],
+    ids=[
+        "prose",
+        "snake",
+        "bold-upper",
+        "hyphen",
+        "balanced-bold",
+        "bold-whole-line",
+        "bold-value",
+        "nbsp",
+    ],
+)
+def test_synth_mints_artifact_only_from_a_genuine_session_authored_marker(tmp_path, line):
+    """The four-part shape `park_asserted` uses: a present, genuine (no synth
+    note), session-authored marker carrying the line. The line tolerates the
+    same bullet/bold spellings `STATUS_LINE_RE` does.
+
+    Ablation: drop the `"artifact_only"` key from the result and every parameter
+    fails on the `is True`."""
+    sp = _artifact_only_spec(tmp_path, line=line)
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj is not None and rj["status"] == "done"
+    assert rj["artifact_only"] is True
+    assert rj["park_asserted"] is False  # a done marker is no park
+
+
+def test_synth_artifact_only_missing_separator_fails_closed(tmp_path):
+    """The public grammar requires a separator between ``Artifact`` and ``only``.
+
+    Ablation: restore ``[ _-]*`` in ``ARTIFACT_ONLY_LINE_RE`` and both assertions
+    fail because the concatenated label mints an artifact-only receipt again.
+    """
+    sp = _artifact_only_spec(tmp_path, line="Artifactonly: true")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert devcontract._artifact_only_asserted("Artifactonly: true") is False
+    assert rj is not None and rj["artifact_only"] is False
+
+
+def test_synth_artifact_only_balanced_bold_shapes_mint(tmp_path):
+    """The advertised Status-like bold shapes include a closing delimiter after
+    the value (`**Artifact only:** **true**`, `- **Artifact only: true**`); the
+    regex consumes it before the end-of-line anchor, so the value is still
+    `true` alone on the line.
+
+    Ablation: drop the trailing `(?:\\*\\*)?` from `ARTIFACT_ONLY_LINE_RE` and
+    both shapes fall to the `$` anchor."""
+    sp = _artifact_only_spec(tmp_path, line="**Artifact only:** **true**")
+    assert "- **Artifact only:** **true**\n" in sp.read_text(encoding="utf-8")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is True
+    assert devcontract._artifact_only_asserted("**Artifact only:** **true**") is True
+    assert devcontract._artifact_only_asserted("- **Artifact only: true**") is True
+
+
+def test_synth_artifact_only_newline_separated_value_fails_closed(tmp_path):
+    """The label and its value must share one line. `Artifact only:` with `true`
+    on the NEXT line — or `Artifact only` with `: true` on the next line — is a
+    bare label and a stray token: every gap in the regex is horizontal
+    whitespace (`[^\\S\\r\\n]*`), so the match cannot cross the boundary the `$`
+    anchor holds, on either side of the colon.
+
+    Ablation: restore `\\s*` AFTER the colon and the spec row mints; restore
+    `\\s*` BEFORE the colon and the pre-colon assertion mints."""
+    sp = _artifact_only_spec(tmp_path, line="Artifact only:\ntrue")
+    assert "Artifact only:\ntrue\n" in sp.read_text(encoding="utf-8")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
+    assert devcontract._artifact_only_asserted("Artifact only:\ntrue") is False
+    assert devcontract._artifact_only_asserted("Artifact only\n: true") is False
+
+
+@pytest.mark.parametrize(
+    "separator",
+    ["\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"],
+    ids=["vt", "ff", "fs", "gs", "rs", "nel", "ls", "ps"],
+)
+@pytest.mark.parametrize("gap", ["after-colon", "before-colon", "leading-bullet"])
+def test_artifact_only_rejects_vertical_separators(separator, gap):
+    r"""The same fail-open DW-285 closed for `Status:`: `[^\S\r\n]` admits
+    every separator `str.splitlines` treats as a line boundary except CR/LF,
+    while MULTILINE `$` anchors on LF alone — so `Artifact only:\x0btrue` read
+    as one line and minted the receipt where every other reader of the marker
+    sees a bare label and a stray token (#795 review). Every gap now takes
+    `_HORIZONTAL_WS_RE`; NBSP and tab still assert.
+
+    Ablation: restore `[^\S\r\n]` to any one gap and its row mints."""
+    if gap == "after-colon":
+        line = f"Artifact only:{separator}true"
+    elif gap == "before-colon":
+        line = f"Artifact only{separator}: true"
+    else:
+        line = f"-{separator}Artifact only: true"
+    assert devcontract._artifact_only_asserted(line) is False
+    assert devcontract._artifact_only_asserted(line.replace(separator, "\u00a0")) is True
+
+
+def test_synth_artifact_only_trailing_prose_fails_closed(tmp_path):
+    """The value is anchored to end of line: `true` followed by prose is a
+    sentence, not an assertion."""
+    sp = _artifact_only_spec(tmp_path, line="Artifact only: true for the ledger, false for code")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
+
+
+def test_synth_artifact_only_fenced_example_inside_the_marker_fails_closed(tmp_path):
+    """A pasted example inside the genuine marker's own body is documentation:
+    a match inside a fenced block mints nothing when no real line follows."""
+    sp = _artifact_only_spec(tmp_path, line=None, extra="\n```\n- Artifact only: true\n```\n")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
+
+
+def test_synth_artifact_only_tolerates_a_run_of_separators(tmp_path):
+    sp = _artifact_only_spec(tmp_path, line="Artifact  only: true")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is True
+
+
+def test_synth_artifact_only_absent_line_fails_closed(tmp_path):
+    sp = _artifact_only_spec(tmp_path, line=None)
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["Artifactonly: true", "artifactonly: true", "**Artifactonly:** **true**"],
+    ids=["fused", "fused-lower", "fused-bold"],
+)
+def test_synth_artifact_only_fused_words_fail_closed(tmp_path, line):
+    """The contract's spellings put at least one space, underscore or hyphen
+    between the two words; the fused `Artifactonly` is none of them, and a
+    malformed or accidental token must not relax the bundle gate (#794 review).
+    Ablation: `[ _-]+` back to `[ _-]*` in `ARTIFACT_ONLY_LINE_RE` and every row
+    reds on `is True`."""
+    sp = _artifact_only_spec(tmp_path, line=line)
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
+    assert devcontract._artifact_only_asserted(line) is False
+
+
+def test_synth_artifact_only_false_value_fails_closed(tmp_path):
+    sp = _artifact_only_spec(tmp_path, line="Artifact only: false")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
+
+
+def test_synth_artifact_only_repaired_marker_fails_closed(tmp_path):
+    """The orchestrator's missing-marker repair cannot retroactively assert on the
+    session's behalf, exactly as it cannot for a park."""
+    sp = _artifact_only_spec(tmp_path, extra=f"\n{devcontract.ORCHESTRATOR_SYNTH_NOTE}\n")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
+
+
+def test_synth_artifact_only_defaults_to_unasserted_without_session_provenance(tmp_path):
+    """`park_marker_session_authored` is the ONE authorship proof serving both
+    mints: without it a genuine-looking marker asserts nothing."""
+    sp = _artifact_only_spec(tmp_path)
+
+    rj = devcontract.synthesize_result(sp, story_key="dw-bundle").result_json
+
+    assert rj["artifact_only"] is False
+
+
+def test_synth_artifact_only_frontmatter_never_mints(tmp_path):
+    """Frontmatter-only fallback (no marker at all) mints nothing, even with the
+    key spelled in the frontmatter."""
+    sp = _spec(tmp_path / "s.md", status="done", auto_run=None)
+    text = sp.read_text(encoding="utf-8").replace(
+        "status: 'done'\n", "status: 'done'\nartifact_only: true\n"
+    )
+    sp.write_text(text, encoding="utf-8")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj is not None and rj["artifact_only"] is False
+
+
+def test_synth_artifact_only_reads_only_the_last_real_marker(tmp_path):
+    """A fenced example and an older genuine marker cannot authorize a later
+    result, mirroring the park row above."""
+    sp = _spec(
+        tmp_path / "s.md",
+        status="done",
+        auto_run=None,
+        body_extra=(
+            "\n```md\n## Auto Run Result\n\nStatus: done\nArtifact only: true\n```\n"
+            "\n## Auto Run Result\n\nStatus: done\nArtifact only: true\n"
+            "\n## Auto Run Result\n\nStatus: done\n"
+        ),
+    )
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
 
 
 def test_auto_run_result_fingerprint_detects_an_identical_appended_marker():
@@ -1502,7 +1873,7 @@ def test_repair_write_failure_never_truncates_spec(tmp_path, monkeypatch, writer
     simply never fire, a silent false green. `pytest.raises` is what catches it."""
     sp = _write(tmp_path, "spec-a.md", original)
 
-    def boom(path, data, *, confine_root, require_writable_target=False):
+    def boom(path, data, *, confine_root, require_writable_target=False, root_identity=None):
         raise OSError("no space left on device")
 
     monkeypatch.setattr(devcontract, "atomic_write_bytes_confined", boom)
@@ -1535,7 +1906,7 @@ def test_atomic_write_spec_hands_the_helper_bytes_not_text(tmp_path, monkeypatch
     seen: list[bytes | str] = []
     real = devcontract.atomic_write_bytes_confined
 
-    def record(path, data, *, confine_root, require_writable_target=False):
+    def record(path, data, *, confine_root, require_writable_target=False, root_identity=None):
         seen.append(data)
         blob = data if isinstance(data, bytes) else data.encode("utf-8")
         real(
@@ -1543,6 +1914,7 @@ def test_atomic_write_spec_hands_the_helper_bytes_not_text(tmp_path, monkeypatch
             blob,
             confine_root=confine_root,
             require_writable_target=require_writable_target,
+            root_identity=root_identity,
         )
 
     # the CONFINED binding (#593) — the arm an in-tree spec takes. Patching
@@ -1714,7 +2086,7 @@ def test_operator_confirmation_write_failure_raises_and_keeps_the_spec(tmp_path,
     never made."""
     sp = _write(tmp_path, "spec-a.md", _PARKED)
 
-    def boom(path, data, *, confine_root, require_writable_target=False):
+    def boom(path, data, *, confine_root, require_writable_target=False, root_identity=None):
         raise OSError("no space left on device")
 
     # the CONFINED binding: `sp` is under `tmp_path`, so the chokepoint takes that
@@ -2167,3 +2539,210 @@ def test_harvest_fingerprint_marks_sha1_as_non_security_use(monkeypatch):
     monkeypatch.setattr(devcontract.hashlib, "sha1", recording_sha1)
     assert devcontract.harvest_fingerprint("a", "b") == "4a3dec2d1f82"
     assert seen == [False]
+
+
+# --------------------------------------------- worktree-mount pin (DW-423)
+#
+# `root_identity=` threads through `_atomic_write_spec` for the writers a
+# `live_spec_root` caller reaches. The swap: the mount renamed aside and a link
+# planted at its name to an outside tree carrying the same spec subpath.
+
+requires_symlinked_mount_swap = pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES or sys.platform == "win32",
+    reason="dir-fd anchoring and POSIX symlinks",
+)
+
+_MOUNT_SPEC = "---\nstatus: done\n---\n\n## Intent\n\nbody\n\n## Auto Run Result\n\nStatus: done\n"
+
+
+def _mount_swap_pair(tmp_path: Path) -> tuple[Path, Path, os.stat_result]:
+    """(mount, outside spec, the mount's accepted identity), the swap already made."""
+    mount = tmp_path / "project" / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    (mount / "specs").mkdir(parents=True)
+    (mount / "specs" / "6-4.md").write_text(_MOUNT_SPEC, encoding="utf-8")
+    identity = os.lstat(mount)
+    outside = tmp_path / "outside"
+    (outside / "specs").mkdir(parents=True)
+    (outside / "specs" / "6-4.md").write_text(_MOUNT_SPEC, encoding="utf-8")
+    mount.rename(mount.with_name("1-aside"))
+    mount.symlink_to(outside, target_is_directory=True)
+    return mount, outside / "specs" / "6-4.md", identity
+
+
+@requires_symlinked_mount_swap
+def test_strip_auto_run_result_pinned_mount_refuses_a_mount_swapped_for_a_link(tmp_path):
+    """The pinned strip refuses a swapped mount; outside bytes unchanged. The unpinned
+    control shows the same swap really strips the outside copy.
+
+    Ablation: drop the `root_identity=` forward in `strip_auto_run_result` (or in
+    `_atomic_write_spec`) and the pinned call strips the outside copy instead."""
+    mount, outside_spec, identity = _mount_swap_pair(tmp_path)
+    spec = mount / "specs" / "6-4.md"
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        devcontract.strip_auto_run_result(spec, confine_root=mount, root_identity=identity)
+    assert outside_spec.read_text(encoding="utf-8") == _MOUNT_SPEC
+
+    assert devcontract.strip_auto_run_result(spec, confine_root=mount)  # control
+    assert "## Auto Run Result" not in outside_spec.read_text(encoding="utf-8")
+
+
+@requires_symlinked_mount_swap
+def test_reset_spec_for_replan_pinned_mount_refuses_a_mount_swapped_for_a_link(tmp_path):
+    """The pinned replan refuses a swapped mount at its first write; outside bytes
+    unchanged. The unpinned control shows the same swap really replans the outside
+    copy.
+
+    Ablation: drop the `root_identity=` forward from `reset_spec_for_replan` to
+    `reset_spec_status` and the pinned call resets the outside copy to draft."""
+    mount, outside_spec, identity = _mount_swap_pair(tmp_path)
+    spec = mount / "specs" / "6-4.md"
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        devcontract.reset_spec_for_replan(spec, confine_root=mount, root_identity=identity)
+    assert outside_spec.read_text(encoding="utf-8") == _MOUNT_SPEC
+
+    assert devcontract.reset_spec_for_replan(spec, confine_root=mount)  # control
+    replanned = outside_spec.read_text(encoding="utf-8")
+    assert "status: draft" in replanned and "## Auto Run Result" not in replanned
+
+
+@requires_symlinked_mount_swap
+def test_reset_spec_for_replan_pinned_restore_refuses_a_mount_swapped_mid_replan(
+    tmp_path, monkeypatch
+):
+    """The replan's RESTORE is pinned too: a mount swapped after the reset landed
+    fails the strip, and the undo then refuses to write through the link rather
+    than landing the preimage outside.
+
+    Ablation: drop the `root_identity=` forward on the restore `_atomic_write_spec`
+    call and the undo writes the preimage into the outside copy."""
+    mount = tmp_path / "project" / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    (mount / "specs").mkdir(parents=True)
+    spec = mount / "specs" / "6-4.md"
+    spec.write_text(_MOUNT_SPEC, encoding="utf-8")
+    identity = os.lstat(mount)
+    outside = tmp_path / "outside"
+    (outside / "specs").mkdir(parents=True)
+    outside_spec = outside / "specs" / "6-4.md"
+    real_strip = devcontract.strip_auto_run_result
+
+    def swap_then_strip(path, **kwargs):
+        # The reset has landed in the real mount; swap the mount for a link to a
+        # copy of what is there now, so the strip and the undo both hit the link.
+        outside_spec.write_bytes(spec.read_bytes())
+        mount.rename(mount.with_name("1-aside"))
+        mount.symlink_to(outside, target_is_directory=True)
+        return real_strip(path, **kwargs)
+
+    monkeypatch.setattr(devcontract, "strip_auto_run_result", swap_then_strip)
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        devcontract.reset_spec_for_replan(spec, confine_root=mount, root_identity=identity)
+    swapped_in = outside_spec.read_text(encoding="utf-8")
+    assert "status: draft" in swapped_in  # the reset's bytes, never the undo's preimage
+    assert swapped_in != _MOUNT_SPEC
+
+
+_MARKERLESS_SPEC = "---\nstatus: done\n---\n\n## Intent\n\nbody\n"
+
+
+@requires_symlinked_mount_swap
+def test_append_auto_run_result_pinned_mount_refuses_a_mount_swapped_for_a_link(tmp_path):
+    """DW-445: the marker-repair append is pinned like the DW-423 writers — a mount
+    swapped for a link refuses and the outside copy is unchanged. The unpinned
+    control shows the same swap really appends to the outside copy.
+
+    Ablation: drop the `root_identity=` forward from `append_auto_run_result` to
+    `_atomic_write_spec` and the pinned call appends the marker outside."""
+    mount = tmp_path / "project" / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    (mount / "specs").mkdir(parents=True)
+    (mount / "specs" / "6-4.md").write_text(_MARKERLESS_SPEC, encoding="utf-8")
+    identity = os.lstat(mount)
+    outside = tmp_path / "outside"
+    (outside / "specs").mkdir(parents=True)
+    outside_spec = outside / "specs" / "6-4.md"
+    outside_spec.write_text(_MARKERLESS_SPEC, encoding="utf-8")
+    mount.rename(mount.with_name("1-aside"))
+    mount.symlink_to(outside, target_is_directory=True)
+    spec = mount / "specs" / "6-4.md"
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        devcontract.append_auto_run_result(spec, "done", confine_root=mount, root_identity=identity)
+    assert outside_spec.read_text(encoding="utf-8") == _MARKERLESS_SPEC
+
+    assert devcontract.append_auto_run_result(spec, "done", confine_root=mount)  # control
+    assert "## Auto Run Result" in outside_spec.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("writer", ["reset_spec_status", "append_auto_run_result"])
+def test_pinned_writers_keep_the_missing_spec_no_op_for_a_gone_mount(tmp_path, writer):
+    """DW-445 "mount gone" row: the engine takes the identity of a mount that no
+    longer exists — `runs.mount_root_identity` answers never-matching, not a raise —
+    and the pinned writer still answers its missing-spec ``False`` before any open,
+    so a gone mount stays the no-op it was rather than becoming a refusal."""
+    from bmad_loop import runs
+
+    mount = tmp_path / "project" / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    mount.mkdir(parents=True)
+    record = (os.lstat(mount).st_dev, os.lstat(mount).st_ino)  # recorded at the mint
+    mount.rmdir()  # gone since
+    identity = runs.mount_root_identity(mount, mount=mount, recorded=record)
+    spec = mount / "specs" / "6-4.md"
+
+    if writer == "reset_spec_status":
+        wrote = devcontract.reset_spec_status(
+            spec, "in-progress", confine_root=mount, root_identity=identity
+        )
+    else:
+        wrote = devcontract.append_auto_run_result(
+            spec, "done", confine_root=mount, root_identity=identity
+        )
+
+    assert wrote is False
+    assert not mount.exists()
+
+
+@requires_symlinked_mount_swap
+@pytest.mark.parametrize("writer", ["reset_spec_status", "append_auto_run_result"])
+def test_atomic_write_spec_external_arm_refuses_a_swapped_pinned_root(tmp_path, writer):
+    """DW-445: `_atomic_write_spec`'s external arm pre-checks a given pin. The spec's
+    RESOLVED spelling after a mount swap lies outside ``confine_root`` — what the
+    engine's resets write — so the pinned write refuses and the outside bytes are
+    unchanged; the unpinned control writes them as before.
+
+    Ablation: drop the `require_root_pinned` pre-check from `_atomic_write_spec`'s
+    external arm and the pinned call rewrites the outside copy."""
+    text = _MARKERLESS_SPEC if writer == "append_auto_run_result" else _MOUNT_SPEC
+    mount, outside_spec, identity = _mount_swap_pair(tmp_path)
+    outside_spec = outside_spec.resolve()
+    outside_spec.write_text(text, encoding="utf-8")
+
+    def write(**kw):
+        if writer == "reset_spec_status":
+            return devcontract.reset_spec_status(outside_spec, "in-progress", **kw)
+        return devcontract.append_auto_run_result(outside_spec, "done", **kw)
+
+    with pytest.raises(platform_util.UnconfinedWriteError, match="pinned to"):
+        write(confine_root=mount, root_identity=identity)
+    assert outside_spec.read_text(encoding="utf-8") == text
+
+    assert write(confine_root=mount)  # control: unpinned, unchanged behaviour
+    assert outside_spec.read_text(encoding="utf-8") != text
+
+
+@requires_symlinked_mount_swap
+def test_atomic_write_spec_external_arm_writes_through_an_intact_pinned_root(tmp_path):
+    """An intact pinned mount whose `_bmad-output` is a link resolving outside it:
+    the pre-check passes and the write lands exactly as unpinned."""
+    mount = tmp_path / "project" / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    mount.mkdir(parents=True)
+    shared = tmp_path / "shared-output"
+    (shared / "specs").mkdir(parents=True)
+    spec = (shared / "specs" / "6-4.md").resolve()
+    spec.write_text(_MOUNT_SPEC, encoding="utf-8")
+    (mount / "_bmad-output").symlink_to(shared, target_is_directory=True)
+
+    assert devcontract.reset_spec_status(
+        spec, "in-progress", confine_root=mount, root_identity=os.lstat(mount)
+    )
+    assert "status: in-progress" in spec.read_text(encoding="utf-8")

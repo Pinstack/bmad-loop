@@ -53,13 +53,19 @@ drifted entries itself, so nothing gates on the record.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import devcontract, sprintstatus, verify
 from .bmadconfig import ProjectPaths
 from .frontmatter import operator_actions_of, read_frontmatter, status_of
-from .platform_util import atomic_write_text_confined, safe_segment
+from .platform_util import (
+    atomic_write_text_confined,
+    make_dirs_confined,
+    require_root_pinned,
+    safe_segment,
+)
 
 RECORDS_REL = Path(".bmad-loop") / "operator"
 LEGACY_STORE_REL = Path(".bmad-loop") / "operator-actions.json"
@@ -141,6 +147,7 @@ def record_park(
     spec_file: str,
     run_id: str,
     parked_at: str,
+    root_identity: os.stat_result | None = None,
 ) -> Path:
     """Write a story's park record, returning its path. Re-parking the same key
     overwrites rather than accumulates: a story owes whatever its latest park
@@ -176,9 +183,29 @@ def record_park(
     writers of this same file — ``Engine._restore_park_record`` and ``confirm``'s
     prune — since write semantics belong to the FILE, not to whichever code path
     reached it last. An operator who marks a park record read-only gets the
-    ``PermissionError`` a bare ``Path.write_text`` raised before #379."""
+    ``PermissionError`` a bare ``Path.write_text`` raised before #379.
+
+    ``root_identity`` pins ``project`` (DW-445), forwarded to the confined
+    writer; ``None`` (the default) is the unpinned write. Only the engine passes
+    one, `runs.mount_root_identity` of its unit mount — under worktree isolation
+    ``project`` is the orchestrator-minted mount, not the operator's checkout.
+    Given one, a ``project`` that is no longer that directory refuses with
+    `UnconfinedWriteError` BEFORE the ``mkdir``, so a mount swapped for a link
+    gets no directories created at the link's target either. That pre-check is
+    ``lstat``-then-``mkdir`` (`platform_util.require_root_pinned`; the ``mkdir``
+    and the write each re-pin through their own handle). The identity is that of
+    ``project`` reached by an ``O_NOFOLLOW`` walk from the mount's MINT-TIME record
+    (DW-446), so a parent directory ABOVE the worktree swapped for a link refuses too.
+
+    The records directory is created by `platform_util.make_dirs_confined`
+    (DW-497), not ``mkdir(parents=True)``: that followed a link planted BELOW
+    ``project`` — at ``.bmad-loop/`` or ``.bmad-loop/operator/`` — and created the
+    tree at its target before the confined write refused. Now such a link refuses
+    with `UnconfinedWriteError` before anything is created through it, pinned or
+    not."""
     path = record_path(project, story_key)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    require_root_pinned(project, root_identity)
+    make_dirs_confined(path.parent, confine_root=project, root_identity=root_identity)
     record = {
         "story_key": story_key,
         "actions": list(actions),
@@ -191,6 +218,7 @@ def record_park(
         json.dumps(record, indent=2, sort_keys=True),
         confine_root=project,
         require_writable_target=True,
+        root_identity=root_identity,
     )
     return path
 

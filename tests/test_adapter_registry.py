@@ -1009,6 +1009,11 @@ def test_make_adapters_generic_shares_synthesizing_but_not_triage(
     assert isinstance(adapters["triage"], GenericAdapter)
     assert not isinstance(adapters["triage"], GenericDevAdapter)
     assert adapters["triage"] is not adapters["dev"]
+    # DW-389: the auto-retro session reads its own result.json, so it is the plain
+    # variant too (sharing triage's (cfg, False) key), never the synthesizing one.
+    assert isinstance(adapters["retro"], GenericAdapter)
+    assert not isinstance(adapters["retro"], GenericDevAdapter)
+    assert adapters["retro"] is adapters["triage"]
 
 
 def test_make_adapters_opencode_http_dispatch_unchanged(
@@ -1035,6 +1040,8 @@ def test_make_adapters_opencode_http_dispatch_unchanged(
     assert adapters["dev"].profile.adapter == "opencode-http"
     assert isinstance(adapters["triage"], OpencodeHttpAdapter)
     assert not isinstance(adapters["triage"], OpencodeDevAdapter)
+    assert isinstance(adapters["retro"], OpencodeHttpAdapter)  # plain, reads result.json
+    assert not isinstance(adapters["retro"], OpencodeDevAdapter)
 
 
 # --------------------------------------------------------------------------- #
@@ -1141,6 +1148,27 @@ def test_validate_model_format_check_keys_on_the_adapter_kind_not_hooklessness(
     assert any(f["check"] == "adapter.hookless" for f in findings)
 
 
+def test_validate_effort_silent_on_an_out_of_tree_kind(fresh_adapter_registry, project, capsys):
+    """`policy.effort-unsupported` is a fact about the bundled tmux GENERIC family
+    ("no channel for effort"); whether an out-of-tree kind can carry it is not
+    knowable here, so the check must stay silent for one rather than assert a
+    capability it cannot see.
+
+    The `adapter.kind == "ok"` assert is the control: the profile loaded and its
+    kind resolved, so the absent warning is the predicate, not a failed load.
+
+    ABLATION: flip the predicate to `prof.adapter != adapter_registry.OPENCODE_HTTP`
+    and this reddens."""
+    fresh_adapter_registry.register_adapter("hermes", needs_mux=False, load=lambda: _stub_builder())
+    install_bmad_config(project)
+    _write_profile(project.project, "hermes", adapter="hermes")
+    _write_policy(project.project, '[adapter]\nname = "hermes"\neffort = "max"\n')
+
+    findings = _validate_findings(project.project, capsys)
+    assert not any(f["check"] == "policy.effort-unsupported" for f in findings)
+    assert [f["severity"] for f in findings if f["check"] == "adapter.kind"] == ["ok"]
+
+
 def test_validate_model_format_warns_on_an_opencode_kind_carrying_a_hook_dialect(
     fresh_adapter_registry, project, capsys
 ):
@@ -1163,6 +1191,230 @@ def test_validate_model_format_warns_on_an_opencode_kind_carrying_a_hook_dialect
     assert findings, "a bare model on the opencode-http kind must warn"
     assert {f["severity"] for f in findings} == {"warning"}
     assert all("haiku" in f["message"] for f in findings)
+
+
+def _dry_run_dev_line(project, capsys) -> str:
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(epic=None, story=None, max_stories=None)
+    assert cli._dry_run(project, pol, args) == 0
+    out = capsys.readouterr().out
+    return next(line for line in out.splitlines() if "dev:" in line)
+
+
+def test_dry_run_previews_the_http_sequence_for_an_opencode_kind_with_a_hook_dialect(
+    fresh_adapter_registry, project, capsys
+):
+    """`_render_invocation` follows the adapter KIND, as `make_adapters` does. An
+    `opencode-http` profile carrying a hook dialect is a legal profile that still
+    launches the HTTP adapter — and sends `effort` as `variant` — so its preview
+    is the server/prompt_async line with the effort, not a tmux argv.
+
+    ABLATION: key the branch on `profile.hookless` and this reddens (argv render,
+    no effort)."""
+    _write_profile(project.project, "ochooked", adapter="opencode-http", hookless=False)
+    _write_policy(
+        project.project,
+        '[adapter]\nname = "ochooked"\nmodel = "anthropic/claude-x"\neffort = "max"\n',
+    )
+    line = _dry_run_dev_line(project, capsys)
+    assert "ochooked serve --hostname 127.0.0.1 --port <auto>" in line
+    assert line.endswith("model=anthropic/claude-x effort=max")
+
+
+def test_dry_run_previews_argv_for_a_hookless_profile_of_another_kind(
+    fresh_adapter_registry, project, capsys
+):
+    """The other direction: a hookless profile owned by an out-of-tree kind must
+    not draw the OpenCode server line (its transport is unknown here, so the
+    fallback is the profile's own binary/argv shape, as for every non-HTTP kind)."""
+    fresh_adapter_registry.register_adapter("hermes", needs_mux=False, load=lambda: _stub_builder())
+    _write_profile(project.project, "hermes", adapter="hermes")  # hookless=True
+    _write_policy(project.project, '[adapter]\nname = "hermes"\nmodel = "m1"\n')
+    line = _dry_run_dev_line(project, capsys)
+    assert "serve --hostname" not in line and "prompt_async" not in line
+    assert "hermes" in line and "--model m1" in line
+
+
+# --------------------------------------------------------------------------- #
+# DW-374 — opencode-http launch_args shapes the serve argv cannot serve
+
+
+def _write_launch_profile(project, name, *, binary, launch_args, adapter="opencode-http"):
+    """A profile overlay with an explicit binary + launch_args. Hookless for the
+    opencode kind; a hook dialect for generic (a hookless generic profile is not
+    the shape under test)."""
+    d = project / ".bmad-loop" / "profiles"
+    d.mkdir(parents=True, exist_ok=True)
+    hooks = (
+        '[hooks]\ndialect = "none"\n'
+        if adapter == "opencode-http"
+        else '[hooks]\ndialect = "claude-settings-json"\n'
+        'config_path = ".hermes/settings.json"\n[hooks.events]\nStop = "Stop"\n'
+    )
+    (d / f"{name}.toml").write_text(
+        f'name = "{name}"\nbinary = "{binary}"\nadapter = "{adapter}"\n'
+        f"launch_args = {json.dumps(list(launch_args))}\n{hooks}",
+        encoding="utf-8",
+    )
+    _write_policy(project, f'[adapter]\nname = "{name}"\n')
+
+
+def _unservable(findings):
+    return [f for f in findings if f["check"] == "adapter.launch-args-unservable"]
+
+
+@pytest.mark.parametrize(
+    "binary, launch_args, needle",
+    [
+        pytest.param("opencode", ["--port", "4096"], "'--port'", id="owned-token"),
+        pytest.param("npx", ["-y", "opencode-ai", "serve"], "'serve'", id="owned-serve"),
+        pytest.param("opencode", ["--hostname=0.0.0.0"], "'--hostname=0.0.0.0'", id="owned-eq"),
+        pytest.param("python3", [], "needs a program", id="interpreter-no-program"),
+        pytest.param("npx", [], "needs a program", id="package-runner-no-program"),
+        pytest.param("python3", ["-u"], "needs a program", id="interpreter-options-only"),
+    ],
+)
+def test_validate_warns_on_an_unservable_opencode_launch_args(
+    fresh_adapter_registry, project, capsys, binary, launch_args, needle
+):
+    """The serve argv is `[binary, *launch_args, "serve", <owned flags>]`: a
+    launch_args token colliding with an owned one, or an interpreter with nothing
+    to run, cannot start a server — and would otherwise surface only at run start
+    as SPAWN_ATTEMPTS failed health polls. A WARNING: validate's exit code is a
+    compatibility contract.
+
+    ABLATION: drop the `report.warn` block in `cmd_validate` and this reddens."""
+    install_bmad_config(project)
+    _write_launch_profile(project.project, "ocwrap", binary=binary, launch_args=launch_args)
+
+    found = _unservable(_validate_findings(project.project, capsys))
+    assert [f["severity"] for f in found] == ["warning"], found
+    assert needle in found[0]["message"] and "ocwrap" in found[0]["message"]
+    assert found[0]["detail"]["launch_args"] == launch_args
+
+
+def test_validate_is_silent_on_an_npx_wrapper(fresh_adapter_registry, project, capsys):
+    """The DW-374 motivating shape is legitimate and draws nothing.
+
+    The `adapter.httpx` finding is the control: the opencode-kind branch ran for
+    this profile, so the absent warning is the predicate, not a skipped branch."""
+    install_bmad_config(project)
+    _write_launch_profile(
+        project.project, "ocwrap", binary="npx", launch_args=["-y", "opencode-ai"]
+    )
+    findings = _validate_findings(project.project, capsys)
+    assert _unservable(findings) == []
+    assert any(f["check"] == "adapter.httpx" for f in findings)
+
+
+def test_validate_launch_args_check_keys_on_the_opencode_kind(
+    fresh_adapter_registry, project, capsys
+):
+    """The same unservable shapes on a `generic` profile are none of this check's
+    business: the generic builder never emits `serve`.
+
+    ABLATION: hoist the check out of the `OPENCODE_HTTP` branch and this reddens."""
+    install_bmad_config(project)
+    _write_launch_profile(
+        project.project, "gen", binary="python3", launch_args=[], adapter="generic"
+    )
+    findings = _validate_findings(project.project, capsys)
+    assert _unservable(findings) == []
+    assert [f["severity"] for f in findings if f["check"] == "adapter.kind"] == ["ok"]
+
+
+# DW-483 — opencode-http extra_args repeating the adapter-owned serve flags
+
+
+def _extra_args_unservable(findings):
+    return [f for f in findings if f["check"] == "policy.extra-args-unservable"]
+
+
+def test_validate_warns_per_role_on_opencode_extra_args_repeating_owned_flags(
+    fresh_adapter_registry, project, capsys
+):
+    """`_serve_argv` appends extra_args AFTER `--port`/`--hostname`/`--print-logs`,
+    so a repeat overrides the port the health poll dials. extra_args resolve per
+    stage: only the role whose resolved args collide is named. A WARNING:
+    validate's exit code is a compatibility contract.
+
+    ABLATION: drop the `report.warn` block in `cmd_validate` and this reddens."""
+    install_bmad_config(project)
+    _write_policy(
+        project.project,
+        '[adapter]\nname = "opencode"\n' '[adapter.review]\nextra_args = ["--hostname=0.0.0.0"]\n',
+    )
+    found = _extra_args_unservable(_validate_findings(project.project, capsys))
+    assert [(f["severity"], f["detail"]["role"]) for f in found] == [("warning", "review")]
+    assert "'--hostname=0.0.0.0'" in found[0]["message"]
+    assert found[0]["detail"]["extra_args"] == ["--hostname=0.0.0.0"]
+
+
+def test_validate_names_every_role_inheriting_colliding_extra_args(
+    fresh_adapter_registry, project, capsys
+):
+    """A base `[adapter] extra_args` is inherited by every same-client stage."""
+    install_bmad_config(project)
+    _write_policy(
+        project.project, '[adapter]\nname = "opencode"\nextra_args = ["--port", "5000"]\n'
+    )
+    found = _extra_args_unservable(_validate_findings(project.project, capsys))
+    assert sorted(f["detail"]["role"] for f in found) == sorted(runsetup.ROLES)
+    assert all("'--port'" in f["message"] for f in found)
+
+
+def test_validate_is_silent_on_opencode_without_extra_args(fresh_adapter_registry, project, capsys):
+    """Unset extra_args (the profile defaults) have nothing to collide with.
+
+    ABLATION: drop the `cfg.extra_args` gate and this reddens (the predicate is
+    then handed None)."""
+    install_bmad_config(project)
+    _write_policy(project.project, '[adapter]\nname = "opencode"\n')
+    findings = _validate_findings(project.project, capsys)
+    assert _extra_args_unservable(findings) == []
+    assert any(f["check"] == "adapter.httpx" for f in findings)
+
+
+def test_validate_is_silent_on_non_colliding_opencode_extra_args(
+    fresh_adapter_registry, project, capsys
+):
+    """`serve` after the owned flags is a positional, not a second subcommand.
+
+    The `adapter.httpx` finding is the control: the opencode-kind profile was
+    loaded, so the absent warning is the predicate, not a skipped branch."""
+    install_bmad_config(project)
+    _write_policy(
+        project.project, '[adapter]\nname = "opencode"\nextra_args = ["serve", "--portal"]\n'
+    )
+    findings = _validate_findings(project.project, capsys)
+    assert _extra_args_unservable(findings) == []
+    assert any(f["check"] == "adapter.httpx" for f in findings)
+
+
+def test_validate_extra_args_check_keys_on_the_opencode_kind(
+    fresh_adapter_registry, project, capsys
+):
+    """The generic builder never emits `serve --port …`, so the same extra_args on
+    a generic-kind profile are none of this check's business.
+
+    ABLATION: drop the `OPENCODE_HTTP` kind test from the check and this reddens."""
+    install_bmad_config(project)
+    _write_launch_profile(project.project, "gen", binary="gen", launch_args=[], adapter="generic")
+    _write_policy(project.project, '[adapter]\nname = "gen"\nextra_args = ["--port", "1"]\n')
+    findings = _validate_findings(project.project, capsys)
+    assert _extra_args_unservable(findings) == []
+    assert [f["severity"] for f in findings if f["check"] == "adapter.kind"] == ["ok"]
+
+
+def test_dry_run_previews_launch_args_before_serve(fresh_adapter_registry, project, capsys):
+    """The dry-run preview renders what `_serve_argv` launches: a wrapper profile
+    previews `npx -y opencode-ai serve …`, not `npx serve …`."""
+    _write_launch_profile(
+        project.project, "ocwrap", binary="npx", launch_args=["-y", "opencode-ai"]
+    )
+    line = _dry_run_dev_line(project, capsys)
+    assert "npx -y opencode-ai serve --hostname 127.0.0.1 --port <auto>" in line
 
 
 def test_validate_flags_an_unregistered_adapter_kind(fresh_adapter_registry, project, capsys):

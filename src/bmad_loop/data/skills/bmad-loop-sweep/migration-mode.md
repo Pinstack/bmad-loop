@@ -9,7 +9,9 @@ parser. Your job is a one-time rewrite of every legacy item into a canonical
 `### DW-<n>:` entry, after which the normal triage flow takes over.
 
 This is the ONE workflow mode that edits a file: exactly the ledger at
-`{implementation_artifacts}/deferred-work.md`. Never any other file, never
+`{implementation_artifacts}/deferred-work.md` — the path in `$BMAD_LOOP_LEDGER`,
+which the orchestrator resolved and which wins over any path you would derive
+yourself. Never any other file, never
 code, never specs, never sprint-status. Never commit — the orchestrator
 commits the migrated ledger after validating it.
 
@@ -63,7 +65,11 @@ commits the migrated ledger after validating it.
      exists (e.g. the text after `→` or a `**Resolution:**` field).
 4. Two manifest items describing the same underlying issue (e.g. a duplicate
    `W1` re-raised in a later review) may merge into ONE DW entry — map both
-   keys to the same `dw_id`. Merge only when their `done` flags match.
+   keys to the same `dw_id`. Merge only when their `done` flags match. The
+   merged entry's severity is the highest normalized manifest severity across
+   all merged items (`critical` > `high` > `medium` > `low`); omit `severity:`
+   only when every merged item has null severity. The orchestrator validates
+   this grouped rule once per target id.
 5. The finished file must contain only the `# Deferred Work` title line and
    canonical `### DW-<n>:` entries. Any leftover freeform section, bullet
    list, or strikethrough item fails the orchestrator's zero-legacy check

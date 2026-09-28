@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import bisect
 import json
+import math
 import re
 from collections import deque
 from dataclasses import dataclass
@@ -33,7 +34,7 @@ from rich.text import Text
 
 from .. import bmadconfig, deferredwork, policy, sprintstatus, stories
 from ..gates import ATTENTION_FILE
-from ..journal import JOURNAL_FILE, LOGS_DIR, STATE_FILE, load_state
+from ..journal import JOURNAL_FILE, LOGS_DIR, STATE_FILE, load_state, unreadable_line_entry
 from ..model import RunState
 from ..platform_util import resolve_or_lexical
 
@@ -64,27 +65,90 @@ from ..runs import (
 # ------------------------------------------------------------- run watching
 
 
+def _describe(exc: BaseException) -> str:
+    """``<Class>: <message>`` — the operator-facing spelling of a folded fault."""
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _classified_sig(path: Path) -> tuple[_StatSig | None, str | None]:
+    """``(sig, fault)``: ``(sig, None)`` for a present file, ``(None, None)`` for
+    genuine absence, ``(None, "<Class>: <msg>")`` for a stat that failed for any
+    other reason. ``_stat_sig`` folds the last two into one ``None``; the readers
+    below must tell "not there" (reset / nothing to show) from "could not look"
+    (keep position, flag it)."""
+    try:
+        st = path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return None, None
+    except OSError as e:
+        return None, _describe(e)
+    return (st.st_mtime_ns, st.st_size, st.st_ino), None
+
+
 class RunWatcher:
     """Stat-gated views of one run dir. Never raises on missing or mid-write
-    files: state() keeps returning the last good parse."""
+    files: state() keeps returning the last good parse.
+
+    Keeping the last good parse is not the same as presenting it as current
+    (DW-472): ``state_fault`` names why the state shown is stale — a state.json
+    that will not parse, or one that has gone or cannot be stat'd after a good
+    read — and clears on the next good parse, or when the last good read's file
+    stats back unchanged. It is published only once the SAME
+    signature has failed on two consecutive looks: a mid-write file is re-stat'd
+    every poll (``_state_sig`` is not advanced on a failure), and a writer still
+    working changes the signature, so a torn read that the next write heals never
+    flags; one the file is still sitting in a poll later is not torn, it is
+    broken. ``attention_fault`` does the same for ATTENTION (DW-475), without the
+    two-look rule — that file is appended, never parsed, so there is no torn read
+    to forgive."""
 
     def __init__(self, run_dir: Path):
         self.run_dir = run_dir
         self._state_sig: _StatSig | None = None
         self._state: RunState | None = None
+        self.state_fault: str | None = None
+        # (signature, why) of the last failed look, awaiting its confirming repeat
+        self._suspect: tuple[_StatSig | None, str] | None = None
         self._attention_sig: _StatSig | None = None
         self._attention = ""
+        self.attention_fault: str | None = None
 
     def state(self) -> RunState | None:
-        sig = _stat_sig(self.run_dir / STATE_FILE)
-        if sig is None or sig == self._state_sig:
+        sig, stat_fault = _classified_sig(self.run_dir / STATE_FILE)
+        if sig is None:
+            # Before the first write there is nothing to be stale; after a good read,
+            # a state.json that vanished or cannot be stat'd leaves that read stale.
+            if self._state is not None:
+                self._note_state_fault(
+                    None,
+                    (
+                        f"state.json cannot be stat'd ({stat_fault})"
+                        if stat_fault
+                        else "state.json is gone"
+                    ),
+                )
+            return self._state
+        if sig == self._state_sig:
+            # The last good read's own file is back unchanged, so it is current again.
+            # A finished or paused run never rewrites state.json: waiting for a fresh
+            # parse to clear the flag would leave a recovered header stale forever.
+            self._suspect = None
+            self.state_fault = None
             return self._state
         try:
             self._state = load_state(self.run_dir)
-            self._state_sig = sig
-        except (OSError, json.JSONDecodeError, KeyError, ValueError):
-            pass  # keep last good
+        except (OSError, json.JSONDecodeError, KeyError, ValueError) as e:
+            self._note_state_fault(sig, f"state.json unreadable ({_describe(e)})")
+            return self._state  # keep last good — flagged once the fault persists
+        self._state_sig = sig
+        self._suspect = None
+        self.state_fault = None
         return self._state
+
+    def _note_state_fault(self, sig: _StatSig | None, why: str) -> None:
+        if self._suspect is not None and self._suspect[0] == sig:
+            self.state_fault = why
+        self._suspect = (sig, why)
 
     def liveness(self) -> str:
         return liveness(self.run_dir)
@@ -106,14 +170,25 @@ class RunWatcher:
         return (self.run_dir / STOP_REQUEST_FILE).is_file()
 
     def attention(self) -> str:
+        """ATTENTION's text, last good read kept across a fault — which
+        ``attention_fault`` then names until a read succeeds (DW-475). Absence is
+        no fault: the engine writes the file only when it has something to say."""
         path = self.run_dir / ATTENTION_FILE
-        sig = _stat_sig(path)
-        if sig is not None and sig != self._attention_sig:
+        sig, fault = _classified_sig(path)
+        if fault is not None:
+            self.attention_fault = f"ATTENTION cannot be stat'd ({fault})"
+            return self._attention
+        if sig is None:
+            self.attention_fault = None
+            return self._attention
+        if sig != self._attention_sig:
             try:
                 self._attention = path.read_text(encoding="utf-8")
                 self._attention_sig = sig
-            except OSError:
-                pass
+            except (OSError, UnicodeDecodeError) as e:
+                self.attention_fault = f"ATTENTION unreadable ({_describe(e)})"
+                return self._attention
+        self.attention_fault = None
         return self._attention
 
 
@@ -121,16 +196,35 @@ class JournalTail:
     """Incremental journal.jsonl reader.
 
     The byte offset only ever advances past complete lines, so a partially
-    flushed append is withheld until its newline lands. Truncation
-    (size < offset) resets to the start; unparseable lines are skipped.
+    flushed append is withheld until its newline lands — and ``Journal.append``'s
+    tail heal is what makes that newline arrive, on the fragment's own line,
+    rather than as the head of the next record. Truncation (size < offset) resets
+    to the start.
+
+    A COMPLETE line (one its newline has landed for) that will not parse is
+    reported as :func:`journal.unreadable_line_entry` in the position it occupied,
+    so a lost record is visible in the live pane rather than skipped. An
+    UNTERMINATED final line is not a marker here — it is still withheld, because
+    this reader cannot yet tell a torn record from one being written. That is the
+    one place this reader deliberately diverges from ``Journal.entries``, which
+    reads the file whole and so mints a marker for a trailing fragment
+    immediately: here the marker appears once the heal terminates the fragment.
     """
 
     def __init__(self, run_dir: Path):
         self.path = run_dir / JOURNAL_FILE
         self._offset = 0
+        # Why the last look at the journal failed, or None (DW-475). A stat or read
+        # FAULT keeps the offset — only genuine absence or a shrink (truncation /
+        # rewrite) restarts from zero — so recovering re-reads nothing twice.
+        self.fault: str | None = None
 
     def read_new(self) -> list[dict[str, Any]]:
-        sig = _stat_sig(self.path)
+        sig, fault = _classified_sig(self.path)
+        if fault is not None:
+            self.fault = f"journal.jsonl cannot be stat'd ({fault})"
+            return []
+        self.fault = None
         if sig is None:
             self._offset = 0
             return []
@@ -139,9 +233,16 @@ class JournalTail:
             self._offset = 0
         if size == self._offset:
             return []
-        with self.path.open("rb") as f:
-            f.seek(self._offset)
-            chunk = f.read(size - self._offset)
+        try:
+            with self.path.open("rb") as f:
+                f.seek(self._offset)
+                chunk = f.read(size - self._offset)
+        except (FileNotFoundError, NotADirectoryError):
+            self._offset = 0  # gone between the stat and the open: absence
+            return []
+        except OSError as e:
+            self.fault = f"journal.jsonl unreadable ({_describe(e)})"
+            return []
         complete = chunk.rfind(b"\n") + 1
         if complete == 0:
             return []
@@ -154,6 +255,10 @@ class JournalTail:
             try:
                 entry = json.loads(line)
             except json.JSONDecodeError:
+                # The shared minter, never a local dict: one shape for this reader and
+                # `Journal.entries`. Byte length off the RAW line, before the
+                # `errors="replace"` decode above, which can change the count.
+                entries.append(unreadable_line_entry(len(raw)))
                 continue
             if isinstance(entry, dict):
                 entries.append(entry)
@@ -406,6 +511,10 @@ class LogView:
         # place and the render collapses to the final frame. A consumer surfaces
         # this so a fullscreen capture isn't mistaken for the whole session.
         self.altscreen_seen = False
+        # Why the cold-open prefix scan could not run, or None (DW-475). A False
+        # `altscreen_seen` then means "not looked", not "not fullscreen", and the
+        # consumer must say so rather than present the tail as the whole session.
+        self.altscreen_scan_fault: str | None = None
         self._reset_screen()
 
     def _reset_screen(self) -> None:
@@ -420,13 +529,15 @@ class LogView:
         self._render_len = 0
         # A truncation restart re-reads from scratch, so re-detect altscreen too.
         self.altscreen_seen = False
+        self.altscreen_scan_fault = None
 
     def _scan_prefix_for_altscreen(self, end: int) -> None:
         """One-time scan of bytes [0, end) for an altscreen switch marker, in
         overlapping windows so a marker straddling a window boundary still
         matches. `end` is the caller-bounded scan ceiling (see
         _ALTSCREEN_PREFIX_SCAN_CAP), not necessarily the full prefix. Sets
-        altscreen_seen; best-effort, never raises."""
+        altscreen_seen; best-effort, never raises — a read fault is recorded in
+        altscreen_scan_fault instead."""
         overlap = max(len(m) for m in _ALTSCREEN_MARKERS) - 1
         window = 1 << 20
         try:
@@ -443,7 +554,8 @@ class LogView:
                     if not buf:
                         return
                     pos += window
-        except OSError:
+        except OSError as e:
+            self.altscreen_scan_fault = _describe(e)
             return
 
     def read_new(self) -> bool:
@@ -559,17 +671,57 @@ def _open_session_start(journal_entries: list[dict[str, Any]]) -> dict[str, Any]
     session-start with no later matching session-end. None when every started
     session has ended (or none started). The task_id is tracked as a string so
     the session-end match is byte-identical to what active_task_id compared."""
+    entry, _ = _open_session_start_indexed(journal_entries)
+    return entry
+
+
+def _open_session_start_indexed(
+    journal_entries: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, int]:
+    """`_open_session_start` plus the entry's index in `journal_entries` (-1 when
+    None), so a caller can scan the entries that FOLLOW the open start — the
+    #680 idle events belong to a session only from its start onward, and a
+    `session-idle` left behind by an earlier session with a reused task id must
+    not be read as this one's."""
     open_entry: dict[str, Any] | None = None
+    open_index = -1
     active: str | None = None
-    for entry in journal_entries:
+    for index, entry in enumerate(journal_entries):
         kind = entry.get("kind")
         if kind == "session-start" and entry.get("task_id") is not None:
             active = str(entry["task_id"])
             open_entry = entry
+            open_index = index
         elif kind == "session-end" and str(entry.get("task_id")) == active:
             active = None
             open_entry = None
-    return open_entry
+            open_index = -1
+    return open_entry, open_index
+
+
+def _idle_since(journal_entries: list[dict[str, Any]], start: int, task_id: str) -> float | None:
+    """Wall timestamp the open session's current idle stretch began (#680), or
+    None when it is not idle: the `since_ts` of the last `session-idle` for
+    `task_id` after index `start`, unless a later `session-active` for the same
+    task closed it. Malformed or non-finite timestamps are ignored without
+    erasing an earlier valid stretch. Never raises on a malformed entry."""
+    since: float | None = None
+    for entry in journal_entries[start + 1 :]:
+        if str(entry.get("task_id")) != task_id:
+            continue
+        kind = entry.get("kind")
+        if kind == "session-idle":
+            raw = entry.get("since_ts")
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                try:
+                    stamp = float(raw)
+                except OverflowError:
+                    continue
+                if math.isfinite(stamp):
+                    since = stamp
+        elif kind == "session-active":
+            since = None
+    return since
 
 
 def active_task_id(run_dir: Path, journal_entries: list[dict[str, Any]]) -> str | None:
@@ -585,8 +737,26 @@ def active_task_id(run_dir: Path, journal_entries: list[dict[str, Any]]) -> str 
             key=lambda p: p.stat().st_mtime_ns,
         )
     except OSError:
+        # Safe fold: this is only the fallback GUESS at which log to show; the next poll
+        # re-guesses, and a logs/ that cannot be listed holds nothing LogView could show.
         return None
     return logs[-1].stem if logs else None
+
+
+@dataclass(frozen=True)
+class UnreadableAgent:
+    """An open session whose agent identity could not be derived (DW-474): a
+    malformed journal entry or policy snapshot. The header shows it as such
+    rather than dropping the agent line, which reads as "no session open"."""
+
+    error: str
+
+
+# What the body of `active_agent` can raise on malformed journal data or a
+# malformed snapshot: a non-dict entry (AttributeError), a missing or ill-typed
+# field (KeyError / TypeError), a bad value (ValueError). Anything else is a
+# programming error and propagates.
+_MALFORMED_AGENT_FAULTS = (AttributeError, KeyError, TypeError, ValueError)
 
 
 @dataclass(frozen=True)
@@ -600,6 +770,11 @@ class ActiveAgent:
     role: str
     name: str
     model: str
+    # Wall timestamp the session's open idle stretch began (#680) — the `since_ts`
+    # of the last `session-idle` not closed by a later `session-active` — or None
+    # while the transcript is moving. The header renders `· idle <age>` from it
+    # only when set. APPENDED, so every positional construction stays valid.
+    idle_since: float | None = None
 
 
 def _story_key_from_task_id(task_id: str, role: str) -> str:
@@ -625,7 +800,7 @@ def _story_key_from_task_id(task_id: str, role: str) -> str:
 
 def active_agent(
     journal_entries: list[dict[str, Any]], policy_snapshot: dict[str, Any] | None
-) -> ActiveAgent | None:
+) -> ActiveAgent | UnreadableAgent | None:
     """The agent currently driving the run, or None when no session is open.
 
     Journal-only: unlike :func:`active_task_id` there is no logs/ fallback — a
@@ -634,9 +809,12 @@ def active_agent(
     directly. For an older, unstamped entry the run's persisted
     ``policy_snapshot`` is rebuilt and resolved for the entry's role; when that
     yields nothing trustworthy (no/empty snapshot) the agent is unknown -> None.
-    Never raises on a malformed entry."""
+    Never raises on a malformed entry: that answers :class:`UnreadableAgent`
+    carrying the fault (DW-474), never ``None`` — which means no session is open.
+    Only the malformed-data faults are caught; any other exception is a bug and
+    propagates."""
     try:
-        entry = _open_session_start(journal_entries)
+        entry, start_index = _open_session_start_indexed(journal_entries)
         if entry is None:
             return None
         task_id = str(entry.get("task_id", ""))
@@ -652,9 +830,38 @@ def active_agent(
             name, model = resolved.name, resolved.model
         story_raw = entry.get("story_key")
         story_key = str(story_raw) if story_raw else _story_key_from_task_id(task_id, role)
-        return ActiveAgent(task_id=task_id, story_key=story_key, role=role, name=name, model=model)
-    except Exception:
-        return None
+        return ActiveAgent(
+            task_id=task_id,
+            story_key=story_key,
+            role=role,
+            name=name,
+            model=model,
+            idle_since=_idle_since(journal_entries, start_index, task_id),
+        )
+    except _MALFORMED_AGENT_FAULTS as e:
+        return UnreadableAgent(error=f"malformed session-start or snapshot: {_describe(e)}")
+
+
+@dataclass(frozen=True)
+class SweepOutcomes:
+    """The run's auto-sweep ledger (#501): triggers whose child sweep was
+    delivered, and triggers refused with their closed ``SWEEP_REFUSED_*`` slug.
+    Disjoint here, though not on disk: a child that started then failed is
+    latched into ``sweeps_triggered`` AND recorded ``failed`` (model.py), and
+    that trigger was not delivered — so it lands in ``refused`` only."""
+
+    triggered: tuple[str, ...] = ()
+    refused: tuple[tuple[str, str], ...] = ()
+
+
+def sweep_outcomes(state: RunState) -> SweepOutcomes:
+    """Project ``sweeps_triggered``/``sweeps_refused`` off the parsed state.json —
+    the same RunState ``status``, ``status --json`` and ``diagnose`` read — in
+    file order. A pre-#501 state.json carries neither key and reads empty."""
+    return SweepOutcomes(
+        triggered=tuple(t for t in state.sweeps_triggered if t not in state.sweeps_refused),
+        refused=tuple(state.sweeps_refused.items()),
+    )
 
 
 def pending_decision(journal_entries: list[dict[str, Any]]) -> tuple[str, str] | None:
@@ -672,37 +879,61 @@ def pending_decision(journal_entries: list[dict[str, Any]]) -> tuple[str, str] |
 
 # --------------------------------------------- project-level artifact readers
 
-# project root -> (config.yaml sig, ProjectPaths)
-_paths_cache: dict[Path, tuple[_StatSig, bmadconfig.ProjectPaths]] = {}
+# project root -> (sigs of every BMAD config source, ProjectPaths)
+_paths_cache: dict[Path, tuple[tuple[object, ...], bmadconfig.ProjectPaths]] = {}
 # sprint-status.yaml path -> (sig or None for missing, parse or None)
 _sprint_cache: dict[Path, tuple[_StatSig | None, sprintstatus.SprintStatus | None]] = {}
 # deferred-work.md path -> (sig or None for missing, items or None)
 _deferred_cache: dict[Path, tuple[_StatSig | None, list[DeferredItem] | None]] = {}
 # project root -> (signature, pending decisions) — invalidated when the ledger,
-# pre-answer store, or the set of run dirs changes
-_missed_cache: dict[Path, tuple[Any, list]] = {}
+# pre-answer store, or the set of run dirs changes. Answers only: a fault is never
+# cached, so the next rescan retries it.
+_missed_cache: dict[Path, tuple[Any, MissedDecisions]] = {}
+# project spelling as asked -> why `_project_paths` last answered None for it
+_paths_fault: dict[Path, str] = {}
+
+
+def _config_source_sig(path: Path) -> object:
+    """A config source's cache signature, distinguishing what `_stat_sig` folds into
+    one `None`: absent, present but failing (an unreadable directory), and a link
+    whose target is gone or loops. `load_paths` refuses the last two where it reads
+    the first as "no layer", so appearing at an absent path must invalidate."""
+    try:
+        st = path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as e:
+        return ("error", e.errno)
+    return ((st.st_mtime_ns, st.st_size, st.st_ino, st.st_mode), _stat_sig(path))
 
 
 def _project_paths(project: Path) -> bmadconfig.ProjectPaths | None:
-    """BMAD artifact paths, stat-gated on config.yaml; None when the project
-    is not initialized (or the config is unreadable)."""
+    """BMAD artifact paths, stat-gated on every config source `load_paths` reads
+    (the four central TOML layers and the legacy config.yaml), so an edit to any
+    of them is seen on the next call; None when the project is not initialized
+    (or the config is unreadable) — why is left in ``_paths_fault`` under the
+    spelling asked, for a caller that must say so rather than answer empty."""
+    asked = project
     project = resolve_or_lexical(project)
-    config_sig = _stat_sig(project / "_bmad" / "bmm" / "config.yaml")
+    sources = (*bmadconfig.CENTRAL_LAYERS_REL, bmadconfig.LEGACY_CONFIG_REL)
+    config_sigs = tuple(_config_source_sig(project / rel) for rel in sources)
     cached_paths = _paths_cache.get(project)
-    if config_sig is not None and cached_paths is not None and cached_paths[0] == config_sig:
+    if cached_paths is not None and cached_paths[0] == config_sigs:
+        _paths_fault.pop(asked, None)
         return cached_paths[1]
     try:
         paths = bmadconfig.load_paths(project)
-    except (bmadconfig.BmadConfigError, OSError):
+    except (bmadconfig.BmadConfigError, OSError) as e:
+        _paths_fault[asked] = _describe(e)
         return None
-    if config_sig is not None:
-        _paths_cache[project] = (config_sig, paths)
+    _paths_fault.pop(asked, None)
+    _paths_cache[project] = (config_sigs, paths)
     return paths
 
 
 def sprint_overview(project: Path) -> sprintstatus.SprintStatus | None:
     """Parsed sprint-status.yaml, or None when unavailable (uninitialized
-    project, missing file, bad YAML). Stat-gated on both config.yaml and the
+    project, missing file, bad YAML). Stat-gated on both the BMAD config and the
     sprint file; the same object is returned while the file is unchanged."""
     paths = _project_paths(project)
     if paths is None:
@@ -769,9 +1000,13 @@ def deferred_entries(project: Path) -> list[DeferredItem] | None:
         return cached[1]
     items: list[DeferredItem] | None = None
     if sig is not None:
+        # OBSERVATION arm of the ledger-read contract (DW-146): the dashboard
+        # writes nothing and already degrades to `items = None` (rendered as
+        # unavailable). `UnicodeDecodeError` is a `ValueError`, so undecodable
+        # bytes escaped this arm and took the whole TUI refresh down instead.
         try:
             text = ledger_path.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             items = None
         else:
             merged: list[tuple[int, DeferredItem]] = []
@@ -784,7 +1019,7 @@ def deferred_entries(project: Path) -> list[DeferredItem] | None:
                             title=e.title,
                             status=e.status,
                             done=bool(e.status) and e.status.split()[0] == "done",
-                            severity=deferredwork.field_severity(e.body),
+                            severity=e.severity,
                             body=e.body,
                         ),
                     )
@@ -811,28 +1046,55 @@ def deferred_entries(project: Path) -> list[DeferredItem] | None:
     return items
 
 
-def pending_missed_decisions(project: Path) -> list:
+@dataclass(frozen=True)
+class MissedDecisions:
+    """:func:`pending_missed_decisions`' answer. ``fault`` is None for a real
+    answer (``items`` may then be empty: nothing is pending); otherwise it names
+    why nothing could be read, and ``items`` is empty because nothing was — not
+    because nothing is pending (DW-473)."""
+
+    items: list[Any]
+    fault: str | None = None
+
+
+def pending_missed_decisions(project: Path) -> MissedDecisions:
     """Deferred-work decisions earlier sweeps surfaced but no one answered (a
     list of sweep.Decision). Cached on a signature of the ledger, the pre-answer
     store, and the set of run dirs — a new sweep (new run dir) or an answer
-    (store/ledger change) invalidates it. Empty when the project is unavailable."""
+    (store/ledger change) invalidates it.
+
+    Never raises. A project whose BMAD config cannot be loaded, a read that
+    raises, and a ledger that exists but cannot be read each answer a
+    ``fault`` (DW-473) — the last because ``decisions.pending_missed_decisions``
+    reads an unreadable ledger as "no open ids" and answers ``[]``, the same
+    probe ``cmd_decisions`` makes. So does an incomplete run listing (DW-468):
+    the triage caches of a run that cannot be read are missing from the answer.
+    A fault is not cached: the next call retries."""
     from .. import decisions  # lazy: pulls sweep; keep this module import-light
 
     paths = _project_paths(project)
     if paths is None:
-        return []
+        why = _paths_fault.get(project, "BMAD config unavailable")
+        return MissedDecisions([], fault=f"BMAD config cannot be loaded ({why})")
     project = paths.project
+    run_dirs, listing_fault = list_run_dirs(project)
+    if listing_fault is not None:
+        return MissedDecisions([], fault=f"run listing incomplete ({listing_fault})")
     sig = (
         _stat_sig(paths.deferred_work),
         _stat_sig(decisions.store_path(project)),
-        tuple(d.name for d in list_run_dirs(project)),
+        tuple(d.name for d in run_dirs),
     )
     cached = _missed_cache.get(project)
     if cached is not None and cached[0] == sig:
         return cached[1]
     try:
-        result = decisions.pending_missed_decisions(project)
-    except (bmadconfig.BmadConfigError, OSError):
-        result = []
+        items = decisions.pending_missed_decisions(project)
+    except (bmadconfig.BmadConfigError, OSError) as e:
+        return MissedDecisions([], fault=_describe(e))
+    _, ledger_fault = deferredwork.read_for_observation(paths.deferred_work)
+    if ledger_fault is not None:
+        return MissedDecisions([], fault=f"deferred-work ledger unreadable ({ledger_fault})")
+    result = MissedDecisions(items)
     _missed_cache[project] = (sig, result)
     return result

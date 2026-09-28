@@ -2,7 +2,9 @@
 artifact trim, and the `clean` CLI command."""
 
 import argparse
+import json
 import os
+from pathlib import Path
 
 import pytest
 from conftest import install_bmad_config, machine_json
@@ -74,9 +76,10 @@ def test_reconcile_orphan_worktrees(project):
     outside = repo / "elsewhere"
     verify.worktree_add(repo, outside, "other", "main")
 
-    handled = runs.reconcile_orphan_worktrees(repo, run_dir)
+    handled, fault = runs.reconcile_orphan_worktrees(repo, run_dir)
 
     assert [p.name for p in handled] == ["unit"]
+    assert fault is None
     assert not wt.exists()
     assert outside.exists()  # a worktree outside the run dir is never touched
     assert repo not in [p for p in verify.worktree_list(repo)[1:]]  # main checkout intact
@@ -89,9 +92,10 @@ def test_reconcile_orphan_worktrees_dry_run(project):
     wt.parent.mkdir(parents=True)
     verify.worktree_add(repo, wt, "feat", "main")
 
-    handled = runs.reconcile_orphan_worktrees(repo, run_dir, dry_run=True)
+    handled, fault = runs.reconcile_orphan_worktrees(repo, run_dir, dry_run=True)
 
     assert [p.name for p in handled] == ["unit"]
+    assert fault is None
     assert wt.exists()  # dry run removes nothing
 
 
@@ -115,8 +119,59 @@ def test_reconcile_orphan_worktrees_spawn_fault_degrades_to_noop(project, monkey
         raise OSError(24, "Too many open files")
 
     monkeypatch.setattr(verify.subprocess, "run", cannot_spawn)
-    assert runs.reconcile_orphan_worktrees(repo, run_dir) == []
+    handled, fault = runs.reconcile_orphan_worktrees(repo, run_dir)
+    assert handled == []
     assert wt.exists()  # nothing was reclaimed, nothing was rmtree'd
+    # DW-470: visibly — the fault is not "nothing orphaned".
+    assert fault is not None and "cannot list git worktrees" in fault
+
+
+def test_reconcile_orphan_worktrees_names_a_worktree_the_fallback_left(project, monkeypatch):
+    """DW-470: `git worktree remove` failed and the `rmtree` fallback left the tree
+    on disk. It is named in the fault and kept out of `handled`, which `clean`
+    prints as "removed worktree" — a claim that would be false.
+
+    Ablation: drop the `lexists` check and `handled` names the worktree again with
+    no fault."""
+    repo = project.project
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    wt = run_dir / "worktrees" / "unit"
+    wt.parent.mkdir(parents=True)
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    def refuse(*_args, **_kwargs):
+        raise verify.GitError("locked")
+
+    monkeypatch.setattr(verify, "worktree_remove", refuse)
+    monkeypatch.setattr(runs.shutil, "rmtree", lambda *a, **k: None)
+
+    handled, fault = runs.reconcile_orphan_worktrees(repo, run_dir)
+
+    assert handled == []
+    assert wt.exists()
+    assert fault is not None and str(wt) in fault and "still on disk" in fault
+
+
+def test_reconcile_stale_worktrees_reports_a_listing_fault_once(project, monkeypatch):
+    """DW-470: a `git worktree list` fault is repo-wide, so every finished run
+    reports the same one; the run-start warning carries it once, not once per run.
+    Ablate the fault return in `reconcile_orphan_worktrees` and `fault` is None."""
+    repo = project.project
+    for name in ("20260101-000000-aaaa", "20260101-000001-bbbb"):
+        save_state(
+            repo / ".bmad-loop" / "runs" / name,
+            RunState(run_id=name, project=str(repo), started_at="x", finished=True),
+        )
+
+    def cannot_list(_repo):
+        raise verify.GitError("git worktree list failed in repo: boom")
+
+    monkeypatch.setattr(verify, "worktree_list", cannot_list)
+
+    handled, fault = runs.reconcile_stale_worktrees(repo, repo)
+
+    assert handled == []
+    assert fault is not None and fault.count("cannot list git worktrees") == 1
 
 
 def test_reconcile_stale_worktrees_finished_only(project):
@@ -132,11 +187,12 @@ def test_reconcile_stale_worktrees_finished_only(project):
     save_state(fin, RunState(run_id="f", project=str(repo), started_at="x", finished=True))
     save_state(stp, RunState(run_id="s", project=str(repo), started_at="x", stopped=True))
 
-    handled = runs.reconcile_stale_worktrees(repo, repo)
+    handled, fault = runs.reconcile_stale_worktrees(repo, repo)
 
     assert not fin_wt.exists()  # finished run's worktree reclaimed
     assert stp_wt.exists()  # stopped run is resumable — left intact
     assert {p.name for p in handled} == {"u"} and len(handled) == 1
+    assert fault is None
 
 
 # ------------------------------------------------------------- retention
@@ -190,7 +246,7 @@ def test_trim_run_dir_keeps_run_viewable(tmp_path):
     assert (run_dir / "state.json").is_file()
     assert (run_dir / "journal.jsonl").is_file()
     # the run still discovers + lists in the dashboard
-    infos = runs.discover_runs(tmp_path)
+    infos, _ = runs.discover_runs(tmp_path)
     assert [i.run_id for i in infos] == ["20260101-000000-aaaa"]
 
 
@@ -226,7 +282,7 @@ def test_trim_run_dir_reclaims_the_verifier_stream_store(tmp_path):
     # the TUI-visible core the trim exists to preserve
     assert (run_dir / "state.json").is_file()
     assert (run_dir / "journal.jsonl").is_file()
-    infos = runs.discover_runs(tmp_path)
+    infos, _ = runs.discover_runs(tmp_path)
     assert [i.run_id for i in infos] == ["20260101-000000-aaaa"]
 
 
@@ -304,6 +360,142 @@ def test_cmd_clean_warns_unknown_liveness(project, monkeypatch, capsys):
     assert cli.cmd_clean(_clean_args(repo)) == 0
     err = capsys.readouterr().err
     assert "run 20260101-000000-aaaa: engine may still be live (unverifiable pid)" in err
+
+
+def test_cmd_clean_warns_for_an_unreadable_pid_file(project, capsys):
+    """DW-465, end to end through the real liveness read: an engine.pid that
+    exists but cannot be read (a directory at the name) used to read as a dead
+    engine, so `clean` reclaimed the run without its unverifiable-pid warning.
+
+    ABLATION: fold `read_named_pid_identity`'s read fault back into `(None, None)`
+    and the warning is gone."""
+    install_bmad_config(project)
+    repo = project.project
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", stopped=True))
+    (run_dir / runs.PID_FILE).mkdir()
+
+    assert cli.cmd_clean(_clean_args(repo)) == 0
+    err = capsys.readouterr().err
+    assert "run 20260101-000000-aaaa: engine may still be live (unverifiable pid)" in err
+
+
+def _deny_stat_under(monkeypatch, root: Path) -> None:
+    """Every `stat()` of `root` or below raises EACCES — an unreadable dir, as
+    3.14's `is_dir`/`is_file` would fold it into False."""
+    real = Path.stat
+
+    def stat(self, *args, **kwargs):
+        if self == root or root in self.parents:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+
+
+def test_cmd_clean_names_an_unreadable_runs_dir(project, monkeypatch, capsys):
+    """DW-468: "nothing to reclaim" over an unreadable runs dir is not the answer.
+    Text warns on stderr; --json carries `listing_fault` with stderr empty.
+    Ablate the listing fault in `list_run_dirs` and both fail."""
+    install_bmad_config(project)
+    repo = project.project
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", stopped=True))
+    _deny_stat_under(monkeypatch, run_dir.parent)
+
+    assert cli.cmd_clean(_clean_args(repo, dry_run=True)) == 0
+    err = capsys.readouterr().err
+    assert "run listing incomplete" in err and "PermissionError" in err
+
+    assert cli.cmd_clean(_clean_args(repo, dry_run=True, json=True)) == 0
+    captured = capsys.readouterr()
+    assert "PermissionError" in json.loads(captured.out)["listing_fault"]
+    assert captured.err == ""
+
+
+def test_cmd_clean_readable_runs_dir_is_silent(project, capsys):
+    install_bmad_config(project)
+    repo = project.project
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", stopped=True))
+
+    assert cli.cmd_clean(_clean_args(repo, dry_run=True)) == 0
+    assert "run listing incomplete" not in capsys.readouterr().err
+    assert cli.cmd_clean(_clean_args(repo, dry_run=True, json=True)) == 0
+    assert json.loads(capsys.readouterr().out)["listing_fault"] is None
+
+
+def _stopped_run(repo: Path) -> Path:
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", stopped=True))
+    return run_dir
+
+
+def test_cmd_clean_names_a_worktree_reconcile_git_could_not_list(project, monkeypatch, capsys):
+    """DW-470: a run whose worktrees git would not list is not "no orphaned
+    worktrees". Text warns on stderr and `clean` still finishes; --json carries
+    `worktree_faults` with stderr empty. Ablate the listing fault in
+    `reconcile_orphan_worktrees` and both fail."""
+    install_bmad_config(project)
+    repo = project.project
+    run_dir = _stopped_run(repo)
+
+    def cannot_list(_repo):
+        raise verify.GitError("git worktree list failed in repo: boom")
+
+    monkeypatch.setattr(verify, "worktree_list", cannot_list)
+
+    assert cli.cmd_clean(_clean_args(repo, dry_run=True)) == 0
+    err = capsys.readouterr().err
+    assert f"warning: run {run_dir.name}: worktree reconcile incomplete" in err
+    assert "boom" in err
+
+    assert cli.cmd_clean(_clean_args(repo, dry_run=True, json=True)) == 0
+    captured = capsys.readouterr()
+    faults = json.loads(captured.out)["worktree_faults"]
+    assert len(faults) == 1 and faults[0].startswith(f"{run_dir.name}: cannot list git worktrees")
+    assert captured.err == ""
+
+
+def test_cmd_clean_names_a_state_dir_sweep_that_could_not_run(project, monkeypatch, capsys):
+    """DW-470: a state-dir sweep that could not name its root is not "swept 0".
+    Ablate the fault return in `reconcile_orphan_state_dirs` and both fail."""
+    install_bmad_config(project)
+    repo = project.project
+    _stopped_run(repo)
+
+    def no_root(_project):
+        raise runs.StateRootError("no usable base")
+
+    monkeypatch.setattr(runs, "project_state_root", no_root)
+
+    assert cli.cmd_clean(_clean_args(repo, dry_run=True)) == 0
+    err = capsys.readouterr().err
+    assert "warning: orphaned state-dir sweep incomplete" in err and "StateRootError" in err
+
+    assert cli.cmd_clean(_clean_args(repo, dry_run=True, json=True)) == 0
+    captured = capsys.readouterr()
+    assert "StateRootError" in json.loads(captured.out)["state_dir_fault"]
+    assert captured.err == ""
+
+
+def test_cmd_clean_healthy_reconcile_reports_no_fault(project, capsys):
+    install_bmad_config(project)
+    repo = project.project
+    run_dir = _stopped_run(repo)
+    wt = run_dir / "worktrees" / "unit"
+    wt.parent.mkdir(parents=True)
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    assert cli.cmd_clean(_clean_args(repo, dry_run=True)) == 0
+    captured = capsys.readouterr()
+    assert "incomplete" not in captured.err
+    assert f"would remove worktree {wt}" in captured.out
+
+    assert cli.cmd_clean(_clean_args(repo, dry_run=True, json=True)) == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["worktree_faults"] == [] and doc["state_dir_fault"] is None
+    assert doc["worktrees"] == [str(wt)]
 
 
 def test_cmd_clean_reclaims_and_keeps_protected(project, capsys):
@@ -406,7 +598,7 @@ def test_cmd_clean_survives_a_session_appearing_mid_clean(project, monkeypatch, 
         save_state(d, RunState(run_id=d.name, project=str(repo), started_at="x", finished=True))
     seen: list[str] = []
 
-    def racing(_project, run_id):
+    def racing(_project, run_id, **_kw):
         if run_id != racer.name:
             return False  # only one run races; the other must still be reclaimed
         seen.append(run_id)
@@ -442,7 +634,7 @@ def test_cmd_clean_reports_a_mid_clean_racer_by_what_it_actually_did(project, mo
     save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", finished=True))
     seen: list[str] = []
 
-    def racing(_project, run_id):
+    def racing(_project, run_id, **_kw):
         seen.append(run_id)
         return len(seen) > 1
 

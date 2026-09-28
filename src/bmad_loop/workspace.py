@@ -9,9 +9,10 @@ lives in the main repo and is passed separately — it never moves.
 - isolation = worktree → per unit: a git worktree mounted under the run dir
   (.bmad-loop/runs/<run_id>/worktrees/, which `bmad-loop init` gitignores, so it
   stays invisible to the main checkout's `git status`), with paths rebased onto
-  it. open_unit_workspace / close_unit_workspace manage the branch + worktree
-  lifecycle; the engine merges the unit branch back into the target branch from
-  the main repo between units.
+  it — a project nested inside `repo_root` keeps its offset there (DW-379), while
+  `root` stays the checkout root either way. open_unit_workspace /
+  close_unit_workspace manage the branch + worktree lifecycle; the engine merges
+  the unit branch back into the target branch from the main repo between units.
 """
 
 from __future__ import annotations
@@ -64,7 +65,9 @@ def _rmtree_confined(wt: Path, run_dir: Path) -> bool:
 @dataclass(frozen=True)
 class Workspace:
     root: Path  # where sessions run (cwd) and git operates
-    paths: ProjectPaths  # artifact paths rebased onto `root`
+    # artifact paths rebased onto `root`; under isolation `paths.project` is the
+    # mount project (`root` itself, or `root/<offset>` for a nested project)
+    paths: ProjectPaths
 
     @classmethod
     def default(cls, paths: ProjectPaths) -> Workspace:
@@ -306,7 +309,7 @@ def _refuse_foreign_checkout(repo_root: Path, branch: str, wt: Path) -> None:
         return
     try:
         resolved = holder.resolve()
-    except (OSError, RuntimeError) as e:
+    except (OSError, RuntimeError, ValueError) as e:
         raise verify.GitError(
             f"unit branch {branch} is checked out at {holder}, which cannot be "
             f"resolved ({e}); refusing to move the branch under a checkout that is "
@@ -382,7 +385,7 @@ def open_unit_workspace(
     unresolved_wt = unit_worktrees_dir(run_dir) / safe_segment(unit_key)
     try:
         wt = unresolved_wt.resolve()
-    except (OSError, RuntimeError) as e:
+    except (OSError, RuntimeError, ValueError) as e:
         raise verify.GitError(
             f"cannot resolve worktree mount path for {unit_key} ({unresolved_wt}): {e}"
         ) from e
@@ -523,6 +526,7 @@ def close_unit_workspace(
     detach_kept: bool = False,
     diff_max_file_bytes: int | None = None,
     on_teardown_degraded: Callable[[str], None] | None = None,
+    forensic_extra: str = "",
 ) -> Path | None:
     """Tear down (or preserve) a unit's worktree.
 
@@ -552,6 +556,11 @@ def close_unit_workspace(
 
     diff_max_file_bytes caps the per-untracked-file size in that forensic patch
     (None = no cap); see verify.capture_diff.
+
+    forensic_extra (failure only) is appended to the captured diff before it is
+    written — the caller's record of changes `git diff` cannot see, such as a
+    story's edit to a skip-worktree-pinned hook config (DW-479). A non-empty extra
+    writes the patch even when the git diff is empty or its capture failed.
     """
     patch: Path | None = None
     if not success:
@@ -565,6 +574,10 @@ def close_unit_workspace(
         except verify.GitError as e:
             capture_err = e
             diff = ""
+        if forensic_extra:
+            if diff and not diff.endswith("\n"):
+                diff += "\n"
+            diff += forensic_extra
         if diff:
             patch = run_dir / "failed" / safe_segment(unit_key) / "changes.patch"
             patch.parent.mkdir(parents=True, exist_ok=True)

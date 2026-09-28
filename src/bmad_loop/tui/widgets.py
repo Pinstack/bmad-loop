@@ -25,6 +25,8 @@ from textual.widgets.option_list import Option
 from textual.widgets.tree import TreeNode
 
 from .. import policy
+from ..escalation import display_pause_reason
+from ..journal import UNREADABLE_LINE_KIND
 from ..model import (
     PAUSE_EPIC_BOUNDARY,
     PAUSE_ESCALATION,
@@ -110,6 +112,19 @@ def agent_label(name: str, model: str) -> str:
     return f"{name}·{model}" if model else name
 
 
+def _format_age(seconds: float) -> str:
+    """Coarse age for the header's `· idle <age>` text (#680): whole minutes
+    below an hour (`12m`), hours and minutes above (`1h05m`), never seconds — the
+    threshold is the stall grace (minutes), so finer resolution would only make
+    the line flicker on every poll. A negative age (a clock stepped backward
+    between the adapter's stamp and this render) reads as `0m` rather than a
+    minus sign."""
+    minutes = max(0, int(seconds // 60))
+    if minutes < 60:
+        return f"{minutes}m"
+    return f"{minutes // 60}h{minutes % 60:02d}m"
+
+
 class RunHeader(Static):
     """One-glance summary of the selected run, or the empty-state hint."""
 
@@ -142,8 +157,13 @@ class RunHeader(Static):
         state: RunState | None,
         decision: tuple[str, str] | None = None,
         stopping: bool = False,
-        agent: data.ActiveAgent | None = None,
+        agent: data.ActiveAgent | data.UnreadableAgent | None = None,
+        state_fault: str | None = None,
+        read_faults: tuple[str, ...] = (),
     ) -> None:
+        """``state_fault`` (DW-472) marks the state shown as the last good read of a
+        state.json that no longer parses; ``read_faults`` (DW-475) are the other
+        run-dir files the poll could not read this tick, each already a sentence."""
         text = Text()
         text.append(run_id, style="bold")
         if state is not None and state.run_type != "story":
@@ -155,8 +175,15 @@ class RunHeader(Static):
         )
         if state is None:
             text.append("\nstate unavailable", style="dim")
+            if state_fault:
+                text.append(f" — {state_fault}", style="dim")
+            _append_read_faults(text, read_faults)
             self.update(text)
             return
+        if state_fault:
+            text.append(
+                f"\n⚠ state stale — {state_fault}; showing the last good read", style="yellow"
+            )
         text.append(f"  started {state.started_at}", style="dim")
         if state.current_epic is not None:
             text.append(f"  epic {state.current_epic}", style="dim")
@@ -183,7 +210,13 @@ class RunHeader(Static):
         text.append(f"  {weighted:,} tokens ({raw:,} raw)", style="dim")
 
         # The agent line: who is driving (or, when idle, who is configured to).
-        if agent is not None:
+        if isinstance(agent, data.UnreadableAgent):
+            # A session is open but its identity could not be derived (DW-474): say
+            # so, rather than fall through to the configured-agents line, which is
+            # what "no session open" looks like.
+            text.append("\nagent unreadable", style="yellow")
+            text.append(f" — {agent.error}", style="dim")
+        elif agent is not None:
             # A session is open: show the live agent, its model and stage role.
             text.append("\nagent ", style="dim")
             text.append(agent.name, style="bold cyan")
@@ -191,6 +224,15 @@ class RunHeader(Static):
                 text.append(f" · {agent.model}", style="cyan")
             if agent.role:
                 text.append(f" · {agent.role}", style="dim")
+            if agent.idle_since is not None:
+                # The transcript has sat still past the stall grace (#680): the
+                # pane may still be repainting a spinner, so this is the one
+                # surface that separates a session working from one parked in a
+                # tool call. Yellow, not red — it is a notice, not a verdict, and
+                # nothing bounds the stretch.
+                text.append(
+                    f" · idle {_format_age(time.time() - agent.idle_since)}", style="yellow"
+                )
         else:
             # No session open: show the configured adapters from the run's policy
             # snapshot. Skip the line entirely when the snapshot can't be rebuilt
@@ -210,6 +252,20 @@ class RunHeader(Static):
                     line += f" triage {agent_label(triage.name, triage.model)}"
                 text.append(line, style="dim")
 
+        # Auto-sweep outcome (#603): a refused sweep must not read like one that
+        # ran — the deferred work it would have drained is still sitting there.
+        # Wording mirrors `cmd_status`; the delivered line stays dim.
+        sweeps = data.sweep_outcomes(state)
+        if sweeps.refused:
+            detail = ", ".join(f"{trigger} ({why})" for trigger, why in sweeps.refused)
+            text.append(
+                f"\n⚠ auto-sweep not run: {detail} — deferred work is untouched",
+                style="bold yellow",
+            )
+            text.append("\n  run `bmad-loop sweep` with a clean worktree", style="dim")
+        if sweeps.triggered:
+            text.append(f"\nauto-sweep ran: {', '.join(sweeps.triggered)}", style="dim")
+
         if stopping:
             # A RUNNING or UNKNOWN run with a pending graceful-stop request: it never
             # enters the PAUSED/CRASHED/INTERRUPTED branches below, so this stands on
@@ -226,7 +282,7 @@ class RunHeader(Static):
                 text.append("  ")
                 text.append(f"[{label}]", style=f"bold {badge_style}")
             if state.paused_reason:
-                text.append(f" — {state.paused_reason}", style="yellow")
+                text.append(f" — {display_pause_reason(state)}", style="yellow")
             # p opens the stage-appropriate review viewer; e resumes; R resolves
             # an escalation (the header only hints the common paths).
             text.append("\n  press p to review · e to resume", style="dim")
@@ -252,14 +308,29 @@ class RunHeader(Static):
             if question:
                 text.append(f" — {_short(question, 100)}", style="yellow")
             text.append("\n  press a to attach and answer", style="bold yellow")
+        _append_read_faults(text, read_faults)
         self.update(text)
+
+
+def _append_read_faults(text: Text, read_faults: tuple[str, ...]) -> None:
+    # Dim, like the other observation notes: the view may be incomplete, nothing is
+    # wrong with the run itself.
+    for fault in read_faults:
+        text.append(f"\n⚠ {fault}", style="dim")
 
 
 # ------------------------------------------------------------ journal lines
 
+# Applied by EQUALITY, before the substring table below runs — see
+# `journal.UNREADABLE_LINE_KIND` for why. The detail local to this file: four PRODUCER
+# kinds end in "-unreadable" (`story-gate-unreadable`, `stories-manifest-unreadable`, …),
+# so any substring rule here would restyle them too.
+_UNREADABLE_LINE_STYLE = "red"
+
 # kind substrings -> style, first match wins; anything else renders dim
 _JOURNAL_STYLES = (
     ("escalation-resolved", "green"),  # positive — must precede the "escalat" -> red rule
+    ("escalation-adopted", "green"),  # positive (DW-386) — same ordering constraint
     ("escalat", "red"),
     ("failed", "red"),
     ("done", "green"),
@@ -289,7 +360,10 @@ _JOURNAL_COL_PAD = 1  # per-column right pad in the row grid
 
 def journal_line(entry: dict[str, Any]) -> Table:
     kind = str(entry.get("kind", "?"))
-    style = next((s for sub, s in _JOURNAL_STYLES if sub in kind), "dim")
+    if kind == UNREADABLE_LINE_KIND:
+        style = _UNREADABLE_LINE_STYLE
+    else:
+        style = next((s for sub, s in _JOURNAL_STYLES if sub in kind), "dim")
     ts = entry.get("ts")
     clock = ""
     if isinstance(ts, (int, float)):

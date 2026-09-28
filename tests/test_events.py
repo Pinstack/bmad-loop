@@ -35,6 +35,7 @@ EVENTS = Path(events.__file__).resolve()
 TWINNED = (
     "_LINK_REPARSE_TAGS",
     "_first_workspace",
+    "_notification_type",
     "_is_link_like",
     "_write_all",
     "_write_event",
@@ -157,6 +158,46 @@ def test_relay_and_the_hook_shape_the_same_event(tmp_path, monkeypatch):
         json.loads(from_hook.read_text()) | {"ts": 0}
     )
     assert from_relay.name.split("-", 1)[1] == from_hook.name.split("-", 1)[1]
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"notification_type": "permission_prompt"}, "permission_prompt"),
+        ({"notificationType": "idle_prompt"}, "idle_prompt"),
+        # only a string is forwarded — anything else no profile table can key on
+        ({"notification_type": 7}, None),
+        ({"notification_type": ["permission_prompt"]}, None),
+        ({}, None),
+    ],
+)
+def test_both_relay_twins_forward_the_notification_type(tmp_path, monkeypatch, payload, expected):
+    """DW-348: the Notification subtype reaches the event file from BOTH writers,
+    spelled the same — the hook does its shaping inline in `main()`, so this is
+    pinned behaviorally like the rest of the payload shape.
+
+    Ablation: drop the `"notification_type"` key from either writer's event dict
+    and this fails on that side's KeyError."""
+    hook_run, relay_run = tmp_path / "hook", tmp_path / "relay"
+    proc = subprocess.run(
+        [sys.executable, str(HOOK), "Notification"],
+        input=json.dumps(payload),
+        env={
+            "PATH": os.environ.get("PATH", ""),
+            **({"SYSTEMROOT": os.environ.get("SYSTEMROOT", "")} if os.name == "nt" else {}),
+            "BMAD_LOOP_RUN_DIR": str(hook_run),
+            "BMAD_LOOP_TASK_ID": "1-1-a-dev-1",
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert _relay("Notification", payload, monkeypatch, relay_run, task_id="1-1-a-dev-1") == 0
+    from_hook = json.loads(next((hook_run / "events").glob("*.json")).read_text())
+    from_relay = json.loads(next((relay_run / "events").glob("*.json")).read_text())
+    assert from_hook["notification_type"] == expected
+    assert from_relay["notification_type"] == expected
 
 
 # -------------------------------------------------------- hardening (twinned)

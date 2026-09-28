@@ -3,8 +3,15 @@ name: Release
 # Auto-publish on merge: when a version bump lands on `main` or a `release/*`
 # maintenance branch, create the matching `vX.Y.Z` tag and GitHub release with
 # notes from CHANGELOG.md. Idempotent — `release.py publish` is a no-op when the
-# tag already exists, so merges that don't bump the version do nothing, and
-# whichever branch carries a given version first wins the tag.
+# tag and its GitHub release already exist, so merges that don't bump the version
+# do nothing, and whichever branch carries a given version first wins the tag. An
+# existing tag is verified, not trusted: the commit it points to on origin must
+# carry the version (or, on a lost `gh release create` race, be exactly the commit
+# this run targeted), and a mismatch, a local-only tag or a failed `git ls-remote`
+# read of origin fails the publish. A verified tag with no release gets its
+# release created on that tag. After a fresh create the tag is re-read on origin
+# and must point at the commit this run targeted (`gh` ignores `--target` for a
+# pre-existing tag); otherwise the publish fails and the operator cleans up.
 on:
   push:
     branches: [main, release/*]
@@ -13,8 +20,8 @@ concurrency:
   # Deliberately ref-independent: `main` and a `release/*` branch can carry the
   # same version, and keying on `github.ref` would put them in separate groups and
   # let both publish runs proceed at once. One group repo-wide serializes them, so
-  # the second run checks out *after* the first pushed the tag and its `tag_exists`
-  # probe short-circuits cleanly. Never cancel-in-progress — a cancelled publish
+  # the second run checks out *after* the first pushed the tag, finds the verified
+  # tag and its release, and no-ops. Never cancel-in-progress — a cancelled publish
   # leaves the tag unmade.
   group: release-publish
   cancel-in-progress: false
@@ -39,7 +46,10 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # need all tags to detect whether vX.Y.Z already exists
-          persist-credentials: false # nothing here runs an authenticated git op
+          # Nothing here runs an authenticated git op: the tag check's
+          # `git ls-remote origin` is an unauthenticated read of the public repo,
+          # and the tag itself is created by `gh`, which uses GH_TOKEN.
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@v10.0.1

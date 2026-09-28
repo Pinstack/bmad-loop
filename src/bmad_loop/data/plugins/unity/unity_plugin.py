@@ -167,7 +167,13 @@ class UnityPlugin(Plugin):
     def on_post_rollback(self, ctx) -> None:
         """After the reset rewrote the tracked tree, tell the Editor to re-import
         so it sees the reverted assets rather than its stale in-memory copies. Best
-        effort — same never-veto contract as ``on_pre_rollback``."""
+        effort — same never-veto contract as ``on_pre_rollback``.
+
+        Fires once for every ``pre_rollback``, including a rollback that paused
+        or failed part-way (``ctx.rollback_outcome`` is ``"paused"``/``"failed"``
+        rather than ``"completed"``). The re-import runs regardless: after a
+        partial or refused reset it is harmless, and it still syncs the Editor
+        with whatever the tree now holds."""
         self._quiesce("post", ctx)
 
     def on_pre_session(self, ctx) -> None:
@@ -395,6 +401,9 @@ class UnityPlugin(Plugin):
         env = self.engine_env(ctx)
         if extra_env:
             env.update(extra_env)
+        # the helper's stdio must match the utf-8 decode below — a pipe otherwise
+        # takes the locale encoding (e.g. cp932), mangling non-ASCII diagnostics.
+        env["PYTHONIOENCODING"] = "utf-8"
         cwd = ctx.worktree or ctx.repo_root or None
         try:
             proc = subprocess.run(  # nosec B603 - operator-enabled engine plugin script
@@ -406,6 +415,8 @@ class UnityPlugin(Plugin):
                 env=env,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout,
             )
         except subprocess.TimeoutExpired:

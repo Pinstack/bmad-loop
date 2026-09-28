@@ -19,6 +19,7 @@ from bmad_loop.policy import (
     GATE_MODES,
     ISOLATION_MODES,
     MERGE_STRATEGIES,
+    OPERATOR_ON_REVIEW_DEMOTION_MODES,
     POLICY_TEMPLATE,
     RETRO_MODES,
     REVIEW_ON_STATUS_CONTRADICTION_MODES,
@@ -60,6 +61,7 @@ SECTION_DC = {
     "adapter.dev": StageAdapterPolicy,
     "adapter.review": StageAdapterPolicy,
     "adapter.triage": StageAdapterPolicy,
+    "adapter.retro": StageAdapterPolicy,
     "sweep": SweepPolicy,
     "scm": ScmPolicy,
     "cleanup": CleanupPolicy,
@@ -80,6 +82,7 @@ OPTIONS_ENUM = {
     ("gates", "retrospective"): RETRO_MODES,
     ("review", "trigger"): REVIEW_TRIGGER_MODES,
     ("review", "on_status_contradiction"): REVIEW_ON_STATUS_CONTRADICTION_MODES,
+    ("operator", "on_review_demotion"): OPERATOR_ON_REVIEW_DEMOTION_MODES,
     ("stories", "source"): STORIES_SOURCES,
     ("limits", "session_budget_mode"): SESSION_BUDGET_MODES,
     ("sweep", "auto"): SWEEP_AUTO_MODES,
@@ -97,6 +100,7 @@ HIDDEN = {
     ("adapter", "dev"),  # rendered as the adapter.dev section
     ("adapter", "review"),  # rendered as the adapter.review section
     ("adapter", "triage"),  # rendered as the adapter.triage section
+    ("adapter", "retro"),  # rendered as the adapter.retro section
     ("dev", "skill"),  # internal dev-skill seam; DEV_SKILLS has one legal value, no UI knob
     # Dashboard pane geometry — set by mouse-drag / the Ctrl+W resize mode, not a
     # form field, so no settings-screen control.
@@ -125,6 +129,23 @@ def test_defaults_match_referenced_dataclass():
         elif f.default is not None:
             # str fields may omit a default (placeholder-only); if present, sync it
             assert f.default == getattr(dc, f.key), f"{f.section}.{f.key}"
+
+
+def test_extra_args_fields_explain_the_bypass_replace_rule():
+    """DW-349: `extra_args` REPLACES the profile's `bypass_args`, so every
+    `extra_args` field (the base table and each stage) says so on the settings
+    screen; the stage entry also names the client-match inheritance."""
+    fields = {f.section: f for f in core_fields() if f.key == "extra_args"}
+    assert set(fields) == {
+        "adapter",
+        "adapter.dev",
+        "adapter.review",
+        "adapter.triage",
+        "adapter.retro",
+    }
+    for section, f in fields.items():
+        assert "replaces" in f.description and "bypass_args" in f.description, section
+    assert "only when the client matches" in fields["adapter.dev"].description
 
 
 def test_select_options_match_enum_sets():

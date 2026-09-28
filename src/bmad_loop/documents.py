@@ -253,7 +253,7 @@ def status_document(state: RunState, *, graceful_stop_pending: bool = False) -> 
     the recorded sessions — never live policy — and deliberately named apart:
 
     - Run-level ``adapters`` is the *configured-resolved* identity: the
-      dev/review/triage adapter the run's ``policy_snapshot`` resolves to, via
+      dev/review/triage/retro adapter the run's ``policy_snapshot`` resolves to, via
       :func:`policy.adapter_policy_from_snapshot` + ``AdapterPolicy.resolved`` so
       the stage-inheritance rules are the canonical ones, not re-derived here.
       ``None`` when the snapshot carries no rebuildable ``[adapter]`` block (a run
@@ -269,7 +269,7 @@ def status_document(state: RunState, *, graceful_stop_pending: bool = False) -> 
     adapters: dict[str, dict[str, str]] | None = None
     if adapter_policy is not None:
         adapters = {}
-        for role in ("dev", "review", "triage"):
+        for role in ("dev", "review", "triage", "retro"):
             resolved = adapter_policy.resolved(role)
             adapters[role] = {"name": resolved.name, "model": resolved.model}
     if state.finished:
@@ -344,7 +344,7 @@ def status_document(state: RunState, *, graceful_stop_pending: bool = False) -> 
 LIST_SCHEMA_VERSION = 1
 
 
-def list_document(infos: list[RunInfo]) -> dict[str, object]:
+def list_document(infos: list[RunInfo], listing_fault: str | None = None) -> dict[str, object]:
     """The `list --json` document: one entry per run, oldest first.
 
     Obeys the pure-document contract in machine.py (additive-only evolution;
@@ -356,6 +356,12 @@ def list_document(infos: list[RunInfo]) -> dict[str, object]:
     runs.short_ref(run_id), derived from the id — stable, not positional.
     paused_stage is "" unless status is "paused". An empty runs dir is a valid
     empty document with exit 0, never an error.
+
+    `listing_fault` is ``null`` for a complete listing, else what could not be
+    read (DW-468): an unreadable runs dir — whose ``runs: []`` then means "could
+    not list", not "no runs" — or run dirs left out because their state could
+    not be stat'd. Additive, no schema bump; exit stays 0 (the text mode warns
+    on stderr).
     """
     return {
         "schema_version": LIST_SCHEMA_VERSION,
@@ -370,6 +376,7 @@ def list_document(infos: list[RunInfo]) -> dict[str, object]:
             }
             for ri in infos
         ],
+        "listing_fault": listing_fault,
     }
 
 
@@ -387,6 +394,7 @@ def cleanup_document(
     windows_unverifiable: list[str],
     scan_error: str | None = None,
     legacy_leftovers: list[str] | None = None,
+    legacy_unverified: list[str] | None = None,
 ) -> dict[str, object]:
     """The `cleanup --json` document: the multiplexer artifacts this invocation
     removed, or — under ``--dry-run`` — would remove.
@@ -434,6 +442,12 @@ def cleanup_document(
     `runs.legacy_registry_leftovers` for what qualifies and why; the text mode
     prints the same list on stderr, the `unverifiable_pid` precedent.
 
+    `sessions.legacy_unverified` is one line per legacy registry that could not
+    be asked at all (DW-469) — no backend could be selected, or a registry's
+    listing raised — so `legacy_leftovers: []` beside a non-empty
+    `legacy_unverified` means "not looked at", not "nothing left". Additive, no
+    schema bump; the text mode prints each line on stderr.
+
     `sessions.removed` did NOT get the same treatment and is still the pre-kill
     prunable partition — an *attempted* kill, since `kill_session` is best-effort
     and silent in exactly the way `kill_window` is. #435 narrowed the windows
@@ -447,6 +461,7 @@ def cleanup_document(
             "live": list(live),
             "unverifiable_pid": sorted(unknown),
             "legacy_leftovers": list(legacy_leftovers or []),
+            "legacy_unverified": list(legacy_unverified or []),
         },
         "ctl_windows": {
             "removed": list(windows),
@@ -473,6 +488,9 @@ def clean_document(
     protected: list[str],
     unverifiable_pid: list[str],
     state_dirs_swept: int,
+    listing_fault: str | None = None,
+    worktree_faults: list[str] | None = None,
+    state_dir_fault: str | None = None,
 ) -> dict[str, object]:
     """The `clean --json` document: the disk this invocation reclaimed, or —
     under ``--dry-run`` — would reclaim.
@@ -511,6 +529,19 @@ def clean_document(
     existing schema version: a v1 consumer reads every field it already knew.
     Those dirs hold only consumed event files, so their bytes are not in
     `freed_bytes` — an accepted under-count of a few kilobytes at most.
+
+    `listing_fault` is ``null`` when every run dir was read, else what could not
+    be (DW-468): an unreadable runs dir, or run dirs whose state could not be
+    stat'd. Those runs are in no list — never reclaimed, never counted toward
+    retention — so without it an unreadable runs dir documents as "nothing to
+    reclaim". The text mode's stderr warning; additive, no schema bump.
+
+    `worktree_faults` holds one ``"<run id>: <fault>"`` line per touched run whose
+    worktree reconcile was incomplete — git would not list worktrees, or a failed
+    removal left one on disk — and `state_dir_fault` is ``null`` unless the
+    orphaned state-dir sweep could not run or skipped entries (DW-470). Without
+    them either fault documents as nothing orphaned, `state_dirs_swept: 0`. The
+    text mode's stderr warnings; additive, no schema bump.
     """
     return {
         "schema_version": CLEAN_SCHEMA_VERSION,
@@ -529,4 +560,7 @@ def clean_document(
         "protected": list(protected),
         "unverifiable_pid": list(unverifiable_pid),
         "state_dirs_swept": state_dirs_swept,
+        "listing_fault": listing_fault,
+        "worktree_faults": list(worktree_faults or ()),
+        "state_dir_fault": state_dir_fault,
     }

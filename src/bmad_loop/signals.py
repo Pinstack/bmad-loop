@@ -28,11 +28,81 @@ from typing import Callable
 @dataclass(frozen=True)
 class HookEvent:
     ts: int
-    event: str  # Stop | SessionStart | SessionEnd | PreCompact
+    event: str  # Stop | SessionStart | SessionEnd | PreCompact | Notification | parked kinds
     task_id: str
     session_id: str | None
     transcript_path: str | None
     path: Path
+    # A Notification event's subtype, forwarded by the relay (DW-348) — e.g.
+    # claude's "permission_prompt". None on every other event, on an older
+    # relay that predates the field, and for a non-string value. APPENDED with a
+    # default so every positional construction stays valid.
+    notification_type: str | None = None
+
+
+def _event_dirs(events_dir: Path, legacy_dir: Path | None) -> list[Path]:
+    """Primary first, then the legacy dir when there is a distinct one. The
+    equality check keeps a caller that passes the same path twice from
+    double-scanning; it cannot produce duplicate events either way (the
+    watcher's ``_consumed`` key would repeat), but the second scan would be
+    pure waste."""
+    if legacy_dir is None or legacy_dir == events_dir:
+        return [events_dir]
+    return [events_dir, legacy_dir]
+
+
+def _parse_event(entry: Path) -> HookEvent | None:
+    """One event file, or ``None`` when it is not a well-formed event."""
+    try:
+        data = json.loads(entry.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict) or "event" not in data or "task_id" not in data:
+        return None
+    notification_type = data.get("notification_type")
+    return HookEvent(
+        ts=int(data.get("ts", 0)),
+        event=str(data["event"]),
+        task_id=str(data["task_id"]),
+        session_id=data.get("session_id"),
+        transcript_path=data.get("transcript_path"),
+        path=entry,
+        notification_type=notification_type if isinstance(notification_type, str) else None,
+    )
+
+
+def is_session_event(event: HookEvent, task_id: str, since_ns: int = 0) -> bool:
+    """The one rule that ties a hook event to a session attempt. ``task_id`` is
+    the session's own id, which folds in the attempt number and generation
+    (``engine._session_task_id``), so another attempt's events never match;
+    ``since_ns`` is that attempt's launch floor, which drops a stale event a
+    resumed run left under the same re-minted id (see ``SignalWatcher.wait_for``)."""
+    return event.task_id == task_id and (not since_ns or event.ts >= since_ns)
+
+
+def session_events(
+    events_dir: Path, legacy_dir: Path | None, task_id: str, since_ns: int = 0
+) -> list[HookEvent]:
+    """Every event on disk for one session attempt, across both channels, oldest
+    first — a read-only snapshot for post-mortem diagnosis (#752), never a
+    completion signal. Unlike ``SignalWatcher.poll`` it creates nothing and
+    consumes nothing, so it sees events the watcher already delivered. A missing
+    directory, primary included, reads as empty (a run whose relay never fired
+    may never have had one made); any other ``OSError`` raises to the caller."""
+    events: list[HookEvent] = []
+    for directory in _event_dirs(events_dir, legacy_dir):
+        try:
+            entries = list(directory.iterdir())
+        except FileNotFoundError:
+            continue
+        for entry in entries:
+            if entry.suffix != ".json":
+                continue
+            event = _parse_event(entry)
+            if event is not None and is_session_event(event, task_id, since_ns):
+                events.append(event)
+    events.sort(key=lambda e: e.ts)
+    return events
 
 
 class SignalWatcher:
@@ -65,13 +135,7 @@ class SignalWatcher:
         events_dir.mkdir(parents=True, exist_ok=True)
 
     def _dirs(self) -> list[Path]:
-        """Primary first, then the legacy dir when there is a distinct one. The
-        equality check keeps a caller that passes the same path twice from
-        double-scanning; it cannot produce duplicate events either way (the
-        ``_consumed`` key would repeat), but the second scan would be pure waste."""
-        if self.legacy_dir is None or self.legacy_dir == self.events_dir:
-            return [self.events_dir]
-        return [self.events_dir, self.legacy_dir]
+        return _event_dirs(self.events_dir, self.legacy_dir)
 
     def poll(self) -> list[HookEvent]:
         """Return new, well-formed events since the last poll, oldest first.
@@ -98,22 +162,9 @@ class SignalWatcher:
                 if key in self._consumed or entry.suffix != ".json":
                     continue
                 self._consumed.add(key)
-                try:
-                    data = json.loads(entry.read_text(encoding="utf-8"))
-                except (json.JSONDecodeError, OSError):
-                    continue
-                if not isinstance(data, dict) or "event" not in data or "task_id" not in data:
-                    continue
-                events.append(
-                    HookEvent(
-                        ts=int(data.get("ts", 0)),
-                        event=str(data["event"]),
-                        task_id=str(data["task_id"]),
-                        session_id=data.get("session_id"),
-                        transcript_path=data.get("transcript_path"),
-                        path=entry,
-                    )
-                )
+                event = _parse_event(entry)
+                if event is not None:
+                    events.append(event)
         events.sort(key=lambda e: e.ts)
         return events
 
@@ -153,7 +204,7 @@ class SignalWatcher:
             if since_ns:
                 self._pending = [e for e in self._pending if e.ts >= since_ns]
             for i, event in enumerate(self._pending):
-                if event.task_id == task_id and event.event in kinds:
+                if is_session_event(event, task_id, since_ns) and event.event in kinds:
                     return self._pending.pop(i)
             if clock() >= deadline:
                 return None

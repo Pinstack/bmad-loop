@@ -148,6 +148,9 @@ Two further consequences:
 
   Whatever the sweep leaves standing is **named on stderr** (and in `cleanup --json`, at
   `sessions.legacy_leftovers`) so a removal count never quietly stands for a partial migration.
+  A legacy registry that could not be asked at all — its listing failed, or no backend could be
+  selected to name one — is named the same way (`sessions.legacy_unverified` in `--json`, a toast
+  in the TUI), since "not looked at" is not "nothing left".
   Three kinds stay behind by design:
 
   - An **untagged** `bmad-loop-<run-id>` session. In a shared registry a matching run directory
@@ -308,6 +311,17 @@ Two operational notes that apply to any external backend:
   import, selection proceeds without it; `bmad-loop mux` prints a
   `warning: external backend '<name>' failed to load: <reason>` line and `validate` notes
   the same. The fix is usually reinstalling or upgrading the adapter.
+- **A raising probe reads as unavailable, but says so.** When a backend's platform
+  predicate, factory or `available()` raises, selection skips it with a one-time
+  `warning:` on stderr, `bmad-loop mux` prints `warning: <name> backend probe failed:
+<error>`, and `validate` adds a `mux.backend-probe` warning. A `version()` that raises
+  is reported as a failed version probe. None of these reads the same as an
+  ordinary unavailable row (DW-464).
 - **`mux set --force` covers late registrations.** A backend that only registers on some
   other machine (where the package IS installed) can still be persisted in a shared
   workflow with `bmad-loop mux set <name> --force`.
+- **`capture_pane` is optional.** `TerminalMultiplexer.capture_pane(window_id)` (the
+  window's visible screen as text) is non-abstract: its default raises
+  `MultiplexerError`, which the generic adapter reads as "no match" at a stall-grace
+  expiry, so an existing backend keeps working unchanged. Override it to enable the
+  profile's `parked_prompt_patterns` (DW-350) on your transport.

@@ -84,10 +84,10 @@ def test_builtin_profiles_load():
         assert "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS" not in profiles[name].env
     # transport/provider fault classification (#194): only the two profiles with
     # captured real-world error output seed patterns — claude (three
-    # capture-anchored patterns, reproducing only COMPLETE Claude Code error
-    # sentences: the "Unable to connect to API" connection failure and the
-    # provider 5xx pair; still no quota cause, since no captured Claude Code
-    # usage-limit line exists) and opencode-http (the serve process's
+    # capture-anchored patterns, each a prefix match on the whole FIRST sentence
+    # of a captured Claude Code error: the "Unable to connect to API" connection
+    # failure and the provider 5xx pair; still no quota cause, since no captured
+    # Claude Code usage-limit line exists) and opencode-http (the serve process's
     # `error.error="AI_APICallError: …"` field). The other four stay inert on
     # purpose: patterns for them could only be written from strings scraped off
     # public issue trackers, and an unverified pattern that fires on a healthy
@@ -152,6 +152,115 @@ def test_env_fault_patterns_parse_from_overlay(tmp_path):
     )
     prof = load_profiles(tmp_path)["mycli"]
     assert prof.env_fault_patterns == ("API Error.*refused", "socket hang up")
+
+
+@pytest.mark.parametrize("field", ["env_fault_patterns", "parked_prompt_patterns"])
+def test_deeply_nested_pattern_is_a_profile_error_not_a_bare_recursion_error(tmp_path, field):
+    """DW-373: `regex.compile` answers a deeply nested pattern with RecursionError,
+    not `regex.error` — it must still surface as a ProfileError naming the field,
+    never escape `load_profiles` bare.
+
+    ABLATION: narrow either loop's except back to `regex.error` and its case
+    reddens with a bare RecursionError."""
+    depth = 5000  # empirically raises RecursionError under regex.compile
+    pattern = "(" * depth + ")" * depth
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(
+        MINIMAL_PROFILE.replace("[hooks]", f"{field} = ['{pattern}']\n[hooks]")
+    )
+    with pytest.raises(ProfileError, match=f"{field} entry is not a valid regex") as excinfo:
+        load_profiles(tmp_path)
+    # The RecursionError path specifically — not a plain `regex.error`, which the
+    # pre-fix `except` already caught and would pass this test for another reason.
+    assert isinstance(excinfo.value.__cause__, RecursionError)
+
+
+def test_parked_signal_fields_default_empty_when_unset(tmp_path):
+    # MINIMAL_PROFILE declares neither -> both inert (DW-348/DW-350)
+    (tmp_path / ".bmad-loop" / "profiles").mkdir(parents=True)
+    (tmp_path / ".bmad-loop" / "profiles" / "mycli.toml").write_text(MINIMAL_PROFILE)
+    prof = load_profiles(tmp_path)["mycli"]
+    assert prof.hooks.notification_types == {}
+    assert prof.parked_prompt_patterns == ()
+
+
+def test_parked_signal_fields_parse_from_overlay(tmp_path):
+    (tmp_path / ".bmad-loop" / "profiles").mkdir(parents=True)
+    (tmp_path / ".bmad-loop" / "profiles" / "mycli.toml").write_text(
+        MINIMAL_PROFILE.replace(
+            "[hooks]", 'parked_prompt_patterns = ["Allow t[o] run"]\n[hooks]'
+        ).replace(
+            'Stop = "Stop" }', 'Stop = "Stop", Ask = "PermissionPrompt", Note = "Notification" }'
+        )
+        + '[hooks.notification_types]\nquota_wait = "QuotaPrompt"\n'
+    )
+    prof = load_profiles(tmp_path)["mycli"]
+    assert prof.parked_prompt_patterns == ("Allow t[o] run",)
+    assert prof.hooks.notification_types == {"quota_wait": "QuotaPrompt"}
+    # a native event may map STRAIGHT to a parked kind: canonical, so accepted
+    assert prof.hooks.events["Ask"] == "PermissionPrompt"
+
+
+def test_claude_maps_its_parked_notification_subtypes():
+    """The claude profile relays `Notification` and maps exactly the subtypes that
+    mean "waiting on a human" (verified against code.claude.com/docs/en/hooks):
+    `quota_auto_resume_fired` means it already resumed, so it stays unmapped. The
+    MCP elicitation dialogs block the session like a permission prompt (DW-434);
+    `agent_needs_input` also fires for another (background) session, so it stays
+    unmapped."""
+    claude = get_profile("claude")
+    assert claude.hooks.events["Notification"] == "Notification"
+    assert claude.hooks.notification_types == {
+        "permission_prompt": "PermissionPrompt",
+        "idle_prompt": "IdlePrompt",
+        "quota_auto_resume_stale": "QuotaPrompt",
+        "quota_auto_resume_disabled": "QuotaPrompt",
+        "elicitation_dialog": "PermissionPrompt",
+        "elicitation_url_dialog": "PermissionPrompt",
+    }
+    assert "agent_needs_input" not in claude.hooks.notification_types
+    # the other hook-driven built-ins opt in on their own evidence; none has yet
+    for name, prof in load_profiles().items():
+        if name != "claude":
+            assert prof.hooks.notification_types == {}, name
+            assert prof.parked_prompt_patterns == (), name
+
+
+# The #727 captured pane lines (Claude Code 2.1.246, run 20260826-114252-3da1),
+# concatenated so this file holds no line the shipped patterns match.
+_CAPTURED_BYPASS_LINES = (
+    "WARNING: Claude Code running in Bypass Permissions " + "mode",
+    "Enter to confirm · Esc " + "to cancel",
+)
+
+
+def test_shipped_claude_parked_patterns_match_the_captured_727_lines():
+    """Each seeded pattern matches the captured line it was seeded from — the
+    evidentiary bar: seed only lines captured off the CLI's own screen."""
+    import regex
+
+    patterns = [regex.compile(p) for p in get_profile("claude").parked_prompt_patterns]
+    assert len(patterns) == len(_CAPTURED_BYPASS_LINES)
+    for pattern, line in zip(patterns, _CAPTURED_BYPASS_LINES):
+        assert pattern.search(f"  {line}  "), (pattern.pattern, line)
+
+
+def test_shipped_claude_parked_patterns_do_not_match_their_own_profile_line():
+    """A session that prints or diffs claude.toml must not read as parked: the
+    single-character classes (`mod[e]`, `t[o]`) exist for this. Do not "clean"
+    them up."""
+    import regex
+
+    patterns = [regex.compile(p) for p in get_profile("claude").parked_prompt_patterns]
+    text = (
+        resources.files("bmad_loop.data")
+        .joinpath("profiles")
+        .joinpath("claude.toml")
+        .read_text(encoding="utf-8")
+    )
+    hits = [line for line in text.splitlines() if any(p.search(line) for p in patterns)]
+    assert hits == []
 
 
 def test_skill_tree_defaults_when_unset():
@@ -326,6 +435,52 @@ def test_render_prompt_passthrough_and_template():
     assert claude.render_prompt("just do it") == "just do it"
 
 
+_BYPASS = ("--permission-mode", "bypassPermissions")
+
+
+@pytest.mark.parametrize(
+    ("launch_args", "bypass_args", "extra_args", "missing"),
+    [
+        # inherit: None means the profile's bypass_args are used as-is
+        ((), _BYPASS, None, ()),
+        # kept: every bypass token present in the override
+        ((), _BYPASS, ("--permission-mode", "bypassPermissions", "--verbose"), ()),
+        # partially kept
+        ((), _BYPASS, ("--permission-mode", "acceptEdits"), ("bypassPermissions",)),
+        # dropped
+        ((), _BYPASS, ("--verbose",), _BYPASS),
+        # explicit empty override drops them all
+        ((), _BYPASS, (), _BYPASS),
+        # a token already in launch_args is in the resolved argv
+        (("--yolo",), ("--yolo",), ("--verbose",), ()),
+        # a profile without bypass flags has nothing to drop
+        ((), (), ("--verbose",), ()),
+        # order kept, duplicates collapsed
+        ((), ("-b", "-a", "-b"), (), ("-b", "-a")),
+    ],
+)
+def test_missing_bypass_tokens(launch_args, bypass_args, extra_args, missing):
+    """DW-349: extra_args REPLACES bypass_args, so the helper names the bypass
+    tokens absent from `launch_args + extra_args` — only for an explicit override."""
+    prof = CLIProfile(
+        name="x",
+        binary="x",
+        hooks=HookSpec("none", "", {}),
+        launch_args=launch_args,
+        bypass_args=bypass_args,
+    )
+    assert prof.missing_bypass_tokens(extra_args) == missing
+
+
+def test_missing_bypass_tokens_on_the_shipped_claude_profile():
+    claude = get_profile("claude")
+    assert claude.missing_bypass_tokens(("--verbose",)) == (
+        "--permission-mode",
+        "bypassPermissions",
+    )
+    assert claude.missing_bypass_tokens(None) == ()
+
+
 def test_user_profile_overlay(tmp_path):
     profiles_dir = tmp_path / ".bmad-loop" / "profiles"
     profiles_dir.mkdir(parents=True)
@@ -490,6 +645,48 @@ def test_user_profile_overlay(tmp_path):
         (
             MINIMAL_PROFILE.replace('dialect = "claude-settings-json"', 'dialect = "none"'),
             "hookless",
+        ),
+        # parked-session signals (DW-348/DW-350): a notification subtype must map
+        # onto a PARKED kind, not any canonical event (a `Stop` here would never
+        # complete anything, but would read as a signal it is not)...
+        (
+            MINIMAL_PROFILE.replace(
+                'Stop = "Stop" }', 'Stop = "Stop", Notification = "Notification" }'
+            )
+            + '[hooks.notification_types]\npermission_prompt = "Stop"\n',
+            "parked kinds",
+        ),
+        # ...needs the Notification carrier the subtype rides on...
+        (
+            MINIMAL_PROFILE
+            + '[hooks.notification_types]\npermission_prompt = "PermissionPrompt"\n',
+            "'Notification' carrier",
+        ),
+        # ...is hook plumbing a hookless profile must not carry...
+        (
+            HOOKLESS_PROFILE
+            + '[hooks.notification_types]\npermission_prompt = "PermissionPrompt"\n',
+            "hookless",
+        ),
+        # ...and must be a table of strings, funnelled rather than coerced.
+        (
+            MINIMAL_PROFILE.replace("[hooks]", "[hooks]\nnotification_types = 5"),
+            "notification_types must map",
+        ),
+        (
+            MINIMAL_PROFILE + "[hooks.notification_types]\npermission_prompt = 1\n",
+            "notification_types must map",
+        ),
+        # a parked_prompt_patterns entry that is not a valid regex fails fast at parse
+        (
+            MINIMAL_PROFILE.replace(
+                "[hooks]", 'parked_prompt_patterns = ["Enter(unbalanced"]\n[hooks]'
+            ),
+            "parked_prompt_patterns entry is not a valid regex",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'parked_prompt_patterns = "Enter"\n[hooks]'),
+            "parked_prompt_patterns must be a list of strings",
         ),
     ],
 )
@@ -909,6 +1106,33 @@ def test_profile_scan_failure_degrades(profile_scan):
         ({"hooks": HookSpec("claude-settings-json", "", {"Stop": "Stop"})}, "config_path"),
         # hookless carrying hook plumbing is a contradiction either way in
         ({"hooks": HookSpec("none", ".m/s.json", {})}, "hookless"),
+        # parked-session signals (DW-348/DW-350), the same four refusals the TOML
+        # route makes: a non-parked kind, no Notification carrier, a hookless
+        # table, an invalid pane pattern
+        (
+            {
+                "hooks": HookSpec(
+                    "claude-settings-json",
+                    ".m/s.json",
+                    {"Stop": "Stop", "Notification": "Notification"},
+                    {"permission_prompt": "Stop"},
+                )
+            },
+            "parked kinds",
+        ),
+        (
+            {
+                "hooks": HookSpec(
+                    "claude-settings-json",
+                    ".m/s.json",
+                    {"Stop": "Stop"},
+                    {"permission_prompt": "PermissionPrompt"},
+                )
+            },
+            "'Notification' carrier",
+        ),
+        ({"hooks": HookSpec("none", "", {}, {"x": "PermissionPrompt"})}, "hookless"),
+        ({"parked_prompt_patterns": ("Enter(unbalanced",)}, "not a valid regex"),
         # the remaining value-level knobs
         ({"usage_parser": "magic"}, "usage_parser"),
         ({"usage_grace_s": -1.0}, "usage_grace_s"),
@@ -981,3 +1205,102 @@ def test_a_valid_entry_point_profile_still_lands(profile_scan):
     )
     assert load_profiles()["acme"].env_fault_patterns == ("API Error.*Connection refused",)
     assert profile_mod.external_profile_errors() == {}
+
+
+# ------------------------------------------------ [workspace_trust] (DW-390)
+
+
+def _write_trust_profile(tmp_path: Path, table: str) -> Path:
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True, exist_ok=True)
+    (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE + table, encoding="utf-8")
+    return tmp_path
+
+
+def test_packaged_antigravity_declares_workspace_trust():
+    from bmad_loop.adapters.profile import WorkspaceTrustSpec
+
+    profiles = load_profiles()
+    assert profiles["antigravity"].workspace_trust == WorkspaceTrustSpec(
+        settings_path="~/.gemini/antigravity-cli/settings.json", key="trustedWorkspaces"
+    )
+    # every other shipped profile leaves home untouched
+    for name in sorted(set(profiles) - {"antigravity"}):
+        assert profiles[name].workspace_trust is None, name
+
+
+def test_workspace_trust_parses_from_an_overlay(tmp_path):
+    project = _write_trust_profile(
+        tmp_path, '\n[workspace_trust]\nsettings_path = "~/.mycli/settings.json"\nkey = "trusted"\n'
+    )
+    spec = load_profiles(project)["mycli"].workspace_trust
+    assert spec is not None
+    assert (spec.settings_path, spec.key) == ("~/.mycli/settings.json", "trusted")
+
+
+def test_workspace_trust_absent_is_none(tmp_path):
+    assert load_profiles(_write_trust_profile(tmp_path, ""))["mycli"].workspace_trust is None
+
+
+@pytest.mark.parametrize(
+    "table",
+    [
+        'workspace_trust = "~/.x.json"\n',
+        '\n[workspace_trust]\nsettings_path = ["~/.x.json"]\nkey = "k"\n',
+        '\n[workspace_trust]\nsettings_path = "~/.x.json"\nkey = 3\n',
+        '\n[workspace_trust]\nkey = "k"\n',
+        '\n[workspace_trust]\nsettings_path = "~/.x.json"\nkey = "k"\nextra = 1\n',
+    ],
+    ids=["not-a-table", "path-not-str", "key-not-str", "path-missing", "unknown-key"],
+)
+def test_workspace_trust_shape_rejections(tmp_path, table):
+    # a bare `workspace_trust = ...` must sit above [hooks] to be top-level
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    text = table + MINIMAL_PROFILE if not table.startswith("\n") else MINIMAL_PROFILE + table
+    (profiles_dir / "mycli.toml").write_text(text, encoding="utf-8")
+    with pytest.raises(ProfileError, match="workspace_trust"):
+        load_profiles(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("settings_path", "key"),
+    [
+        (".gemini/settings.json", "k"),  # not ~/-prefixed
+        ("/etc/settings.json", "k"),
+        ("~settings.json", "k"),
+        ("~/../other-user/settings.json", "k"),
+        ("~/.gemini/../../x.json", "k"),
+        ("~//etc/passwd", "k"),  # joins to an absolute path
+        ("~/", "k"),  # names home itself
+        ("~/.", "k"),
+        ("~/C:/x.json", "k"),
+        ("~/NUL/settings.json", "k"),
+        ("~/.gemini/settings.json. ", "k"),
+        ("~/.gemini/settings.json", ""),
+        ("~/.gemini/settings.json", "   "),
+        ("~/.gemini/settings.json", " trustedWorkspaces"),
+    ],
+)
+def test_workspace_trust_value_rejections_on_both_routes(tmp_path, settings_path, key):
+    """Value rules live in `_validate_profile`, so the TOML route and the
+    entry-point (constructed dataclass) route refuse the same set."""
+    from dataclasses import replace
+
+    from bmad_loop.adapters.profile import WorkspaceTrustSpec
+
+    project = _write_trust_profile(
+        tmp_path,
+        f"\n[workspace_trust]\nsettings_path = {settings_path!r}\nkey = {key!r}\n".replace(
+            "'", '"'
+        ),
+    )
+    with pytest.raises(ProfileError, match="workspace_trust"):
+        load_profiles(project)
+
+    constructed = replace(
+        get_profile("claude"),
+        workspace_trust=WorkspaceTrustSpec(settings_path=settings_path, key=key),
+    )
+    with pytest.raises(ProfileError, match="workspace_trust"):
+        profile_mod._validate_profile(constructed, "entry point test")

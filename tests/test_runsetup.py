@@ -15,6 +15,8 @@ at the end of the file.
 """
 
 import dataclasses
+import hashlib
+import json
 import os
 import shutil
 import threading
@@ -30,6 +32,7 @@ from bmad_loop import policy as policy_mod
 from bmad_loop import runs, runsetup
 from bmad_loop.adapters.profile import ProfileError
 from bmad_loop.journal import Journal, load_state, state_lock
+from bmad_loop.model import RunState
 
 # A profile overlay carrying the whole launch surface the digest covers. It lives
 # under .bmad-loop/profiles/, inside the tree every driven session can write.
@@ -200,11 +203,12 @@ def test_digest_moves_when_the_transport_flips_to_hookless(pinned):
     token in it. (Since the adapter registry the field that picks the BUILDER is
     `profile.adapter` — pinned by its own test; `hookless` still decides what the
     opencode builder emits, which is what this row covers.) That builder's
-    `_serve_argv` drops
-    `launch_args`, the prompt and the `bypass_args` fallback and puts the literal
-    "serve" at argv[1] — run with `cwd` at the workspace root. Against an
-    interpreter `binary` (python/sh/node, the real program in `launch_args` —
-    nothing forbids that shape) argv[1] is a script path resolved out of the tree
+    `_serve_argv` drops the prompt and the `bypass_args` fallback and puts the
+    literal "serve" right after `binary` + `launch_args` — run with `cwd` at the
+    workspace root. Against an interpreter `binary` (python/sh/node) with an
+    empty or options-only `launch_args` (e.g. `python3 -u`) — nothing forbids
+    that shape; validate only warns — "serve" lands in the script slot, a
+    script path resolved out of the tree
     every driven session can write, and the spawn precedes the health poll it
     fails. Pinning `binary` does not cover it, because the attacker inherits the
     binary rather than choosing it. None of the hook fields deleted here are
@@ -356,10 +360,16 @@ class _AcceptingEngine:
         pass
 
 
+class _CapturingEngine:
+    def __init__(self, *args, **kwargs):
+        self.kwargs = kwargs
+
+
 def _split_root_paths(project):
-    """`_fake_paths` with the one supported divergence: `repo_root` naming a code
-    tree that is not the BMAD project dir (`isolation = "none"` plus a `repo_root:`
-    key; `bmadconfig.worktree_isolation_conflict` refuses the other combination).
+    """`_fake_paths` with the divergence a `repo_root:` key configures: `repo_root`
+    naming a code tree that is not the BMAD project dir (supported beside
+    `isolation = "none"`; beside worktree isolation only when it contains the project,
+    `bmadconfig.worktree_isolation_conflict` refusing a disjoint one — DW-379).
 
     `_fake_paths` leaves the two roots identical — as does the `project` fixture
     everywhere else — so without this no composition test can tell a `repo_root`
@@ -374,6 +384,598 @@ def _split_root_paths(project):
 
 def _accepting_adapters(*_a, **_k):
     return {role: None for role in runsetup.ROLES}
+
+
+@pytest.mark.parametrize(
+    ("only_ids", "min_severity"),
+    [(("DW-3", "DW-1"), None), (None, "high")],
+    ids=["only", "min-severity"],
+)
+def test_compose_sweep_persists_and_wires_selectors(tmp_path, only_ids, min_severity):
+    composed = runsetup.compose_sweep(
+        project=tmp_path,
+        paths=_fake_paths(tmp_path),
+        policy=policy_mod.loads(""),
+        run_id=RUN_ID,
+        prompting=False,
+        decisions_only=False,
+        max_bundles=None,
+        repeat=None,
+        max_cycles=None,
+        trigger="cli",
+        make_adapters=_accepting_adapters,
+        sweep_engine_cls=_CapturingEngine,
+        trusted_config_digest="deadbeef",
+        only_ids=only_ids,
+        min_severity=min_severity,
+    )
+
+    options = json.loads((composed.run_dir / "sweep.json").read_text(encoding="utf-8"))
+    assert options["only"] == (list(only_ids) if only_ids is not None else None)
+    assert options["min_severity"] == min_severity
+    persisted = load_state(composed.run_dir)
+    assert persisted.sweep_options_version == runsetup.SWEEP_OPTIONS_VERSION
+    assert (
+        persisted.sweep_options_digest
+        == hashlib.sha256((composed.run_dir / "sweep.json").read_bytes()).hexdigest()
+    )
+    assert composed.engine.kwargs["only_ids"] == only_ids
+    assert composed.engine.kwargs["min_severity"] == min_severity
+
+
+@pytest.mark.parametrize(
+    ("only_ids", "min_severity"),
+    [((), None), (("bad",), None), (("DW-1",), "high"), (None, "urgent")],
+)
+def test_compose_sweep_refuses_invalid_selectors_before_publication(
+    tmp_path, only_ids, min_severity
+):
+    with pytest.raises(ValueError):
+        runsetup.compose_sweep(
+            project=tmp_path,
+            paths=_fake_paths(tmp_path),
+            policy=policy_mod.loads(""),
+            run_id=RUN_ID,
+            prompting=False,
+            decisions_only=False,
+            max_bundles=None,
+            repeat=None,
+            max_cycles=None,
+            trigger="cli",
+            make_adapters=_accepting_adapters,
+            sweep_engine_cls=_CapturingEngine,
+            trusted_config_digest="deadbeef",
+            only_ids=only_ids,
+            min_severity=min_severity,
+        )
+
+    assert not runs.run_dir_for(tmp_path, RUN_ID).exists()
+
+
+def test_compose_sweep_refuses_options_its_resume_loader_cannot_read(tmp_path):
+    many_ids = tuple(f"DW-{index:08d}" for index in range(10_000))
+
+    with pytest.raises(runsetup.SweepOptionsError, match="exceed"):
+        runsetup.compose_sweep(
+            project=tmp_path,
+            paths=_fake_paths(tmp_path),
+            policy=policy_mod.loads(""),
+            run_id=RUN_ID,
+            prompting=False,
+            decisions_only=False,
+            max_bundles=None,
+            repeat=None,
+            max_cycles=None,
+            trigger="cli",
+            make_adapters=_accepting_adapters,
+            sweep_engine_cls=_CapturingEngine,
+            trusted_config_digest="deadbeef",
+            only_ids=many_ids,
+        )
+
+    assert not runs.run_dir_for(tmp_path, RUN_ID).exists()
+
+
+def test_compose_sweep_publishes_options_before_marked_state_and_pid(tmp_path, monkeypatch):
+    observed: list[str] = []
+    real_save_state = runsetup.save_state
+    real_write_pid = runs.write_pid
+
+    def assert_complete_options(run_dir):
+        options = json.loads((run_dir / "sweep.json").read_text(encoding="utf-8"))
+        assert options["only"] == ["DW-3", "DW-1"]
+        assert options["min_severity"] is None
+
+    def observed_save(run_dir, state):
+        assert_complete_options(run_dir)
+        assert state.sweep_options_version == runsetup.SWEEP_OPTIONS_VERSION
+        observed.append("state")
+        real_save_state(run_dir, state)
+
+    def observed_pid(run_dir):
+        assert_complete_options(run_dir)
+        assert load_state(run_dir).sweep_options_version == runsetup.SWEEP_OPTIONS_VERSION
+        observed.append("pid")
+        real_write_pid(run_dir)
+
+    monkeypatch.setattr(runsetup, "save_state", observed_save)
+    monkeypatch.setattr(runs, "write_pid", observed_pid)
+
+    runsetup.compose_sweep(
+        project=tmp_path,
+        paths=_fake_paths(tmp_path),
+        policy=policy_mod.loads(""),
+        run_id=RUN_ID,
+        prompting=False,
+        decisions_only=False,
+        max_bundles=None,
+        repeat=None,
+        max_cycles=None,
+        trigger="cli",
+        make_adapters=_accepting_adapters,
+        sweep_engine_cls=_CapturingEngine,
+        trusted_config_digest="deadbeef",
+        only_ids=("DW-3", "DW-1"),
+    )
+
+    assert observed == ["state", "pid"]
+
+
+def test_compose_sweep_unwinds_options_when_state_publication_fails(tmp_path, monkeypatch):
+    run_dir = runs.run_dir_for(tmp_path, RUN_ID)
+
+    def fail_after_options(_run_dir, _state):
+        assert (run_dir / "sweep.json").is_file()
+        raise RuntimeError("state publication failed")
+
+    monkeypatch.setattr(runsetup, "save_state", fail_after_options)
+
+    with pytest.raises(RuntimeError, match="state publication failed"):
+        runsetup.compose_sweep(
+            project=tmp_path,
+            paths=_fake_paths(tmp_path),
+            policy=policy_mod.loads(""),
+            run_id=RUN_ID,
+            prompting=False,
+            decisions_only=False,
+            max_bundles=None,
+            repeat=None,
+            max_cycles=None,
+            trigger="cli",
+            make_adapters=_accepting_adapters,
+            sweep_engine_cls=_CapturingEngine,
+            trusted_config_digest="deadbeef",
+            only_ids=("DW-1",),
+        )
+
+    assert not run_dir.exists()
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [None, "{}"],
+    ids=["missing", "old-empty-object"],
+)
+def test_resume_defaults_old_sweep_options_to_unrestricted(tmp_path, monkeypatch, contents):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    if contents is not None:
+        (run_dir / "sweep.json").write_text(contents, encoding="utf-8")
+    state = RunState(
+        run_id=RUN_ID,
+        project=str(tmp_path),
+        started_at="now",
+        run_type="sweep",
+    )
+    monkeypatch.setattr(runs, "kill_session", lambda _run_id: None)
+
+    composed = runsetup.compose_resume(
+        project=tmp_path,
+        paths=_fake_paths(tmp_path),
+        run_dir=run_dir,
+        state=state,
+        policy=policy_mod.loads(""),
+        journal=Journal(run_dir),
+        sweep_factory=lambda _trigger, *, started: None,
+        make_adapters=_accepting_adapters,
+        engine_cls=_CapturingEngine,
+        stories_engine_cls=_CapturingEngine,
+        sweep_engine_cls=_CapturingEngine,
+    )
+
+    assert composed.engine.kwargs["only_ids"] is None
+    assert composed.engine.kwargs["min_severity"] is None
+
+
+def test_missing_sweep_options_requires_current_state_marker(tmp_path):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+
+    assert runsetup.load_sweep_resume_options(run_dir).only_ids is None
+    with pytest.raises(runsetup.SweepOptionsError, match="missing"):
+        runsetup.load_sweep_resume_options(run_dir, required=True)
+
+
+@pytest.mark.parametrize("contents", ["{}", '{"only": null}'])
+def test_current_sweep_options_require_both_selector_fields(tmp_path, contents):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    (run_dir / "sweep.json").write_text(contents, encoding="utf-8")
+
+    with pytest.raises(runsetup.SweepOptionsError, match="selector field"):
+        runsetup.load_sweep_resume_options(run_dir, required=True)
+
+    assert runsetup.load_sweep_resume_options(run_dir).only_ids is None
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        "[]",
+        "{",
+        '{"only": "DW-1", "min_severity": null}',
+        '{"only": ["DW-²"], "min_severity": null}',
+        '{"only": null, "min_severity": "urgent"}',
+        '{"only": ["DW-1"], "min_severity": "high"}',
+    ],
+    ids=["non-object", "invalid-json", "only-shape", "non-decimal-id", "severity-value", "both"],
+)
+def test_resume_refuses_malformed_selector_bearing_options(tmp_path, monkeypatch, contents):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    (run_dir / "sweep.json").write_text(contents, encoding="utf-8")
+    state = RunState(
+        run_id=RUN_ID,
+        project=str(tmp_path),
+        started_at="now",
+        run_type="sweep",
+        sweep_options_version=runsetup.SWEEP_OPTIONS_VERSION,
+        sweep_options_digest=hashlib.sha256(contents.encode("utf-8")).hexdigest(),
+    )
+    killed = []
+    monkeypatch.setattr(runs, "kill_session", lambda run_id: killed.append(run_id))
+
+    with pytest.raises(runsetup.SweepOptionsError):
+        runsetup.compose_resume(
+            project=tmp_path,
+            paths=_fake_paths(tmp_path),
+            run_dir=run_dir,
+            state=state,
+            policy=policy_mod.loads(""),
+            journal=Journal(run_dir),
+            sweep_factory=lambda _trigger, *, started: None,
+            make_adapters=_accepting_adapters,
+            engine_cls=_CapturingEngine,
+            stories_engine_cls=_CapturingEngine,
+            sweep_engine_cls=_CapturingEngine,
+        )
+
+    assert killed == []
+
+
+@pytest.mark.parametrize(
+    "contents",
+    ["[]", "{", '{"only": "DW-1", "min_severity": null}'],
+    ids=["non-object", "invalid-json", "malformed-selector"],
+)
+def test_legacy_corrupt_sweep_options_resume_unrestricted(tmp_path, monkeypatch, contents):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    (run_dir / "sweep.json").write_text(contents, encoding="utf-8")
+    state = RunState(
+        run_id=RUN_ID,
+        project=str(tmp_path),
+        started_at="now",
+        run_type="sweep",
+    )
+    monkeypatch.setattr(runs, "kill_session", lambda _run_id: None)
+
+    composed = runsetup.compose_resume(
+        project=tmp_path,
+        paths=_fake_paths(tmp_path),
+        run_dir=run_dir,
+        state=state,
+        policy=policy_mod.loads(""),
+        journal=Journal(run_dir),
+        sweep_factory=lambda _trigger, *, started: None,
+        make_adapters=_accepting_adapters,
+        engine_cls=_CapturingEngine,
+        stories_engine_cls=_CapturingEngine,
+        sweep_engine_cls=_CapturingEngine,
+    )
+
+    assert composed.engine.kwargs["only_ids"] is None
+    assert composed.engine.kwargs["min_severity"] is None
+
+
+@pytest.mark.parametrize("fault_site", ["open", "read"])
+def test_legacy_unreadable_sweep_options_resume_unrestricted_but_current_refuses(
+    tmp_path, monkeypatch, fault_site
+):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    options_path = run_dir / "sweep.json"
+    options_path.write_text("{}", encoding="utf-8")
+    if fault_site == "open":
+        real_open = os.open
+
+        def denied_open(path, flags, *args, **kwargs):
+            if Path(path) == options_path:
+                raise PermissionError("denied in test")
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(runsetup.os, "open", denied_open)
+        message = "cannot be opened"
+    else:
+
+        def denied_read(*_args):
+            raise OSError("denied")
+
+        monkeypatch.setattr(runsetup.os, "read", denied_read)
+        message = "cannot be read"
+
+    assert runsetup.load_sweep_resume_options(run_dir).only_ids is None
+    with pytest.raises(runsetup.SweepOptionsError, match=message):
+        runsetup.load_sweep_resume_options(run_dir, required=True)
+
+
+def test_resume_refuses_a_link_like_sweep_options_path(tmp_path, monkeypatch):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    options_path = run_dir / "sweep.json"
+    options_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(runsetup, "is_link_like", lambda path: path == options_path)
+
+    with pytest.raises(runsetup.SweepOptionsError, match="link-like"):
+        runsetup.load_sweep_resume_options(run_dir)
+
+
+def test_resume_refuses_a_nonregular_existing_sweep_options_path(tmp_path, monkeypatch):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    (run_dir / "sweep.json").mkdir(parents=True)
+
+    def windows_directory_open_refusal(*_args, **_kwargs):
+        raise PermissionError("Windows refuses opening a directory")
+
+    monkeypatch.setattr(runsetup.os, "open", windows_directory_open_refusal)
+
+    with pytest.raises(runsetup.SweepOptionsError, match="regular file|cannot be opened"):
+        runsetup.load_sweep_resume_options(run_dir)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="host has no FIFO support")
+def test_resume_refuses_a_fifo_sweep_options_path_without_blocking(tmp_path):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    os.mkfifo(run_dir / "sweep.json")
+
+    with pytest.raises(runsetup.SweepOptionsError, match="regular file"):
+        runsetup.load_sweep_resume_options(run_dir)
+
+
+def test_resume_refuses_oversize_sweep_options(tmp_path):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    (run_dir / "sweep.json").write_bytes(b" " * (runsetup._MAX_SWEEP_OPTIONS_BYTES + 1))
+
+    with pytest.raises(runsetup.SweepOptionsError, match="exceeds"):
+        runsetup.load_sweep_resume_options(run_dir)
+
+
+def test_resume_refuses_non_utf8_sweep_options(tmp_path):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    (run_dir / "sweep.json").write_bytes(b"{\xff}")
+
+    with pytest.raises(runsetup.SweepOptionsError, match="UTF-8"):
+        runsetup.load_sweep_resume_options(run_dir, required=True)
+
+    assert runsetup.load_sweep_resume_options(run_dir).only_ids is None
+
+
+@pytest.mark.parametrize("version", [-1, 1, runsetup.SWEEP_OPTIONS_VERSION + 1])
+def test_resume_refuses_unsupported_sweep_options_version_before_mutation(
+    tmp_path, monkeypatch, version
+):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    (run_dir / "sweep.json").write_text(
+        json.dumps({"only": None, "min_severity": None}), encoding="utf-8"
+    )
+    state = RunState(
+        run_id=RUN_ID,
+        project=str(tmp_path),
+        started_at="now",
+        run_type="sweep",
+        sweep_options_version=version,
+    )
+    killed = []
+    monkeypatch.setattr(runs, "kill_session", lambda run_id: killed.append(run_id))
+
+    with pytest.raises(runsetup.SweepOptionsError, match="unsupported sweep options version"):
+        runsetup.compose_resume(
+            project=tmp_path,
+            paths=_fake_paths(tmp_path),
+            run_dir=run_dir,
+            state=state,
+            policy=policy_mod.loads(""),
+            journal=Journal(run_dir),
+            sweep_factory=lambda _trigger, *, started: None,
+            make_adapters=_accepting_adapters,
+            engine_cls=_CapturingEngine,
+            stories_engine_cls=_CapturingEngine,
+            sweep_engine_cls=_CapturingEngine,
+        )
+
+    assert killed == []
+
+
+def test_resume_reconstructs_persisted_sweep_selectors(tmp_path, monkeypatch):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    options_text = json.dumps({"only": ["DW-3", "DW-1", "DW-3"], "min_severity": None})
+    (run_dir / "sweep.json").write_text(options_text, encoding="utf-8")
+    state = RunState(
+        run_id=RUN_ID,
+        project=str(tmp_path),
+        started_at="now",
+        run_type="sweep",
+        sweep_options_version=runsetup.SWEEP_OPTIONS_VERSION,
+        sweep_options_digest=hashlib.sha256(options_text.encode("utf-8")).hexdigest(),
+    )
+    monkeypatch.setattr(runs, "kill_session", lambda _run_id: None)
+
+    composed = runsetup.compose_resume(
+        project=tmp_path,
+        paths=_fake_paths(tmp_path),
+        run_dir=run_dir,
+        state=state,
+        policy=policy_mod.loads(""),
+        journal=Journal(run_dir),
+        sweep_factory=lambda _trigger, *, started: None,
+        make_adapters=_accepting_adapters,
+        engine_cls=_CapturingEngine,
+        stories_engine_cls=_CapturingEngine,
+        sweep_engine_cls=_CapturingEngine,
+    )
+
+    assert composed.engine.kwargs["only_ids"] == ("DW-3", "DW-1")
+    assert composed.engine.kwargs["min_severity"] is None
+
+
+def test_resume_reconstructs_unicode_decimal_selector(tmp_path, monkeypatch):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    options_text = json.dumps({"only": ["DW-９"], "min_severity": None}, ensure_ascii=False)
+    (run_dir / "sweep.json").write_text(options_text, encoding="utf-8")
+    state = RunState(
+        run_id=RUN_ID,
+        project=str(tmp_path),
+        started_at="now",
+        run_type="sweep",
+        sweep_options_version=runsetup.SWEEP_OPTIONS_VERSION,
+        sweep_options_digest=hashlib.sha256(options_text.encode("utf-8")).hexdigest(),
+    )
+    monkeypatch.setattr(runs, "kill_session", lambda _run_id: None)
+
+    composed = runsetup.compose_resume(
+        project=tmp_path,
+        paths=_fake_paths(tmp_path),
+        run_dir=run_dir,
+        state=state,
+        policy=policy_mod.loads(""),
+        journal=Journal(run_dir),
+        sweep_factory=lambda _trigger, *, started: None,
+        make_adapters=_accepting_adapters,
+        engine_cls=_CapturingEngine,
+        stories_engine_cls=_CapturingEngine,
+        sweep_engine_cls=_CapturingEngine,
+    )
+
+    assert composed.engine.kwargs["only_ids"] == ("DW-９",)
+
+
+def test_resume_reconstructs_persisted_min_severity(tmp_path, monkeypatch):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    options_text = json.dumps({"only": None, "min_severity": "high"})
+    (run_dir / "sweep.json").write_text(options_text, encoding="utf-8")
+    state = RunState(
+        run_id=RUN_ID,
+        project=str(tmp_path),
+        started_at="now",
+        run_type="sweep",
+        sweep_options_version=runsetup.SWEEP_OPTIONS_VERSION,
+        sweep_options_digest=hashlib.sha256(options_text.encode("utf-8")).hexdigest(),
+    )
+    monkeypatch.setattr(runs, "kill_session", lambda _run_id: None)
+
+    composed = runsetup.compose_resume(
+        project=tmp_path,
+        paths=_fake_paths(tmp_path),
+        run_dir=run_dir,
+        state=state,
+        policy=policy_mod.loads(""),
+        journal=Journal(run_dir),
+        sweep_factory=lambda _trigger, *, started: None,
+        make_adapters=_accepting_adapters,
+        engine_cls=_CapturingEngine,
+        stories_engine_cls=_CapturingEngine,
+        sweep_engine_cls=_CapturingEngine,
+    )
+
+    assert composed.engine.kwargs["only_ids"] is None
+    assert composed.engine.kwargs["min_severity"] == "high"
+
+
+def test_resume_refuses_replacing_targeted_options_with_valid_unrestricted_json(
+    tmp_path, monkeypatch
+):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    targeted = json.dumps({"only": ["DW-1"], "min_severity": None})
+    (run_dir / "sweep.json").write_text(
+        json.dumps({"only": None, "min_severity": None}), encoding="utf-8"
+    )
+    state = RunState(
+        run_id=RUN_ID,
+        project=str(tmp_path),
+        started_at="now",
+        run_type="sweep",
+        sweep_options_version=runsetup.SWEEP_OPTIONS_VERSION,
+        sweep_options_digest=hashlib.sha256(targeted.encode("utf-8")).hexdigest(),
+    )
+    killed = []
+    monkeypatch.setattr(runs, "kill_session", lambda run_id: killed.append(run_id))
+
+    with pytest.raises(runsetup.SweepOptionsError, match="bound at launch"):
+        runsetup.compose_resume(
+            project=tmp_path,
+            paths=_fake_paths(tmp_path),
+            run_dir=run_dir,
+            state=state,
+            policy=policy_mod.loads(""),
+            journal=Journal(run_dir),
+            sweep_factory=lambda _trigger, *, started: None,
+            make_adapters=_accepting_adapters,
+            engine_cls=_CapturingEngine,
+            stories_engine_cls=_CapturingEngine,
+            sweep_engine_cls=_CapturingEngine,
+        )
+
+    assert killed == []
+
+
+def test_legacy_run_does_not_inherit_selector_shaped_options(tmp_path, monkeypatch):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    (run_dir / "sweep.json").write_text(
+        json.dumps({"only": ["DW-9"], "min_severity": None}), encoding="utf-8"
+    )
+    state = RunState(
+        run_id=RUN_ID,
+        project=str(tmp_path),
+        started_at="now",
+        run_type="sweep",
+    )
+    monkeypatch.setattr(runs, "kill_session", lambda _run_id: None)
+
+    composed = runsetup.compose_resume(
+        project=tmp_path,
+        paths=_fake_paths(tmp_path),
+        run_dir=run_dir,
+        state=state,
+        policy=policy_mod.loads(""),
+        journal=Journal(run_dir),
+        sweep_factory=lambda _trigger, *, started: None,
+        make_adapters=_accepting_adapters,
+        engine_cls=_CapturingEngine,
+        stories_engine_cls=_CapturingEngine,
+        sweep_engine_cls=_CapturingEngine,
+    )
+
+    assert composed.engine.kwargs["only_ids"] is None
+    assert composed.engine.kwargs["min_severity"] is None
 
 
 @pytest.mark.parametrize("run_type", ["run", "sweep"])
@@ -438,6 +1040,117 @@ def test_composition_persists_the_code_root(tmp_path, run_type):
     assert persisted.repo_root == str(paths.repo_root)
     assert persisted.code_root == paths.repo_root
     assert persisted.code_root != Path(persisted.project)
+
+
+@pytest.mark.parametrize("run_type", ["run", "sweep"])
+def test_composition_records_the_run_dir_mint_identity(tmp_path, monkeypatch, run_type):
+    """DW-446: both composers persist the run dir's mint-time identity — the
+    `(st_dev, st_ino)` of the claim `_claim_run_dir` took when it created the
+    directory — as `RunState.run_dir_identity`, which the verify-stream pin compares
+    against. Both, because `compose_run` goes through `build_run_state` and
+    `compose_sweep` constructs `RunState` inline.
+
+    Graded against the CLAIM, which is spied. Asserted on the persisted state.
+
+    Ablation: drop `run_dir_identity=` at either composer and that parametrization
+    reddens alone (None)."""
+    claims: list[os.stat_result] = []
+    real_claim = runsetup._claim_run_dir
+
+    def spy_claim(run_dir):
+        claim = real_claim(run_dir)
+        claims.append(claim)
+        return claim
+
+    monkeypatch.setattr(runsetup, "_claim_run_dir", spy_claim)
+    if run_type == "run":
+        composed = runsetup.compose_run(
+            project=tmp_path,
+            paths=_fake_paths(tmp_path),
+            policy=policy_mod.loads(""),
+            run_id=RUN_ID,
+            epic_filter=None,
+            story_filter=None,
+            max_stories=None,
+            stories_on=False,
+            spec_folder="",
+            sweep_factory=lambda _trigger, *, started: None,
+            make_adapters=_accepting_adapters,
+            engine_cls=_AcceptingEngine,
+            stories_engine_cls=_AcceptingEngine,
+            trusted_config_digest="deadbeef",
+        )
+    else:
+        composed = _run_compose_sweep(tmp_path, _accepting_adapters, engine_cls=_AcceptingEngine)
+
+    (claim,) = claims
+    persisted = load_state(composed.run_dir)
+    assert persisted.run_dir_identity == (claim.st_dev, claim.st_ino)
+    current = os.lstat(composed.run_dir)
+    assert persisted.run_dir_identity == (current.st_dev, current.st_ino)
+
+
+def test_claim_identity_is_none_for_a_zero_inode():
+    """A zero inode carries no identity (it never matches), so it records None and
+    the verify stream refuses. On the dir-fd arm that is unchanged; the win32 arm,
+    which used to write through a zero-inode run dir, now refuses it (accepted
+    2026-09-27)."""
+    zero = os.stat_result((0o040755, 0, 5, 0, 0, 0, 0, 0, 0, 0))
+    assert runsetup._claim_identity(zero) is None
+    real = os.stat_result((0o040755, 9, 5, 0, 0, 0, 0, 0, 0, 0))
+    assert runsetup._claim_identity(real) == (5, 9)
+
+
+@pytest.mark.parametrize("composer", ["run", "resume"])
+def test_story_compositions_wire_the_retro_adapter(tmp_path, monkeypatch, composer):
+    """DW-389: `compose_run` and the story branch of `compose_resume` hand the
+    engine the `retro` role's own adapter, so an `[adapter.retro]` override drives
+    the auto-retrospective session rather than silently falling back to dev.
+
+    Ablation: drop `retro_adapter=adapters["retro"]` from either composer and that
+    parametrization reddens alone (the kwarg is then absent)."""
+    built = {role: object() for role in runsetup.ROLES}
+
+    def make_adapters(*_a, **_k):
+        return dict(built)
+
+    if composer == "run":
+        composed = runsetup.compose_run(
+            project=tmp_path,
+            paths=_fake_paths(tmp_path),
+            policy=policy_mod.loads(""),
+            run_id=RUN_ID,
+            epic_filter=None,
+            story_filter=None,
+            max_stories=None,
+            stories_on=False,
+            spec_folder="",
+            sweep_factory=lambda _trigger, *, started: None,
+            make_adapters=make_adapters,
+            engine_cls=_CapturingEngine,
+            stories_engine_cls=_CapturingEngine,
+            trusted_config_digest="deadbeef",
+        )
+    else:
+        run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+        run_dir.mkdir(parents=True)
+        monkeypatch.setattr(runs, "kill_session", lambda _run_id: None)
+        composed = runsetup.compose_resume(
+            project=tmp_path,
+            paths=_fake_paths(tmp_path),
+            run_dir=run_dir,
+            state=RunState(run_id=RUN_ID, project=str(tmp_path), started_at="now"),
+            policy=policy_mod.loads(""),
+            journal=Journal(run_dir),
+            sweep_factory=lambda _trigger, *, started: None,
+            make_adapters=make_adapters,
+            engine_cls=_CapturingEngine,
+            stories_engine_cls=_CapturingEngine,
+            sweep_engine_cls=_CapturingEngine,
+        )
+
+    assert composed.engine.kwargs["retro_adapter"] is built["retro"]
+    assert composed.engine.kwargs["adapter"] is built["dev"]
 
 
 @pytest.mark.parametrize("run_type", ["run", "sweep"])
@@ -888,7 +1601,7 @@ def test_compose_sweep_unwinds_when_the_started_latch_raises(tmp_path):
     published: dict[str, bool] = {}
 
     def make_adapters(project, run_dir, policy, *, profiles=None):
-        return {"dev": object(), "review": object(), "triage": object()}
+        return {"dev": object(), "review": object(), "triage": object(), "retro": object()}
 
     def boom() -> None:
         published["run_dir"] = runs.run_dir_for(tmp_path, RUN_ID).is_dir()

@@ -36,9 +36,10 @@ SWEEP_AUTO_MODES = {"never", "per-epic", "run-end"}
 REVIEW_TRIGGER_MODES = {"always", "recommended"}
 REVIEW_ON_TIMEOUT_MODES = {"retry", "salvage-if-done", "defer"}
 REVIEW_ON_STATUS_CONTRADICTION_MODES = {"escalate", "retry"}
+OPERATOR_ON_REVIEW_DEMOTION_MODES = {"escalate", "park"}
 # Session stages, in run order. Lives here rather than in the TUI because
 # settings_schema's expand_stages loop fans a template section out over it.
-STAGES = ("dev", "review", "triage")
+STAGES = ("dev", "review", "triage", "retro")
 # Where the run gets its story queue. "sprint-status" (default) is the classic
 # flow — bmad-sprint-planning writes sprint-status.yaml from prose epics.
 # "stories" is the opt-in folder+id dispatch flow (BMAD-METHOD #2549): a typed,
@@ -79,6 +80,11 @@ class GatesPolicy:
 class LimitsPolicy:
     max_review_cycles: int = 3
     max_dev_attempts: int = 2
+    # Raw ignored artifact bytes admitted into a frozen publication payload.
+    # These are MiB policy values; the publication helper receives byte limits
+    # so it remains independent of the policy model.
+    artifact_file_max_mb: int = 5
+    artifact_payload_max_mb: int = 10
     # additional review rounds the orchestrator grants *solely* because a
     # completed round finalized the story (status: done) yet still set
     # `followup_review_recommended: true`. Once this many such self-recommended
@@ -108,8 +114,11 @@ class LimitsPolicy:
     # stalled. The grace starts at session launch and re-arms on transport
     # activity (pane-log output or parent/child OpenCode SSE frames) and fresh
     # Stop/idle evidence, so productive work keeps extending it. Bounded by
-    # session_timeout_min. 0 disables the launch timer while retaining fail-fast
-    # handling when a turn ends without a terminal spec/result.
+    # session_timeout_min. Also the transcript-idle notice threshold (#680): the
+    # journal's session-idle/session-active pair and the TUI's idle age fire when
+    # the live transcript sits still this long. 0 disables the launch timer (and
+    # the idle notice) while retaining fail-fast handling when a turn ends without
+    # a terminal spec/result.
     dev_stall_grace_s: int = 600
     # how many best-effort wake nudges a silent dev/review session receives on
     # dev_stall_grace_s expiry before it is called stalled. Transport activity
@@ -318,6 +327,16 @@ class OperatorPolicy:
     # know the status, so a session that writes it anyway is retried with that
     # mismatch as feedback rather than silently committing.
     enabled: bool = True
+    # What a REVIEW pass that finalizes the spec at `awaiting-operator` gets
+    # (DW-383). "escalate" (default) keeps the historical behavior: the review
+    # prompt carries no park clause, the demotion is not accepted, and the loop
+    # cycles on it like any non-terminal status. "park" takes it down the normal
+    # commit path as a park: the board moves `done -> awaiting-operator` through
+    # the one allowlisted regression (statemachine.BOARD_REGRESSIONS), the review
+    # verify gate holds it to the park pair + non-empty actions + verify commands,
+    # and the story commits to AWAITING_OPERATOR. Inert unless parking itself is
+    # live (`enabled` in sprint mode) — stories/sweep runs never park.
+    on_review_demotion: str = "escalate"
 
 
 @dataclass(frozen=True)
@@ -355,12 +374,29 @@ class CleanupPolicy:
     clean_tmp: bool = True  # let engine plugins clean their /tmp scratch (e.g. Unity MCP zips)
 
 
+# Legacy adapter names from older policy.toml files, plus friendly short names,
+# mapped to the canonical profile name. Owned here — not in `adapters.profile`,
+# which re-exports it as `ALIASES` for `get_profile` — because `[adapter] name`
+# semantics are a policy fact: `AdapterPolicy.resolved()` must see "opencode" and
+# "opencode-http" as the SAME client, or a stage naming the other spelling would
+# be treated as a client switch and lose the inherited model/effort/extra_args.
+PROFILE_ALIASES: dict[str, str] = {"claude-code-tmux": "claude", "opencode": "opencode-http"}
+
+
+def canonical_profile_name(name: str) -> str:
+    """The profile name `get_profile` resolves `name` to — aliases collapsed."""
+    return PROFILE_ALIASES.get(name, name)
+
+
 @dataclass(frozen=True)
 class StageAdapterPolicy:
     """Per-stage overrides; None = inherit from [adapter]."""
 
     name: str | None = None
     model: str | None = None
+    # Reasoning effort, free-form (provider- and model-specific names); None =
+    # inherit from [adapter] under the same client-specific rule as `model`.
+    effort: str | None = None
     extra_args: tuple[str, ...] | None = None
     # None = inherit from [adapter] (which itself falls back to the CLI profile)
     usage_grace_s: float | None = None
@@ -377,12 +413,20 @@ class ResolvedAdapter:
     # limits.stop_without_result_nudges respectively
     usage_grace_s: float | None = None
     stop_without_result_nudges: int | None = None
+    # Reasoning effort; "" = provider default. Only the opencode-http adapter
+    # carries it (as the per-prompt `variant`); the tmux generic family has no
+    # channel for it and ignores it (`bmad-loop validate` warns). Appended AFTER
+    # the older fields because `resolved()` constructs this positionally.
+    effort: str = ""
 
 
 @dataclass(frozen=True)
 class AdapterPolicy:
     name: str = "claude"  # CLI profile name; "claude-code-tmux" kept as legacy alias
     model: str = ""
+    # Reasoning effort for every stage that runs this client; free-form because
+    # the legal names are provider- and model-specific ("" = provider default).
+    effort: str = ""
     # None = use the profile's default bypass flags; a list replaces them
     extra_args: tuple[str, ...] | None = None
     # kill the run's bmad-loop-<id> tmux session when it finishes (False keeps
@@ -395,9 +439,17 @@ class AdapterPolicy:
     dev: StageAdapterPolicy = field(default_factory=StageAdapterPolicy)
     review: StageAdapterPolicy = field(default_factory=StageAdapterPolicy)
     triage: StageAdapterPolicy = field(default_factory=StageAdapterPolicy)
+    # The headless epic-boundary retrospective (`gates.retrospective = "auto"`,
+    # DW-389). Appended last: every other stage is keyword-constructed.
+    retro: StageAdapterPolicy = field(default_factory=StageAdapterPolicy)
 
     def resolved(self, role: str) -> ResolvedAdapter:
-        stage = {"dev": self.dev, "review": self.review, "triage": self.triage}.get(role)
+        stage = {
+            "dev": self.dev,
+            "review": self.review,
+            "triage": self.triage,
+            "retro": self.retro,
+        }.get(role)
         if stage is None:
             return ResolvedAdapter(
                 self.name,
@@ -405,12 +457,15 @@ class AdapterPolicy:
                 self.extra_args,
                 self.usage_grace_s,
                 self.stop_without_result_nudges,
+                effort=self.effort,
             )
         name = stage.name if stage.name is not None else self.name
-        # model and extra_args are client-specific: inherit from the base only
-        # when the stage runs the same client; a client switch falls back to
-        # that profile's defaults (CLI default model, profile bypass flags).
-        same_client = name == self.name
+        # model, effort and extra_args are client-specific: inherit from the base
+        # only when the stage runs the same client; a client switch falls back to
+        # that profile's defaults (CLI default model, provider default effort,
+        # profile bypass flags). Compared by CANONICAL name: `opencode` and
+        # `opencode-http` are one profile, not a switch.
+        same_client = canonical_profile_name(name) == canonical_profile_name(self.name)
         # usage_grace_s / stop_without_result_nudges are benign timing knobs that
         # mean "fall back to the profile default" when None, so plain stage ??
         # base inheritance is safe regardless of a client switch.
@@ -429,6 +484,9 @@ class AdapterPolicy:
                 stage.stop_without_result_nudges
                 if stage.stop_without_result_nudges is not None
                 else self.stop_without_result_nudges
+            ),
+            effort=(
+                stage.effort if stage.effort is not None else (self.effort if same_client else "")
             ),
         )
 
@@ -456,9 +514,11 @@ def _stage_from_snapshot(raw: Any) -> StageAdapterPolicy:
         return StageAdapterPolicy()
     name = raw.get("name")
     model = raw.get("model")
+    effort = raw.get("effort")
     return StageAdapterPolicy(
         name=None if name is None else str(name),
         model=None if model is None else str(model),
+        effort=None if effort is None else str(effort),
         extra_args=_snapshot_extra_args(raw.get("extra_args")),
         usage_grace_s=raw.get("usage_grace_s"),
         stop_without_result_nudges=raw.get("stop_without_result_nudges"),
@@ -470,7 +530,7 @@ def adapter_policy_from_snapshot(snapshot: dict[str, Any] | None) -> AdapterPoli
 
     ``snapshot`` is ``RunState.policy_snapshot`` — the json-round-tripped
     ``asdict(Policy)``. This reconstructs the ``[adapter]`` sub-tree (the base
-    plus the dev/review/triage :class:`StageAdapterPolicy` stages) so display
+    plus the dev/review/triage/retro :class:`StageAdapterPolicy` stages) so display
     paths can reuse the canonical :meth:`AdapterPolicy.resolved` instead of
     re-deriving its stage-inheritance / client-switch rules against a raw dict.
 
@@ -493,6 +553,7 @@ def adapter_policy_from_snapshot(snapshot: dict[str, Any] | None) -> AdapterPoli
         return AdapterPolicy(
             name=name,
             model=str(adapter_d.get("model", AdapterPolicy.model)),
+            effort=str(adapter_d.get("effort", AdapterPolicy.effort)),
             extra_args=_snapshot_extra_args(adapter_d.get("extra_args")),
             cleanup_session_on_finish=bool(
                 adapter_d.get("cleanup_session_on_finish", AdapterPolicy.cleanup_session_on_finish)
@@ -502,6 +563,7 @@ def adapter_policy_from_snapshot(snapshot: dict[str, Any] | None) -> AdapterPoli
             dev=_stage_from_snapshot(adapter_d.get("dev")),
             review=_stage_from_snapshot(adapter_d.get("review")),
             triage=_stage_from_snapshot(adapter_d.get("triage")),
+            retro=_stage_from_snapshot(adapter_d.get("retro")),
         )
     except Exception:
         return None
@@ -534,12 +596,13 @@ class ScmPolicy:
     # attempt's source but preserves the corrected spec under the BMAD artifact
     # folders, which it treats as orchestrator-owned.
     rollback_on_failure: bool = False
-    # preserve_keep bounds both recovery-ref families auto-rollback parks before
-    # its hard reset — the attempt-preserve/* branches and the
-    # refs/attempt-preserve-dirty/* worktree snapshots: each run start keeps only
-    # the N most recent per family (by committer date) and deletes the tail, so a
-    # long-lived project with rollback_on_failure on doesn't accumulate them
-    # forever. 0 = never prune (maximum safety).
+    # preserve_keep bounds the three recovery-ref families — the attempt-preserve/*
+    # branches and refs/attempt-preserve-dirty/* rollback snapshots auto-rollback
+    # parks before its hard reset, and the refs/merge-preflight-preserve/* merge
+    # pre-flight snapshots of operator edits it restores (DW-356): each run start
+    # keeps only the N most recent per family (by committer date) and deletes the
+    # tail, so a long-lived project doesn't accumulate them forever. 0 = never
+    # prune (maximum safety).
     preserve_keep: int = 20
     # failed_diff_max_mb caps the per-file size (MB) of untracked files captured
     # into a kept-failed unit's forensic changes.patch, so a stray build dir or
@@ -677,6 +740,7 @@ def _stage_adapter(adapter_d: dict[str, Any], key: str) -> StageAdapterPolicy:
     return StageAdapterPolicy(
         name=_opt_typed_str(raw, f"adapter.{key}", "name"),
         model=_opt_typed_str(raw, f"adapter.{key}", "model"),
+        effort=_opt_typed_str(raw, f"adapter.{key}", "effort"),
         extra_args=_typed_str_tuple(raw, f"adapter.{key}", "extra_args"),
         usage_grace_s=_opt_grace(raw, f"adapter.{key}"),
         stop_without_result_nudges=_opt_nudges(raw, f"adapter.{key}"),
@@ -849,6 +913,18 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         max_dev_attempts=_typed_int(
             limits_d, "limits", "max_dev_attempts", LimitsPolicy.max_dev_attempts
         ),
+        artifact_file_max_mb=_typed_int(
+            limits_d,
+            "limits",
+            "artifact_file_max_mb",
+            LimitsPolicy.artifact_file_max_mb,
+        ),
+        artifact_payload_max_mb=_typed_int(
+            limits_d,
+            "limits",
+            "artifact_payload_max_mb",
+            LimitsPolicy.artifact_payload_max_mb,
+        ),
         max_followup_reviews=_typed_int(
             limits_d, "limits", "max_followup_reviews", LimitsPolicy.max_followup_reviews
         ),
@@ -898,6 +974,14 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     )
     if limits.max_review_cycles < 1 or limits.max_dev_attempts < 1:
         raise PolicyError("limits.max_review_cycles and limits.max_dev_attempts must be >= 1")
+    if limits.artifact_file_max_mb < 1:
+        raise PolicyError(
+            f"limits.artifact_file_max_mb must be >= 1: got {limits.artifact_file_max_mb}"
+        )
+    if limits.artifact_payload_max_mb < 1:
+        raise PolicyError(
+            f"limits.artifact_payload_max_mb must be >= 1: got {limits.artifact_payload_max_mb}"
+        )
     if limits.max_followup_reviews < 0:
         raise PolicyError(
             f"limits.max_followup_reviews must be >= 0: got {limits.max_followup_reviews}"
@@ -1016,6 +1100,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     adapter = AdapterPolicy(
         name=_typed_str(adapter_d, "adapter", "name", AdapterPolicy.name),
         model=_typed_str(adapter_d, "adapter", "model", AdapterPolicy.model),
+        effort=_typed_str(adapter_d, "adapter", "effort", AdapterPolicy.effort),
         extra_args=_typed_str_tuple(adapter_d, "adapter", "extra_args"),
         cleanup_session_on_finish=_typed_bool(
             adapter_d,
@@ -1028,6 +1113,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         dev=_stage_adapter(adapter_d, "dev"),
         review=_stage_adapter(adapter_d, "review"),
         triage=_stage_adapter(adapter_d, "triage"),
+        retro=_stage_adapter(adapter_d, "retro"),
     )
     sweep = SweepPolicy(
         auto=_typed_str(sweep_d, "sweep", "auto", SweepPolicy.auto),
@@ -1217,8 +1303,17 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         tasks_height=_tui_dim(tui_d, "tasks_height"),
     )
     operator = OperatorPolicy(
-        enabled=_typed_bool(operator_d, "operator", "enabled", OperatorPolicy.enabled)
+        enabled=_typed_bool(operator_d, "operator", "enabled", OperatorPolicy.enabled),
+        on_review_demotion=_typed_str(
+            operator_d, "operator", "on_review_demotion", OperatorPolicy.on_review_demotion
+        ).strip(),
     )
+    if operator.on_review_demotion not in OPERATOR_ON_REVIEW_DEMOTION_MODES:
+        raise PolicyError(
+            "operator.on_review_demotion must be one of "
+            f"{sorted(OPERATOR_ON_REVIEW_DEMOTION_MODES)}:"
+            f" got {operator.on_review_demotion!r}"
+        )
     mux = MuxPolicy(backend=_typed_str(mux_d, "mux", "backend", MuxPolicy.backend).strip())
     if mux.backend and not _MUX_NAME_RE.match(mux.backend):
         raise PolicyError(
@@ -1277,17 +1372,19 @@ POLICY_TEMPLATE = """\
 
 [gates]
 mode = "per-epic"            # none | per-epic | per-story-spec-approval
-retrospective = "notify"     # never | notify | auto (auto unsupported in v1)
+retrospective = "notify"     # never | notify | auto — auto runs a headless /bmad-retrospective -H session at each epic boundary and for a finished last epic at run end ([adapter.retro]) and commits its doc + board
 
 [limits]
 max_review_cycles = 3
 max_dev_attempts = 2
+artifact_file_max_mb = 5    # raw-byte cap for each ignored artifact selected for publication
+artifact_payload_max_mb = 10 # raw-byte cap across all selected ignored publication artifacts
 max_followup_reviews = 1     # additional review rounds granted solely because a finalized (status: done) round still recommended a follow-up; once spent, such a round converges + refiles the recommendation instead of burning another cycle. 0 = never honor a pass's own recommendation
 session_timeout_min = 90
 git_timeout_s = 120          # bound on any single git subprocess; exceeding it pauses/degrades (never crashes the run) — raise on a loaded host or a very large worktree
 teardown_grace_s = 20        # verified teardown: poll a killed session window up to this long, then force-kill its pane pids and re-kill (#157). 0 = single unverified best-effort kill
 stop_without_result_nudges = 1
-dev_stall_grace_s = 600      # silence grace armed at dev/review launch and re-armed by transport activity or fresh Stop/idle evidence before bounded recovery. 0 = no launch timer, but a result-less turn end still fails fast
+dev_stall_grace_s = 600      # silence grace armed at dev/review launch and re-armed by transport activity or fresh Stop/idle evidence before bounded recovery; also the transcript-idle notice threshold (journal session-idle/session-active, TUI idle age). 0 = no launch timer (and no idle notice), but a result-less turn end still fails fast
 dev_stall_nudges = 2         # best-effort wake nudges per silent grace before stalling; fresh Stop/idle evidence restores this budget. 0 = stall on grace expiry
 dev_stall_nudges_cap = 6     # total (never-restored) nudge bound per dev/review session; bounds launch-time recovery and Stop/idle budget refills because an accepted nudge does not guarantee a wake. 0 = stall on first grace expiry
 workflow_stall_nudges_cap = 3 # total (never-restored) stall nudges for an injected plugin-workflow session before it is called stalled; bounds a session that finished its work but never wrote its completion marker. 0 = stall on first grace expiry
@@ -1349,6 +1446,8 @@ spec_folder = ""
 [adapter]
 name = "claude"              # claude | codex | gemini | copilot | antigravity | opencode-http (alias: opencode) | <custom .bmad-loop/profiles/*.toml>
 model = ""                   # empty = CLI default model (opencode-http wants "provider/model")
+effort = ""                  # reasoning effort, free-form (e.g. "high", "max"); empty = provider default.
+                             # Sent by opencode-http as the per-prompt `variant`; the tmux CLIs ignore it
 cleanup_session_on_finish = true  # kill the run's tmux session when it finishes (false keeps it for inspection)
 # extra_args replaces the profile's default permission-bypass flags when set:
 # extra_args = ["--permission-mode", "bypassPermissions"]
@@ -1358,11 +1457,11 @@ cleanup_session_on_finish = true  # kill the run's tmux session when it finishes
 # usage_grace_s = 8.0                # seconds to poll the transcript for token usage after a session ends
 # stop_without_result_nudges = 5     # result-less Stop signals tolerated before a session is called stalled
 
-# Per-stage overrides for the dev, review and sweep-triage passes. Unset keys
-# inherit from [adapter] when the stage runs the same client; a stage that
-# switches client falls back to that profile's defaults instead (model and
-# extra_args are client-specific). Stage tables must come after the [adapter]
-# keys above.
+# Per-stage overrides for the dev, review, sweep-triage and auto-retrospective
+# passes. Unset keys inherit from [adapter] when the stage runs the same client;
+# a stage that switches client falls back to that profile's defaults instead
+# (model, effort and extra_args are client-specific). Stage tables must come
+# after the [adapter] keys above.
 # [adapter.dev]
 # model = "opus"
 # [adapter.review]
@@ -1371,6 +1470,12 @@ cleanup_session_on_finish = true  # kill the run's tmux session when it finishes
 # stop_without_result_nudges = 5     # e.g. a multi-turn review needs more nudges than dev
 # [adapter.triage]
 # model = "opus"
+# [adapter.retro]                    # gates.retrospective = "auto" sessions
+# model = "opus"
+# With an opencode-http base, effort tunes reasoning per stage (opencode-http
+# only — a tmux CLI ignores it and `bmad-loop validate` warns):
+# [adapter.review]
+# effort = "max"                     # e.g. a deeper review pass than dev
 
 [sweep]
 # Deferred-work sweep: triage + execute open deferred-work.md entries.
@@ -1403,7 +1508,7 @@ merge_strategy = "merge"     # ff | merge | squash (worktree mode merges the uni
 delete_branch = true         # delete the unit branch after a successful merge
 keep_failed = true           # keep a failed unit's worktree+branch for inspection
 rollback_on_failure = false  # in-place (isolation="none") recovery after a failed attempt. false = never touch the tree; pause with manual recovery steps. true = auto-revert the attempt's tracked changes + remove only the untracked files this run created (WARNING: discards the attempt's uncommitted work; never a blanket git clean). Governs unattended/stopped attempts only: a resolved escalation's re-drive always auto-recovers regardless (reverts the failed source, keeps the corrected spec). Prefer isolation="worktree" to avoid touching your main checkout.
-preserve_keep = 20           # attempt-preserve/* branches and attempt-preserve-dirty/* snapshots kept at run start (per family), newest by committer date; the tail is deleted (0 = never prune)
+preserve_keep = 20           # attempt-preserve/* recovery branches, attempt-preserve-dirty/* rollback snapshots and merge-preflight-preserve/* merge pre-flight snapshots kept at run start (per family), newest by committer date; the tail is deleted (0 = never prune)
 failed_diff_max_mb = 5       # per-file size cap (MB) for untracked files in a kept-failed unit's changes.patch; oversized files are skipped with a marker
 failed_diff_unlimited = false # true = capture the failed-unit diff with no size cap (may produce very large patches; warns when active)
 # commit_message_template: when set, the commit message dev sessions use for a
@@ -1465,6 +1570,12 @@ low_frame_rate = false
 # story with `bmad-loop confirm <story-key>` once you have done those actions.
 # Turn this off to hold sessions to the two older outcomes (done / blocked).
 enabled = true
+# What happens when a REVIEW pass concludes a `done` story still owes such
+# actions and finalizes its spec at awaiting-operator. "escalate" (default): the
+# review is not offered the park and the demotion is not accepted. "park": the
+# review prompt offers the park, and a demotion that passes the verify gate
+# moves the board done -> awaiting-operator, commits, and parks the story.
+# on_review_demotion = "escalate"
 
 [mux]
 # Terminal-multiplexer backend for this machine (the transport axis — which

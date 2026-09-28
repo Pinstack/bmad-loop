@@ -111,7 +111,7 @@ Never open a new `## [X.Y.Z]` section yourself: a release _promotes_ `## [Unrele
 Releases are cut by maintainers with `scripts/release.py`, which is two-phase:
 
 - **`prepare X.Y.Z`** runs on a release branch. **Promote the CHANGELOG by hand first** — rename `## [Unreleased]` to `## [X.Y.Z] — <ISO date>` and reopen an empty `## [Unreleased]` above it; `prepare` does not do this for you and refuses to run until it is done. It then stamps the version everywhere via `sync_version.py`, regenerates TUI assets when they changed, and commits, leaving the branch ready for a PR.
-- **`publish`** runs on `main` after that PR merges (driven by `.github/workflows/release.yml`) — it creates the tag and GitHub release from the CHANGELOG, and is idempotent.
+- **`publish`** runs on `main` after that PR merges (driven by `.github/workflows/release.yml`) — it creates the tag and GitHub release from the CHANGELOG, and is idempotent. An existing tag is verified, not trusted: the commit it points to on origin must carry the version (or, when `gh release create` loses a race, be exactly the commit this run targeted), and a mismatch fails the publish.
 
 Version strings are stamped only by `scripts/sync_version.py`; never hand-edit them in `pyproject.toml`, `module.yaml`, `marketplace.json`, or `uv.lock`. The version is validated in CI — if you touch it, run `uv run --no-project python scripts/sync_version.py --check`.
 

@@ -203,6 +203,27 @@ clean non-zero exit vetoes); set `fail_closed = true` to make any failure defer
 the unit. An in-process handler can opt into the same by setting `fail_closed =
 True` on its class.
 
+**Hard stops.** Declarative hooks (and the verify commands) run through a
+stop-aware runner. A hard `bmad-loop stop` that lands while a hook is running
+kills the hook's process tree, and the run stops: the bus journals
+`plugin-hook-interrupted` (`plugin`, `stage`) instead of `plugin-hook-error`, and
+`fail_closed` never turns that into a veto, because an interrupted hook has not
+failed. If the interrupted hook is on `post_run`, the run still finishes. A hook
+timeout kills the tree the same way. The runner re-scans the tree under the
+hook's root once a second while that root runs, and again every 50 ms while the
+root winds down after its signal; at kill time it also takes in each surviving
+known process's current children. Only processes still alive with a matching
+recorded identity are signalled. A background job whose parent shell exited is
+killed if its parent chain was still under the live root at one of those scans,
+and a process forked in the root's TERM handler is killed if the root lived one
+50 ms re-scan after forking. These cannot be reached: a process that starts and
+is reparented away within one scan interval, a TERM handler that forks and exits
+at once, a descendant already reparented away from a surviving job once the root
+has exited, and a process that starts while the survivors are being reaped. On
+macOS without `psutil`, only the root is killed. Hooks that run as part of the
+stop's own unwind — `pre_worktree_teardown`/`post_worktree_teardown`,
+`pre_rollback`/`post_rollback` — are not interrupted and still run to completion.
+
 **Versioning.** Every manifest declares `api_version`. The framework supports a
 set of versions (`SUPPORTED_API`). A **builtin** with an unsupported version is a
 hard error (a packaging bug we shipped); a **third-party** one is **skipped with a
@@ -268,15 +289,17 @@ A `[hooks.<stage>]` shell command. The bus runs it with:
 - **cwd** = the unit's worktree (or repo root);
 - a `BMAD_LOOP_*` environment describing the run:
 
-  | Var                                                                               | Meaning                                       |
-  | --------------------------------------------------------------------------------- | --------------------------------------------- |
-  | `BMAD_LOOP_STAGE`                                                                 | the stage firing                              |
-  | `BMAD_LOOP_RUN_ID` / `BMAD_LOOP_RUN_DIR`                                          | run identity                                  |
-  | `BMAD_LOOP_REPO_ROOT` / `BMAD_LOOP_WORKTREE`                                      | git roots                                     |
-  | `BMAD_LOOP_STORY_KEY` / `BMAD_LOOP_ROLE` / `BMAD_LOOP_PHASE` / `BMAD_LOOP_BRANCH` | unit context                                  |
-  | `BMAD_LOOP_AGENTS`                                                                | comma-separated CLI agent ids in the worktree |
-  | `BMAD_LOOP_PLUGIN`                                                                | your plugin's name                            |
-  | `BMAD_LOOP_SETTING_<KEY>`                                                         | each resolved setting                         |
+  | Var                                                                               | Meaning                                                 |
+  | --------------------------------------------------------------------------------- | ------------------------------------------------------- |
+  | `BMAD_LOOP_STAGE`                                                                 | the stage firing                                        |
+  | `BMAD_LOOP_RUN_ID` / `BMAD_LOOP_RUN_DIR`                                          | run identity                                            |
+  | `BMAD_LOOP_REPO_ROOT` / `BMAD_LOOP_WORKTREE`                                      | git roots                                               |
+  | `BMAD_LOOP_STORY_KEY` / `BMAD_LOOP_ROLE` / `BMAD_LOOP_PHASE` / `BMAD_LOOP_BRANCH` | unit context                                            |
+  | `BMAD_LOOP_AGENTS`                                                                | comma-separated CLI agent ids in the worktree           |
+  | `BMAD_LOOP_DELIVERY_ID`                                                           | dedup key of an at-least-once stage                     |
+  | `BMAD_LOOP_ROLLBACK_OUTCOME`                                                      | `post_rollback` only: `completed` / `paused` / `failed` |
+  | `BMAD_LOOP_PLUGIN`                                                                | your plugin's name                                      |
+  | `BMAD_LOOP_SETTING_<KEY>`                                                         | each resolved setting                                   |
 
 A **blocking** hook's non-zero exit **vetoes** (defers) the unit. A non-blocking
 hook is advisory (logged `plugin-hook`).
@@ -332,7 +355,8 @@ stage. It carries:
 - **Read-only facts** (properties, no setter): `run_id`, `story_key`, `epic`,
   `phase`, `attempt`, `role`, `worktree`, `branch`, `repo_root`, `run_dir`,
   `agents`, `result_json` (a copy), `session_status`, `verify_reason`,
-  `decision_action`, `settings`. Observe these; you can never rewrite history.
+  `decision_action`, `delivery_id`, `rollback_outcome`, `settings`. Observe
+  these; you can never rewrite history.
 - **A mutable whitelist** — assign only these, and only where the stage allows:
   `proposed_prompt`, `proposed_env`, `proposed_feedback`,
   `proposed_commit_message`, `proposed_decision`.
@@ -372,17 +396,44 @@ there.
 | `pre_pick_next` / `post_pick_next`         | around selecting the next story |
 | `pre_epic_boundary` / `post_epic_boundary` | at an epic transition           |
 
+Under `[gates] retrospective = "auto"`, the epic transition also runs one headless
+retrospective session between those two stages. That session fires
+`pre_retro_session`, then the generic `pre_session` / `post_session`, with
+`role = "retro"` and the story key `epic-<N>-retrospective`. That key is not a
+story in the run's state. A veto on either pre-stage fails the retrospective
+(journaled `retro-auto-failed`); it does not pause the run.
+
 ### Story / unit
 
-| Stage                                              | When                                                                              | Mutable surface                                       |
-| -------------------------------------------------- | --------------------------------------------------------------------------------- | ----------------------------------------------------- |
-| `pre_story` / `post_story`                         | around one story                                                                  | veto (`pre_`)                                         |
-| `pre_worktree_setup` / `post_worktree_setup`       | around isolated-worktree provisioning                                             | —                                                     |
-| `pre_ready_gate` / `post_ready_gate`               | around the engine-ready gate                                                      | veto (`pre_`)                                         |
-| `pre_worktree_teardown` / `post_worktree_teardown` | around teardown (in a `finally`)                                                  | **observe-only** — a veto here cannot un-tear-down    |
-| `pre_rollback` / `post_rollback`                   | around a failed attempt's `git reset --hard` (only when a rollback actually runs) | **observe-only** — a veto here cannot block the reset |
-| `pre_integrate`                                    | before integrating a finished unit                                                | —                                                     |
-| `pre_merge` / `post_merge`                         | around the local branch merge                                                     | —                                                     |
+| Stage                                              | When                                                                                                                                         | Mutable surface                                       |
+| -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
+| `pre_story` / `post_story`                         | around one story                                                                                                                             | veto (`pre_`)                                         |
+| `pre_worktree_setup` / `post_worktree_setup`       | around isolated-worktree provisioning                                                                                                        | —                                                     |
+| `pre_ready_gate` / `post_ready_gate`               | around the engine-ready gate                                                                                                                 | veto (`pre_`)                                         |
+| `pre_worktree_teardown` / `post_worktree_teardown` | around teardown (in a `finally`)                                                                                                             | **observe-only** — a veto here cannot un-tear-down    |
+| `pre_rollback` / `post_rollback`                   | around a failed attempt's `git reset --hard` (only when a rollback actually runs); `post_` pairs every `pre_`, even a paused/failed rollback | **observe-only** — a veto here cannot block the reset |
+| `pre_integrate`                                    | before integrating a finished unit                                                                                                           | —                                                     |
+| `pre_merge` / `post_merge`                         | around the local branch merge                                                                                                                | —                                                     |
+
+`post_story` fires after an isolated unit's worktree teardown. If the worktree was
+removed, a declarative `post_story` hook runs from the repo root and
+`BMAD_LOOP_WORKTREE` still names the removed worktree; if it was kept (a deferred
+unit under `keep_failed`), the hook runs from that worktree.
+
+`post_rollback` fires exactly once for every emitted `pre_rollback`, including when
+the rollback stops part-way — it pauses the run for manual recovery (an
+attempt-owned spec it cannot safely restore, work it could not park, a refused
+reset) or an unexpected error escapes it. `ctx.rollback_outcome`
+(`BMAD_LOOP_ROLLBACK_OUTCOME` for a declarative hook) says which: `completed`,
+`paused`, or `failed`; after the latter two the tree may be only partially reset.
+It is `None` on every other stage, `pre_rollback` included. A plugin that
+quiesces in `pre_rollback` can therefore always rely on the matching release;
+one that does post-reset work (re-installing dependencies, re-applying state)
+should gate it on `completed`, since `post_rollback` no longer implies the reset
+finished.
+Rollback paths that never emit `pre_rollback` (a clean tree, a policy pause with
+`[scm] rollback_on_failure` off, an owned-spec pause raised before the rollback
+starts) emit neither stage.
 
 ### Dev
 
@@ -429,7 +480,13 @@ passes apart — `output_tail`, `spawn_error`, byte counts, and run-relative `st
 `stderr_path` pointers under the run's `verify/` directory; full streams are not
 embedded in the journal. `spawn_error` rides the record because the record's
 readers are out-of-process and `returncode` alone cannot separate a child that
-never started from one that ran. That store is deliberately separate from `logs/`, which
+never started from one that ran. A pass cut short by a hard `bmad-loop stop` (DW-353)
+records `interrupted: true` with `returncode` −1001 (`INTERRUPTED_RC`): the command
+the stop killed has `output_tail` `interrupted by a hard stop request`, and every later
+command, which was never started, still gets a record, with `output_tail`
+`not started: an earlier command was interrupted by a hard stop request`. The run
+stops right after journalling that pass, so no hook observes it and no decision is
+taken on it. The field is absent from every pass that ran through. That store is deliberately separate from `logs/`, which
 holds coding-CLI pane captures named after session task ids and is read as such
 by the TUI.
 
@@ -443,6 +500,9 @@ two but names neither.
 | --------------------------- | -------------------------------------------------------------------------------------- |
 | `ctx.verification_stage`    | `"dev"` for the initial dev verification, `"fix"` for a repair one, `None` if none ran |
 | `ctx.verification_sequence` | the story's 1-based ordinal for that pass, or `None` if it recorded nothing            |
+
+The review gate publishes the same pair on its own stage, [`post_review_verify`](#review),
+always as `"review"` (or `None`).
 
 Together they are the join key: the `verify-command-result` entries carrying this
 `story_key` + `verification_stage` + `verification_sequence` are exactly this
@@ -482,12 +542,12 @@ carries the reason. A plugin reading these pointers must therefore treat both
 file holds a command's whole output. Treat verifier output as potentially sensitive and store, upload, sign,
 or act on it only from an explicitly configured plugin.
 
-**The dev phase is the whole of this HOOK, not of the journal.** `[verify]
-commands` also run at the _review_ gate — `verify_review` /
-`verify_review_stories` / `verify_review_bundle` end on the same core classifier
-— and those runs **are journalled** (`verification_stage: "review"`, sharing the
-story's one `verification_sequence` counter with the dev and fix passes) but are
-**not published to any hook.** They run in `repo_root`, the same root
+**`post_dev_verify` covers the dev phase only.** `[verify] commands` also run at
+the _review_ gate — `verify_review` / `verify_review_stories` /
+`verify_review_bundle` end on the same core classifier — and those runs are
+journalled (`verification_stage: "review"`, sharing the story's one
+`verification_sequence` counter with the dev and fix passes) and published on
+their own stage, [`post_review_verify`](#review). They run in `repo_root`, the same root
 the dev phase uses (#695); only the gates' own artifact reads — the spec, the
 sprint board, the deferred-work ledger — stay project-rooted. Five engine gates reach them: the
 converged review pass, the review-budget-exhaustion rescue, the review-timeout
@@ -502,7 +562,10 @@ Two consequences a handler has to be written for:
 
 - **`verify-command-result` entries are a complete census of a RUN's verifier
   command invocations, but not of every gate visit or of a project's.** Every
-  command executed by an in-run dev, fix or review pass lands a record. A pass
+  command an in-run dev, fix or review pass executed lands a record. A pass cut
+  short by a hard stop also records each command it never started, marked
+  `interrupted: true` with a `not started:` `output_tail`, so the record count of
+  such a pass is its configured command count, not what actually ran. A pass
   with no `[verify] commands` configured executes nothing and therefore records
   nothing; `bmad-loop confirm --reverify` stays outside because it runs after the
   run that parked the story is over. Count distinct `verification_sequence`
@@ -516,11 +579,6 @@ Two consequences a handler has to be written for:
   `review-result`, `review-skipped*`, `review-timeout-salvage*`,
   `review-budget-committed`, or `review-followup-damped` event described above.
 
-The hook boundary is deliberate, not an oversight — the review leg would need its
-own stage rather than a second meaning for one named `post_dev_verify` — and is
-tracked as a follow-up in [#656](https://github.com/bmad-code-org/bmad-loop/issues/656),
-which now narrows to that stage: the journalling half of it has landed.
-
 ### Review
 
 | Stage                 | When                           | Mutable surface                                   |
@@ -529,11 +587,38 @@ which now narrows to that stage: the journalling half of it has landed.
 | `pre_review_session`  | before each review session     | `proposed_prompt`, `proposed_env`, veto           |
 | `post_review_session` | after each review session      | —                                                 |
 | `post_review_result`  | after a review verdict         | a [workflow injection point](#workflows-provides) |
+| `post_review_verify`  | after each review verify gate  | —                                                 |
 | `pre_fix_session`     | before a verify-repair session | `proposed_prompt`, `proposed_env`, veto           |
 
-None of these carries the review gate's `[verify] commands` results — that gate
-journals every command it runs, stream captures included, but publishes nothing to
-a hook context. See the boundary note above `### Review`.
+`post_review_verify` is the review leg's counterpart of `post_dev_verify`: its own
+stage, not a second meaning for that one. It fires once per review verify gate
+visit — the converged review pass, the review-budget-exhaustion rescue, the
+review-timeout salvage, and each of the (up to two) passes inside the skip-review
+commit path — in every run mode (sprint, stories, sweep). A gate visit ended by
+an exception (a hard stop, a repair pause, an engine error) is never published. A
+story can therefore see it **several times** (once per review cycle that reached
+the gate, plus a re-check after a verify-repair), so write handlers to be
+idempotent and key on `verification_sequence` when it is set (it is `None` when no
+commands ran). It fires after the gate itself has finished — including its own
+acceptance bookkeeping (binding the review artifact source, a sweep's ledger
+reclose) — and before the engine routes on the outcome (journals
+`review-verify-failed`, escalates, repairs, or commits). It is observation only: a
+handler cannot change the gate's outcome, the routing, or the journal.
+
+The context carries the same payload as `post_dev_verify`:
+
+| Field                       | Value                                                                                                                                                                                                                                                                                  |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ctx.session_status`        | the status of the review session whose product was gated — the timeout-class status on the review-timeout salvage visit; `None` on the skip-review path, where no review session ran                                                                                                   |
+| `ctx.result_json`           | that review session's result (a copy) — often `None` on the timeout-salvage visit; `None` on the skip-review path                                                                                                                                                                      |
+| `ctx.verify_reason`         | the gate's outcome reason (the failure reason on a red gate)                                                                                                                                                                                                                           |
+| `ctx.command_results`       | the `CommandResult` records the gate's command pass ran, in order                                                                                                                                                                                                                      |
+| `ctx.verification_stage`    | `"review"` whenever the gate reached its command pass (including zero commands); `None` when one of the gate's artifact checks refused first — the spec, the operator-action list, the sprint board, or a sweep's ledger (stories mode checks the spec only); `verify_reason` names it |
+| `ctx.verification_sequence` | the story's ordinal for that pass (joins the `verify-command-result` entries), or `None` if it recorded nothing (no `[verify] commands`, or no pass)                                                                                                                                   |
+
+Read `command_results == ()` with `verification_stage` exactly as for
+`post_dev_verify`. A review pass cut short by a hard `bmad-loop stop` stops the run
+before the gate is classified, so it is never published.
 
 ### Commit
 
@@ -561,6 +646,17 @@ a hook context. See the boundary note above `### Review`.
 | `pre_decision` / `post_decision`                       | around a human-decision item     |
 | `pre_bundle` / `post_bundle`                           | around a deferred-work bundle    |
 | `pre_materialize_bundles` / `post_materialize_bundles` | around materializing bundles     |
+
+`post_migrate` gets **at least one delivery attempt**. The engine records the
+completed migration before firing it and, if the process or host dies before the emit
+returns, fires it again on resume. A returned emit counts as delivered even when a
+handler failed: a Python raise, a declarative error, timeout or non-zero exit is not
+retried, and a veto on `post_migrate` is ignored. Every delivery of one completion
+carries the same `ctx.delivery_id` (`BMAD_LOOP_DELIVERY_ID` for a declarative hook),
+and a later re-migration gets a new one. A handler with non-idempotent side effects
+should deduplicate on that id. Stages without an id leave `ctx.delivery_id` as `None`
+and do not set the variable. A migration whose ledger holds no legacy entries completes
+without a session and fires neither `pre_migrate_session` nor `post_migrate`.
 
 ---
 

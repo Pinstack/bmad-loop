@@ -53,6 +53,7 @@ from .model import (
     PAUSE_STORY_CHECKPOINT,
     Phase,
     StoryTask,
+    result_mapping,
 )
 from .runs import graceful_stop_requested
 
@@ -124,10 +125,14 @@ class StoriesEngine(Engine):
         return stories.relativize_spec_folder(self.paths.project, spec_folder)
 
     def _stories_folder(self) -> Path:
-        """The spec folder resolved against the current workspace root (project
-        root at pick time, the unit worktree during a driven story)."""
+        """The spec folder resolved against the current workspace's PROJECT (the
+        project at pick time, the unit's mount project during a driven story).
+
+        The folder is stored project-relative (:meth:`_relativize`), so it joins on
+        ``workspace.paths.project`` — not ``workspace.root``, the code root, which a
+        ``repo_root:`` override moves away from the project (DW-379)."""
         rel = Path(self._spec_folder_rel)
-        return rel if rel.is_absolute() else self.workspace.root / rel
+        return rel if rel.is_absolute() else self.workspace.paths.project / rel
 
     def _load_stories(self) -> stories.Stories:
         return stories.load_stories(self._stories_folder())
@@ -224,6 +229,27 @@ class StoriesEngine(Engine):
                 self.journal.append("stories-escalation-unresolved", story_key=key)
                 gates.notify(self.policy, self.run_dir, f"unresolved escalation: {key}", reason)
                 raise RunPaused(reason, PAUSE_ESCALATION, key)
+
+    def _run_end_retrospective(self) -> None:
+        """Inert: stories mode has no epics (every ``_StoryRef.epic`` is the 0
+        sentinel), so there is no finished epic to run a retrospective for — the
+        run-end twin of the epic boundary that never fires here (DW-488)."""
+
+    def _unresolved_escalation_key(self) -> str | None:
+        """Only an in-run escalation (``attempt > 0``) blocks ``finished``. A
+        pick-time wedge / unknown-selector task (``attempt == 0``) is re-classified
+        from disk every pick (see ``_repause_inrun_escalation``), so reaching run end
+        means the human fixed it by hand; its stale ESCALATED record must not
+        re-pause the run, whose only way past would be a re-arm that re-drives the
+        fixed story."""
+        return next(
+            (
+                k
+                for k, t in self.state.tasks.items()
+                if t.phase == Phase.ESCALATED and t.attempt > 0
+            ),
+            None,
+        )
 
     def _pause_unknown_selector(self, selector: str) -> None:
         """The ``--story`` selector resolves to no manifest entry: pause for
@@ -364,8 +390,10 @@ class StoriesEngine(Engine):
         if label is not None:
             return {}
         # Let the dev/review adapter resolve the story spec deterministically by
-        # id (skip the mtime scan). Project-relative — the adapter rebases it
-        # against spec.cwd, so it is correct in place and under worktree isolation.
+        # id (skip the mtime scan). Project-relative — the adapter anchors it on the
+        # project's place in spec.cwd (`mountpaths.rebased_project`, the offset a
+        # nested `repo_root:` adds, DW-379), matching `_stories_folder`, so it is
+        # correct in place and under worktree isolation.
         env = {"BMAD_LOOP_SPEC_FOLDER": self._spec_folder_rel}
         # On a plan-halt leg tell the adapter to synthesize the ready-for-dev spec
         # as a *successful* terminal (plan done), not died-mid-flight. Keyed off the
@@ -387,6 +415,8 @@ class StoriesEngine(Engine):
               (the primitive is disk-resolved — see ``Engine._dev_skill``)
             + (plan-halt leg) `` Halt after planning.``
             + (when ``invoke_dev_with`` non-empty) a newline then its verbatim text.
+            + (on a retry with verified parked work) a blank line then
+              ``recovery_flow.retry_preserve_paragraph`` (#777).
 
         The folder is always project-relative (kills the absolute-path concern;
         the contract allows an absolute one but we never emit it). ``invoke_dev_with``
@@ -414,6 +444,11 @@ class StoriesEngine(Engine):
             prompt += " Halt after planning."
         if entry is not None and entry.invoke_dev_with:
             prompt += "\n" + entry.invoke_dev_with
+        # A retry after a rolled-back attempt names its verified parked work (#777),
+        # after the planner's verbatim text so that channel stays untouched.
+        preserved = self._retry_preserve_notice(task)
+        if preserved:
+            prompt += "\n\n" + preserved
         return prompt
 
     def _entry_for(self, task: StoryTask) -> stories.StoryEntry | None:
@@ -455,7 +490,7 @@ class StoriesEngine(Engine):
 
     def _harvest_spec_path(self, task: StoryTask, result_json: dict | None) -> Path | None:
         """Resolve the same id-keyed story spec that verification will accept."""
-        if not (result_json or {}).get("spec_file"):
+        if not result_mapping(result_json).get("spec_file"):
             return None
         state = stories.resolve_story_spec(self._stories_folder(), task.story_key)
         return state.path if state.kind == stories.KIND_PRESENT else None
@@ -506,7 +541,7 @@ class StoriesEngine(Engine):
         # The adapter marks a plan-halt leg's synthesized result `plan_halt`; latch
         # it onto the task so _drive_story pauses for plan review (and clears it on
         # the leg-2 re-drive), and switch verify to the ready-for-dev plan gate.
-        plan_halt = bool((result_json or {}).get("plan_halt"))
+        plan_halt = bool(result_mapping(result_json).get("plan_halt"))
         task.plan_checkpoint_pending = plan_halt
         # Read-back detection: the just-run dev session HALTed pre-planning and left
         # a fixed-slug sentinel. Journal it (with its recorded blocking condition)
@@ -556,7 +591,7 @@ class StoriesEngine(Engine):
         # A plan-halt leg produced only the plan (spec at ready-for-dev); there is
         # no implementation yet, so skip the project build/test gate — it would
         # fail on a half-built tree before the human ever sees the plan.
-        return not bool((result_json or {}).get("plan_halt"))
+        return not bool(result_mapping(result_json).get("plan_halt"))
 
     def _verify_review(self, task: StoryTask):
         # Drop the sprint-status gate (stories mode has no board); the id-keyed

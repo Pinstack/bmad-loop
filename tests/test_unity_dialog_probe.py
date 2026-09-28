@@ -100,6 +100,61 @@ def test_report_notify_gating(tmp_path, monkeypatch):
     assert called == []  # notify disabled → JSONL/ATTENTION only, no desktop popup
 
 
+def test_report_shapes_an_untrusted_title_like_gates_notify(tmp_path, monkeypatch):
+    """DW-418: the X11 window title is untrusted. ATTENTION gets exactly ONE line with
+    the title shaped by ``gates.notice_line`` (control bytes escaped, line breaks
+    folded), notify-send gets the same shaped text after ``--`` (as
+    ``gates._notifier_argv`` builds it), and the JSONL keeps the raw title.
+
+    Ablation: write the raw ``message`` in ``_report`` and a forged ``fake line``
+    record lands in ATTENTION; drop ``--`` and the argv assertion reddens."""
+    mod = _load_probe()
+    calls = []
+    monkeypatch.setattr(mod.shutil, "which", lambda _c: "/usr/bin/notify-send")
+    monkeypatch.setattr(mod.subprocess, "run", lambda argv, **k: calls.append(argv))
+    raw = "Save?\x1b[31m\nfake line"
+    mod._report(tmp_path, "7", raw, notify=True)
+
+    shaped = "window 7: Save?\\x1b[31m ⏎ fake line"
+    attention = (tmp_path / mod.ATTENTION_FILE).read_text(encoding="utf-8")
+    assert attention.count("\n") == 1 and attention.endswith("\n")
+    assert attention.startswith("[")
+    assert attention.rstrip("\n").endswith(f"] Unity modal dialog detected: {shaped}")
+    assert "\x1b" not in attention
+    assert calls == [
+        ["notify-send", "--app-name=bmad-loop", "--", "Unity modal dialog detected", shaped]
+    ]
+    rec = json.loads((tmp_path / mod.PROBE_JSONL).read_text(encoding="utf-8"))
+    assert rec["title"] == raw  # the full-detail record stays raw
+
+
+def test_report_passes_a_dash_title_after_the_option_terminator(tmp_path, monkeypatch):
+    """The notify-send argv carries ``--`` before the summary/body, mirroring
+    ``gates._notifier_argv`` (DW-418). Defense-in-depth: the body always starts with
+    ``window <id>: `` today, so even a ``-``-leading title is not an option.
+
+    Ablation: drop ``--`` from the argv and this reddens."""
+    mod = _load_probe()
+    calls = []
+    monkeypatch.setattr(mod.shutil, "which", lambda _c: "/usr/bin/notify-send")
+    monkeypatch.setattr(mod.subprocess, "run", lambda argv, **k: calls.append(argv))
+    mod._report(tmp_path, "8", "--help save changes before", notify=True)
+    (argv,) = calls
+    assert argv[:3] == ["notify-send", "--app-name=bmad-loop", "--"]
+    assert argv[3:] == ["Unity modal dialog detected", "window 8: --help save changes before"]
+
+
+def test_report_survives_a_lone_surrogate_title(tmp_path, monkeypatch):
+    """A lone surrogate in the title is escaped visibly, so the ATTENTION write
+    cannot raise ``UnicodeEncodeError`` (DW-419's shaping, shared via
+    ``gates.notice_line``)."""
+    mod = _load_probe()
+    monkeypatch.setattr(mod.shutil, "which", lambda _c: None)
+    mod._report(tmp_path, "9", "bad \udcff do you want to save", notify=True)
+    attention = (tmp_path / mod.ATTENTION_FILE).read_text(encoding="utf-8")
+    assert "window 9: bad \\udcff do you want to save" in attention
+
+
 def test_scan_once_dedupes_repeat_detections(tmp_path):
     mod = _load_probe()
     run = _make_run({"222": "save changes before closing"})

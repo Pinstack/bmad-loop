@@ -6,7 +6,10 @@ exclusively through hook-written event files (Stop/SessionEnd) plus the
 presence of the skill-written result.json — the pane log's *contents* never
 drive the wait loop (only tee'd for human debugging), though its *growth*
 (mtime/size, never the bytes — see ``_log_activity_key``) is read as a liveness
-signal to re-arm the dev-stall grace window. The one exception is post-mortem:
+signal to re-arm the dev-stall grace window and, on a separate timeline, as the
+#727 no-work verdict (``SessionResult.produced_work`` — see ``_work_verdict``);
+the live transcript's growth is likewise stat'ed, never parsed, for the #680
+idle notice (``_sample_transcript_idle``). The one exception is post-mortem:
 after the verdict and reconcile have settled, a single tail read of the log
 classifies a transport-failure environment fault (#194, see
 ``_classify_env_fault``) — it labels the result, it never drives the wait loop.
@@ -22,19 +25,26 @@ fallback.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import enum
 import hashlib
 import json
 import shlex
+import stat
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
+
+import regex
 
 from .. import devcontract, gates, runs
 from ..bmadconfig import ProjectPaths
 from ..journal import LOGS_DIR, TASK_CYCLE_ARTIFACTS
 from ..model import TokenUsage
+from ..mountpaths import rebased_project
 from ..policy import Policy
 from ..process_host import ProcessHostError, get_process_host
 from ..signals import SignalWatcher
@@ -69,9 +79,9 @@ from .env_fault import ENV_FAULT_EVIDENCE_MAX as ENV_FAULT_EVIDENCE_MAX
 from .env_fault import ENV_FAULT_MATCH_TIMEOUT_S as ENV_FAULT_MATCH_TIMEOUT_S
 from .env_fault import ENV_FAULT_STATUSES as ENV_FAULT_STATUSES
 from .env_fault import ENV_FAULT_TAIL_BYTES as ENV_FAULT_TAIL_BYTES
-from .env_fault import EnvFaultMixin
+from .env_fault import EnvFaultMixin, _excerpt
 from .multiplexer import MultiplexerError, TerminalMultiplexer, get_multiplexer
-from .profile import CLIProfile
+from .profile import PARKED_EVENTS, CLIProfile
 
 if TYPE_CHECKING:
     from ..process_host import ProcessHost
@@ -126,10 +136,64 @@ class _SnapVerdict(enum.Enum):
     REFUSE = "refuse"
 
 
+@dataclass
+class _IdleTracker:
+    """Per-session state of the #680 transcript idle detector, owned by one
+    `wait_for_completion` call and advanced by `_sample_transcript_idle` on the
+    heartbeat cadence.
+
+    `last_key` is the transcript's (mtime_ns, size) as of the last successful
+    sample; None means no sample yet, and it is the ONLY "have we sampled"
+    sentinel — the two `last_change_*` clocks read as 0.0 until then and are never
+    consulted before it is set. `idle_s` is the latest measured age (what
+    `heartbeat.json` reports), None until the first sample. `open_since` is the
+    wall time the currently open idle stretch began — the `since_ts` its
+    `session-idle` carried — or None between stretches: the latch that makes the
+    pair one-per-stretch."""
+
+    # The transcript path the samples below belong to. A later hook event that
+    # names a DIFFERENT path rebaselines the tracker (`_sample_transcript_idle`):
+    # a key measured on one file says nothing about another.
+    path: str | None = None
+    last_key: tuple[int, int] | None = None
+    last_change_mono: float = 0.0
+    last_change_wall: float = 0.0
+    idle_s: float | None = None
+    open_since: float | None = None
+    # A close event whose best-effort journal write failed. Retry it on later
+    # samples so the TUI does not keep showing an idle session as stuck.
+    pending_active_s: float | None = None
+    # A sample ran while the named transcript could not be stat'ed (not yet
+    # created). The next successful sample is a change from absence, not a
+    # pre-existing file's baseline.
+    seen_absent: bool = False
+
+
 # min spacing between heartbeat.json overwrites in wait_for_completion; the
 # heartbeat's staleness is what makes a frozen orchestrator (#157) diagnosable.
 HEARTBEAT_INTERVAL_S = 30.0
-EVENT_KINDS = {"SessionStart", "Stop", "SessionEnd"}
+# Startup-frame window for the #727 no-work verdict: pane-log growth detected on a
+# tick later than this many seconds after the wait loop started counts as work;
+# growth inside it is the CLI painting its first frame — a banner, a menu, a
+# permission dialog — which a parked session does exactly once and a working one
+# streams past for minutes. Seconds, because a launch paint lands in seconds, and
+# an order of magnitude under the 600 s default `dev_stall_grace_s`, so a working
+# session has the whole grace to prove itself past the window. A CLI slower than
+# this to paint at all retries as it does today (its first frame reads as work).
+# Not a policy knob: the value separates two regimes an order of magnitude apart,
+# so its exact position is not load-bearing.
+FIRST_FRAME_S = 30.0
+# `Notification` and the parked kinds (DW-348) never complete a session: the wait
+# loop only LATCHES them, and the one place the latch acts is the stall-grace
+# expiry, where it withholds the wake nudge and ends the session parked (see
+# `_parked_hook_evidence`). With claude's `idle_prompt` mapped, that is the usual
+# end of a result-less turn: the wake nudge is replaced by a pause.
+EVENT_KINDS = {"SessionStart", "Stop", "SessionEnd", "Notification"} | set(PARKED_EVENTS)
+# Wall-clock bound on EACH `parked_prompt_patterns` search over a captured pane
+# line (DW-350) — the `regex` module's per-search timeout, the env-fault
+# classifier's doctrine (`env_fault.ENV_FAULT_MATCH_TIMEOUT_S`). A pattern that
+# blows it declines the match, so the nudge goes out exactly as it would have.
+PARKED_PROMPT_MATCH_TIMEOUT_S = 2.0
 NUDGE_TEXT = (
     "You are running in bmad-loop automation mode. Finish the workflow now: "
     "complete any remaining steps and write the result JSON file to "
@@ -196,6 +260,43 @@ RESULT_FILE_ARTIFACTS: tuple[str, ...] = (
 )
 
 
+def _result_path(tasks_dir: Path, task_id: str) -> Path:
+    """Where THIS task's result.json lives under an adapter's ``tasks_dir``."""
+    return tasks_dir / task_id / "result.json"
+
+
+def load_result_document(tasks_dir: Path, task_id: str) -> dict | None:
+    """Read one task's skill-written result document exactly as the completion
+    read-back does: ``None`` when no regular file is there; ``OSError``,
+    ``ValueError`` (unparseable JSON, a non-object top level, an unencodable
+    string) or ``RecursionError`` for a present document the read-back refuses.
+    `_ResultFileMixin._read_result` folds every raise into ``None``; the sweep
+    session-failure diagnostic (#752) keeps "missing" and "malformed" apart."""
+    path = _result_path(tasks_dir, task_id)
+    # `stat()` + `S_ISREG`, not `is_file()` (the DW-224 shape): 3.14's `is_file()`
+    # swallows a metadata fault as False, which would report a refused document
+    # as absent; 3.11-3.13 raise. Only absence and a non-directory component are
+    # ``None`` on every runtime — any other fault raises as a present refusal.
+    try:
+        mode = path.stat().st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    if not stat.S_ISREG(mode):
+        return None
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"result.json is not a JSON object: {type(data).__name__}")
+    # Plugin HookContext makes this same defensive copy before exposing
+    # result data, so reject a shape that would recurse there while the
+    # artifact is still inside the shared observation boundary.
+    copy.deepcopy(data)
+    # JSON accepts escaped lone surrogates, but the default ATTENTION
+    # sink writes reasons as UTF-8. Validate every parsed string without
+    # imposing stricter numeric semantics on completed session results.
+    json.dumps(data, ensure_ascii=False).encode("utf-8")
+    return data
+
+
 class _ResultFileMixin:
     """Result-file read-back and verdict finalization: acquire the
     skill-written result dict and fold it into the session's final
@@ -255,8 +356,19 @@ class _ResultFileMixin:
         skill-written ``result.json`` (briefly awaiting it on the Stop event,
         reading once otherwise). Subclasses whose skill writes no result.json
         (GenericDevAdapter) override this to synthesize the dict from another
-        on-disk artifact."""
-        return self._await_result(handle.task_id) if wait else self._read_result(handle.task_id)
+        on-disk artifact.
+
+        A present document the read-back refuses still reads as None — the
+        verdict is unchanged — but not silently (DW-451): ``wait=True`` names it
+        in the grace-expiry resultless-stop record (see `_await_result`), and this
+        one-shot read, reached only from `_final`, leaves a
+        ``result-json-refused`` crumb (``error``)."""
+        if wait:
+            return self._await_result(handle.task_id)
+        result, refusal = self._probe_result(handle.task_id)
+        if refusal is not None:
+            self._note_lifecycle(handle.task_id, "result-json-refused", error=refusal)
+        return result
 
     def _produced_work(self, handle: SessionHandle, stop_seen: bool) -> bool:
         """Whether this session shows ANY evidence it actually ran, for the #261
@@ -291,14 +403,138 @@ class _ResultFileMixin:
         tees a pane log."""
         return None
 
-    def _session_vanished(self) -> bool:
+    def _work_verdict(self, handle: SessionHandle, stop_seen: bool, activity_seen: bool) -> bool:
+        """`SessionResult.produced_work` for a non-completed exit (#727): did this
+        session do anything at all before it ended?
+
+        Three ways to answer True, ORed like `_produced_work`'s halves and for the
+        same reasons: a `Stop` arrived (a turn ended — the hook half, immune to a
+        misbound pane sink); there is no pane log to read (`_log_evidence` is None —
+        opencode-http, unit fixtures — and unknown never blocks); or the wait loop
+        saw activity (`activity_seen`): the pane log changed on a tick later than
+        `FIRST_FRAME_S` after it started and before the first stall wake nudge (the
+        timeline half), OR a pre-nudge transcript change carried a model-side
+        record, OR pre-nudge usage reported model spend. These last two signals
+        survive a misbound pane sink; setup-only and post-nudge writes do not
+        supply proof.
+
+        The timeline half is what separates this from `_produced_work`, and why the
+        #261 gate is reused for its tristate only, not its verdict: that gate's
+        256-byte floor was calibrated for wedged windows that logged 0 and 2 bytes,
+        and a permission dialog rendered once is ~2 KB — it clears the floor, so the
+        floor alone files a parked CLI as one that worked. The question the operator
+        asks is "did the pane ever change after its first frame?", and only the loop
+        that watched it tick by tick can answer. Growth after the first stall wake
+        nudge attempt is excluded by construction (the caller never flips
+        `activity_seen` once a stall nudge was attempted, delivered or not — a
+        raising send may still have pasted its text, DW-449): the nudge's `send-keys … Enter`
+        confirms a dialog's default and the pane grows with the echo and the exit
+        text, which is the loop's own keystrokes, not work — a session that
+        genuinely woke proves it with a `Stop`, the doctrine the nudge-budget refill
+        already follows. Only `STALL_NUDGE_TEXT` counts as that nudge; the budget
+        wrap-up nudge (`BUDGET_NUDGE_TEXT`) and the #276 contract nudge do not
+        close the window, and are out of this verdict's scope."""
+        if stop_seen or activity_seen:
+            return True
+        return self._log_evidence(handle) is None
+
+    @staticmethod
+    def _transcript_has_assistant_activity(transcript_path: str, since_size: int) -> bool:
+        """A model-side JSONL record written after a sampled baseline.
+
+        The idle detector remains stat-only. Reading content here is solely for
+        the no-work verdict. A line crossing the old EOF is included so a torn
+        line completed by the latest append can still prove work. Gemini's
+        `$set.messages` snapshots can replay older messages, so a model message
+        with an ID only proves work when it is new or changed. Copilot's metrics
+        only prove work when output or reasoning tokens are positive; input
+        tokens alone can be a submitted prompt. Codex token counts are cumulative,
+        so only an increase in output tokens proves new work.
+
+        A read fault is NOT folded into "no activity" here (DW-455): the
+        ``OSError`` propagates, because this staticmethod cannot crumb and the
+        caller has already moved the growth baseline past the bytes it could not
+        read. The wait loop's ``sample_transcript`` treats it as no evidence —
+        the verdict it would have reached — and crumbs the streak.
+        """
+        seen_messages: dict[str, dict] = {}
+        codex_output_seen = 0
+        # Hook paths are external observations. A FIFO can be stat'ed but opening
+        # it for a JSONL scan would block the deterministic wait loop indefinitely.
+        if not Path(transcript_path).is_file():
+            return False
+        with Path(transcript_path).open("rb") as stream:
+            while line := stream.readline():
+                after_baseline = stream.tell() > since_size
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                messages = [entry]
+                set_patch = entry.get("$set")
+                if isinstance(set_patch, dict):
+                    snapshot = set_patch.get("messages")
+                    if isinstance(snapshot, list):
+                        messages.extend(
+                            message for message in snapshot if isinstance(message, dict)
+                        )
+                for message in messages:
+                    if message.get("type") not in ("assistant", "gemini") and message.get(
+                        "role"
+                    ) not in ("assistant", "model"):
+                        continue
+                    message_id = message.get("id")
+                    if isinstance(message_id, str):
+                        previous = seen_messages.get(message_id)
+                        seen_messages[message_id] = message
+                        if after_baseline and message != previous:
+                            return True
+                    elif after_baseline:
+                        return True
+                payload = entry.get("payload")
+                if (
+                    after_baseline
+                    and isinstance(payload, dict)
+                    and payload.get("type") == "agent_message"
+                ):
+                    return True
+                if isinstance(payload, dict) and payload.get("type") == "token_count":
+                    info = payload.get("info")
+                    if isinstance(info, dict):
+                        totals = info.get("total_token_usage")
+                        usage = totals if isinstance(totals, dict) else info
+                        output = usage.get("output_tokens")
+                        if type(output) is int:
+                            if after_baseline and output > codex_output_seen:
+                                return True
+                            codex_output_seen = max(codex_output_seen, output)
+                if after_baseline:
+                    data = entry.get("data")
+                    metrics = data.get("modelMetrics") if isinstance(data, dict) else None
+                    if isinstance(metrics, dict):
+                        for model in metrics.values():
+                            usage = model.get("usage") if isinstance(model, dict) else None
+                            if isinstance(usage, dict) and any(
+                                type(usage.get(key)) is int and usage[key] > 0
+                                for key in ("outputTokens", "reasoningTokens")
+                            ):
+                                return True
+        return False
+
+    def _session_vanished(self, task_id: str) -> bool:
         """Whether the whole multiplexer session is gone, asked only once a
         crash verdict has already been reached (#489). Base: False — an adapter
         with no session to lose (opencode-http) never vanishes. Overridden by
         `GenericAdapter`.
 
         Same failure convention as `_window_alive`: `MultiplexerError` is the
-        seam's declared "couldn't ask" and the override swallows it to False.
+        seam's declared "couldn't ask" and the override degrades it to False —
+        visibly, with a ``session-probe-failed`` crumb under ``task_id``
+        (DW-382), so "not vanished" and "could not ask" stay distinguishable.
+        A negative ``has_session`` that the override cannot confirm as a proved-
+        gone session degrades the same way (DW-459): True means proved gone.
         Anything else propagates, exactly as it does from the liveness probe —
         this is a label on a verdict already made, so it degrades rather than
         second-guessing the verdict, but it does not swallow unknown faults."""
@@ -315,6 +551,7 @@ class _ResultFileMixin:
         accept_result: bool = True,
         budget_weighted: int | None = None,
         stop_seen: bool = False,
+        produced_work: bool = True,
     ) -> SessionResult:
         """Session is gone or done responding: completed if the result file
         landed anyway, otherwise the fallback status. ``accept_result=False``
@@ -323,7 +560,11 @@ class _ResultFileMixin:
         ``budget_weighted`` (a tripped session-budget guard's sample) rides
         every exit so the engine can journal it whatever the verdict.
         ``stop_seen`` is the proof-of-work hook signal, threaded separately from
-        ``session_id``/``transcript`` because those are also set by a mere launch."""
+        ``session_id``/``transcript`` because those are also set by a mere launch.
+        ``produced_work`` is the wait loop's `_work_verdict` (#727), stamped on
+        every NON-completed result; a read-back upgrade to ``completed`` resets it
+        to True, because the flag is scoped to non-completed exits and a
+        ``completed`` session-end must not carry a no-work stamp."""
         result_json = self._result_json(handle, spec, wait=False) if accept_result else None
         if (
             result_json is not None
@@ -353,7 +594,7 @@ class _ResultFileMixin:
         # its own exit rather than the window dying — the label stays truthful
         # there because it reports what the mux answered, not how the window
         # ended.
-        vanished = status == "crashed" and self._session_vanished()
+        vanished = status == "crashed" and self._session_vanished(handle.task_id)
         if vanished:
             # Evidence rides along like every neighbouring crumb: which session
             # went missing (several runs share a host) and what verdict it lands.
@@ -376,10 +617,11 @@ class _ResultFileMixin:
             budget_weighted=budget_weighted,
             stop_seen=stop_seen,
             session_vanished=vanished,
+            produced_work=True if status == "completed" else produced_work,
         )
 
     def _result_path(self, task_id: str) -> Path:
-        return self.tasks_dir / task_id / "result.json"
+        return _result_path(self.tasks_dir, task_id)
 
     def _append_diag_jsonl(self, task_id: str, filename: str, payload: dict) -> None:
         """Append ``payload`` as one JSON line to ``tasks/<task_id>/<filename>``.
@@ -422,6 +664,15 @@ class _ResultFileMixin:
             {"ts": time.time_ns(), "event": event, **fields},
         )
 
+    def _note_nudge_send_failed(self, handle: SessionHandle, nudge: str, e: Exception) -> None:
+        """Crumb a nudge whose send raised (DW-449): ``nudge`` names which one
+        (``stall``/``budget``/``stop``/``contract``), ``error`` the fault in the
+        ``session-probe-failed`` shape. The caller's verdict path is unchanged —
+        this only keeps an undelivered nudge from reading as a delivered one."""
+        self._note_lifecycle(
+            handle.task_id, "nudge-send-failed", nudge=nudge, error=f"{type(e).__name__}: {e}"
+        )
+
     def _write_heartbeat(self, task_id: str, payload: dict) -> None:
         """Best-effort overwrite of ``tasks/<task_id>/heartbeat.json``: the wait
         loop's proof-of-life. A heartbeat much staler than HEARTBEAT_INTERVAL_S
@@ -434,36 +685,38 @@ class _ResultFileMixin:
         except OSError:
             pass
 
-    def _read_result(self, task_id: str) -> dict | None:
-        path = self._result_path(task_id)
+    def _probe_result(self, task_id: str) -> tuple[dict | None, str | None]:
+        """`load_result_document` with its refusal kept apart from absence: the
+        document (or None when absent) and None, or None and the refusal as
+        ``"<ExcType>: <message>"`` for a present document the read-back refuses."""
         try:
-            if not path.is_file():
-                return None
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                return None
-            # Plugin HookContext makes this same defensive copy before exposing
-            # result data, so reject a shape that would recurse there while the
-            # artifact is still inside the shared observation boundary.
-            copy.deepcopy(data)
-            # JSON accepts escaped lone surrogates, but the default ATTENTION
-            # sink writes reasons as UTF-8. Validate every parsed string without
-            # imposing stricter numeric semantics on completed session results.
-            json.dumps(data, ensure_ascii=False).encode("utf-8")
-        except (OSError, ValueError, RecursionError):
-            return None
-        return data
+            return load_result_document(self.tasks_dir, task_id), None
+        except (OSError, ValueError, RecursionError) as e:
+            return None, f"{type(e).__name__}: {e}"
+
+    def _read_result(self, task_id: str) -> dict | None:
+        """The result dict, or None for absent AND refused alike. The silent
+        primitive: callers that must tell the two apart use `_probe_result`."""
+        return self._probe_result(task_id)[0]
 
     def _await_result(self, task_id: str, grace_s: float = RESULT_GRACE_S) -> dict | None:
         deadline = time.monotonic() + grace_s
         while True:
-            result = self._read_result(task_id)
+            result, refusal = self._probe_result(task_id)
             if result is not None:
                 return result
             if time.monotonic() >= deadline:
-                self._note_resultless_stop(
-                    task_id, "no-result-json", f"no readable {self._result_path(task_id)}"
-                )
+                # One record per give-up, never one per poll. It reflects the
+                # final poll (DW-451): a present-but-refused document is
+                # `malformed-result-json` with the refusal, so it no longer reads
+                # as a document that was never written.
+                path = self._result_path(task_id)
+                if refusal is not None:
+                    self._note_resultless_stop(
+                        task_id, "malformed-result-json", f"{path}: {refusal}"
+                    )
+                else:
+                    self._note_resultless_stop(task_id, "no-result-json", f"no readable {path}")
                 return None
             time.sleep(RESULT_POLL_S)
 
@@ -508,6 +761,13 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # keeps the fail-fast behavior; the dev adapter raises it so a session
         # that ended its turn awaiting a background process isn't mis-stalled.
         self._stall_grace_s = 0.0
+        # Threshold for the #680 transcript-idle notice, in seconds: the policy's
+        # `dev_stall_grace_s` read directly, NOT `_stall_grace_s`, because the base
+        # adapter leaves that at 0 (no stall detection for triage / plugin-workflow
+        # / non-synthesizing sessions) while the idle notice is observation only
+        # and belongs to every pane-driven session the same. Same knob, no new
+        # policy field; 0 disables the notice along with the stall timer.
+        self._idle_threshold_s = float(policy.limits.dev_stall_grace_s)
         # Wake-nudges to spend on grace expiry before stalling. 0 here is moot for
         # the base adapter (grace 0 never opens the window); the dev adapter sets
         # it from policy so an idle wait is re-invoked rather than killed outright.
@@ -532,6 +792,12 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         self.logs_dir = run_dir / LOGS_DIR
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
+        # task_id -> launched_ns of the session whose `log-evidence-failed` crumb
+        # is already written (DW-450): one exit can consult `_log_evidence` up to
+        # three times (the #727 verdict, `_final`'s #261 gate, the post-kill
+        # rescue), and a fault must read as one record, not three. Keyed by
+        # launch, not task id alone, because a re-armed run reuses task ids.
+        self._log_evidence_faulted: dict[str, int] = {}
 
     # --------------------------------------------------------- multiplexer
 
@@ -549,8 +815,13 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         extra = self.extra_args
         if extra is None:
             extra = self.profile.bypass_args
+        binary = self.binary
+        if self.profile.hooks.dialect == "codex-hooks-json":
+            from ..codex_trust import resolved_codex_binary
+
+            binary = resolved_codex_binary(binary, self.profile.env) or binary
         argv = [
-            self.binary,
+            binary,
             *self.profile.launch_args,
             self.profile.render_prompt(spec.prompt),
             *extra,
@@ -664,25 +935,52 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # fresh Stop — proof it woke and acted — restores the budget; only an
         # unresponsive session burns through it. Bounded overall by spec.timeout_s.
         stall_nudges_left = self._stall_nudges
-        # monotonic total of stall nudges sent this session — never restored,
-        # unlike stall_nudges_left. When spec.stall_nudges_cap is set (the
-        # engine sets it for every session it drives), a session that keeps
-        # ending its turn without a result cannot ride the fresh-Stop refill
-        # forever: after cap total nudges it is declared stalled. cap=None
-        # (raw constructor default) skips the check.
+        # monotonic total of stall nudges DELIVERED this session — never
+        # restored, unlike stall_nudges_left. A send that raised is counted
+        # apart in stall_nudges_failed (DW-449), so heartbeat.json never reports
+        # an undelivered nudge as sent. Both counters feed the ATTEMPT total the
+        # cap check and the #727 pre-nudge activity window read: a raise may
+        # follow a delivered paste (`send_text` pastes and presses Enter in
+        # separate calls), so a failed attempt closes the window exactly as a
+        # delivered one does — its echo must never be credited as work. When
+        # spec.stall_nudges_cap is set (the engine sets it for every session it
+        # drives), a session that keeps ending its turn without a result cannot
+        # ride the fresh-Stop refill forever: after cap total ATTEMPTS it is
+        # declared stalled, so a transport that always fails still hits the cap.
+        # cap=None (raw constructor default) skips the check.
         stall_nudges_sent = 0
+        stall_nudges_failed = 0
         # latched on the first accepted `Stop`: the hook half of the #261 proof-of-work
         # gate. Tracked apart from session_id/transcript_path — those are populated by
         # SessionStart and SessionEnd too, which a CLI that launched and wedged emits
         # without doing any work. Rides out on every exit (see SessionResult.stop_seen)
         # so `_post_kill_reconcile` reads the same signal after run() kills the window.
         stop_seen = False
-        # internal observability counter: counts ticks where the liveness probe
-        # raised a transport error (e.g. a 30s tmux hang). It deliberately does
-        # NOT escalate to "crashed" — a transient transport hiccup is not proof
-        # of death; spec.timeout_s already bounds a persistent failure to a
-        # timeout.
+        # Parked-session latch (DW-348): the evidence string of the latest hook
+        # event saying the CLI is waiting on a human (a permission/idle/quota
+        # prompt), or None. Set by a parked kind — directly, or a `Notification`
+        # whose subtype the profile maps — and cleared by a `Stop`, since a turn
+        # that ended proves the prompt was answered. It completes nothing and
+        # re-arms nothing: it is consulted only where the grace expiry would type
+        # the stall wake nudge, which it withholds (the nudge's Enter can answer
+        # the prompt, #727), ending the session `stalled` + `parked`.
+        parked_evidence: str | None = None
+        # the running streak of no-event ticks whose liveness probe raised a
+        # transport error (e.g. a 30s tmux hang); reset by the next clean probe.
+        # It deliberately does NOT escalate to "crashed" — a transient transport
+        # hiccup is not proof of death; spec.timeout_s already bounds a
+        # persistent failure to a timeout. Surfaced (DW-447): heartbeat.json
+        # carries the live streak, `timeout-fired` the final one, and the streak's
+        # transitions are crumbed — `liveness-probe-failed` at its first failure,
+        # `liveness-probe-recovered` (with its length) at the first clean probe —
+        # never once per failed tick, so a persistent hang cannot flood the file.
         probe_failures = 0
+        # the running streak of budget usage samples whose transcript read raised
+        # (DW-452) — the probe_failures model for the usage read: the guard skips
+        # the tick, heartbeat.json carries the count (as of the previous sample —
+        # sampling follows the heartbeat write), and only the streak's transitions
+        # are crumbed (`usage-sample-failed` / `usage-sample-recovered`).
+        usage_failures = 0
         # monotonic ts of the last heartbeat.json overwrite; None = not yet
         # written, so the first tick always stamps one.
         last_heartbeat: float | None = None
@@ -697,8 +995,115 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         budget_weighted: int | None = None
         budget_deadline: float | None = None
         budget_wall_deadline: float | None = None
+        # No-work verdict (#727), the timeline half of `_work_verdict`. `frame_key`
+        # is the pane log's (mtime_ns, size) as of the last tick, sampled once at
+        # the top of EVERY tick — a sibling of `last_activity`, never the same
+        # variable: that one drives the stall re-arm and is re-baselined on Stop
+        # and nudge, which is exactly the accounting this must not share. It flips
+        # `activity_seen` when the key changes on a tick later than FIRST_FRAME_S
+        # after the loop started and before the first stall wake nudge attempt
+        # (delivered or not, DW-449); growth after it is the loop's own
+        # keystrokes echoing (see
+        # `_work_verdict`). Latched: once seen, the session worked.
+        loop_started = time.monotonic()
+        frame_key = self._log_activity_key(handle.task_id)
+        activity_seen = False
+
+        def sample_frame() -> None:
+            # One pane-frame sample: flip `activity_seen` on growth that lands later
+            # than FIRST_FRAME_S after the loop started and before the first stall
+            # wake nudge. Called at the top of every tick and again by
+            # `produced_work()` right before each exit verdict, because output that
+            # arrives during `watcher.wait_for` and is followed by window death or a
+            # `SessionEnd` in the same iteration would otherwise be judged on the
+            # previous tick's key. The post-nudge exclusion holds on the re-sample
+            # too: the attempt total is already > 0 on every tick after the nudge
+            # attempt, delivered or not (DW-449).
+            nonlocal frame_key, activity_seen
+            tick_key = self._log_activity_key(handle.task_id)
+            if tick_key is not None and tick_key != frame_key:
+                if (
+                    not activity_seen
+                    and stall_nudges_sent + stall_nudges_failed == 0
+                    and time.monotonic() - loop_started > FIRST_FRAME_S
+                ):
+                    activity_seen = True
+                frame_key = tick_key
+
+        # Idle detection (#680): the live transcript's (mtime_ns, size), sampled on
+        # the heartbeat cadence from the first tick that knows `transcript_path`
+        # — see `_sample_transcript_idle`. Observes only: nothing here nudges,
+        # stalls or kills (#680 item 2 stays open), and `stall_deadline` is
+        # neither consulted nor touched.
+        idle = _IdleTracker()
+
+        # A transcript can grow for an initial user prompt or the loop's own
+        # wake nudge, neither of which proves model work. Latch model-side
+        # evidence only while the pre-nudge window remains open.
+        transcript_work_seen = False
+        usage_seen = False
+        # The running streak of transcript activity scans that raised (DW-455).
+        # A raising scan is no evidence — what the old in-scan fold returned —
+        # but the baseline has already moved past the bytes it could not read,
+        # so the streak is crumbed at its transitions, as probe_failures is:
+        # `transcript-scan-failed` at failure 1, `transcript-scan-recovered` at
+        # the next clean scan.
+        scan_failures = 0
+
+        def sample_transcript(path: str, now: float) -> None:
+            nonlocal transcript_work_seen, scan_failures
+            same_path = idle.path == path
+            prior_key = idle.last_key if same_path else None
+            was_absent = idle.seen_absent if same_path else False
+            self._sample_transcript_idle(handle.task_id, path, idle, now)
+            current_key = idle.last_key
+            # A same-size rewrite or truncation does not append a new record.
+            # Scanning from byte zero in that case would credit an old assistant
+            # record as fresh work merely because mtime changed.
+            grew = current_key is not None and (
+                (prior_key is not None and current_key[1] > prior_key[1])
+                or (prior_key is None and was_absent and current_key[1] > 0)
+            )
+            if grew and stall_nudges_sent + stall_nudges_failed == 0 and not transcript_work_seen:
+                start = prior_key[1] if prior_key is not None else 0
+                try:
+                    transcript_work_seen = self._transcript_has_assistant_activity(path, start)
+                except OSError as e:
+                    scan_failures += 1
+                    if scan_failures == 1:
+                        self._note_lifecycle(
+                            handle.task_id,
+                            "transcript-scan-failed",
+                            error=f"{type(e).__name__}: {e}",
+                        )
+                    return
+                if scan_failures:
+                    self._note_lifecycle(
+                        handle.task_id, "transcript-scan-recovered", failures=scan_failures
+                    )
+                scan_failures = 0
+
+        def produced_work() -> bool:
+            # Read at call time, after a final frame sample, so every exit below
+            # reports the loop's final view of the pane rather than the last tick's.
+            sample_frame()
+            if transcript_path:
+                # Same for the transcript: a write inside the final heartbeat
+                # interval has not been sampled yet. A full sample, not a bare
+                # compare, so an idle stretch that ended in that interval is closed
+                # with its `session-active` before `session-end` lands, and the
+                # #727 transcript evidence check sees the write.
+                sample_transcript(transcript_path, time.monotonic())
+            return self._work_verdict(
+                handle, stop_seen, activity_seen or transcript_work_seen or usage_seen
+            )
 
         while True:
+            # Top-of-tick pane-frame sample for the no-work verdict (#727). Before
+            # the timeout check so growth on the final tick still counts; before the
+            # nudge arm so a tick that both sees growth and sends a nudge scores the
+            # growth (the nudge cannot have caused what preceded it).
+            sample_frame()
             remaining = deadline - time.monotonic()
             wall_expired = time.time() >= wall_deadline
             if remaining <= 0 or wall_expired:
@@ -716,6 +1121,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     expired_clock=expired,
                     timeout_s=spec.timeout_s,
                     mono_remaining_s=round(remaining, 3),
+                    # nonzero = the deadline landed while liveness was unknown
+                    probe_failures=probe_failures,
                 )
                 return SessionResult(
                     status="timeout",
@@ -725,6 +1132,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     timeout_expired_clock=expired,
                     budget_weighted=budget_weighted,
                     stop_seen=stop_seen,
+                    produced_work=produced_work(),
                 )
             # Hard-stop poll (#319), per-iteration and deliberately NOT inside
             # the heartbeat throttle below: the loop's own wait is capped at 5s
@@ -746,10 +1154,16 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     transcript_path=transcript_path,
                     budget_weighted=budget_weighted,
                     stop_seen=stop_seen,
+                    produced_work=produced_work(),
                 )
             now = time.monotonic()
             if last_heartbeat is None or now - last_heartbeat >= HEARTBEAT_INTERVAL_S:
                 last_heartbeat = now
+                # Transcript idle sample (#680), ahead of the heartbeat write so
+                # the payload carries this tick's age. Inert until a hook event
+                # has named the transcript.
+                if transcript_path:
+                    sample_transcript(transcript_path, now)
                 self._write_heartbeat(
                     handle.task_id,
                     {
@@ -757,6 +1171,15 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         "remaining_s": round(remaining, 3),
                         "stall_armed": stall_deadline is not None,
                         "stall_nudges_sent": stall_nudges_sent,
+                        # stall nudges whose send raised (DW-449)
+                        "stall_nudges_failed": stall_nudges_failed,
+                        # seconds since the live transcript last changed (#680);
+                        # null until a hook event has named the transcript.
+                        "transcript_idle_s": idle.idle_s,
+                        # the running liveness-probe failure streak (DW-447)
+                        "probe_failures": probe_failures,
+                        # the running budget usage-sample failure streak (DW-452)
+                        "usage_sample_failures": usage_failures,
                     },
                 )
                 # Mid-session spec-status transition sampling (#276 M2) rides the
@@ -772,7 +1195,29 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     and spec.token_budget_mode in ("warn", "enforce")
                     and transcript_path
                 ):
-                    weighted = self._sample_weighted_usage(transcript_path, spec)
+                    weighted, usage_fault = self._sample_weighted_usage(transcript_path, spec)
+                    # A raising read is still "no sample" this tick; its streak is
+                    # crumbed at the transitions only (DW-452), like the liveness
+                    # probe's — one torn mid-append read is a failed/recovered pair,
+                    # a persistent fault one open streak the heartbeat counts.
+                    if usage_fault is not None:
+                        usage_failures += 1
+                        if usage_failures == 1:
+                            self._note_lifecycle(
+                                handle.task_id, "usage-sample-failed", error=usage_fault
+                            )
+                    else:
+                        if usage_failures:
+                            self._note_lifecycle(
+                                handle.task_id, "usage-sample-recovered", failures=usage_failures
+                            )
+                        usage_failures = 0
+                    if (
+                        weighted is not None
+                        and weighted > 0
+                        and stall_nudges_sent + stall_nudges_failed == 0
+                    ):
+                        usage_seen = True
                     if weighted is not None and weighted > spec.token_budget:
                         budget_tripped = True
                         budget_weighted = weighted
@@ -805,20 +1250,21 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                                 # zero grace = terminate at trip, no nudge — but
                                 # window death still wins (artifact honored via
                                 # the crash path), exactly like grace expiry; a
-                                # transport error is not proof of death.
-                                try:
-                                    if not self._window_alive(handle):
-                                        return self._final(
-                                            handle,
-                                            spec,
-                                            "crashed",
-                                            session_id,
-                                            transcript_path,
-                                            budget_weighted=weighted,
-                                            stop_seen=stop_seen,
-                                        )
-                                except MultiplexerError:
-                                    pass
+                                # transport error is not proof of death, and
+                                # the crumb records the verdict was reached
+                                # with liveness unknown (DW-454).
+                                alive = self._probe_liveness(handle, "over-budget")
+                                if alive is False:
+                                    return self._final(
+                                        handle,
+                                        spec,
+                                        "crashed",
+                                        session_id,
+                                        transcript_path,
+                                        budget_weighted=weighted,
+                                        stop_seen=stop_seen,
+                                        produced_work=produced_work(),
+                                    )
                                 self._note_lifecycle(
                                     handle.task_id,
                                     "over-budget-fired",
@@ -826,6 +1272,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                                     budget=spec.token_budget,
                                     grace_s=spec.token_budget_grace_s,
                                     zero_grace=True,
+                                    liveness_unknown=alive is None,
                                 )
                                 return SessionResult(
                                     status="over_budget",
@@ -833,14 +1280,16 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                                     transcript_path=transcript_path,
                                     budget_weighted=weighted,
                                     stop_seen=stop_seen,
+                                    produced_work=produced_work(),
                                 )
                             try:
                                 self.send_text(handle, BUDGET_NUDGE_TEXT)
-                            except MultiplexerError:
+                            except MultiplexerError as e:
                                 # a dead/hung window can't take the nudge; the
                                 # grace still arms — the next tick's liveness
-                                # probe scores a dead window crashed.
-                                pass
+                                # probe scores a dead window crashed. The
+                                # undelivered nudge leaves a crumb (DW-449).
+                                self._note_nudge_send_failed(handle, "budget", e)
                             budget_deadline = time.monotonic() + spec.token_budget_grace_s
                             budget_wall_deadline = time.time() + spec.token_budget_grace_s
             if budget_deadline is not None and (
@@ -854,20 +1303,19 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # over_budget WITHOUT reading the result file — an artifact
                 # under a live window is never trusted (#48/#53). A transport
                 # error is not proof of death, so it falls through to the
-                # over_budget verdict.
-                try:
-                    if not self._window_alive(handle):
-                        return self._final(
-                            handle,
-                            spec,
-                            "crashed",
-                            session_id,
-                            transcript_path,
-                            budget_weighted=budget_weighted,
-                            stop_seen=stop_seen,
-                        )
-                except MultiplexerError:
-                    pass
+                # over_budget verdict, flagged `liveness_unknown` (DW-454).
+                alive = self._probe_liveness(handle, "over-budget")
+                if alive is False:
+                    return self._final(
+                        handle,
+                        spec,
+                        "crashed",
+                        session_id,
+                        transcript_path,
+                        budget_weighted=budget_weighted,
+                        stop_seen=stop_seen,
+                        produced_work=produced_work(),
+                    )
                 self._note_lifecycle(
                     handle.task_id,
                     "over-budget-fired",
@@ -875,6 +1323,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     budget=spec.token_budget,
                     grace_s=spec.token_budget_grace_s,
                     zero_grace=False,
+                    liveness_unknown=alive is None,
                 )
                 return SessionResult(
                     status="over_budget",
@@ -882,6 +1331,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     transcript_path=transcript_path,
                     budget_weighted=budget_weighted,
                     stop_seen=stop_seen,
+                    produced_work=produced_work(),
                 )
             event = self.watcher.wait_for(
                 handle.task_id,
@@ -909,18 +1359,31 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     transcript_path=transcript_path,
                     budget_weighted=budget_weighted,
                     stop_seen=stop_seen,
+                    produced_work=produced_work(),
                 )
             if event is None:
                 try:
                     alive = self._window_alive(handle)
-                except MultiplexerError:
+                except MultiplexerError as e:
                     # transport hiccup (e.g. a 30s tmux hang), not proof of
                     # death: never roll back a possibly-working session. Skip the
                     # crash check this tick; hook events still complete it, and
                     # spec.timeout_s bounds a persistent transport failure to an
-                    # honest "timeout".
+                    # honest "timeout". Crumbed on the streak's first failure
+                    # only (DW-447) — the heartbeat carries the running count.
                     probe_failures += 1
+                    if probe_failures == 1:
+                        self._note_lifecycle(
+                            handle.task_id,
+                            "liveness-probe-failed",
+                            site="tick",
+                            error=f"{type(e).__name__}: {e}",
+                        )
                     continue
+                if probe_failures:
+                    self._note_lifecycle(
+                        handle.task_id, "liveness-probe-recovered", failures=probe_failures
+                    )
                 probe_failures = 0
                 if not alive:
                     # died without a SessionEnd hook (killed, crashed hard)
@@ -932,6 +1395,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         transcript_path,
                         budget_weighted=budget_weighted,
                         stop_seen=stop_seen,
+                        produced_work=produced_work(),
                     )
                 if stall_deadline is not None:
                     # No artifact shortcut here: the window is alive on this tick
@@ -952,23 +1416,48 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         stall_deadline = time.monotonic() + self._stall_grace_s
                         continue
                 if stall_deadline is not None and time.monotonic() >= stall_deadline:
-                    if stall_nudges_left > 0 and (
-                        spec.stall_nudges_cap is None or stall_nudges_sent < spec.stall_nudges_cap
-                    ):
+                    # The cap bounds ATTEMPTS, delivered or not (DW-449).
+                    nudge_due = stall_nudges_left > 0 and (
+                        spec.stall_nudges_cap is None
+                        or stall_nudges_sent + stall_nudges_failed < spec.stall_nudges_cap
+                    )
+                    # Parked gate (DW-348/DW-350), the one decision point: a CLI
+                    # waiting on a human must not be typed at, because the nudge's
+                    # trailing Enter can ANSWER its prompt (#727). The hook latch
+                    # first; failing that, one look at the visible screen — on
+                    # EVERY expiry, not only a nudging one, so the final stall
+                    # (nudges spent, or none configured) is labelled parked too
+                    # and pauses instead of retrying (DW-433). Either way no
+                    # nudge is typed and the session ends through the tail below.
+                    parked_now = parked_evidence
+                    if parked_now is None:
+                        parked_now = self._pane_parked_evidence(handle)
+                    if parked_now is not None:
+                        self._note_lifecycle(
+                            handle.task_id,
+                            "stall-nudge-withheld",
+                            evidence=parked_now,
+                            nudge_due=nudge_due,
+                        )
+                    elif nudge_due:
                         # The wake nudge IS the re-invocation bmad-loop otherwise
                         # lacks: prod the idle session and re-arm. Budget is
                         # restored only by a fresh Stop (a real turn-end), so the
                         # nudge's own echoed keystrokes can't be mistaken for the
                         # agent waking; an unresponsive session keeps draining it.
                         stall_nudges_left -= 1
-                        stall_nudges_sent += 1
                         try:
                             self.send_text(handle, STALL_NUDGE_TEXT)
-                        except MultiplexerError:
+                        except MultiplexerError as e:
                             # A dead/hung window cannot take the nudge. The
-                            # bounded attempt is still spent, and the next tick's
-                            # ordinary liveness probe owns the verdict.
-                            pass
+                            # bounded attempt is still spent (the cap counts
+                            # it), and the next tick's ordinary liveness probe
+                            # owns the verdict — but it is not counted as sent
+                            # and it leaves a crumb (DW-449).
+                            stall_nudges_failed += 1
+                            self._note_nudge_send_failed(handle, "stall", e)
+                        else:
+                            stall_nudges_sent += 1
                         stall_deadline = time.monotonic() + self._stall_grace_s
                         last_activity = self._log_activity_key(handle.task_id)
                         continue
@@ -980,24 +1469,24 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     # instead of a stall that discards a just-flushed result. A
                     # transport error is not proof of death (as at the top of the
                     # tick); fall through to the stall — spec.timeout_s bounds a
-                    # persistent failure.
-                    try:
-                        if not self._window_alive(handle):
-                            return self._final(
-                                handle,
-                                spec,
-                                "crashed",
-                                session_id,
-                                transcript_path,
-                                budget_weighted=budget_weighted,
-                                stop_seen=stop_seen,
-                            )
-                    except MultiplexerError:
-                        pass
+                    # persistent failure. A dead window is never labelled parked:
+                    # nothing is waiting on a human once the CLI is gone. The
+                    # probe fault is crumbed (`site="stall"`, DW-454).
+                    if self._probe_liveness(handle, "stall") is False:
+                        return self._final(
+                            handle,
+                            spec,
+                            "crashed",
+                            session_id,
+                            transcript_path,
+                            budget_weighted=budget_weighted,
+                            stop_seen=stop_seen,
+                            produced_work=produced_work(),
+                        )
                     # Still alive: an artifact on disk cannot upgrade the stall to
                     # completed — it may be stale or mid-write; only a Stop or
                     # window death vouches for it.
-                    return self._final(
+                    stalled = self._final(
                         handle,
                         spec,
                         "stalled",
@@ -1006,7 +1495,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         accept_result=False,
                         budget_weighted=budget_weighted,
                         stop_seen=stop_seen,
+                        produced_work=produced_work(),
                     )
+                    if parked_now is not None:
+                        return dataclasses.replace(stalled, parked=True, parked_evidence=parked_now)
+                    return stalled
                 continue
             # Bind task attribution only from the launched session's first
             # identified SessionStart. Once bound, reject a differently
@@ -1076,11 +1569,36 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # real transcript is preserved for usage tallying.
                 continue
             session_id = event.session_id or session_id
+            if event.transcript_path and event.transcript_path != transcript_path:
+                # Take the idle baseline as soon as a hook names a new transcript,
+                # including a later re-point (#680). A write before the next
+                # heartbeat is then a change for the #727 work check rather than
+                # being absorbed into the baseline at exit.
+                sample_transcript(event.transcript_path, time.monotonic())
             transcript_path = event.transcript_path or transcript_path
 
             if event.event == "SessionStart":
                 continue
+            if event.event == "Notification" or event.event in PARKED_EVENTS:
+                # Parked-session signal (DW-348): latch it, never act on it here.
+                # The stall-grace expiry is the one decision point, so the grace
+                # keeps its timing (pane growth still re-arms it). What changes
+                # is the expiry: claude sends `idle_prompt` ~60 s after every
+                # finished turn, so a result-less Stop followed by idle silence
+                # re-latches and the session ends PARKED (a pause) instead of
+                # receiving the stall wake nudge — the intended DW-348 decision.
+                # A project overlay that drops `idle_prompt` from
+                # `[hooks.notification_types]` restores the nudge. An unmapped
+                # Notification subtype is ignored.
+                evidence = self._parked_hook_evidence(event.event, event.notification_type)
+                if evidence is not None:
+                    parked_evidence = evidence
+                    self._note_lifecycle(handle.task_id, "parked-signal", evidence=evidence)
+                continue
             if event.event == "Stop":
+                # A completed turn proves any prompt the CLI was parked on got
+                # answered: drop the parked latch before anything else (DW-348).
+                parked_evidence = None
                 # A turn ENDED — the one canonical event that proves the CLI did
                 # something, and so the hook half of the #261 proof-of-work gate.
                 # Latched after the subagent filter above, which rejects a stop that
@@ -1088,6 +1606,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 stop_seen = True
                 result_json = self._result_json(handle, spec, wait=True)
                 if result_json is not None:
+                    if transcript_path:
+                        # The one exit that does not go through `produced_work()`:
+                        # sample once more so an idle stretch that ended inside the
+                        # final interval is closed before `session-end` (#680).
+                        sample_transcript(transcript_path, time.monotonic())
                     return SessionResult(
                         status="completed",
                         result_json=result_json,
@@ -1100,10 +1623,10 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     nudges_left -= 1
                     try:
                         self.send_text(handle, NUDGE_TEXT)
-                    except MultiplexerError:
+                    except MultiplexerError as e:
                         # The next deterministic liveness probe decides whether
                         # the un-nudgeable window is dead or merely unavailable.
-                        pass
+                        self._note_nudge_send_failed(handle, "stop", e)
                     continue
                 if self._stall_grace_s <= 0:
                     return self._final(
@@ -1114,6 +1637,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         transcript_path,
                         budget_weighted=budget_weighted,
                         stop_seen=stop_seen,
+                        produced_work=produced_work(),
                     )
                 # A result-less Stop, but the session may have ended its turn to
                 # await a background process (a Unity PlayMode run, a slow test)
@@ -1137,6 +1661,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     transcript_path,
                     budget_weighted=budget_weighted,
                     stop_seen=stop_seen,
+                    produced_work=produced_work(),
                 )
 
     def _log_evidence(self, handle: SessionHandle) -> bool | None:
@@ -1154,10 +1679,22 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         on arrival reports False (rendered nothing) rather than None (no such signal):
         the DOA case is the gate's whole purpose and must not read as unknown. What
         is left in the None state is a handle this adapter never launched — unit
-        fixtures — for which "unknown never blocks" is the right and only answer."""
+        fixtures — for which "unknown never blocks" is the right and only answer.
+
+        Any other stat fault also returns None — the verdict is unchanged — but it
+        opens the gate on a log this adapter created, so it is not silent (DW-450):
+        a ``log-evidence-failed`` crumb (``error``), once per session however many
+        verdict sites ask."""
         try:
             size = (self.logs_dir / f"{handle.task_id}.log").stat().st_size
-        except OSError:
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            if self._log_evidence_faulted.get(handle.task_id) != handle.launched_ns:
+                self._log_evidence_faulted[handle.task_id] = handle.launched_ns
+                self._note_lifecycle(
+                    handle.task_id, "log-evidence-failed", error=f"{type(e).__name__}: {e}"
+                )
             return None
         return size > PROOF_OF_WORK_MIN_LOG_BYTES
 
@@ -1172,10 +1709,204 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             return None
         return (st.st_mtime_ns, st.st_size)
 
+    @staticmethod
+    def _transcript_activity_key(transcript_path: str) -> tuple[int, int] | None:
+        """Activity signature of the live transcript the hooks named: (mtime_ns,
+        size), or None when it cannot be stat'ed this tick (not yet created, torn
+        by a rename, unreadable). The stat-only sibling of `_log_activity_key` for
+        the #680 idle detector: the transcript is what the CLI appends to when it
+        is actually doing something — a tool result, a model turn — where the pane
+        log also grows for a spinner repaint. Deliberately never parsed:
+        `_sample_weighted_usage` yields no sample for `usage_parser = "none"`, and idle
+        detection has to work for that profile too. None is "no sample", never
+        "idle" — the caller skips the tick."""
+        try:
+            st = Path(transcript_path).stat()
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
+
+    def _sample_transcript_idle(
+        self, task_id: str, transcript_path: str, idle: _IdleTracker, now: float
+    ) -> None:
+        """One heartbeat-cadence sample of the #680 idle detector: advance `idle`
+        from the transcript's current stat key and journal the stretch boundaries.
+
+        A None key (not yet created, torn by a rename, unreadable) skips the tick
+        and leaves the stretch as it was — `_sample_weighted_usage`'s tolerance,
+        for a stat — but remembers that the named path was absent, so the file's
+        later appearance is a change, not the baseline. A key that moved closes any open stretch with one
+        `session-active` carrying the stretch's full length; a key that has not
+        moved for `_idle_threshold_s` opens one with one `session-idle` (`idle_s`,
+        `since_ts`, `threshold_s`), latched until the key moves again. The
+        threshold is `limits.dev_stall_grace_s` on purpose — read from policy, so
+        the plain adapter (triage, plugin workflows) honours it although it arms
+        no stall timer: on a dev/review session the event fires exactly when the
+        session WOULD have stalled had its pane not kept repainting, so the two
+        records are directly comparable, and `0` disables both. No journal
+        attached (`resolve.run_session`, `probe`, fixtures) means no events; the
+        age is still measured for `heartbeat.json`. Every write is best-effort —
+        an unwritable journal must not end a session that is, by this very
+        evidence, alive."""
+
+        def flush_active() -> None:
+            if idle.pending_active_s is None or self.journal is None:
+                return
+            try:
+                self.journal.append("session-active", task_id=task_id, idle_s=idle.pending_active_s)
+            except OSError:
+                return
+            idle.pending_active_s = None
+
+        if idle.path != transcript_path:
+            # A different transcript than the one sampled so far (a hook event
+            # re-pointed it): start over on this file — its first key is a
+            # baseline, not a change. An open stretch belonged to the old file
+            # and is closed here, since nothing else can close it: the TUI would
+            # otherwise read the old `session-idle` for as long as the new file
+            # keeps moving. Any earlier work verdict remains latched by the caller.
+            if idle.open_since is not None:
+                idle.pending_active_s = round(now - idle.last_change_mono, 3)
+            idle.path = transcript_path
+            idle.last_key = None
+            idle.idle_s = None
+            idle.open_since = None
+            idle.seen_absent = False
+        key = self._transcript_activity_key(transcript_path)
+        flush_active()
+        if key is None:
+            if idle.last_key is None:
+                idle.seen_absent = True
+            return
+        if key != idle.last_key:
+            if idle.open_since is not None:
+                idle.pending_active_s = round(now - idle.last_change_mono, 3)
+                flush_active()
+            idle.open_since = None
+            idle.last_key = key
+            idle.last_change_mono = now
+            idle.last_change_wall = time.time()
+        idle.idle_s = round(now - idle.last_change_mono, 3)
+        if (
+            idle.open_since is None
+            and idle.pending_active_s is None
+            and self.journal is not None
+            and self._idle_threshold_s > 0
+            and idle.idle_s >= self._idle_threshold_s
+        ):
+            try:
+                self.journal.append(
+                    "session-idle",
+                    task_id=task_id,
+                    idle_s=idle.idle_s,
+                    since_ts=idle.last_change_wall,
+                    threshold_s=self._idle_threshold_s,
+                )
+            except OSError:
+                pass
+            else:
+                idle.open_since = idle.last_change_wall
+
     def _window_alive(self, handle: SessionHandle) -> bool:
         return handle.native_id in self.mux.list_window_ids(self.session_name)
 
-    def _session_vanished(self) -> bool:
+    def _probe_liveness(self, handle: SessionHandle, site: str) -> bool | None:
+        """`_window_alive` for a one-shot verdict site (DW-454): True/False as
+        answered, or None when the probe raised ``MultiplexerError`` — after a
+        ``liveness-probe-failed`` crumb (``site``, ``error``) records that the
+        verdict about to be reached was reached with liveness unknown. Callers
+        treat None as "not dead", exactly as before. The wait loop's per-tick
+        probe stays inline: it crumbs streak transitions, not every fault."""
+        try:
+            return self._window_alive(handle)
+        except MultiplexerError as e:
+            self._note_lifecycle(
+                handle.task_id,
+                "liveness-probe-failed",
+                site=site,
+                error=f"{type(e).__name__}: {e}",
+            )
+            return None
+
+    def _parked_hook_evidence(self, kind: str, notification_type: str | None) -> str | None:
+        """The parked-signal evidence a hook event carries, or None (DW-348).
+
+        A canonical parked kind (a profile mapped its CLI's native event straight
+        to one) is its own evidence. The ``Notification`` carrier is parked only
+        when the profile's ``hooks.notification_types`` maps its forwarded
+        subtype — anything else (``auth_success``, a missing or non-string
+        subtype, an older relay that forwards none) is not a wait on a human."""
+        if kind in PARKED_EVENTS:
+            return kind
+        if kind != "Notification" or notification_type is None:
+            return None
+        mapped = self.profile.hooks.notification_types.get(notification_type)
+        if mapped is None:
+            return None
+        return f"Notification({notification_type}) -> {mapped}"
+
+    @cached_property
+    def _parked_prompt_patterns(self) -> tuple[regex.Pattern[str], ...]:
+        """``profile.parked_prompt_patterns``, compiled once per adapter on first
+        use. The profile validated each with this same engine at parse time, so
+        compiling cannot raise here. Same caching CONSTRAINT as
+        ``EnvFaultMixin._env_fault_patterns``: swap ``self.profile`` before the
+        first stall-expiry, or assign this attribute directly."""
+        return tuple(regex.compile(p) for p in self.profile.parked_prompt_patterns)
+
+    def _pane_parked_evidence(self, handle: SessionHandle) -> str | None:
+        """Whether the VISIBLE pane shows a prompt only a human should answer
+        (DW-350): the evidence (pattern plus quoted line) of the first
+        ``parked_prompt_patterns`` match, else None.
+
+        Read only at a stall-grace expiry with no hook latch — whether a wake
+        nudge is due or the stall is final (DW-433). Observation that
+        degrades: no patterns, a backend that cannot capture (the seam default
+        raises ``MultiplexerError``; a duck-typed backend may lack the method),
+        a capture fault, or a search that blows ``PARKED_PROMPT_MATCH_TIMEOUT_S``
+        all read as "no match": a due nudge goes out, or the final stall ends
+        unparked, exactly as before. The two faults are not silent (DW-448): a
+        ``parked-probe-failed`` crumb (``reason`` = ``capture-failed`` or
+        ``match-timeout`` + its ``pattern``; ``error``) records that the look
+        at the pane failed. No patterns and a backend without ``capture_pane``
+        are configuration, not faults, and stay silent."""
+        patterns = self._parked_prompt_patterns
+        if not patterns:
+            return None
+        capture = getattr(self.mux, "capture_pane", None)
+        if capture is None:
+            return None
+        try:
+            screen = capture(handle.native_id)
+        except MultiplexerError as e:
+            self._note_lifecycle(
+                handle.task_id,
+                "parked-probe-failed",
+                reason="capture-failed",
+                error=f"{type(e).__name__}: {e}",
+            )
+            return None
+        if not isinstance(screen, str):
+            return None
+        text = _ANSI_RE.sub("", screen.replace("\r", "\n"))
+        for line in text.split("\n"):
+            for pat in patterns:
+                try:
+                    hit = pat.search(line, timeout=PARKED_PROMPT_MATCH_TIMEOUT_S)
+                except TimeoutError as e:
+                    self._note_lifecycle(
+                        handle.task_id,
+                        "parked-probe-failed",
+                        reason="match-timeout",
+                        pattern=pat.pattern,
+                        error=f"{type(e).__name__}: {e}",
+                    )
+                    return None
+                if hit is not None:
+                    return f"pane matched {pat.pattern!r}: {_excerpt(line, hit.start())}"
+        return None
+
+    def _session_vanished(self, task_id: str) -> bool:
         # The disambiguating probe (#489): `list_window_ids` returns [] for a
         # dead window AND for a session that no longer exists, so a plain
         # window-death verdict cannot tell an exited CLI from a session destroyed
@@ -1192,11 +1923,38 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # Safe to ask this late: `run()`'s teardown kills the WINDOW, never the
         # session, so our own kill cannot fake a vanishing, and a session once
         # gone stays gone.
+        #
+        # has_session's False is weak by contract (#489): every non-zero exit maps
+        # to it, including psmux's "Invalid session key" and "connection timed
+        # out", which a LIVE session answers (DW-459). So a False is only a lead,
+        # confirmed through list_window_ids, whose [] is a positive claim (the
+        # session was listed empty or proved gone — for the tmux family, a stderr
+        # in _SESSION_GONE_STDERR) and which raises when the listing proves
+        # nothing. A raise or a listing that still finds windows is "not proved
+        # gone": crumbed as a probe failure, never as a vanishing.
         try:
-            return not self.mux.has_session(self.session_name)
-        except MultiplexerError:
-            # Unknown is not vanished — the same rule the liveness probe follows.
+            if self.mux.has_session(self.session_name):
+                return False
+            windows = self.mux.list_window_ids(self.session_name)
+        except MultiplexerError as e:
+            # Unknown is not vanished — the same rule the liveness probe follows —
+            # but the degrade leaves a crumb (DW-382): without it a mux that could
+            # not answer reads exactly like a session that answered "still here".
+            self._note_session_probe_failed(task_id, f"{type(e).__name__}: {e}")
             return False
+        if windows:
+            self._note_session_probe_failed(
+                task_id,
+                f"has_session denied the session but list_window_ids listed "
+                f"{len(windows)} window(s)",
+            )
+            return False
+        return True
+
+    def _note_session_probe_failed(self, task_id: str, error: str) -> None:
+        self._note_lifecycle(
+            task_id, "session-probe-failed", session=self.session_name, error=error
+        )
 
     def send_text(self, handle: SessionHandle, text: str) -> None:
         self.mux.send_text(handle.native_id, text)
@@ -1244,11 +2002,16 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # verifies it landed and chases the harvested tree.
         self.mux.kill_window(handle.native_id)
         deadline = time.monotonic() + grace
+        # Whether the LAST poll raised (DW-454): that poll's "not dead" reading is
+        # what sends the kill to escalation, so `kill-escalated` records it.
+        liveness_unknown = False
         while True:
             try:
                 dead = not self._window_alive(handle)
+                liveness_unknown = False
             except MultiplexerError:
                 dead = False  # transport hiccup — liveness unknown this tick, keep polling
+                liveness_unknown = True
             if dead:
                 # Window died within grace (the normal case): reap any harvested
                 # straggler that outlived the pane pgid, sharing this deadline.
@@ -1266,7 +2029,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # pid would pass — the ProcessHost contract forbids force-killing it, exactly
         # like the clean-path reap below. Then re-strike the window.
         repane = self.mux.window_pane_pids(handle.native_id)
-        self._note_lifecycle(handle.task_id, "kill-escalated", pids=repane)
+        self._note_lifecycle(
+            handle.task_id, "kill-escalated", pids=repane, liveness_unknown=liveness_unknown
+        )
         for pid in repane:
             try:
                 host.force_kill(pid)
@@ -1344,21 +2109,29 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             handle.task_id, "kill-outcome", reaped=True, forced=forced, unreaped=unreaped
         )
 
-    def _sample_weighted_usage(self, transcript_path: str, spec: SessionSpec) -> int | None:
-        """Cumulative weighted spend of the live session's transcript, or None
-        when the guard must stay inert this tick (parser "none", nothing
-        tallied yet, an unreadable file). Sampling must never break the wait
-        loop — the liveness-probe tolerance model, for the usage read. The
-        transcript is a LIVE file being appended mid-turn: a flush boundary
-        can split a multibyte UTF-8 character, so the torn read raises
-        UnicodeDecodeError (a ValueError) — as tolerated as an OSError."""
+    def _sample_weighted_usage(
+        self, transcript_path: str, spec: SessionSpec
+    ) -> tuple[int | None, str | None]:
+        """``(weighted, fault)``: the cumulative weighted spend of the live
+        session's transcript, or None when the guard must stay inert this tick
+        (parser "none", nothing tallied yet, an unreadable file); ``fault`` is
+        ``"<ExcType>: <message>"`` when the read raised, else None. Sampling must
+        never break the wait loop — the liveness-probe tolerance model, for the
+        usage read. The transcript is a LIVE file being appended mid-turn: a
+        flush boundary can split a multibyte UTF-8 character, so the torn read
+        raises UnicodeDecodeError (a ValueError) — as tolerated as an OSError.
+
+        A fault still reads as "no sample" (the budget block skips the tick), but
+        it is returned apart from a clean None (DW-452) so the wait loop can crumb
+        the streak: a persistent one leaves `token_budget_mode = "enforce"` off
+        for the rest of the session, which must not look like a quiet transcript."""
         try:
             usage = tally_usage(self.profile.usage_parser, Path(transcript_path))
-        except (OSError, ValueError):
-            return None
+        except (OSError, ValueError) as e:
+            return None, f"{type(e).__name__}: {e}"
         if usage is None:
-            return None
-        return usage.weighted_total(spec.cache_read_weight)
+            return None, None
+        return usage.weighted_total(spec.cache_read_weight), None
 
     def read_usage(self, result: SessionResult) -> TokenUsage | None:
         if not result.transcript_path:
@@ -1376,10 +2149,18 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             time.sleep(RESULT_POLL_S)
 
 
-class _SessionStarter(Protocol):
-    """Next concrete adapter in the dev mixin's cooperative MRO."""
+class _SessionHost(Protocol):
+    """Next concrete adapter in the dev mixin's cooperative MRO.
+
+    The mixin dispatches two lifecycle methods through it: ``start_session``
+    (to take the launch snapshot before the transport starts) and ``run`` (to
+    bound that snapshot's retention to the session's lifetime). Both hosts —
+    GenericDevAdapter and OpencodeDevAdapter — inherit ``run`` from
+    ``CodingCLIAdapter``, so this is the base implementation in both MROs."""
 
     def start_session(self, spec: SessionSpec) -> SessionHandle: ...
+
+    def run(self, spec: SessionSpec) -> SessionResult: ...
 
 
 class _DevSynthesisMixin(_ResultFileMixin):
@@ -1388,7 +2169,11 @@ class _DevSynthesisMixin(_ResultFileMixin):
     skill contract). Locates the terminal spec the skill leaves on disk and
     synthesizes the legacy result dict via :mod:`devcontract`. Hosts provide
     ``self.paths`` (a :class:`ProjectPaths`), the ``self.policy`` knobs read
-    by ``_configure_dev_knobs``, and the ``_probe_alive`` liveness seam."""
+    by ``_configure_dev_knobs``, and the ``_probe_alive`` liveness seam. It also
+    owns the session-scoped lifetime of every per-task store it creates: its
+    ``run()`` override calls ``_evict_task_state`` once the lifecycle ends, which
+    drops the task's entries from all of them (DW-96, DW-107). Hosts that own a
+    per-task store the mixin cannot reach override that seam and delegate up."""
 
     # Set by the concrete adapter's __init__ (see docstring); bare annotations
     # (no runtime effect) tell the type checker the host attributes this reads.
@@ -1424,17 +2209,22 @@ class _DevSynthesisMixin(_ResultFileMixin):
         # Missing-marker fingerprint observations (#224):
         # task_id -> (path, mtime_ns, frontmatter status, observation count).
         # Task ids are unique per session, so entries never need resetting
-        # between sessions; the dict lives for the adapter's lifetime.
+        # between sessions; the entry is never cleared *within* the session
+        # (except the in-flight stale-fingerprint clear in `_frontmatter_fallback`,
+        # which deliberately restarts the count) and is evicted at the end of the
+        # session by `run()`'s `finally` (see `_evict_task_state`).
         self._fm_fallback_obs: dict[str, tuple[str, int, str, int]] = {}
         # First mid-session spec-status transition observed per session (#276 M2):
         # task_id -> normalized status. Recorded by `_observe_tick` when the spec's
         # frontmatter first moves off its launch status to a non-terminal state (in
         # practice `in-review`), which makes a later terminal frontmatter proof THIS
         # session wrote it. Same lifetime doctrine as `_fm_fallback_obs` — task_ids
-        # are unique per session, so entries are recorded once and never cleared.
+        # are unique per session, so an entry is recorded once and never cleared
+        # *within* the session, then evicted by `run()`'s `finally`.
         self._fm_transition_obs: dict[str, str] = {}
         # Targeted contract-nudge budget (#276 M4): task_ids that have already been
-        # sent the one CONTRACT_NUDGE_TEXT nudge. A set, never cleared, so the nudge
+        # sent the one CONTRACT_NUDGE_TEXT nudge. A set, never cleared *within* the
+        # session (eviction is `run()`'s `finally`, past every reader), so the nudge
         # fires at most once per session even though an mtime bump resets the
         # `_fm_fallback_obs` observation counter to 1 (#149's refill hazard cannot
         # apply — this budget is not a counter and touches no stall counters).
@@ -1447,6 +2237,13 @@ class _DevSynthesisMixin(_ResultFileMixin):
         # incomplete; a path-level None means that one launch file was unreadable.
         # Both fail closed at the affected scope without letting an unrelated bad
         # Markdown file suppress a newly created, readable story spec.
+        #
+        # The heaviest of the four stores, and the reason the eviction seam exists:
+        # an unpinned launch captures one entry per `*.md` in the artifacts dir, so
+        # retaining a snapshot per session would grow O(sessions x files) for the
+        # adapter's lifetime (DW-96) where the three stores above grow O(sessions).
+        # All four are evicted the same way, by `_evict_task_state` from `run()`'s
+        # `finally`; the bound is in-flight scope, not a cap or an LRU.
         self._launch_auto_run_results: dict[str, dict[str, tuple[int, str] | None] | None] = {}
 
     @staticmethod
@@ -1496,13 +2293,59 @@ class _DevSynthesisMixin(_ResultFileMixin):
         # cooperative MRO dispatch rather than naming either host explicitly;
         # the protocol gives Pyright the host contract without adding a runtime
         # base that could alter method resolution.
-        return cast(_SessionStarter, super()).start_session(spec)
+        return cast(_SessionHost, super()).start_session(spec)
+
+    def run(self, spec: SessionSpec) -> SessionResult:
+        try:
+            return cast(_SessionHost, super()).run(spec)
+        finally:
+            self._evict_task_state(spec.task_id)
+
+    def _evict_task_state(self, task_id: str) -> None:
+        """Retention bound for the four per-task stores named below (DW-96,
+        DW-106, DW-107). One documented eviction site rather than a pop scattered
+        per store; hosts owning a store this mixin cannot reach (OpencodeDev-
+        Adapter's `_server_procs`) override this and delegate up.
+
+        NOT every per-session store on every host: `OpencodeHttpAdapter._usage`
+        deliberately stays out. It is keyed by `session_id` rather than
+        `task_id`, and `read_usage(result)` is called by the engine AFTER `run()`
+        returns — so evicting it here would not just be out of scope, it would
+        zero token accounting for every session. It is instead bounded by a
+        capacity cap at its own write site (`USAGE_STASH_CAP`, DW-117), which
+        needs no lifecycle hook at all; do not add it to this seam.
+
+        Every in-lifecycle reader lives inside `run()` — `wait_for_completion`'s
+        read-back, `_observe_tick`'s sampling and the nudge budget, and
+        `_post_kill_reconcile`'s post-teardown rescue, which really does call
+        `_park_marker_session_authored` (and `_probe_alive`) after the kill — so
+        `run()`'s `finally` is the first point where these entries are provably
+        dead evidence. A later direct read has no attempt-relative evidence and
+        already fails closed on the missing key. Eviction sits at the END of the
+        lifecycle because that rescue genuinely reads after the kill; it does NOT
+        rest on today's rescue gates happening to make that verdict unobservable
+        in the result (they do — a rescue requires a consistent `done`,
+        `park_asserted` requires an `awaiting-operator` marker, and
+        `synthesize_result` makes those mutually exclusive — but that is a
+        coincidence of the current gates, not a reason to evict earlier).
+
+        Called from a `finally` (not a post-return line) so a raising
+        `wait_for_completion` evicts too, and scoped to the one task id so a
+        concurrent in-flight session keeps its entries. `pop(..., None)` /
+        `discard` (never `del`) so a `start_session` that raised before anything
+        was recorded cannot replace the real exception with a KeyError."""
+        self._launch_auto_run_results.pop(task_id, None)
+        self._fm_fallback_obs.pop(task_id, None)
+        self._fm_transition_obs.pop(task_id, None)
+        self._contract_nudge_sent.discard(task_id)
 
     def _park_marker_session_authored(self, spec_path: Path, spec: SessionSpec) -> bool:
         """Whether the live marker differs from this session's launch marker."""
         if spec.task_id not in self._launch_auto_run_results:
-            # Production always enters through start_session. A direct diagnostic
-            # read-back has no attempt-relative evidence and therefore fails closed.
+            # Two ways to land here, both answered the same: a direct diagnostic
+            # read-back that never entered through start_session, and a read after
+            # `run()` evicted the entry (DW-96). Neither has attempt-relative
+            # evidence to answer from, so both fail closed.
             return False
         captured = self._launch_auto_run_results[spec.task_id]
         if captured is None:
@@ -1539,7 +2382,8 @@ class _DevSynthesisMixin(_ResultFileMixin):
         # In worktree isolation the skill runs with cwd set to the worktree and
         # writes its terminal spec under the worktree's rebased implementation-
         # artifacts dir, not the main checkout's. Resolve the search dir from the
-        # live session cwd (a no-op in place, where cwd == the project root, and
+        # live session cwd (a no-op in place, where cwd is the code root and
+        # rebased() re-derives the project at its offset inside it, DW-379, and
         # for artifact dirs configured outside the project tree, which rebased()
         # leaves put). Keep the configured dir as a defensive fallback.
         primary = self.paths.rebased(cwd).implementation_artifacts
@@ -1670,7 +2514,8 @@ class _DevSynthesisMixin(_ResultFileMixin):
 
         A pure sampling path, never a verdict path: it needs a launch snapshot to
         observe against, fires at most once per session (task_ids are unique;
-        entries are never cleared), and any unreadable/torn read is a skipped
+        the entry is never cleared within the session — ``run()``'s ``finally``
+        evicts it afterwards), and any unreadable/torn read is a skipped
         sample (silent OSError return), never evidence. Blank/torn parses (``s ==
         ""``) and terminal states (``done``/``blocked``) are NOT recorded — a
         terminal frontmatter is the Stop harvest's business, and the launch status
@@ -1704,19 +2549,61 @@ class _DevSynthesisMixin(_ResultFileMixin):
             )
 
     @staticmethod
-    def _same_spec(candidate: Path, snap_path: str) -> bool:
-        """Whether ``candidate`` and the snapshot's recorded path are the SAME file
-        by filesystem identity (#276 M1), not raw string spelling. ``snap_path`` is
-        the engine's ``str(task.spec_file)``; a ``..`` segment, a symlinked artifacts
-        dir, or a case-variant alias makes an equivalent path compare unequal
-        lexically and would silently disable the hash/transition gate. ``resolve()``
-        (the repo's identity convention, non-strict) collapses those; an unresolvable
-        path degrades to "not the same file" — conservative, the gate stays inert
-        rather than ever falsely refusing."""
+    def _same_spec(candidate: Path, snap_path: str) -> tuple[bool, str | None]:
+        """``(same, fault)``: whether ``candidate`` and the snapshot's recorded path
+        are the SAME file by filesystem identity (#276 M1), not raw string spelling.
+        ``snap_path`` is the engine's ``str(task.spec_file)``; a ``..`` segment, a
+        symlinked artifacts dir, or a case-variant alias makes an equivalent path
+        compare unequal lexically and would silently disable the hash/transition
+        gate. ``resolve()`` (the repo's identity convention, non-strict) collapses
+        those; an unresolvable path degrades to "not the same file" — conservative,
+        the gate stays inert rather than ever falsely refusing.
+
+        That degrade disables the M1 refuse gate, so it is returned as ``fault``
+        (``"<ExcType>: <message>"``) for the caller to crumb
+        (``spec-identity-unreadable``, DW-456) — this staticmethod cannot.
+        ``RuntimeError`` is caught beside ``OSError`` like every other ``resolve()``
+        guard here: on the 3.11 floor a symlink loop raises it."""
         try:
-            return candidate.resolve() == Path(snap_path).resolve()
-        except OSError:
+            return candidate.resolve() == Path(snap_path).resolve(), None
+        except (OSError, RuntimeError) as e:
+            return False, f"{type(e).__name__}: {e}"
+
+    def _snapshot_identity(self, task_id: str, candidate: Path, snap: SpecSnapshot | None) -> bool:
+        """``_same_spec`` against the launch snapshot, crumbing an identity fault
+        (DW-456): ``spec-identity-unreadable`` (``spec``, ``snapshot``, ``error``).
+        No snapshot is no comparison and no crumb. The verdict is unchanged — a
+        fault is still "not the same file" (NEUTRAL)."""
+        if snap is None:
             return False
+        same, fault = self._same_spec(candidate, snap.path)
+        if fault is not None:
+            self._note_lifecycle(
+                task_id,
+                "spec-identity-unreadable",
+                spec=str(candidate),
+                snapshot=snap.path,
+                error=fault,
+            )
+        return same
+
+    def _note_spec_read_fault(
+        self, task_id: str, verdict: str, spec_path: Path, error: str, *, wait: bool
+    ) -> None:
+        """Record a spec read-back that gave up on a FAULT (DW-457) — ``stat-failed``
+        or ``unreadable-spec`` — apart from the genuine answers (``no-artifact``,
+        ``stale-mtime``, ``not-terminal``) it used to be filed under. A Stop
+        read-back (``wait=True``) writes it as its give-up resultless-stop verdict
+        (``<path>: <error>``); a one-shot ``wait=False`` read (`_final`, the
+        dead-window `_post_kill_reconcile`), which otherwise leaves no record,
+        writes ``spec-readback-failed`` (``reason`` = the verdict, ``spec``,
+        ``error``). The read-back's answer — no result — is unchanged."""
+        if wait:
+            self._note_resultless_stop(task_id, verdict, f"{spec_path}: {error}")
+        else:
+            self._note_lifecycle(
+                task_id, "spec-readback-failed", reason=verdict, spec=str(spec_path), error=error
+            )
 
     def _snapshot_verdict(
         self,
@@ -1789,20 +2676,26 @@ class _DevSynthesisMixin(_ResultFileMixin):
         case: a review that died with a NON-terminal frontmatter.
 
         Owns the give-up breadcrumb: exactly one of ``no-artifact``,
-        ``ambiguous-frontmatter``, ``unmodified-since-launch``, or
+        ``ambiguous-frontmatter``, ``unreadable-spec`` (the candidate's read
+        faulted, DW-457), ``unmodified-since-launch``, or
         ``terminal-frontmatter-pending`` per wait=True pass (none on a harvest).
         A plain wait=False read (the crash path) is compare-only — it may harvest
         an already-stable fingerprint but never records observations or
-        breadcrumbs; the hash gate is the one wait=False path that leaves a crumb,
-        and only under a dead window (``frontmatter-unmodified-refused``).
+        breadcrumbs; the wait=False paths that leave a crumb are the hash gate,
+        only under a dead window (``frontmatter-unmodified-refused``), and a
+        fault: an unreadable candidate (``spec-readback-failed``, DW-457). An
+        identity fault against the launch snapshot is crumbed in every mode
+        (``spec-identity-unreadable``, DW-456).
 
         On the FIRST ``terminal-frontmatter-pending`` observation (wait=True, one
         candidate, not the hash-gate refusal, transition not yet proven) it also
         fires the #276 M4 contract nudge when ``limits.dev_contract_nudge`` is on:
         one ``CONTRACT_NUDGE_TEXT`` send asking the skill to append the marker it
         owed, then repair at the source rather than only synthesizing here. It is
-        bounded by the never-cleared ``_contract_nudge_sent`` set (marked before
-        the send, ``MultiplexerError`` swallowed) — exactly once per session,
+        bounded by ``_contract_nudge_sent``, a set never cleared within the session
+        and evicted afterwards by ``run()``'s ``finally`` (marked before the send;
+        a raising send is crumbed ``nudge-send-failed``, not ``contract-nudge-sent``,
+        and never retried) — exactly once per session,
         touching no stall counters, so an mtime bump that resets ``observations``
         to 1 never re-nudges. A compliant append is harvested by the ordinary
         marker scan on a later Stop, leaving synthesis as the backstop.
@@ -1856,7 +2749,7 @@ class _DevSynthesisMixin(_ResultFileMixin):
             return None
         path = candidates[0]
         snap = spec.spec_snapshot
-        same_file = snap is not None and self._same_spec(path, snap.path)
+        same_file = self._snapshot_identity(task_id, path, snap)
         try:
             mtime_ns = path.stat().st_mtime_ns
             fm_status = status_of(read_frontmatter(path))
@@ -1864,13 +2757,14 @@ class _DevSynthesisMixin(_ResultFileMixin):
             # by filesystem identity) — an unrelated marker-less spec under the same
             # artifacts dir shares no launch state, so hashing it is meaningless work.
             digest = hashlib.sha256(path.read_bytes()).hexdigest() if same_file else None
-        except OSError:
+        except OSError as e:
             # Torn mid-write read: not evidence of anything — same degrade as
-            # the read-back doctrine everywhere else on this path.
-            if wait:
-                self._note_resultless_stop(
-                    task_id, "no-artifact", f"unreadable marker-less candidate {path}"
-                )
+            # the read-back doctrine everywhere else on this path. Named as the
+            # fault it is (DW-457), not as `no-artifact`, and crumbed on the
+            # wait=False reads (`_final`, the dead-window reconcile) too.
+            self._note_spec_read_fault(
+                task_id, "unreadable-spec", path, f"{type(e).__name__}: {e}", wait=wait
+            )
             return None
         # Launch-snapshot verdict (#276 M1/M2), shared with the stories read-back.
         # REFUSE (M1) — bytes byte-identical to the review-launch snapshot with NO
@@ -1936,25 +2830,28 @@ class _DevSynthesisMixin(_ResultFileMixin):
             # harvested by the normal marker scan on a later Stop; synthesis stays
             # the backstop). Exactly once per session: the task_id is marked BEFORE
             # the send so a raising transport still satisfies exactly-once, and the
-            # never-cleared set — not the mtime-resettable observation counter — is
-            # the budget, so the #149 refill hazard cannot apply. Touches no stall
-            # counters.
+            # set — never cleared within the session, and not the mtime-resettable
+            # observation counter — is the budget, so the #149 refill hazard cannot
+            # apply. Touches no stall counters. `contract-nudge-sent` is written
+            # only once the send succeeded; a raising send leaves
+            # `nudge-send-failed` instead and is not retried (DW-449).
             if (
                 self._contract_nudge_enabled
                 and observations == 1
                 and task_id not in self._contract_nudge_sent
             ):
                 self._contract_nudge_sent.add(task_id)
-                self._note_lifecycle(
-                    task_id, "contract-nudge-sent", spec=str(path), status=fm_status
-                )
                 try:
                     self.send_text(
                         handle,
                         CONTRACT_NUDGE_TEXT.format(spec_path=path, status=fm_status),
                     )
-                except MultiplexerError:
-                    pass
+                except MultiplexerError as e:
+                    self._note_nudge_send_failed(handle, "contract", e)
+                else:
+                    self._note_lifecycle(
+                        task_id, "contract-nudge-sent", spec=str(path), status=fm_status
+                    )
         return None
 
     def _stories_synth_result(
@@ -1964,8 +2861,9 @@ class _DevSynthesisMixin(_ResultFileMixin):
         <id>-*.md`` by id (never the mtime scan) and synthesize from it.
 
         ``BMAD_LOOP_SPEC_FOLDER`` carries the project-relative (or absolute) spec
-        folder; rebase a relative one against ``spec.cwd`` exactly like
-        ``_artifact_dirs`` so worktree isolation resolves inside the live checkout.
+        folder; rebase a relative one onto the project's place in ``spec.cwd`` (the
+        mount project under isolation, ``<cwd>/<offset>`` under a nested
+        ``repo_root``) so worktree isolation resolves inside the live checkout.
         A PRESENT or SENTINEL spec synthesizes (a blocked sentinel becomes a
         CRITICAL escalation → PAUSE, same as any block) — but only when the spec was
         (re)written by THIS session: like the mtime-scan path's ``since_ns`` floor, a
@@ -1996,9 +2894,27 @@ class _DevSynthesisMixin(_ResultFileMixin):
 
         story_key = spec.env.get("BMAD_LOOP_STORY_KEY") or ""
         folder = Path(spec.env["BMAD_LOOP_SPEC_FOLDER"])
-        base = folder if folder.is_absolute() else Path(spec.cwd) / folder
+        # Project-relative, so anchored on the project's place in the live checkout:
+        # `spec.cwd` is the code root, which a nested `repo_root:` puts above the
+        # project (`<cwd>/<offset>`), and `StoriesEngine._stories_folder` joins the
+        # same folder on the project (DW-379). Lexical — the default config's offset
+        # is `.`, so this is `spec.cwd` itself there.
+        base = (
+            folder
+            if folder.is_absolute()
+            else rebased_project(self.paths.project, self.paths.repo_root, Path(spec.cwd)) / folder
+        )
         plan_halt = bool(spec.env.get("BMAD_LOOP_PLAN_HALT"))
         deadline = time.monotonic() + RESULT_GRACE_S
+        # The launch-snapshot faults (DW-456) are crumbed once per read-back call,
+        # not once per grace poll: a persistent fault re-occurs every RESULT_POLL_S.
+        snapshot_faults_noted: set[str] = set()
+
+        def note_snapshot_fault(event: str, **fields: str) -> None:
+            if event not in snapshot_faults_noted:
+                snapshot_faults_noted.add(event)
+                self._note_lifecycle(handle.task_id, event, **fields)
+
         while True:
             state = stories.resolve_story_spec(base, story_key)
             if state.kind == stories.KIND_AMBIGUOUS:
@@ -2014,10 +2930,20 @@ class _DevSynthesisMixin(_ResultFileMixin):
                 return None
             # Classify this pass for the result-less breadcrumb; overwritten
             # below when the spec is present but not (yet) this session's
-            # terminal output.
+            # terminal output. `fault` is set instead when the pass gave up on a
+            # read FAULT (DW-457) — `stat-failed` / `unreadable-spec`, never filed
+            # as the genuine `stale-mtime` / `not-terminal` answers it used to be.
             verdict, detail = state.kind, str(state.path or base)
+            fault: tuple[Path, str] | None = None
             if state.kind in (stories.KIND_PRESENT, stories.KIND_SENTINEL) and state.path:
-                if not self._written_this_session(state.path, handle.launched_ns):
+                try:
+                    fresh = self._written_this_session(state.path, handle.launched_ns)
+                except OSError as e:
+                    fresh = False
+                    verdict, fault = "stat-failed", (state.path, f"{type(e).__name__}: {e}")
+                if fault is not None:
+                    pass
+                elif not fresh:
                     verdict = "stale-mtime"
                     detail = f"{state.path} predates session launch"
                 else:
@@ -2025,15 +2951,31 @@ class _DevSynthesisMixin(_ResultFileMixin):
                     # fallback so the stories read-back can't false-complete on an
                     # unmodified `done` spec. Only bites on a review session (the
                     # engine threads `spec_snapshot` there); a dev leg leaves it None
-                    # → NEUTRAL → the mtime-floor accept below.
+                    # → NEUTRAL → the mtime-floor accept below. Both of its faults
+                    # still read NEUTRAL, crumbed (DW-456).
                     snap = spec.spec_snapshot
-                    same_file = snap is not None and self._same_spec(state.path, snap.path)
+                    same_file = False
+                    if snap is not None:
+                        same_file, identity_fault = self._same_spec(state.path, snap.path)
+                        if identity_fault is not None:
+                            note_snapshot_fault(
+                                "spec-identity-unreadable",
+                                spec=str(state.path),
+                                snapshot=snap.path,
+                                error=identity_fault,
+                            )
                     digest = None
                     if same_file:
                         try:
                             digest = hashlib.sha256(state.path.read_bytes()).hexdigest()
-                        except OSError:
-                            digest = None  # torn read → NEUTRAL; synthesize keeps its degrade
+                        except OSError as e:
+                            # torn read → NEUTRAL; synthesize keeps its degrade
+                            digest = None
+                            note_snapshot_fault(
+                                "spec-digest-unreadable",
+                                spec=str(state.path),
+                                error=f"{type(e).__name__}: {e}",
+                            )
                     snap_verdict = self._snapshot_verdict(
                         same_file=same_file, snap=snap, task_id=handle.task_id, digest=digest
                     )
@@ -2050,11 +2992,13 @@ class _DevSynthesisMixin(_ResultFileMixin):
                             f"(snapshot mtime_ns={snap.mtime_ns}); refusing stories synthesis"
                         )
                     else:
+                        sr = None
+                        read_fault: str | None = None
                         try:
                             sr = devcontract.synthesize_result(
                                 state.path, story_key=story_key or None, plan_halt=plan_halt
                             )
-                        except UnicodeDecodeError:
+                        except UnicodeDecodeError as e:
                             # A non-UTF-8 read is either a torn glimpse of a spec still
                             # being written (keep polling — a later pass sees the finished
                             # write) or a genuinely corrupt file: then the grace expires
@@ -2062,30 +3006,54 @@ class _DevSynthesisMixin(_ResultFileMixin):
                             # wedge (resolve_story_spec degrades an undecodable PRESENT
                             # spec to status "" → pause for resolve), never a crash of
                             # the read-back poll.
-                            sr = None
+                            read_fault = f"{type(e).__name__}: {e}"
                         if sr is not None and sr.result_json is not None:
                             return sr
-                        verdict = "not-terminal"
-                        detail = (
-                            f"{state.path} has no terminal status (frontmatter {state.status!r})"
-                        )
+                        # `synthesize_result` folds its own read faults into "not
+                        # terminal yet"; re-read to tell the two apart (DW-457).
+                        read_fault = read_fault or self._spec_read_fault(state.path)
+                        if read_fault is not None:
+                            verdict, fault = "unreadable-spec", (state.path, read_fault)
+                        else:
+                            verdict = "not-terminal"
+                            detail = (
+                                f"{state.path} has no terminal status"
+                                f" (frontmatter {state.status!r})"
+                            )
             if not wait or time.monotonic() >= deadline:
-                if wait:
+                if fault is not None:
+                    self._note_spec_read_fault(handle.task_id, verdict, *fault, wait=wait)
+                elif wait:
                     self._note_resultless_stop(handle.task_id, verdict, detail)
                 return None
             time.sleep(RESULT_POLL_S)
+
+    @staticmethod
+    def _spec_read_fault(spec_path: Path) -> str | None:
+        """``"<ExcType>: <message>"`` when ``spec_path`` cannot be read as UTF-8
+        text right now, else None. Classification only (DW-457): the stories
+        read-back asks it after a synthesis that found nothing, because
+        ``synthesize_result`` folds an unreadable or undecodable spec into "not
+        terminal yet" — this tells that fault apart from a genuinely non-terminal
+        spec for the record, without changing the answer."""
+        try:
+            spec_path.read_bytes().decode("utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            return f"{type(e).__name__}: {e}"
+        return None
 
     @staticmethod
     def _written_this_session(spec_path: Path, launched_ns: int) -> bool:
         """Whether ``spec_path`` was (re)written at/after the session launched — the
         same launch-floor guard ``devcontract.find_result_artifact`` applies on the
         scan path, so a stale terminal spec from a prior step (a dev ``done`` a
-        follow-up review re-opens) is not mistaken for this session's output. A spec
-        that vanished between resolve and stat is treated as not-yet-written."""
-        try:
-            return spec_path.stat().st_mtime_ns >= launched_ns
-        except OSError:
-            return False
+        follow-up review re-opens) is not mistaken for this session's output.
+
+        A stat fault — a spec that vanished between resolve and stat included —
+        raises ``OSError`` (DW-457): the caller still reads it as not-yet-written,
+        but records it as ``stat-failed`` rather than as a spec that predates the
+        launch."""
+        return spec_path.stat().st_mtime_ns >= launched_ns
 
     def _post_kill_reconcile(
         self, handle: SessionHandle, spec: SessionSpec, result: SessionResult
@@ -2139,14 +3107,23 @@ class _DevSynthesisMixin(_ResultFileMixin):
             # is still alive, so the live-window invariant still applies.
             return result
         if alive is None:
-            return result  # liveness unknowable: unknown is not dead
+            # liveness unknowable: unknown is not dead — but the abandoned
+            # rescue leaves a crumb (DW-453). The generic adapter's probe has
+            # already crumbed its fault (`liveness-probe-failed`, `post-kill`).
+            self._note_lifecycle(
+                handle.task_id,
+                "post-kill-rescue-abandoned",
+                reason="liveness-unknown",
+                status=result.status,
+            )
+            return result
         try:
             # dead_window: the probe above settled liveness, so the missing-
             # marker fallback (#224) may synthesize from a terminal frontmatter
             # on a single sighting — the gates below still refuse anything but
             # a self-consistent, escalation-free successful terminal.
             sr = self._synth_result(handle, spec, wait=False, dead_window=True)
-        except (OSError, UnicodeDecodeError):
+        except (OSError, UnicodeDecodeError) as e:
             # An unreadable artifact is not evidence a session finished. This
             # hook runs right after run()'s finally-kill — the moment a spec the
             # CLI was mid-write is truncated, possibly through a multi-byte UTF-8
@@ -2154,7 +3131,14 @@ class _DevSynthesisMixin(_ResultFileMixin):
             # anomaly. Keep the verdict: a best-effort rescue must never escalate
             # a clean stall/timeout into an exception, which the engine does not
             # contain per-task (it fails the whole run). UnicodeDecodeError is a
-            # ValueError, so both must be named.
+            # ValueError, so both must be named. The abandon is crumbed (DW-453).
+            self._note_lifecycle(
+                handle.task_id,
+                "post-kill-rescue-abandoned",
+                reason="unreadable-artifact",
+                error=f"{type(e).__name__}: {e}",
+                status=result.status,
+            )
             return result
         if sr is None or sr.result_json is None or not sr.status_consistent:
             return result
@@ -2214,10 +3198,9 @@ class GenericDevAdapter(_DevSynthesisMixin, GenericAdapter):
         self._configure_dev_knobs()
 
     def _probe_alive(self, handle: SessionHandle) -> bool | None:
-        try:
-            return self._window_alive(handle)
-        except MultiplexerError:
-            return None
+        # A raising probe is crumbed `liveness-probe-failed` (`site="post-kill"`,
+        # `error`) before the caller abandons the rescue (DW-453).
+        return self._probe_liveness(handle, "post-kill")
 
 
 # Back-compat alias: the adapter was ``GenericTmuxAdapter`` before tmux moved

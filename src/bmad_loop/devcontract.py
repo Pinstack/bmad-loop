@@ -15,7 +15,12 @@ present. A genuine `## Auto Run Result` marker has three narrow roles: its
 status/detail route the blocked→PAUSE decision; its status is a compatibility
 fallback that may populate the synthesized result when frontmatter is blank or
 missing; and proof that the current session authored the marker supplies
-attempt ownership for `park_asserted`. From that compatibility result, `done`
+attempt ownership for `park_asserted` — and, since DW-273, for `artifact_only`,
+the bundle leg's assertion that its whole deliverable lives under the gitignored
+artifacts dir. Both booleans are minted by the same four-part shape (a present,
+genuine, session-authored marker carrying the line, with no orchestrator synth
+note) and `park_marker_session_authored` is the one authorship proof serving
+both; frontmatter never mints either. From that compatibility result, `done`
 alone may be reconciled onto disk, `blocked` routes to PAUSE, and
 `awaiting-operator` remains subject to the on-disk frontmatter/status gate.
 Where the marker and populated frontmatter disagree we surface it
@@ -28,6 +33,7 @@ verify.py against actual on-disk state.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from collections.abc import Mapping, Sequence, Set
 from dataclasses import dataclass
@@ -37,7 +43,7 @@ from typing import Any
 from . import deferredwork
 from .fences import fenced as _fenced
 from .frontmatter import _edit_frontmatter_block, auto_dev_baseline_of, status_of
-from .platform_util import atomic_write_bytes, atomic_write_bytes_confined
+from .platform_util import atomic_write_bytes, atomic_write_bytes_confined, require_root_pinned
 from .verify import DEV_WORKFLOW, operator_actions_of, read_frontmatter
 
 # The section the skill appends on EVERY terminal path (success and blocked),
@@ -45,12 +51,55 @@ from .verify import DEV_WORKFLOW, operator_actions_of, read_frontmatter
 # marker on the spec-watch fallback; the `Status:` line within it is the only
 # field we parse structurally — everything else is free prose.
 AUTO_RUN_HEADING_RE = re.compile(r"^##\s+Auto Run Result\s*$", re.MULTILINE)
-# `Status:` possibly bulleted ("- Status: blocked") / bolded ("**Status:** done"),
-# case-insensitive on the label, value is the first token on the line.
+# Python's whitespace class includes several characters that ``str.splitlines``
+# treats as line boundaries. Structural gaps must exclude every such separator
+# while retaining horizontal Unicode whitespace such as tab and NBSP.
+_HORIZONTAL_WS_RE = r"[^\S\r\n\x0b\x0c\x1c-\x1e\x85\u2028\u2029]"
+# `Status:` possibly bulleted ("- Status: blocked") / bolded
+# ("**Status:** **done**"), case-insensitive on the label, value is the first
+# alphabetic-or-hyphen token on the line. Every structural gap is horizontal
+# whitespace: a bare label cannot borrow its value from the following line.
 STATUS_LINE_RE = re.compile(
-    r"^\s*(?:[-*]\s*)?(?:\*\*)?status(?:\*\*)?\s*:\s*(?:\*\*)?\s*([A-Za-z-]+)",
+    rf"^{_HORIZONTAL_WS_RE}*(?:[-*]{_HORIZONTAL_WS_RE}*)?"
+    rf"(?:\*\*)?status(?:\*\*)?{_HORIZONTAL_WS_RE}*:"
+    rf"(?:\*\*)?{_HORIZONTAL_WS_RE}*(?:\*\*)?{_HORIZONTAL_WS_RE}*([A-Za-z-]+)",
     re.IGNORECASE | re.MULTILINE,
 )
+# The bundle leg's artifact-only assertion (DW-273): an `Artifact only: true` /
+# `artifact_only: true` / `Artifact-only: true` line (a run of AT LEAST ONE
+# space/underscore/hyphen between the words — `[ _-]+`, never `*`, so the fused
+# `Artifactonly: true` is no spelling of the contract and cannot relax the
+# bundle gate (#794 review) — case-insensitive) inside the SAME marker. It takes
+# the same bulleted/bolded label and value shapes `STATUS_LINE_RE` tolerates
+# (`**Artifact only:** **true**`, `- **Artifact only: true**`): every `**` is
+# optional and the closing one is consumed before the end-of-line anchor. Only
+# the literal value `true` ALONE on the line asserts — anchored to end of line so
+# prose such as
+# `Artifact only: true for the ledger, false for code` is no assertion; neither is
+# `false`, a bare label, or any other token. Every gap is `_HORIZONTAL_WS_RE`
+# (space, tab, NBSP... — never CR/LF nor the vertical separators `splitlines`
+# honours), so as with `Status:`, the label and its value must share one line.
+# `Artifact only:` followed by `true` on the next line, or `Artifact only` with
+# `: true` on the next line, is a bare label and a stray token, not an
+# assertion — and so is `Artifact only:\x0btrue`, which `[^\S\r\n]` admitted
+# while MULTILINE `$` anchors on LF alone (#795 review). Matches are read
+# through `_artifact_only_asserted`, which skips a match inside a fenced block
+# (a pasted example within the marker).
+ARTIFACT_ONLY_LINE_RE = re.compile(
+    rf"^{_HORIZONTAL_WS_RE}*(?:[-*]{_HORIZONTAL_WS_RE}*)?"
+    rf"(?:\*\*)?artifact[ _-]+only(?:\*\*)?{_HORIZONTAL_WS_RE}*:"
+    rf"(?:\*\*)?{_HORIZONTAL_WS_RE}*(?:\*\*)?{_HORIZONTAL_WS_RE}*true"
+    rf"(?:\*\*)?{_HORIZONTAL_WS_RE}*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _artifact_only_asserted(detail: str) -> bool:
+    """True when the marker body carries a genuine (non-fenced) artifact-only line.
+    A match inside a fenced block is documentation, not an assertion — the same
+    reading `_section_headings` gives a fenced heading."""
+    return any(not _fenced(detail, m.start()) for m in ARTIFACT_ONLY_LINE_RE.finditer(detail))
+
 
 # Terminal frontmatter statuses the skill can leave behind.
 DONE = "done"
@@ -161,7 +210,10 @@ def parse_auto_run_result(text: str) -> AutoRunResult:
         return AutoRunResult(present=False, status="", detail="")
     last = matches[-1]
     body = text[last.end() : _next_heading_start(text, last.end())]
-    status_m = STATUS_LINE_RE.search(body)
+    status_m = next(
+        (match for match in STATUS_LINE_RE.finditer(body) if not _fenced(body, match.start())),
+        None,
+    )
     status = status_m.group(1).strip().lower() if status_m else ""
     return AutoRunResult(present=True, status=status, detail=body.strip())
 
@@ -384,6 +436,15 @@ def synthesize_result(
     whose prose ``## Auto Run Result`` says ``done`` while the frontmatter lags,
     so a plan-halt ``ready-for-dev`` (no such prose) is never reconciled to
     ``done`` and this leg's success outcome is not clobbered.
+
+    ``park_marker_session_authored`` is the adapter's proof that the LAST genuine
+    marker was written by the session being synthesized (``GenericDevAdapter``
+    fingerprints the marker at launch and compares at Stop). It serves two mints,
+    deliberately under one name: ``park_asserted`` (a park's proof-of-work
+    waiver, #676) and ``artifact_only`` (a bundle's artifact-only receipt,
+    DW-273). Both are attempt-ownership claims about the same marker, so one
+    authorship proof is the right number — a second flag could only disagree
+    with the first.
     """
     try:
         fm = read_frontmatter(spec_path)
@@ -427,7 +488,14 @@ def synthesize_result(
     escalations: list[dict[str, Any]] = []
     if status == BLOCKED or arr.status == BLOCKED:
         detail = arr.detail or "generic dev session reported a blocked outcome"
-        escalations.append({"type": "blocked", "severity": "CRITICAL", "detail": detail[:2000]})
+        escalations.append(
+            {
+                "type": "blocked",
+                "severity": "CRITICAL",
+                "detail": detail,
+                "spec_file": str(spec_path),
+            }
+        )
 
     result: dict[str, Any] = {
         "workflow": DEV_WORKFLOW,
@@ -443,6 +511,17 @@ def synthesize_result(
         "park_asserted": (
             arr.present
             and arr.status == AWAITING_OPERATOR
+            and ORCHESTRATOR_SYNTH_NOTE not in arr.detail
+            and park_marker_session_authored
+        ),
+        # The bundle leg's artifact-only assertion (DW-273), minted by the same
+        # four-part shape and from the same authorship proof: the current
+        # session's genuine marker carries the line, and nothing else — not
+        # frontmatter, not a repaired marker — can assert it. `verify_dev_bundle`
+        # is the only consumer; the sprint and stories gates never read it.
+        "artifact_only": (
+            arr.present
+            and _artifact_only_asserted(arr.detail)
             and ORCHESTRATOR_SYNTH_NOTE not in arr.detail
             and park_marker_session_authored
         ),
@@ -596,7 +675,13 @@ def is_frontmatter_candidate(path: Path, *, since_ns: int) -> bool:
     return status_of(fm) in (DONE, BLOCKED, AWAITING_OPERATOR)
 
 
-def _atomic_write_spec(spec_path: Path, text: str, *, confine_root: Path) -> None:
+def _atomic_write_spec(
+    spec_path: Path,
+    text: str,
+    *,
+    confine_root: Path,
+    root_identity: os.stat_result | None = None,
+) -> None:
     """Rewrite ``spec_path`` with ``text`` via a same-directory temp file + atomic
     rename, so an interrupted / short / disk-full write can never truncate the
     canonical spec — a failed repair must lose no work (fault injection on the old
@@ -630,13 +715,30 @@ def _atomic_write_spec(spec_path: Path, text: str, *, confine_root: Path) -> Non
     belongs to is a pyright error rather than an unconfined write. The two
     `frontmatter`-side writers of these same files land on the identical pair of
     calls (#379); this wrapper stays for its callers' ``str``-in signature and
-    this docstring."""
+    this docstring.
+
+    ``root_identity`` pins ``confine_root`` on the terms
+    `frontmatter.set_frontmatter_status` states — forwarded on the confined arm
+    (DW-423), pre-checked on the external arm (DW-445); ``None`` is the unpinned
+    write on both. Threaded through the writers a mount-rooted caller reaches
+    (`reset_spec_status`, `strip_auto_run_result`, `reset_spec_for_replan`,
+    `append_auto_run_result`): the ``live_spec_root`` re-arm/replan writers pin
+    via `runs.live_spec_root_identity` (DW-423), and the engine's writers — which
+    confine to ``workspace.paths.project``, under worktree isolation the mount —
+    pin via `runs.mount_root_identity` when their workspace is a unit mount
+    (DW-445). `append_operator_confirmation` is project-rooted (``bmad-loop
+    confirm``) and stays unpinned."""
     payload = text.encode("utf-8")
     if spec_path.is_relative_to(confine_root):
         atomic_write_bytes_confined(
-            spec_path, payload, confine_root=confine_root, require_writable_target=True
+            spec_path,
+            payload,
+            confine_root=confine_root,
+            require_writable_target=True,
+            root_identity=root_identity,
         )
     else:
+        require_root_pinned(confine_root, root_identity)
         atomic_write_bytes(spec_path, payload, follow_symlinks=False, require_writable_target=True)
 
 
@@ -664,7 +766,13 @@ def _render_status_line(line: str, m: re.Match[str], value: str) -> str:
     return f"{pre}{q}{value}{q}{rest}" + ("\n" if line.endswith("\n") else "")
 
 
-def reset_spec_status(spec_path: Path, new_status: str, *, confine_root: Path) -> bool:
+def reset_spec_status(
+    spec_path: Path,
+    new_status: str,
+    *,
+    confine_root: Path,
+    root_identity: os.stat_result | None = None,
+) -> bool:
     """Rewrite the frontmatter ``status:`` value of a spec in place.
 
     Used by the generic-skill repair path: bmad-build-auto self-finalizes a spec to
@@ -721,12 +829,17 @@ def reset_spec_status(spec_path: Path, new_status: str, *, confine_root: Path) -
     if new_body is None:
         return False
     _atomic_write_spec(
-        spec_path, head + new_body + tail + text[fm.end() :], confine_root=confine_root
+        spec_path,
+        head + new_body + tail + text[fm.end() :],
+        confine_root=confine_root,
+        root_identity=root_identity,
     )
     return True
 
 
-def strip_auto_run_result(spec_path: Path, *, confine_root: Path) -> bool:
+def strip_auto_run_result(
+    spec_path: Path, *, confine_root: Path, root_identity: os.stat_result | None = None
+) -> bool:
     """Remove every ``## Auto Run Result`` section from a spec, in place.
 
     Companion to `reset_spec_status` on the re-drive path: re-opening a spec by
@@ -765,11 +878,15 @@ def strip_auto_run_result(spec_path: Path, *, confine_root: Path) -> bool:
         kept.append(text[pos : m.start()])
         pos = _next_heading_start(text, m.end())
     kept.append(text[pos:])
-    _atomic_write_spec(spec_path, "".join(kept), confine_root=confine_root)
+    _atomic_write_spec(
+        spec_path, "".join(kept), confine_root=confine_root, root_identity=root_identity
+    )
     return True
 
 
-def reset_spec_for_replan(spec_path: Path, *, confine_root: Path) -> bool:
+def reset_spec_for_replan(
+    spec_path: Path, *, confine_root: Path, root_identity: os.stat_result | None = None
+) -> bool:
     """Reset a spec to ``draft`` and strip its stale result transactionally.
 
     The TUI exposes those two writes as one operator action. Capture the exact
@@ -782,15 +899,23 @@ def reset_spec_for_replan(spec_path: Path, *, confine_root: Path) -> bool:
     two writes cannot leave a partial replan. A fault that leaves the preimage
     untouched does not rewrite it. If the restore itself fails, that failure
     escapes; otherwise the original stage failure is re-raised.
+
+    ``root_identity`` pins ``confine_root`` for all three writes — reset, strip
+    and the restore — so a worktree mount swapped for a link refuses the replan
+    rather than landing it outside the repository (DW-423).
     """
     original = spec_path.read_bytes()
     try:
-        reset = reset_spec_status(spec_path, "draft", confine_root=confine_root)
+        reset = reset_spec_status(
+            spec_path, "draft", confine_root=confine_root, root_identity=root_identity
+        )
         if not reset:
             if not spec_path.is_file():
                 raise FileNotFoundError(f"replan spec vanished during status reset: {spec_path}")
             return False
-        stripped = strip_auto_run_result(spec_path, confine_root=confine_root)
+        stripped = strip_auto_run_result(
+            spec_path, confine_root=confine_root, root_identity=root_identity
+        )
         if not stripped and not spec_path.is_file():
             raise FileNotFoundError(f"replan spec vanished during result strip: {spec_path}")
     except BaseException:
@@ -799,7 +924,12 @@ def reset_spec_for_replan(spec_path: Path, *, confine_root: Path) -> bool:
         except OSError:
             unchanged = False
         if not unchanged:
-            _atomic_write_spec(spec_path, original.decode("utf-8"), confine_root=confine_root)
+            _atomic_write_spec(
+                spec_path,
+                original.decode("utf-8"),
+                confine_root=confine_root,
+                root_identity=root_identity,
+            )
         raise
     return True
 
@@ -837,7 +967,12 @@ OPERATOR_CONFIRM_NOTE = (
 
 
 def append_auto_run_result(
-    spec_path: Path, status: str, *, confine_root: Path, detail: str = ""
+    spec_path: Path,
+    status: str,
+    *,
+    confine_root: Path,
+    detail: str = "",
+    root_identity: os.stat_result | None = None,
 ) -> bool:
     """Append a synthesized ``## Auto Run Result`` marker section — the inverse of
     `strip_auto_run_result`.
@@ -871,7 +1006,11 @@ def append_auto_run_result(
     blank / ``Status: <status>`` / blank / the provenance note (plus an optional
     detail paragraph). ``status`` is normalized lowercase and MUST be the spec's
     own frontmatter ``status`` — the caller passes exactly that — so
-    `synthesize_result`'s ``consistent`` cross-check holds on every later re-read."""
+    `synthesize_result`'s ``consistent`` cross-check holds on every later re-read.
+
+    ``root_identity`` pins ``confine_root`` as `_atomic_write_spec` states: the
+    engine's marker repair passes `runs.mount_root_identity` of its unit mount
+    (DW-445), ``None`` otherwise."""
     if not spec_path.is_file():
         return False
     # Raw read (not read_text): preserve the file's exact line endings, and let an
@@ -896,7 +1035,9 @@ def append_auto_run_result(
     section = f"## Auto Run Result{nl}{nl}Status: {status}{nl}{nl}{ORCHESTRATOR_SYNTH_NOTE}{nl}"
     if detail:
         section += f"{nl}{detail.strip()}{nl}"
-    _atomic_write_spec(spec_path, text + section, confine_root=confine_root)
+    _atomic_write_spec(
+        spec_path, text + section, confine_root=confine_root, root_identity=root_identity
+    )
     return True
 
 

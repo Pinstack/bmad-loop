@@ -296,7 +296,7 @@ def test_set_frontmatter_field_write_failure_raises_and_keeps_the_spec(tmp_path,
     spec.write_text(SPEC, encoding="utf-8")
     before = spec.read_bytes()
 
-    def boom(path, data, *, confine_root, require_writable_target=False):
+    def boom(path, data, *, confine_root, require_writable_target=False, root_identity=None):
         raise OSError("no space left on device")
 
     monkeypatch.setattr(verify, "atomic_write_bytes_confined", boom)
@@ -329,7 +329,7 @@ def test_set_frontmatter_field_hands_the_helper_bytes_not_text(tmp_path, monkeyp
     seen: list[bytes | str] = []
     real = verify.atomic_write_bytes_confined
 
-    def record(path, data, *, confine_root, require_writable_target=False):
+    def record(path, data, *, confine_root, require_writable_target=False, root_identity=None):
         seen.append(data)
         blob = data if isinstance(data, bytes) else data.encode("utf-8")
         real(
@@ -337,6 +337,7 @@ def test_set_frontmatter_field_hands_the_helper_bytes_not_text(tmp_path, monkeyp
             blob,
             confine_root=confine_root,
             require_writable_target=require_writable_target,
+            root_identity=root_identity,
         )
 
     monkeypatch.setattr(verify, "atomic_write_bytes_confined", record)
@@ -1982,7 +1983,7 @@ def test_rearm_restores_the_spec_when_the_result_strip_faults(tmp_path, monkeypa
     before = spec.read_bytes()
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))
 
-    def boom(spec_path, *, confine_root):
+    def boom(spec_path, *, confine_root, root_identity=None):
         raise OSError(28, "No space left on device")
 
     # patched on the module under test, so the flip runs for real and PUBLISHES
@@ -2030,7 +2031,7 @@ def test_rearm_restores_an_isolated_tasks_spec_that_sits_outside_the_worktree(
     before = spec.read_bytes()
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec), worktree_path=str(wt))
 
-    def boom(spec_path, *, confine_root):
+    def boom(spec_path, *, confine_root, root_identity=None):
         raise OSError(28, "No space left on device")
 
     monkeypatch.setattr(runs.devcontract, "strip_auto_run_result", boom)
@@ -3682,6 +3683,28 @@ def _minted_id(tmp_path, monkeypatch, story_key, generation) -> str:
     # id row below with a bare IndexError rather than naming what broke
     assert adapter.specs, "run_session built no SessionSpec"
     return adapter.specs[0].task_id
+
+
+def test_run_session_threads_model_and_effort_onto_the_spec(tmp_path, monkeypatch):
+    """`cmd_resolve` reads both from `pol.adapter.resolved("dev")`; `run_session`
+    must hand both to the adapter on the spec (#643 for effort), and default both
+    to "" so every existing caller stays byte-identical."""
+    monkeypatch.setattr(resolve.subprocess, "run", lambda *a, **k: None)
+    adapter = _SpecCapture()
+    resolve.run_session(
+        adapter,
+        tmp_path,
+        tmp_path / "run",
+        "6-4-cli-list-command",
+        generation=0,
+        model="anthropic/claude-x",
+        effort="max",
+    )
+    assert adapter.specs[0].model == "anthropic/claude-x"
+    assert adapter.specs[0].effort == "max"
+    plain = _SpecCapture()
+    resolve.run_session(plain, tmp_path, tmp_path / "run", "6-4-cli-list-command", generation=0)
+    assert plain.specs[0].model == "" and plain.specs[0].effort == ""
 
 
 def test_run_session_id_is_byte_identical_to_the_hand_mint_at_generation_zero(
@@ -5554,3 +5577,32 @@ def test_journal_entries_or_none_drops_a_non_mapping_line(tmp_path):
 
     assert entries is not None
     assert [e["kind"] for e in entries] == ["a", "b"]
+
+
+def test_build_context_absolutizes_a_nested_mount_spec_onto_the_mount_project(
+    tmp_path, monkeypatch
+):
+    """DW-379: under a `repo_root` that CONTAINS the project (`<repo>/app`), an isolated
+    unit's spec is persisted relative to the MOUNT PROJECT, `<mount>/app`, so the
+    context names that copy — not `<mount>/<rel>`, the outer tree's same-named path,
+    which is planted here as a decoy.
+
+    Ablation: anchor `runs.task_spec_root` on the raw `worktree_path` and this reddens
+    on the decoy."""
+    rel = "_bmad-output/specs/6-4-cli-list-command.md"
+    repo = tmp_path / "repo"
+    app = repo / "app"
+    wt = tmp_path / "wt"
+    for root in (wt / "app", wt, app):  # the run's copy, an outer decoy, main's twin
+        spec = root / rel
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        spec.write_text(SPEC, encoding="utf-8")
+
+    run_dir, state, _ = _escalated_run(
+        app, spec_file=rel, worktree_path=str(wt), repo_root=str(repo)
+    )
+    monkeypatch.chdir(app)
+
+    path = _context(state, run_dir, "6-4-cli-list-command", isolation="worktree")
+    ctx = json.loads(path.read_text(encoding="utf-8"))
+    assert ctx["spec_file"] == (wt / "app" / rel).as_posix()

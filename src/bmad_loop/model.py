@@ -20,6 +20,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from .mountpaths import project_offset, rebased_project
+
 
 class Phase(StrEnum):
     PENDING = "pending"
@@ -174,6 +176,30 @@ class SessionRecord:
         )
 
 
+def result_mapping(result_json: dict[str, Any] | None) -> dict[str, Any]:
+    """Return the original result dictionary, or an empty dictionary otherwise.
+
+    SessionRecord.from_dict rehydrates result_json unchecked, and third-party
+    adapters may return non-dictionaries despite the declared contract. The
+    first-party generic adapter already rejects such documents at its reader.
+    Keep the narrow annotation to catch incorrect arguments statically; the
+    runtime guard covers those untrusted producers (DW-206/DW-207).
+
+    Consumers use the existing empty-document channel for these reads, without
+    adding an error or event. This replaces falsiness-only `result_json or {}`
+    reads, which raised on truthy non-dictionaries. The raw session document
+    remains available to validators with their own shape-refusal channels.
+
+    Preserve dictionary identity so downstream reconciliation can mutate the
+    same document, including the review loop's normalized local value. Empty
+    dictionaries also retain identity; their field reads answer just as the old
+    empty substitute did. No caller's document is copied or rewritten here.
+    """
+    if isinstance(result_json, dict):
+        return result_json
+    return {}
+
+
 def _rebased_on(path: str | None, root: Path) -> str | None:
     """One persisted spec path, re-anchored on `root`; absolute values pass through.
 
@@ -186,6 +212,51 @@ def _rebased_on(path: str | None, root: Path) -> str | None:
     if not path or Path(path).is_absolute():
         return path
     return str(root / path)
+
+
+def _baseline_artifacts_from(raw: object) -> dict[str, list[int] | None] | None:
+    """Rehydrate `StoryTask.baseline_artifacts` from state.json: a mapping of
+    path -> `[mtime_ns, size]` or `None`. Anything else — a pre-upgrade absent
+    key, or a shape a hand edit mangled — reads as "no snapshot", on which the
+    artifact-only receipt refuses rather than guesses."""
+    if not isinstance(raw, dict):
+        return None
+    out: dict[str, list[int] | None] = {}
+    for key, value in raw.items():
+        if value is None:
+            out[str(key)] = None
+        elif (
+            isinstance(value, list)
+            and len(value) == 2
+            # `bool` is an `int`; a `[true, 42]` is a mangled record, not a fingerprint
+            and all(isinstance(v, int) and not isinstance(v, bool) for v in value)
+        ):
+            out[str(key)] = [value[0], value[1]]
+        else:
+            # Never `int(...)` a value here: a `["bad", 42]` or `[null, 42]` must
+            # read as "no snapshot", not raise out of `from_dict` and keep the
+            # whole run state — and `bmad-loop resume` — from loading.
+            return None
+    return out
+
+
+def _identity_record_from(raw: object) -> tuple[int, int] | None:
+    """Rehydrate a mint-time root identity record (DW-446) from state.json: a
+    two-int ``[st_dev, st_ino]`` list. A pre-upgrade absent key, ``null``, or any
+    other shape reads as "no record" — on which every pin refuses rather than
+    degrading to an unpinned open — and never raises out of ``from_dict``."""
+    if not isinstance(raw, list):
+        return None
+    items: list[object] = list(raw)
+    # `bool` is an `int`; a `[true, 42]` is a mangled record, not an identity
+    ints = [v for v in items if isinstance(v, int) and not isinstance(v, bool)]
+    if len(items) == 2 and len(ints) == 2:
+        return (ints[0], ints[1])
+    return None
+
+
+def _identity_record_to(record: tuple[int, int] | None) -> list[int] | None:
+    return None if record is None else [record[0], record[1]]
 
 
 @dataclass
@@ -231,16 +302,75 @@ class StoryTask:
     # orchestrator runs a follow-up review pass (bmad-build-auto re-invoked on the
     # done spec); otherwise it skips it.
     followup_review_recommended: bool = False
+    # A timeout salvage verified this product but could not refile its follow-up
+    # over an unreadable ledger. Resume retries that current review's salvage,
+    # including authoritative verification, instead of rebuilding the attempt.
+    salvage_refile_pending: bool = False
+    # Sweep migration recovery format. 0 is a pre-upgrade task whose restart
+    # keeps the legacy reset-and-reread behavior; 1 requires the run-owned
+    # baseline/manifest (and, by phase, rewrite/result) records.
+    migration_recovery_format: int = 0
+    # True only when the migration publisher itself armed the run-scoped ledger
+    # doubt. A later successful idempotent replay may release that doubt, but
+    # must never release one inherited from another sweep phase.
+    migration_ledger_doubt_owned: bool = False
+    # DW-405/407: whether the migrate task's latest escalation left from
+    # COMMITTING. ESCALATED erases the prior phase, and TRIAGE_VERIFY
+    # escalations carry the same marker and records, so this durable fact, read
+    # together with phase ESCALATED, grants a cycle-one resume the idempotent
+    # commit-tail retry. Re-stamped on every migrate escalation (a re-arm to
+    # PENDING may leave it set until then); pre-upgrade tasks default to no retry.
+    migration_commit_escalated: bool = False
+    # DW-429: whether the migrate task's latest escalation refused a READABLE
+    # rival ledger (a live value the restore would have overwritten). ESCALATED
+    # erases the prior phase and a rival is byte-indistinguishable from a
+    # session's partial rewrite, so this durable fact tells the generic
+    # ESCALATED restart to put the observed rival back after its reset instead
+    # of hard-resetting it away. Re-stamped on every migrate escalation, cleared
+    # when that restart leaves ESCALATED; pre-upgrade tasks default to no keep.
+    migration_ledger_rival: bool = False
+    # DW-436: whether the migrate task's validation-retry leg rejected a
+    # rewrite in the current attempt. That leg leaves TRIAGE_VERIFY with the
+    # marker but no rewrite record, the same shape as a corrupt record set, so
+    # this durable fact tells a marked TRIAGE_VERIFY resume to restore the
+    # baseline snapshot and redispatch instead of escalating. Set before the
+    # retry leg's reset, cleared on each redispatch and when a restart leaves
+    # for PENDING, re-stamped False on every migrate escalation; pre-upgrade
+    # tasks default to no latch (today's fail-closed escalation).
+    migration_rewrite_rejected: bool = False
+    # DW-317: stable identity of one migration completion, minted fresh in the
+    # same save that records DONE (a re-migration mints a new one). Hooks see it
+    # as ``ctx.delivery_id`` / ``BMAD_LOOP_DELIVERY_ID`` to deduplicate the
+    # at-least-once ``post_migrate`` delivery. None = pre-upgrade/no completion.
+    migration_delivery_id: str | None = None
+    # True from that DONE save until the ``sweep-migrated`` row is journaled and
+    # ``post_migrate`` has returned; a cycle-one resume replays while it is set.
+    migration_delivery_pending: bool = False
+    # The ``sweep-migrated`` row's counts (converted / entries_now / open_now),
+    # persisted with the identity so a replay needs no migrate-* record reads.
+    migration_delivery_counts: dict[str, int] | None = None
     baseline_commit: str | None = None
     # untracked, non-ignored paths present at baseline capture (repo-relative
     # posix). On rollback only paths NOT in this set are removed, so files the
     # user already had on disk are never deleted. None = pre-upgrade run (no
     # snapshot); rollback then removes no untracked files at all.
     baseline_untracked: list[str] | None = None
+    # Attempt-start fingerprints (`[st_mtime_ns, st_size]`, or None when the entry
+    # was listed but could not be measured) of every IGNORED entry under
+    # `implementation_artifacts`, keyed by repo-relative posix path — the baseline
+    # the bundle path's artifact-only receipt (DW-273) measures ownership against,
+    # since ignored paths have no git baseline of their own. Stamped beside the
+    # pair above at every genuinely new attempt, cleared with them. None = no
+    # snapshot (a story task, a pre-upgrade run, or a capture that degraded), on
+    # which the receipt refuses.
+    baseline_artifacts: dict[str, list[int] | None] | None = None
     # Deferred-work bookkeeping is persisted before its readers land so an older
     # state.json remains resumable throughout the forward-port.  The nullable
     # snapshot text and its captured flag are deliberately separate: None means
     # "no ledger existed", while False means "no snapshot was taken".
+    # A `_digest_of` sha256, or `engine._UNREADABLE_LEDGER_DIGEST` when the
+    # baseline read was refused by the OS (DW-258): still a `str`, but not a
+    # digest — `engine._ledger_changed_since_baseline` reads it as "unknown".
     baseline_ledger_digest: str | None = None
     pre_harvest_ledger: str | None = None
     pre_harvest_ledger_captured: bool = False
@@ -260,6 +390,20 @@ class StoryTask:
     # the commit boundary. Same ledger, same isolation problem: a gitignored path
     # never merges out of the unit worktree, so the flip has to be re-applied.
     story_closes_intended: list[str] = field(default_factory=list)
+    # The seeded deferred-work ledger's text as provisioning laid it into this
+    # unit's worktree (DW-375), or None when no ledger seed was nominated (a
+    # tracked or out-of-tree ledger, or one the main checkout does not carry).
+    # Success-path teardown diffs the worktree ledger against it and journals
+    # whatever the engine-recorded writes above do not explain; persisted, like
+    # `pre_harvest_ledger`, so a resume replaying the merge still has it.
+    ledger_seed_text: str | None = None
+    # Every tracked hook config provisioning rewrote AND pinned skip-worktree in
+    # this unit's worktree (DW-368): worktree-relative path -> {"dialect", "text"},
+    # the text being exactly what was written. The pin hides a story's own edit to
+    # that file from `git add -A`, so success teardown compares the file on disk
+    # with this record (relay hooks ignored) and pauses instead of discarding an
+    # edit. A fresh provision overwrites it; persisted so a resume re-checks it.
+    pinned_config_rewrites: dict[str, dict[str, str]] = field(default_factory=dict)
     # The sprint-status stage `_post_dev_state_sync` REQUESTED for this story, or
     # None when it never ran (sweep bundles, stories mode, the legacy path). Same
     # isolation problem as the ledger payloads above, one file over: under
@@ -276,6 +420,36 @@ class StoryTask:
     accepted_dev_session_index: int | None = None
     harvest_carry_commit_pending: bool = False
     isolated_ledger_carried: bool = False
+    # Publication evidence is independent of the artifact-only receipt. None
+    # means legacy/unarmed; an empty baseline proves all paths were absent.
+    artifact_baseline: dict[str, str] | None = None
+    artifact_destination: str | None = None
+    # Exact ignored source bytes accepted by deterministic verification, as
+    # relpath -> sha256. Separate from ``artifact_baseline`` (destination
+    # overwrite authority) and ``artifact_payload`` (frozen replay bytes).
+    # None means legacy/unarmed or an acceptance whose binding was refused; an
+    # empty mapping proves the accepted selection contained no ignored files.
+    artifact_source_digests: dict[str, str] | None = None
+    # Git-clean-filter-normalized blob ids accepted for every tracked or
+    # pending-tracked declared deliverable. These authorize only the exact
+    # staged bytes at the final commit boundary; modes remain Git's concern.
+    # None means legacy/unarmed or an incomplete/refused binding, while an
+    # empty mapping proves the accepted selection contained no Git deliverables.
+    artifact_tracked_source_oids: dict[str, str] | None = None
+    # Stable owner of both accepted-source maps. Session-list indexes are
+    # append-only, unlike attempt/cycle counters after a human re-arm. The
+    # identity is persisted before source bytes are read so a crash in that
+    # window cannot replay the same accepted result and mint new authority.
+    artifact_acceptance_identity: str | None = None
+    artifact_payload: dict[str, str] | None = None
+    artifact_publication_complete: bool = False
+    # Durable authority for one target-side integration attempt.  The append
+    # journal is allowed to lose a torn final record, so it cannot be the source
+    # of truth for crash replay.  This JSON-native receipt is saved atomically
+    # before Git may move the target ref.  Its operation identity is coupled to
+    # Git's reflog action; ``old_revision``/``new_revision`` are filled from that
+    # ref update after it is observed.  None is legacy/no active integration.
+    integration_attempt: dict[str, Any] | None = None
     spec_file: str | None = None
     # The spec owned by the current/last dispatched dev attempt. Unlike
     # ``spec_file`` (the accepted/result artifact), this is bound before launch
@@ -312,7 +486,8 @@ class StoryTask:
     # writer wins, so one `git merge --ff-only <ref>` recovers the whole attempt
     # — unless `preserve_partial` is set). Set by RecoveryFlow, cleared at the top
     # of every auto-rollback so it can never name a *previous* attempt's ref; read
-    # by `_defer` (notification) and projected into `status`. None = the last
+    # by `_defer` (notification), projected into `status`, and — once verified
+    # against git — named in the retry dev prompt (#777). None = the last
     # auto-rollback parked nothing (no commits above baseline and a clean or
     # uncapturable tree, or the ref failed to take). Isolation-INDEPENDENT: a unit
     # worktree's own dev-retry rollback parks on the same shared refs, so a
@@ -331,6 +506,21 @@ class StoryTask:
     # cannot tell those apart, which is why this is recorded rather than derived.
     # Cleared with `preserve_ref`. Survives the resume serialization round-trip.
     preserve_partial: bool = False
+    # provenance of `preserve_ref`, the one input the retry dev prompt's pointer
+    # at it cannot get from git (#777, `recovery_flow.retry_preserve_paragraph`):
+    # True when the auto-rollback that cleared the previous ref ran after a dev
+    # session of the current attempt was dispatched — a recorded session, or a
+    # durable DEV_RUNNING that a hard stop or crash mid-session left without one
+    # (`Engine._dev_attempt_dispatched`) — so whatever it parks is that attempt's
+    # work. False when neither holds — a resolve re-drive resets a tree no
+    # dispatched attempt produced — and set back to False by `SweepEngine.
+    # _reset_superseded_bundle_state`, which keeps a superseded bundle's ref
+    # (clearing the name would orphan the work) that shares this task's run, key
+    # and baseline. Positive evidence
+    # only: a state.json written before this field loads False, so an unproven ref
+    # is never offered. Reset with `preserve_ref`. Survives the resume
+    # serialization round-trip.
+    preserve_from_attempt: bool = False
     # set by runs.rearm_escalation: this task was re-armed out of ESCALATED for a
     # clean rebuild against the corrected spec (not a failed attempt). Lets the
     # resume-time manual-recovery notice describe the real cause; cleared once the
@@ -373,6 +563,16 @@ class StoryTask:
     # diff, and clears it once the corrected work commits. None = ordinary
     # from-scratch re-drive. Survives the resume serialization round-trip.
     restore_patch: str | None = None
+    # Latched by runs.adopt_escalated_branch (`bmad-loop resolve --adopt-branch`,
+    # DW-386): the operator vouched for an ESCALATED task's kept worktree branch, so
+    # the task was moved straight to COMMITTING. On resume, _finish_inflight's
+    # COMMITTING arm reads it to flip the spec to its terminal status and mirror the
+    # board before the ordinary finalize/merge. Cleared by _finalize_commit_phase on
+    # success, by runs.rearm_escalation, and by every re-escalation (Engine._escalate
+    # and WorktreeFlow.escalate_unit), so an ESCALATED task never carries it.
+    # Survives the resume serialization round-trip; deliberately absent from
+    # `documents.py`'s `--json` projection (schema 1).
+    adopt_pending: bool = False
     # sweep bundles only: the deferred-work ids this task closes and the
     # rendered intent file handed to dev sessions
     dw_ids: list[str] = field(default_factory=list)
@@ -381,6 +581,19 @@ class StoryTask:
     # mounted worktree dir and branch, recorded so a paused/crashed run can
     # reconstruct or discard the in-flight worktree on resume.
     worktree_path: str = ""
+    # The mount's mint-time identity, ``(st_dev, st_ino)`` (DW-446): recorded by
+    # `worktree_flow.run_isolated` beside `worktree_path` before any session runs,
+    # and cleared wherever `worktree_path` is. The mount writers'
+    # `runs.mount_root_identity` compares the mount they open against it, so a
+    # mount — or an ancestor (`worktrees/`, `runs/<id>/`) — swapped for a link to
+    # a tree holding a real `<unit>` refuses. None — a pre-upgrade state.json, an
+    # unpinnable mount — refuses every pinned mount write until
+    # `runs.reconcile_root_identities` backfills it on resume/re-arm. That locked
+    # load never overwrites a non-None record, save one exception: a mount that
+    # still lstats as a real directory with the same `st_ino` and a renumbered
+    # `st_dev` (a reboot/remount) has its `st_dev` re-bound. Deliberately absent
+    # from `documents.py`'s `--json` projection (schema 1).
+    worktree_identity: tuple[int, int] | None = None
     branch: str = ""
     sessions: list[SessionRecord] = field(default_factory=list)
     tokens: TokenUsage = field(default_factory=TokenUsage)
@@ -417,7 +630,9 @@ class StoryTask:
             return
         raise KeyError(task_id)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, mount_project: Path | None = None) -> dict[str, Any]:
+        """``mount_project`` anchors the relative spec spellings: see
+        :meth:`_serialized_worktree_path`. ``RunState.to_dict`` passes each task's."""
         return {
             "story_key": self.story_key,
             "epic": self.epic,
@@ -428,8 +643,22 @@ class StoryTask:
             "generation": self.generation,
             "escalations_resolved_upto": self.escalations_resolved_upto,
             "followup_review_recommended": self.followup_review_recommended,
+            "salvage_refile_pending": self.salvage_refile_pending,
+            "migration_recovery_format": self.migration_recovery_format,
+            "migration_ledger_doubt_owned": self.migration_ledger_doubt_owned,
+            "migration_commit_escalated": self.migration_commit_escalated,
+            "migration_ledger_rival": self.migration_ledger_rival,
+            "migration_rewrite_rejected": self.migration_rewrite_rejected,
+            "migration_delivery_id": self.migration_delivery_id,
+            "migration_delivery_pending": self.migration_delivery_pending,
+            "migration_delivery_counts": (
+                dict(self.migration_delivery_counts)
+                if self.migration_delivery_counts is not None
+                else None
+            ),
             "baseline_commit": self.baseline_commit,
             "baseline_untracked": self.baseline_untracked,
+            "baseline_artifacts": self.baseline_artifacts,
             "baseline_ledger_digest": self.baseline_ledger_digest,
             "pre_harvest_ledger": self.pre_harvest_ledger,
             "pre_harvest_ledger_captured": self.pre_harvest_ledger_captured,
@@ -439,12 +668,24 @@ class StoryTask:
             "harvested_deferrals": self.harvested_deferrals,
             "bundle_closes_intended": self.bundle_closes_intended,
             "story_closes_intended": self.story_closes_intended,
+            "ledger_seed_text": self.ledger_seed_text,
+            "pinned_config_rewrites": deepcopy(self.pinned_config_rewrites),
             "board_advance_intended": self.board_advance_intended,
             "accepted_dev_session_index": self.accepted_dev_session_index,
             "harvest_carry_commit_pending": self.harvest_carry_commit_pending,
             "isolated_ledger_carried": self.isolated_ledger_carried,
-            "spec_file": self._serialized_worktree_path(self.spec_file),
-            "dispatched_spec_file": self._serialized_worktree_path(self.dispatched_spec_file),
+            "artifact_baseline": deepcopy(self.artifact_baseline),
+            "artifact_destination": self.artifact_destination,
+            "artifact_source_digests": deepcopy(self.artifact_source_digests),
+            "artifact_tracked_source_oids": deepcopy(self.artifact_tracked_source_oids),
+            "artifact_acceptance_identity": self.artifact_acceptance_identity,
+            "artifact_payload": deepcopy(self.artifact_payload),
+            "artifact_publication_complete": self.artifact_publication_complete,
+            "integration_attempt": deepcopy(self.integration_attempt),
+            "spec_file": self._serialized_worktree_path(self.spec_file, mount_project),
+            "dispatched_spec_file": self._serialized_worktree_path(
+                self.dispatched_spec_file, mount_project
+            ),
             "dispatched_spec_snapshot": (
                 base64.b64encode(self.dispatched_spec_snapshot).decode("ascii")
                 if self.dispatched_spec_snapshot is not None
@@ -455,38 +696,50 @@ class StoryTask:
             "defer_reason": self.defer_reason,
             "preserve_ref": self.preserve_ref,
             "preserve_partial": self.preserve_partial,
+            "preserve_from_attempt": self.preserve_from_attempt,
             "rearmed": self.rearmed,
             "resolved_redrive": self.resolved_redrive,
             "plan_checkpoint_pending": self.plan_checkpoint_pending,
             "plan_review_owed": self.plan_review_owed,
             "sentinel_kind": self.sentinel_kind,
             "restore_patch": self.restore_patch,
+            "adopt_pending": self.adopt_pending,
             "dw_ids": self.dw_ids,
             "bundle_file": self.bundle_file,
             "worktree_path": self.worktree_path,
+            "worktree_identity": _identity_record_to(self.worktree_identity),
             "branch": self.branch,
             "sessions": [s.to_dict() for s in self.sessions],
             "tokens": self.tokens.to_dict(),
             "token_budget_warned": self.token_budget_warned,
         }
 
-    def _serialized_worktree_path(self, path: str | None) -> str | None:
-        """Persist a worktree-local spec path relative to its mounted root.
+    def _serialized_worktree_path(
+        self, path: str | None, mount_project: Path | None = None
+    ) -> str | None:
+        """Persist a worktree-local spec path relative to its mount PROJECT.
 
         Both the accepted/result spec and the attempt-owned dispatched spec use
         this one normalization path so their state.json representations cannot
-        drift. In-place and outside-worktree paths remain verbatim.
+        drift. In-place and outside-mount-project paths remain verbatim.
+
+        A relative spelling is always project-relative (DW-379): ``mount_project`` is
+        ``ProjectPaths.rebased(<mount>).project`` — the mount root itself unless the
+        project is nested inside ``repo_root`` (then ``<mount>/<offset>``). It
+        defaults to ``worktree_path``, which is exactly that answer for the default
+        config, so a state.json written before the offset existed keeps its meaning.
         """
         if not path or not self.worktree_path:
             return path
+        anchor = mount_project if mount_project is not None else Path(self.worktree_path)
         try:
             # as_posix: persist the relative path with forward slashes so state.json
             # stays portable across OSes (matches the in-worktree spec layout).
-            return Path(path).relative_to(self.worktree_path).as_posix()
+            return Path(path).relative_to(anchor).as_posix()
         except ValueError:
-            return path  # spec lives outside the worktree; keep absolute
+            return path  # spec lives outside the mount project; keep absolute
 
-    def release_spec_paths_from_mount(self) -> None:
+    def release_spec_paths_from_mount(self, mount_project: Path | None = None) -> None:
         """Give up the spec ownership a mount being DISCARDED carried.
 
         The counterpart to :meth:`rebase_spec_paths_on`, and deliberately not its
@@ -509,16 +762,17 @@ class StoryTask:
         unbound attempt is a legal state. `_record_dev_spec` cannot repair it either
         — it no-ops while `spec_file` is set.
 
-        Uses the same relativization as `to_dict`, so the discarded-mount spelling
-        and the persisted one cannot drift, which also means a spec OUTSIDE the mount
-        stays verbatim: it was never the mount's to give up. MUST be called while
-        `worktree_path` still names the mount.
+        Uses the same relativization as `to_dict` — ``mount_project`` is the same
+        anchor, defaulting to `worktree_path` — so the discarded-mount spelling and
+        the persisted one cannot drift, which also means a spec OUTSIDE the mount
+        project stays verbatim: it was never the mount's to give up. MUST be called
+        while `worktree_path` still names the mount.
         """
         self.dispatched_spec_file = None
         self.dispatched_spec_snapshot = None
-        self.spec_file = self._serialized_worktree_path(self.spec_file)
+        self.spec_file = self._serialized_worktree_path(self.spec_file, mount_project)
 
-    def release_mount_owned_state(self) -> None:
+    def release_mount_owned_state(self, mount_project: Path | None = None) -> None:
         """Give up EVERYTHING a mount owned: its spec ownership and the measurements
         taken inside it.
 
@@ -541,11 +795,21 @@ class StoryTask:
         no-op instead of a probe of the wrong tree.
 
         MUST be called while `worktree_path` still names the mount — the spec
-        relativization is measured against it.
+        relativization is measured against it (or against ``mount_project``, the
+        mount's project, when the caller knows it: see `release_spec_paths_from_mount`).
         """
-        self.release_spec_paths_from_mount()
+        self.release_spec_paths_from_mount(mount_project)
+        self.artifact_baseline = None
+        self.artifact_destination = None
+        self.artifact_source_digests = None
+        self.artifact_tracked_source_oids = None
+        self.artifact_acceptance_identity = None
+        self.artifact_payload = None
+        self.artifact_publication_complete = False
+        self.integration_attempt = None
         self.baseline_commit = None
         self.baseline_untracked = None
+        self.baseline_artifacts = None
 
     def rebase_spec_paths_on(self, root: Path) -> None:
         """Re-absolutize both spec-ownership paths against the tree that owns them.
@@ -566,8 +830,9 @@ class StoryTask:
         Idempotent: an absolute value is already anchored (a spec outside the mount
         is persisted verbatim) and passes through untouched, so re-running this
         against the same root cannot double-join. `root` is the tree the values were
-        persisted relative to — `task.worktree_path` — never the caller's cwd or
-        project.
+        persisted relative to — the MOUNT PROJECT, ``ProjectPaths.rebased(
+        task.worktree_path).project`` (`task.worktree_path` itself unless the project
+        is nested, DW-379) — never the caller's cwd or the main project.
         """
         self.spec_file = _rebased_on(self.spec_file, root)
         self.dispatched_spec_file = _rebased_on(self.dispatched_spec_file, root)
@@ -582,6 +847,13 @@ class StoryTask:
         symlink-external absolute values keep their original spelling. Resolving
         both sides before containment prevents a lexical in-project path through an
         outward symlink from being redirected into a replacement checkout.
+
+        Every probe sits INSIDE the ``try``, the regular-file one included (DW-116).
+        ``run_isolated`` calls this before its first ``except``, so an ``OSError`` out
+        of ``target.is_file()`` — a TOCTOU against the ``strict=True`` resolve just
+        above it, or a non-EACCES fault — killed the run rather than leaving the
+        spelling alone. Non-raising behavior is byte-identical: a false probe still
+        returns without relativizing, and so now does a raising one.
         """
         raw = self.spec_file
         if not raw or not Path(raw).is_absolute():
@@ -590,9 +862,9 @@ class StoryTask:
             project_root = project.resolve(strict=True)
             target = Path(raw).resolve(strict=True)
             relative = target.relative_to(project_root)
+            if not target.is_file():
+                return
         except (OSError, RuntimeError, ValueError):
-            return
-        if not target.is_file():
             return
         self.spec_file = relative.as_posix()
 
@@ -619,12 +891,30 @@ class StoryTask:
             generation=int(d.get("generation", 0)),
             escalations_resolved_upto=int(d.get("escalations_resolved_upto", 0)),
             followup_review_recommended=bool(d.get("followup_review_recommended", False)),
+            salvage_refile_pending=bool(d.get("salvage_refile_pending", False)),
+            migration_recovery_format=int(d.get("migration_recovery_format", 0)),
+            migration_ledger_doubt_owned=bool(d.get("migration_ledger_doubt_owned", False)),
+            migration_commit_escalated=bool(d.get("migration_commit_escalated", False)),
+            migration_ledger_rival=bool(d.get("migration_ledger_rival", False)),
+            migration_rewrite_rejected=bool(d.get("migration_rewrite_rejected", False)),
+            migration_delivery_id=(
+                str(d["migration_delivery_id"])
+                if d.get("migration_delivery_id") is not None
+                else None
+            ),
+            migration_delivery_pending=bool(d.get("migration_delivery_pending", False)),
+            migration_delivery_counts=(
+                {str(k): int(v) for k, v in d["migration_delivery_counts"].items()}
+                if d.get("migration_delivery_counts") is not None
+                else None
+            ),
             baseline_commit=d.get("baseline_commit"),
             baseline_untracked=(
                 [str(p) for p in d["baseline_untracked"]]
                 if d.get("baseline_untracked") is not None
                 else None
             ),
+            baseline_artifacts=_baseline_artifacts_from(d.get("baseline_artifacts")),
             baseline_ledger_digest=(
                 str(d.get("baseline_ledger_digest"))
                 if d.get("baseline_ledger_digest") is not None
@@ -646,6 +936,13 @@ class StoryTask:
             harvested_deferrals=[deepcopy(dict(item)) for item in d.get("harvested_deferrals", [])],
             bundle_closes_intended=[str(i) for i in d.get("bundle_closes_intended", [])],
             story_closes_intended=[str(i) for i in d.get("story_closes_intended", [])],
+            ledger_seed_text=(
+                str(d.get("ledger_seed_text")) if d.get("ledger_seed_text") is not None else None
+            ),
+            pinned_config_rewrites={
+                str(rel): {str(k): str(v) for k, v in dict(entry).items()}
+                for rel, entry in dict(d.get("pinned_config_rewrites") or {}).items()
+            },
             board_advance_intended=(
                 str(d["board_advance_intended"])
                 if d.get("board_advance_intended") is not None
@@ -658,6 +955,18 @@ class StoryTask:
             ),
             harvest_carry_commit_pending=bool(d.get("harvest_carry_commit_pending", False)),
             isolated_ledger_carried=bool(d.get("isolated_ledger_carried", False)),
+            artifact_baseline=deepcopy(d.get("artifact_baseline")),
+            artifact_destination=d.get("artifact_destination"),
+            artifact_source_digests=deepcopy(d.get("artifact_source_digests")),
+            artifact_tracked_source_oids=deepcopy(d.get("artifact_tracked_source_oids")),
+            artifact_acceptance_identity=(
+                str(d["artifact_acceptance_identity"])
+                if d.get("artifact_acceptance_identity") is not None
+                else None
+            ),
+            artifact_payload=deepcopy(d.get("artifact_payload")),
+            artifact_publication_complete=bool(d.get("artifact_publication_complete", False)),
+            integration_attempt=deepcopy(d.get("integration_attempt")),
             spec_file=d.get("spec_file"),
             dispatched_spec_file=d.get("dispatched_spec_file"),
             dispatched_spec_snapshot=dispatched_spec_snapshot,
@@ -666,15 +975,18 @@ class StoryTask:
             defer_reason=d.get("defer_reason"),
             preserve_ref=d.get("preserve_ref"),
             preserve_partial=bool(d.get("preserve_partial", False)),
+            preserve_from_attempt=bool(d.get("preserve_from_attempt", False)),
             rearmed=bool(d.get("rearmed", False)),
             resolved_redrive=bool(d.get("resolved_redrive", False)),
             plan_checkpoint_pending=bool(d.get("plan_checkpoint_pending", False)),
             plan_review_owed=bool(d.get("plan_review_owed", False)),
             sentinel_kind=str(d.get("sentinel_kind", "")),
             restore_patch=d.get("restore_patch"),
+            adopt_pending=bool(d.get("adopt_pending", False)),
             dw_ids=[str(i) for i in d.get("dw_ids", [])],
             bundle_file=d.get("bundle_file"),
             worktree_path=str(d.get("worktree_path", "")),
+            worktree_identity=_identity_record_from(d.get("worktree_identity")),
             branch=str(d.get("branch", "")),
             sessions=[SessionRecord.from_dict(s) for s in d.get("sessions", [])],
             tokens=TokenUsage.from_dict(d.get("tokens", {})),
@@ -703,11 +1015,35 @@ class RunState:
     # in one step; this flag rides the state write itself, which is what lets a
     # retry tell "moved and recorded" from "moved, record still owed" — the one
     # distinction that keeps the record retryable without ever asserting a move
-    # that was not persisted. Consumed by whichever surface retries first: a second
-    # `restamp_code_root` writes its own record, and a plain `resume` folds the
-    # move into its `run-resume` line. Deliberately absent from `documents.py`'s `--json`
+    # that was not persisted. Consumed by whichever surface retries first, and by
+    # both the same way: a second `restamp_code_root` and a plain `resume` each
+    # discharge the debt with their own `rearm-code-root-restamped` append naming
+    # the root THIS field's `repo_root` still describes, before overwriting it —
+    # never by folding it into another line, which would answer an A→B debt with a
+    # row that names no root. Deliberately absent from `documents.py`'s `--json`
     # projection (schema 1), like `rearmed` / `resolved_redrive`.
     code_root_restamp_pending: bool = False
+    # One-resume latch for `bmad-loop resume --accept-baseline` (DW-371). Written
+    # True or False by `cli._prepare_resume_locked` on EVERY resume, so a plain,
+    # TUI, or `resolve` re-arm resume clears a stale latch; the engine also clears
+    # it once in-flight recovery returns normally. While set, the restart arms
+    # re-stamp each restarted in-place task's baseline from the current checkout
+    # BEFORE the rollback, so commits made while the run was down become the new
+    # baseline instead of being parked and reset over. Deliberately absent from
+    # `documents.py`'s `--json` projection (schema 1).
+    accept_baseline: bool = False
+    # The run dir's mint-time identity, ``(st_dev, st_ino)`` (DW-446): recorded by
+    # `runsetup.compose_run`/`compose_sweep` from the claim that minted the dir.
+    # `Journal.write_verify_stream` compares the run dir it opens against it, so
+    # `runs/` or `runs/<id>/` swapped for a link to a tree holding a real `<id>/`
+    # refuses. None — a pre-upgrade state.json, an unpinnable or zero-inode claim
+    # — refuses the verify stream (on the win32 arm too, which before DW-446 wrote
+    # through a zero-inode run dir) until `runs.reconcile_root_identities`
+    # backfills it on resume/re-arm; a zero-inode run dir never backfills. A
+    # non-None record is never overwritten except the locked `st_dev` re-bind
+    # (same `st_ino`, still a real directory). Deliberately absent from
+    # `documents.py`'s `--json` projection (schema 1).
+    run_dir_identity: tuple[int, int] | None = None
     policy_snapshot: dict[str, Any] = field(default_factory=dict)
     # SECONDARY copy of the host-exec baseline (#498) — runsetup.config_digest over
     # the agent-writable config that reaches HOST code execution: verify commands,
@@ -759,6 +1095,15 @@ class RunState:
     crashed: bool = False
     crash_error: str | None = None
     run_type: str = "story"  # "story" | "sweep" — resume/status dispatch on it
+    # Version of the separately persisted sweep.json options format. Zero means
+    # a pre-marker run, where a missing options file is the legacy unrestricted
+    # shape. Selector-capable sweeps stamp the current nonzero version at launch,
+    # so losing sweep.json cannot silently widen them on resume.
+    sweep_options_version: int = 0
+    # SHA-256 of the exact sweep.json bytes published for the current format.
+    # State and options are separate atomic files; this binding makes replacing
+    # a targeted run's valid options with an unrestricted document fail closed.
+    sweep_options_digest: str = ""
     # story-queue source (policy.StoriesPolicy.source), pinned at run start so
     # resume/resolve rebuild the right engine (StoriesEngine vs the sprint Engine)
     # without re-reading policy — a policy edit mid-run must not switch a live run's
@@ -770,6 +1115,64 @@ class RunState:
     # sweep runs only: the triage->bundles cycle in progress; 1 maps to the
     # legacy (unsuffixed) artifact names so old paused runs resume unchanged
     sweep_cycle: int = 1
+    # sweep runs only: the run's own dispositions of deferred-work decisions —
+    # ids already journaled as skipped-unattended, and ids whose recorded answer
+    # this run already journaled as DROPPED (and notified). Persisted so a
+    # pause/resume of the SAME run does not re-announce a disposition it already
+    # made; deliberately run-scoped, so a NEW run re-evaluates every decision
+    # from scratch. Deliberately NOT the human's answer either: that stays in
+    # `<run>/decisions.json`, auditable and untouched — only the disposition the
+    # run reached about it lives here.
+    sweep_skipped_decisions: list[str] = field(default_factory=list)
+    sweep_dropped_decisions: list[str] = field(default_factory=list)
+    # sweep runs only, and a VERDICT rather than a disposition (DW-200): ids whose
+    # `build` answer this run recorded while `record_decision` reported writing no
+    # `decision:` line. It answers a different question from the two lists above —
+    # "this answer's ledger line never landed", not "this disposition was already
+    # announced" — and neither replaces the other. Persisted because the verdict is
+    # observed in `_decisions_phase` and consumed in `_materialize_bundles`: an
+    # interruption anywhere between them must not resume into a materialized bundle
+    # for an id the ledger holds no entry for. Cleared by the drop that announces
+    # it, in the same `_save()` that quarantines the id in
+    # `sweep_dropped_decisions`. An id no later drop announces remains until the
+    # run ends; this list never doubles as a second announcement gate.
+    sweep_unlanded_decisions: list[str] = field(default_factory=list)
+    # sweep runs only, and the RUN's ledger-publication doubt rather than a
+    # cycle's (DW-218/219). `_ledger_in_doubt` / `_close_ledger_in_doubt` live on
+    # the SweepEngine instance and are cycle-scoped by design; this mirrors them
+    # the moment either is armed, because the window that loses them is between
+    # the arming site and `_cycle`'s dispatch gate reporting: a stop request
+    # observed in the withheld branch, or any crash in the same span, ends the
+    # process with the verdict held only in memory, and the resume then dispatches
+    # the bundles whose `git add -A` sweeps the half-written ledger into HEAD.
+    # It follows the latch it mirrors rather than outliving it: a later effect
+    # landing in the same decision walk proves the ledger reads and writes again,
+    # and `_release_ledger_doubt` clears the mirror there — but ONLY for an arm
+    # THIS process made. The mirror is left standing while the close phase's latch
+    # is armed this cycle, and whenever it was inherited from a previous process,
+    # because "the ledger reads and writes again" is a statement about this
+    # process's LAST ATTEMPT and nothing wider — not about a write a different
+    # phase made, nor about bytes a previous process left on disk. Those two wait
+    # for the documented repair: a human edits the ledger
+    # and re-runs `bmad-loop sweep`, which is a NEW run with fresh state, so the
+    # residual stickiness cannot contaminate a later cycle: `_loop` stops or
+    # returns when doubt remains armed at the boundary. A cycle that releases its
+    # doubt can continue repeating with a clear mirror. Absent from an
+    # older `state.json`, it reads False: a compatibility default, so that run
+    # resumes exactly as it does today. Not evidence the run which wrote it was
+    # healthy — it could have armed an instance latch and lost it at the same
+    # interruption this field closes.
+    sweep_ledger_in_doubt: bool = False
+    # sweep runs only: a ledger write this run published whose commit has not yet
+    # landed. Latched BEFORE the already-resolved close and each decision effect
+    # write, cleared by the ledger-family `_commit_ledger` once git says the file
+    # is at HEAD, and settled at the top of a resume. The two sites gate their own
+    # commit on THIS invocation's write result (DW-183/DW-185), and a process that
+    # dies between the publish and the commit replays as an invocation that wrote
+    # nothing — so without the debt on disk the closure the journal already claims
+    # stays dirty ahead of the cycle's bundles. A pre-latch `state.json` loads
+    # False and resumes exactly as before.
+    sweep_ledger_commit_owed: bool = False
     # auto-sweep triggers already fired this run (e.g. "epic-1", "run-end");
     # guards re-fire on resume
     sweeps_triggered: list[str] = field(default_factory=list)
@@ -803,6 +1206,28 @@ class RunState:
         state.json (empty ``repo_root``) degrades to precisely what it did before
         rather than to a path that does not exist."""
         return Path(self.repo_root or self.project)
+
+    def mount_project(self, task: StoryTask) -> Path | None:
+        """The mount project of ``task``'s recorded mount, or None without one.
+
+        ``ProjectPaths.rebased(<mount>).project`` recomputed from what this state
+        records — ``project`` and :attr:`code_root` — through the one shared
+        definition, :func:`mountpaths.rebased_project`: the mount itself unless the
+        project is nested inside the code root (DW-379). The anchor every relative
+        spec spelling of that task is persisted against and read back from.
+
+        A recorded pair that looks DISJOINT answers the mount itself, the pre-DW-379
+        anchor. No mount is ever made for a disjoint layout (worktree isolation refuses
+        it), so a recorded mount beside such a pair means the recorded spellings went
+        stale — a project moved in the default config keeps its launch-time `project`
+        while resume re-stamps `repo_root` — and the default config's answer is the
+        mount root."""
+        if not task.worktree_path:
+            return None
+        mount = Path(task.worktree_path)
+        if project_offset(Path(self.project), self.code_root) is None:
+            return mount
+        return rebased_project(Path(self.project), self.code_root, mount)
 
     def handled_keys(self) -> set[str]:
         """Story keys this run already drove to a terminal phase."""
@@ -841,6 +1266,8 @@ class RunState:
             "project": self.project,
             "repo_root": self.repo_root,
             "code_root_restamp_pending": self.code_root_restamp_pending,
+            "accept_baseline": self.accept_baseline,
+            "run_dir_identity": _identity_record_to(self.run_dir_identity),
             "started_at": self.started_at,
             "policy_snapshot": self.policy_snapshot,
             "trusted_config_digest": self.trusted_config_digest,
@@ -856,14 +1283,21 @@ class RunState:
             "crashed": self.crashed,
             "crash_error": self.crash_error,
             "run_type": self.run_type,
+            "sweep_options_version": self.sweep_options_version,
+            "sweep_options_digest": self.sweep_options_digest,
             "source": self.source,
             "spec_folder": self.spec_folder,
             "sweep_cycle": self.sweep_cycle,
+            "sweep_skipped_decisions": self.sweep_skipped_decisions,
+            "sweep_dropped_decisions": self.sweep_dropped_decisions,
+            "sweep_unlanded_decisions": self.sweep_unlanded_decisions,
+            "sweep_ledger_in_doubt": self.sweep_ledger_in_doubt,
+            "sweep_ledger_commit_owed": self.sweep_ledger_commit_owed,
             "sweeps_triggered": self.sweeps_triggered,
             "sweeps_refused": self.sweeps_refused,
             "target_branch": self.target_branch,
             "plugin_shared": self.plugin_shared,
-            "tasks": {k: t.to_dict() for k, t in self.tasks.items()},
+            "tasks": {k: t.to_dict(self.mount_project(t)) for k, t in self.tasks.items()},
         }
 
     @classmethod
@@ -873,6 +1307,8 @@ class RunState:
             project=d["project"],
             repo_root=str(d.get("repo_root", "")),
             code_root_restamp_pending=bool(d.get("code_root_restamp_pending", False)),
+            accept_baseline=bool(d.get("accept_baseline", False)),
+            run_dir_identity=_identity_record_from(d.get("run_dir_identity")),
             started_at=d["started_at"],
             policy_snapshot=d.get("policy_snapshot", {}),
             trusted_config_digest=str(d.get("trusted_config_digest", "")),
@@ -888,9 +1324,16 @@ class RunState:
             crashed=bool(d.get("crashed", False)),
             crash_error=d.get("crash_error"),
             run_type=str(d.get("run_type", "story")),
+            sweep_options_version=int(d.get("sweep_options_version", 0)),
+            sweep_options_digest=str(d.get("sweep_options_digest", "")),
             source=str(d.get("source", "sprint-status")),
             spec_folder=str(d.get("spec_folder", "")),
             sweep_cycle=int(d.get("sweep_cycle", 1)),
+            sweep_skipped_decisions=[str(s) for s in d.get("sweep_skipped_decisions", [])],
+            sweep_dropped_decisions=[str(s) for s in d.get("sweep_dropped_decisions", [])],
+            sweep_unlanded_decisions=[str(s) for s in d.get("sweep_unlanded_decisions", [])],
+            sweep_ledger_in_doubt=bool(d.get("sweep_ledger_in_doubt", False)),
+            sweep_ledger_commit_owed=bool(d.get("sweep_ledger_commit_owed", False)),
             sweeps_triggered=[str(s) for s in d.get("sweeps_triggered", [])],
             sweeps_refused={str(k): str(v) for k, v in d.get("sweeps_refused", {}).items()},
             target_branch=str(d.get("target_branch", "")),
@@ -970,6 +1413,28 @@ class VerifyOutcome:
     # only what the waived gate would have found. `True` / `False` / `None` have
     # the same no-diff / diff / unknown meanings as `park_zero_diff`.
     plan_halt_zero_diff: bool | None = None
+    # A deferred-work BUNDLE's artifact-only receipt (DW-273). `True` when the
+    # bundle path's proof-of-work gate found nothing it counts, the session's
+    # synthesized result asserted `artifact_only: true` (the strict boolean
+    # `devcontract` mints from the current session's genuine marker, exactly as
+    # `park_asserted`), and a directory-scoped `git status --ignored` listing of
+    # the configured `implementation_artifacts` dir held IGNORED entries (`!!`
+    # records — the tracked and untracked ones are what the probe already
+    # measured). Only
+    # `verify.verify_dev_bundle` sets it; the sprint and stories legs never
+    # consult the receipt, so on their outcomes it is always `False`.
+    #
+    # It is a receipt, not a waiver: the gate still ran and positively answered
+    # "nothing changed" before the receipt was consulted, and what the receipt
+    # proves is bounded — ignored paths carry no baseline, so the listing shows
+    # only that the artifacts dir holds session-reachable content under the code
+    # tree, never WHICH entry this session wrote. The assertion is the
+    # load-bearing half, as it is for a park.
+    artifact_only_accepted: bool = False
+    # The number of ignored entries the receipt's listing held, carried to the journal
+    # (`bundle-artifact-only-accepted`'s `count`). `None` whenever no receipt was
+    # accepted, including on every non-bundle leg.
+    artifact_only_residue: int | None = None
 
     @classmethod
     def passed(
@@ -978,12 +1443,16 @@ class VerifyOutcome:
         park_proof_skipped: bool = False,
         park_zero_diff: bool | None = None,
         plan_halt_zero_diff: bool | None = None,
+        artifact_only_accepted: bool = False,
+        artifact_only_residue: int | None = None,
     ) -> "VerifyOutcome":
         return cls(
             ok=True,
             park_proof_skipped=park_proof_skipped,
             park_zero_diff=park_zero_diff,
             plan_halt_zero_diff=plan_halt_zero_diff,
+            artifact_only_accepted=artifact_only_accepted,
+            artifact_only_residue=artifact_only_residue,
         )
 
     @classmethod

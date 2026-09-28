@@ -102,7 +102,8 @@ body:
       description: On WSL, run `bmad-loop mux` and read the `selection:` line — `platform default for linux`
         is the supported setup, `platform default for win32` means you are on the Windows build
         and should say so below. A forced `BMAD_LOOP_MUX_BACKEND`/`[mux] backend` choice replaces
-        that line with the forced reason; `bmad-loop diagnose` reports `sys.platform` either way.
+        that line with the forced reason; once a run exists, `bmad-loop diagnose` reports
+        `sys.platform` either way (before the first run it exits with `no runs found`).
       options:
         - macOS
         - Windows

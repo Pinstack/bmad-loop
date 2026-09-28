@@ -21,15 +21,23 @@ it lazily for its own tests.
 from __future__ import annotations
 
 import copy
+import dataclasses
+import difflib
 import json
+import posixpath
+import secrets
+from collections import Counter
 from collections.abc import Collection, Sequence
+from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, NoReturn
+from typing import TYPE_CHECKING, Any, Callable, NoReturn
 
-from . import gates, verify
+from . import artifact_publication, codex_trust, deferredwork, gates, verify, workspace_trust
+from .adapters.profile import ProfileError
 from .install import (
     _REVIEW_LAYER_SKILLS,
+    ANTIGRAVITY_HOOK_GROUP,
     BASE_SKILLS,
     BMAD_DIR,
     BMAD_SCRIPTS_SEED_REL,
@@ -37,7 +45,6 @@ from .install import (
     CENTRAL_CONFIG_REL,
     DEV_PRIMITIVE_MARKERS,
     DEV_PRIMITIVE_ROLES,
-    HOOK_SCRIPT_REL,
     MERGED_REVIEW_SKILL,
     MODULE_SKILLS,
     RENDER_DIR_REL,
@@ -46,6 +53,7 @@ from .install import (
     RENDERER_SEED_SENTINELS,
     _absent_renderer_sources,
     _copy_traversable,
+    _hook_command,
     _is_dir,
     _is_file,
     _occupied,
@@ -60,8 +68,8 @@ from .install import (
     strip_relay_hooks,
 )
 from .model import Phase
-from .platform_util import atomic_write_text
-from .process_host import get_process_host
+from .mountpaths import rebased_project
+from .platform_util import atomic_write_text, filesystem_type, root_identity_record
 from .workspace import (
     UnitWorkspace,
     Workspace,
@@ -74,7 +82,7 @@ if TYPE_CHECKING:
     from importlib.resources.abc import Traversable
 
     from .adapters.base import CodingCLIAdapter
-    from .adapters.profile import CLIProfile
+    from .adapters.profile import CLIProfile, WorkspaceTrustSpec
     from .bmadconfig import ProjectPaths
     from .journal import Journal
     from .model import RunState, StoryTask
@@ -91,6 +99,211 @@ _SETUP_MCP_AGENT_IDS = {"claude": "claude-code"}
 def _setup_mcp_agent_id(profile_name: str) -> str:
     """Map a CLI profile name to its Unity-MCP `setup-mcp` agent id."""
     return _SETUP_MCP_AGENT_IDS.get(profile_name, profile_name)
+
+
+def _crlf_normalized(data: bytes) -> bytes:
+    """``data`` with every CRLF read as LF — the one translation a git checkout
+    under ``core.autocrlf`` applies on its own (see `_warn_accepted_spec_superseded`)."""
+    return data.replace(b"\r\n", b"\n")
+
+
+def _artifact_seed(artifact: Path, repo: Path, worktree: Path) -> tuple[str, ...]:
+    """The seed rel for one orchestrator-owned artifact (ledger or board), or ``()``.
+
+    The shared body of ``WorktreeFlow._ledger_seed`` and ``_board_seed``. The rel
+    is the CONFIGURED path — the parent resolved, the leaf NOT — because that is
+    the path ``ProjectPaths.rebased`` hands every worktree reader. Resolving the
+    leaf too followed a symlinked artifact to its target's rel, so the copy landed
+    where no reader looks (DW-377, was #462).
+
+    ``repo`` and ``worktree`` are the project-local roots :func:`provision_roots`
+    names — the main project and the mount project (the checkout roots themselves in
+    the default config, DW-379) — so the rel is project-relative, and "out-of-repo"
+    below means outside the PROJECT.
+
+    The fully resolved target rel has two uses. First, it keeps the out-of-project
+    exclusion: the seed loop refuses such a source whatever rel it is handed, so
+    an untracked leaf link to an outside target leaves the worktree's configured
+    path absent (the worktree reads an outside target in place only when the
+    checkout carries the link, or when the artifacts DIR itself is out of tree).
+    Second, it is the seed rel when the checkout carries the link as a tracked
+    DANGLING entry: the seed loop will not copy through a link, so the target is
+    the only path it will write, and the link then reads that copy.
+
+    ``()`` on any resolve/relative fault; for an artifact absent from the main
+    checkout (dropped silently by the seed loop, so naming it would be invisible
+    rather than inert); for one the checkout already delivers; and behind a
+    worktree link whose target is already in the worktree. Every probe is total.
+    """
+    try:
+        repo_resolved = repo.resolve()
+        rel = (artifact.parent.resolve() / artifact.name).relative_to(repo_resolved).as_posix()
+        target_rel = artifact.resolve().relative_to(repo_resolved).as_posix()
+    except (OSError, RuntimeError, ValueError):
+        return ()
+    if not _is_file(artifact) or _is_file(worktree / rel):
+        return ()
+    try:
+        linked = (worktree / rel).is_symlink()
+    except (OSError, ValueError):
+        # An entry that cannot be inspected is not safe to write through either.
+        return ()
+    if linked:
+        return () if _occupied(worktree / target_rel) else (target_rel,)
+    return (rel,)
+
+
+def _artifact_seed_dropped(artifact: Path, repo: Path, worktree: Path) -> tuple[str, ...]:
+    """The configured rel :func:`_artifact_seed` excluded as out-of-project, when the
+    worktree ends up without it — or ``()`` (DW-432).
+
+    Naming only: the out-of-project exclusion itself stands, and nothing here seeds or
+    copies. It exists because that exclusion was silent — an untracked leaf symlink
+    whose target resolves outside the PROJECT left the worktree's configured path
+    absent with no journal entry saying so. For a nested project a target that is
+    inside ``repo_root`` but outside the project is named too (and still not copied:
+    the copier's checkout-wide containment check would let it through, which would be
+    a behavior change).
+
+    ``(rel,)`` only when the configured rel (parent resolved, leaf not — the one
+    :func:`_artifact_seed` derives) lies inside ``repo``, the fully resolved target
+    does NOT, the main-checkout artifact reads as a file, and ``worktree / rel`` does
+    not (a checkout carrying the link as a tracked live entry delivers it). ``repo``
+    and ``worktree`` are the :func:`provision_roots` pair, so the rel is
+    project-relative like every other ``worktree-seed-dropped`` entry. Meant to run
+    after provisioning, on the post-provisioning worktree. Total: a resolve fault is
+    "not dropped".
+    """
+    try:
+        repo_resolved = repo.resolve()
+        rel = (artifact.parent.resolve() / artifact.name).relative_to(repo_resolved).as_posix()
+    except (OSError, RuntimeError, ValueError):
+        return ()
+    try:
+        artifact.resolve().relative_to(repo_resolved)
+    except ValueError:
+        pass  # the target escapes the project: the exclusion this names
+    except (OSError, RuntimeError):
+        return ()
+    else:
+        return ()  # an in-project target is _artifact_seed's to deliver
+    if not _is_file(artifact) or _is_file(worktree / rel):
+        return ()
+    return (rel,)
+
+
+def provision_roots(worktree: Path, repo_root: Path, project: Path | None) -> tuple[Path, Path]:
+    """``(src_root, dst_root)``: where provisioning reads each project-local surface
+    in the main checkout, and where it lands it in the mount (DW-379).
+
+    The project lies inside ``repo_root`` (the default config included), so the
+    mount mirrors the main checkout: ``src_root`` is the main project and
+    ``dst_root`` the mount project, :func:`mountpaths.rebased_project`'s single
+    definition (``<worktree>/<offset>``; ``worktree`` itself when the offset is
+    ``.``). ``project=None`` keeps the checkout roots, ``(repo_root, worktree)``.
+
+    A project NOT inside ``repo_root`` (a disjoint layout) raises
+    :class:`verify.GitError`: the checkout carries no copy of it, so there is no
+    mirror to build, and `bmadconfig.worktree_isolation_conflict` refuses worktree
+    isolation for that layout before any mount is made (#414). Reaching here with
+    one is a bypassed refusal, and seeding from either root would bring back the
+    silent stall the refusal exists for, so it fails loud instead.
+
+    Lexical: the caller hands over the spellings it wants compared (provisioning
+    resolves all three first). Containment is NOT narrowed by this — every caller
+    keeps judging sources against ``repo_root`` and destinations against
+    ``worktree``, checkout-wide."""
+    if project is None:
+        return repo_root, worktree
+    if not project.is_relative_to(repo_root):
+        raise verify.GitError(
+            f"cannot provision a worktree for a project ({project}) outside repo_root "
+            f"({repo_root}): worktree isolation is refused for that layout (#414)"
+        )
+    return project, rebased_project(project, repo_root, worktree)
+
+
+def _shield_rel(worktree: Path, dst_root: Path, rel: str) -> str:
+    """A ``dst_root``-relative rel spelled worktree-relative, for the git-add shield.
+
+    Identity when ``dst_root`` is the worktree (the default config, byte-for-byte);
+    otherwise the project's offset is prefixed, so a pattern built as ``f"/{rel}"``
+    anchors at ``/<offset>/...`` where provisioning actually wrote."""
+    offset = dst_root.relative_to(worktree).as_posix()
+    if offset == ".":
+        return rel
+    return posixpath.normpath(f"{offset}/{rel}")
+
+
+def _normalized_ledger_lines(text: str) -> list[str]:
+    """Rstripped non-blank lines, engine ``seen-again:`` stamps dropped."""
+    return [
+        line
+        for line in (raw.rstrip() for raw in text.splitlines())
+        if line and not line.startswith("seen-again:")
+    ]
+
+
+def _uncarried_ledger_changes(
+    seed: str,
+    current: str,
+    *,
+    harvested: Collection[tuple[str, str]],
+    closed: Collection[str],
+) -> tuple[list[str], int]:
+    """What differs between a seeded ledger and its worktree copy beyond engine writes.
+
+    Pure (DW-375). ``harvested`` is the task's recorded ``(origin, source_spec)``
+    pairs and ``closed`` its intended story/bundle close ids — the writes the
+    post-merge carry re-applies. Explained ids are the closed ids plus every id
+    NEW in ``current`` that carries a harvested pair (harvest ids minted in the
+    worktree are not recorded, so the pair is the key, as it is the carry's).
+    Entries compare by id over a normalized body (rstripped non-blank lines,
+    ``seen-again:`` dropped). Returns the unexplained ids — seed order, then
+    current order — and ``count``, the symmetric multiset difference of
+    normalized non-blank lines outside every canonical span (flat blocks and
+    other non-entry text).
+    """
+    seed_entries = deferredwork.parse_ledger(seed)
+    current_entries = deferredwork.parse_ledger(current)
+
+    def bodies(entries: list[deferredwork.DWEntry]) -> dict[str, list[list[str]]]:
+        by_id: dict[str, list[list[str]]] = {}
+        for entry in entries:
+            by_id.setdefault(entry.id, []).append(_normalized_ledger_lines(entry.body))
+        return by_id
+
+    seed_bodies = bodies(seed_entries)
+    current_bodies = bodies(current_entries)
+    explained = set(closed)
+    for entry in current_entries:
+        if entry.id not in seed_bodies and any(
+            deferredwork.field_line_present(entry, "origin", origin)
+            and deferredwork.field_line_present(entry, "source_spec", source_spec)
+            for origin, source_spec in harvested
+        ):
+            explained.add(entry.id)
+    unexplained: list[str] = []
+    for entry in (*seed_entries, *current_entries):
+        dw_id = entry.id
+        if dw_id in explained or dw_id in unexplained:
+            continue
+        if seed_bodies.get(dw_id) != current_bodies.get(dw_id):
+            unexplained.append(dw_id)
+
+    def outside(text: str, entries: list[deferredwork.DWEntry]) -> Counter[str]:
+        kept: list[str] = []
+        cursor = 0
+        for start, end in sorted(entry.span for entry in entries):
+            kept.append(text[cursor:start])
+            cursor = max(cursor, end)
+        kept.append(text[cursor:])
+        return Counter(line for chunk in kept for line in _normalized_ledger_lines(chunk))
+
+    before = outside(seed, seed_entries)
+    after = outside(current, current_entries)
+    count = sum(((before - after) + (after - before)).values())
+    return unexplained, count
 
 
 def _worktree_skill_copy_candidates(repo_root: Path, tree: str) -> tuple[str, ...]:
@@ -317,7 +530,7 @@ def _reconcile_tracked_patterns(
     return kept, (" ".join(reasons) if reasons else None)
 
 
-def _pin_tracked_config_rewrite(worktree: Path, rel: str) -> str | None:
+def _pin_tracked_config_rewrite(worktree: Path, rel: str) -> tuple[bool, str | None]:
     """Keep a rewritten TRACKED hook config out of the unit's story commits.
 
     The worktree-local exclude cannot: git consults ignore rules only for
@@ -330,11 +543,19 @@ def _pin_tracked_config_rewrite(worktree: Path, rel: str) -> str | None:
     (it is the sparse-checkout mechanism) and that dies with the worktree, so
     the rewrite stays session-local.
 
-    While the pin holds, the config is orchestrator-owned: a story's own edit to
-    the pinned file stays session-local and is discarded with the worktree. That
-    is deliberate — before this pin the tracked case stalled outright (#352), so
-    there is no prior working behavior to preserve, and any file-level hiding
-    that keeps OUR rewrite out of `add -A` hides a story's edit with it.
+    While the pin holds, a story's own edit to the pinned file is hidden from
+    `add -A` along with OUR rewrite — any file-level hiding hides both — so it
+    never reaches the unit commit. Rather than let teardown delete it with the
+    worktree, the caller records each pinned rewrite (``provision_worktree``'s
+    ``on_pinned``) and success teardown compares the file on disk against that
+    record with relay hooks ignored: any other difference journals
+    ``pinned-config-edit-refused`` and pauses the run with the worktree kept
+    (DW-368, ``WorktreeFlow._refuse_pinned_config_edits``). The edit is not
+    carried anywhere; the operator does that by hand.
+
+    Returns ``(pinned, degrade)``: ``pinned`` is True only when the skip-worktree
+    bit was actually set, so a caller can tell a pin from "not tracked" / "not a
+    repo" (both ``(False, None)``); ``degrade`` is the observation fault below.
 
     NOT-A-REPO IS SILENT for the same reason the shield's tracked-probe is:
     provisioning a plain directory is ordinary, and there is no index and no
@@ -348,14 +569,14 @@ def _pin_tracked_config_rewrite(worktree: Path, rel: str) -> str | None:
     """
     try:
         if verify.git_bytes(worktree, "rev-parse", "--absolute-git-dir").returncode != 0:
-            return None
+            return False, None
     except (verify.GitError, OSError):
-        return None
+        return False, None
     try:
         if not verify.path_tracked_file(worktree, rel):
-            return None
+            return False, None
     except (verify.GitError, OSError) as e:
-        return (
+        return False, (
             f"could not check whether the rewritten hook config {rel} is tracked "
             f"({e}); if the project tracks it, the worktree's machine-specific relay "
             "command may be committed and merged back (#352)"
@@ -367,14 +588,189 @@ def _pin_tracked_config_rewrite(worktree: Path, rel: str) -> str | None:
             "config is tracked, so without the pin its machine-specific relay rewrite "
             "would reach story commits and merge back (#352)"
         )
-    return None
+    return True, None
 
 
-def _seed_bmad_tree(worktree: Path, repo_root: Path) -> tuple[list[str], list[str]]:
+def _normalized_pinned_config(parsed: dict[str, Any], dialect: str) -> dict[str, Any]:
+    """A parsed hook config with the orchestrator-owned relay hooks removed.
+
+    Drops exactly what ``strip_relay_hooks`` drops, plus the hook container once
+    that leaves it empty — provisioning may have created it only to hold the relay.
+    Works on a deep copy: the strip mutates.
+    """
+    cfg = copy.deepcopy(parsed)
+    strip_relay_hooks(cfg, dialect)
+    key = ANTIGRAVITY_HOOK_GROUP if dialect == "antigravity-hooks-json" else "hooks"
+    if cfg.get(key) == {}:
+        del cfg[key]
+    return cfg
+
+
+def _json_canonical(value: Any) -> str:
+    """JSON text with sorted keys: equal only for the same JSON value. Python's
+    ``==`` alone is not — it reads ``true`` as ``1`` and ``1`` as ``1.0``."""
+    return json.dumps(value, sort_keys=True)
+
+
+def _pinned_config_edits(worktree: Path, pins: dict[str, dict[str, str]]) -> list[str]:
+    """Describe every story edit to a pinned hook config, or ``[]`` for none (DW-368).
+
+    ``pins`` is ``StoryTask.pinned_config_rewrites``: worktree-relative path ->
+    ``{"dialect", "text"}`` as provisioning wrote it. A file byte-identical to its
+    record is untouched; otherwise both sides are parsed and compared with relay
+    hooks and an emptied hook container ignored, so a changed or removed relay
+    command, or a reformat, is not an edit. A non-relay hook a story or user added
+    IS one. Deterministic, and conservative because teardown is irreversible: a
+    config that is missing, unreadable, undecodable, unparseable or not a JSON
+    object while pinned counts as an edit, its description naming the fault.
+    """
+    edits: list[str] = []
+    for rel in sorted(pins):
+        entry = pins[rel]
+        recorded_text = str(entry.get("text", ""))
+        dialect = str(entry.get("dialect", ""))
+        path = worktree / rel
+        try:
+            raw = path.read_bytes()
+        except FileNotFoundError:
+            edits.append(f"{rel}: deleted while pinned")
+            continue
+        except OSError as e:
+            edits.append(f"{rel}: unreadable while pinned ({e})")
+            continue
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as e:
+            edits.append(f"{rel}: not valid UTF-8 ({e})")
+            continue
+        if text == recorded_text:
+            continue
+        try:
+            current = json.loads(text)
+        except json.JSONDecodeError as e:
+            edits.append(f"{rel}: no longer parses as JSON ({e})")
+            continue
+        if not isinstance(current, dict):
+            edits.append(f"{rel}: no longer a JSON object ({type(current).__name__})")
+            continue
+        try:
+            recorded = json.loads(recorded_text)
+        except json.JSONDecodeError as e:
+            edits.append(f"{rel}: the recorded rewrite cannot be parsed ({e})")
+            continue
+        if not isinstance(recorded, dict):
+            edits.append(f"{rel}: the recorded rewrite is not a JSON object")
+            continue
+        now = _normalized_pinned_config(current, dialect)
+        was = _normalized_pinned_config(recorded, dialect)
+        if _json_canonical(now) == _json_canonical(was):
+            continue
+        # keys on one side only (even with a null value) plus keys whose values differ
+        changed = sorted(
+            (now.keys() ^ was.keys())
+            | {
+                k
+                for k in now.keys() & was.keys()
+                if _json_canonical(now[k]) != _json_canonical(was[k])
+            }
+        )
+        edits.append(f"{rel}: changed outside the relay hooks (keys: {', '.join(changed)})")
+    return edits
+
+
+_PINNED_FORENSICS_HEADER = (
+    "# bmad-loop (DW-479): edits to skip-worktree-pinned hook configs.\n"
+    "# `git diff` reads a skip-worktree path as clean, so the patch above (if any)\n"
+    "# omits these. Each diff's base is the rewrite provisioning wrote and pinned\n"
+    "# (bmad-loop relay hooks included), not the baseline commit, so this section is\n"
+    "# commented out and does NOT apply: `git apply` skips it; carry it by hand.\n"
+)
+
+
+def _unified_diff_text(before: str, after: str | None, rel: str) -> str:
+    """A unified diff of ``before`` -> ``after`` for ``rel`` (``after=None``: deleted,
+    diffed to ``/dev/null``), with git's no-newline marker where a side lacks one.
+    Every line is ``# ``-prefixed: its base is the relay-bearing rewrite, not the
+    baseline, so a live hunk would make an all-or-nothing ``git apply`` of the whole
+    patch fail; commented, ``git apply`` skips it as garbage."""
+    lines = difflib.unified_diff(
+        _lines_keepends(before),
+        _lines_keepends(after or ""),
+        fromfile=f"a/{rel}",
+        # patch-format spelling of "no file", on every platform (not os.devnull)
+        tofile=posixpath.devnull if after is None else f"b/{rel}",
+    )
+    out: list[str] = []
+    for line in lines:
+        out.append(f"# {line}")
+        if not line.endswith("\n"):
+            out.append("\n# \\ No newline at end of file\n")
+    return "".join(out)
+
+
+def _lines_keepends(text: str) -> list[str]:
+    """``text`` split on ``\n`` only, ends kept. ``str.splitlines`` also splits on
+    U+2028/U+2029/``\x85``/``\r`` and more, all legal raw inside a JSON string,
+    which would put a bogus line break mid-hunk."""
+    parts = [f"{piece}\n" for piece in text.split("\n")]
+    parts[-1] = parts[-1][:-1]  # the last piece had no newline after it
+    return parts if parts[-1] else parts[:-1]
+
+
+def _pinned_config_forensics(worktree: Path, pins: dict[str, dict[str, str]]) -> str:
+    """The forensic-patch section for story edits to pinned hook configs, or ``""``
+    when there is none (DW-479).
+
+    A DEFERRED unit's ``changes.patch`` is ``git diff <baseline>``, which reads a
+    skip-worktree-pinned config as clean, so a story's edit to one never reached the
+    patch and was lost silently when teardown removed the worktree. ``pins`` is
+    ``StoryTask.pinned_config_rewrites``; each rel is judged alone by
+    :func:`_pinned_config_edits`, so a relay-only change or a reformat adds nothing.
+    Each edited rel gets its description line(s) as ``#`` comments, then a
+    commented-out unified diff from the recorded rewrite to the on-disk text (to
+    ``/dev/null`` when the file is gone) — commented so ``git apply`` of the patch
+    above still works. No git call: the recorded rewrite is exactly what provisioning
+    wrote, so the diff isolates the story's own delta without the relay noise.
+
+    Total: a file that cannot be read or decoded keeps its description line and
+    gets no diff.
+    """
+    sections: list[str] = []
+    for rel in sorted(pins):
+        entry = pins[rel]
+        edits = _pinned_config_edits(worktree, {rel: entry})
+        if not edits:
+            continue
+        section = "".join(f"# {line}\n" for line in edits)
+        after: str | None
+        try:
+            after = (worktree / rel).read_bytes().decode("utf-8")
+        except FileNotFoundError:
+            after = None
+        except (OSError, UnicodeDecodeError):
+            sections.append(section)
+            continue
+        sections.append(section + _unified_diff_text(str(entry.get("text", "")), after, rel))
+    if not sections:
+        return ""
+    return _PINNED_FORENSICS_HEADER + "".join(sections)
+
+
+def _seed_bmad_tree(
+    worktree: Path, repo_root: Path, *, project: Path | None = None
+) -> tuple[list[str], list[str]]:
     """Merge the repo's project-local BMAD surface into an isolated worktree.
 
-    Renderer-backed skills receive the worktree as their project root and do not
-    walk upward for ``_bmad``. Copy every usable file except generated render output,
+    Read from ``<src_root>/_bmad`` and landed at ``<dst_root>/_bmad``
+    (:func:`provision_roots`) — under a nested project that is the mount project,
+    never the checkout root. Both returned readings are WORKTREE-relative, because
+    both feed the git-add shield, which git reads from the worktree root.
+
+    Renderer-backed skills receive the mount PROJECT as their project root — the
+    worktree itself in the default config, ``<worktree>/<offset>`` for a project
+    nested in ``repo_root`` (DW-379), while the session cwd stays the checkout root,
+    the accepted parity with isolation none — and do not walk upward for ``_bmad``.
+    Copy every usable file except generated render output,
     per-file and without clobbering checkout content. The shared Traversable walk is
     intentional: unlike ``rglob``, it descends a symlinked child directory, allowing
     the result-side completeness predicates to see every file the copier considered.
@@ -394,10 +790,12 @@ def _seed_bmad_tree(worktree: Path, repo_root: Path) -> tuple[list[str], list[st
       their own, so the answer has to stay per-file even when ``shield_rels``
       collapsed.
     """
-    src_root = repo_root / BMAD_DIR
+    source_root, mount_root = provision_roots(worktree, repo_root, project)
+    bmad_rel = _shield_rel(worktree, mount_root, BMAD_DIR)
+    src_root = source_root / BMAD_DIR
     if not _is_dir(src_root):
         return [], []
-    dst_root = worktree / BMAD_DIR
+    dst_root = mount_root / BMAD_DIR
     had_bmad = _is_dir(dst_root)
     try:
         tops = sorted(src_root.iterdir(), key=lambda entry: entry.name)
@@ -419,10 +817,10 @@ def _seed_bmad_tree(worktree: Path, repo_root: Path) -> tuple[list[str], list[st
                 worktree=worktree,
                 repo_root=repo_root,
             ):
-                seeded.append(f"{BMAD_DIR}/{rel}")
+                seeded.append(f"{bmad_rel}/{rel}")
     if not seeded:
         return [], []
-    return ([BMAD_DIR] if not had_bmad else seeded), seeded
+    return ([bmad_rel] if not had_bmad else seeded), seeded
 
 
 def _record_seeded(
@@ -466,27 +864,40 @@ def _written_rels(worktree: Path, landed: Sequence[Path]) -> list[str]:
     return [p.relative_to(worktree).as_posix() for p in landed if _is_file(p)]
 
 
-def _bmad_scripts_seed_incomplete(worktree: Path, repo_root: Path) -> bool:
+def _bmad_scripts_seed_incomplete(
+    worktree: Path, repo_root: Path, *, project: Path | None = None
+) -> bool:
     """Whether a required repo renderer unit member missed the worktree.
 
     Match the renderer preflight's content-keyed required-file predicate. Arbitrary
     sibling scripts are still merge-seeded, but their absence cannot prove the
     renderer will HALT and therefore must not arm the CRITICAL escalation gate.
+    Probes the project-local roots :func:`provision_roots` names.
     """
+    src_root, dst_root = provision_roots(worktree, repo_root, project)
     return any(
-        _renderer_unit_required(repo_root, rel)
-        and _is_file(repo_root / rel)
-        and not _is_file(worktree / rel)
+        _renderer_unit_required(src_root, rel)
+        and _is_file(src_root / rel)
+        and not _is_file(dst_root / rel)
         for rel in RENDERER_SCRIPT_UNIT_REL
     )
 
 
-def _central_config_seed_incomplete(worktree: Path, repo_root: Path) -> bool:
+def _central_config_seed_incomplete(
+    worktree: Path, repo_root: Path, *, project: Path | None = None
+) -> bool:
     """Whether the repo's required renderer config failed to reach the worktree."""
-    return _is_file(repo_root / CENTRAL_CONFIG_REL) and not _is_file(worktree / CENTRAL_CONFIG_REL)
+    src_root, dst_root = provision_roots(worktree, repo_root, project)
+    return _is_file(src_root / CENTRAL_CONFIG_REL) and not _is_file(dst_root / CENTRAL_CONFIG_REL)
 
 
-def base_skills_seed_incomplete(worktree: Path, repo_root: Path, trees: Sequence[str]) -> list[str]:
+def base_skills_seed_incomplete(
+    worktree: Path,
+    repo_root: Path,
+    trees: Sequence[str],
+    *,
+    project: Path | None = None,
+) -> list[str]:
     """Required upstream skill rels present in the repo but absent in the worktree.
 
     ``BASE_SKILLS`` is a copy-if-present catalog, not a requirement set. Gate only
@@ -505,13 +916,16 @@ def base_skills_seed_incomplete(worktree: Path, repo_root: Path, trees: Sequence
     ``SKILL.md`` remains the run-start preflight's concern and cannot produce a false
     CRITICAL escalation here. Stories mode adds its content-keyed dispatch probe at
     the caller, where the run mode is available.
+
+    The skill trees are project-local: probed under :func:`provision_roots`.
     """
+    src_root, dst_root = provision_roots(worktree, repo_root, project)
     missing: list[str] = []
     for tree in dict.fromkeys(trees):
-        primitive = dev_primitive_or_default(repo_root, tree)
-        for skill in _required_worktree_skills(repo_root, tree):
-            repo_skill = repo_root / tree / skill
-            worktree_skill = worktree / tree / skill
+        primitive = dev_primitive_or_default(src_root, tree)
+        for skill in _required_worktree_skills(src_root, tree):
+            repo_skill = src_root / tree / skill
+            worktree_skill = dst_root / tree / skill
             if not _is_file(repo_skill / "SKILL.md"):
                 # Distinguish an unreadable directory from a skill the repo simply
                 # does not carry. The walk yields only the former as a directory leaf.
@@ -542,8 +956,14 @@ def worktree_seed_undelivered(
     seed_files: Sequence[str] = (),
     seed_globs: Sequence[str] = (),
     config_paths: Sequence[str] = (),
+    *,
+    project: Path | None = None,
 ) -> list[str]:
     """Seed rels the repo carries that never reached the worktree.
+
+    Rels are project-relative, read under and probed against the roots
+    :func:`provision_roots` names, exactly as provisioning copied them; the
+    containment arms below stay checkout-wide (``repo_root``/``worktree``).
 
     Source containment is deliberately *not* an eligibility requirement: a source
     symlink resolving outside the repo is the canonical entry the seed loop refuses
@@ -556,32 +976,36 @@ def worktree_seed_undelivered(
     source escape, a symlinked destination, or destination escape proves the seed was
     refused. This report is informational and is never an escalation gate.
     """
-    unresolved_repo_root = repo_root
+    unresolved_src_root, _ = provision_roots(worktree, repo_root, project)
     try:
         worktree = worktree.resolve()
         repo_root = repo_root.resolve()
-    except (OSError, RuntimeError):
+        project = project.resolve() if project is not None else None
+    except (OSError, RuntimeError, ValueError):
         # Observation only: root uncertainty cannot prove delivery, but it must
         # not turn an informational journal probe into a run-wide failure.
         rels = [str(rel) for rel in seed_files]
         for pattern in seed_globs:
             try:
-                matches = sorted(unresolved_repo_root.glob(pattern))
-            except (OSError, RuntimeError):
+                matches = sorted(unresolved_src_root.glob(pattern))
+            except (OSError, RuntimeError, ValueError):
                 continue
-            rels.extend(match.relative_to(unresolved_repo_root).as_posix() for match in matches)
+            rels.extend(match.relative_to(unresolved_src_root).as_posix() for match in matches)
         return list(dict.fromkeys(rels))
+    src_root, dst_root = provision_roots(worktree, repo_root, project)
     rels = [str(rel) for rel in seed_files]
     for pattern in seed_globs:
-        rels.extend(
-            match.relative_to(repo_root).as_posix() for match in sorted(repo_root.glob(pattern))
-        )
+        try:
+            matches = sorted(src_root.glob(pattern))
+        except (OSError, RuntimeError, ValueError):
+            continue
+        rels.extend(match.relative_to(src_root).as_posix() for match in matches)
     hook_configs = {Path(rel) for rel in config_paths}
 
     def contained(path: Path, root: Path) -> bool:
         try:
             return path.resolve().is_relative_to(root)
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             return False
 
     def delivered(src: Path, dst: Path) -> bool:
@@ -623,10 +1047,10 @@ def worktree_seed_undelivered(
 
     undelivered: list[str] = []
     for rel in dict.fromkeys(rels):
-        src = repo_root / rel
+        src = src_root / rel
         if not (_is_file(src) or _is_dir(src)):
             continue
-        dst = worktree / rel
+        dst = dst_root / rel
         if Path(rel) in hook_configs:
             try:
                 destination_is_link = dst.is_symlink()
@@ -645,8 +1069,15 @@ def module_skills_seed_undelivered(
     worktree: Path,
     trees: Sequence[str],
     skills_root: Traversable | None = None,
+    *,
+    repo_root: Path | None = None,
+    project: Path | None = None,
 ) -> list[str]:
     """Wheel-bundled ``MODULE_SKILLS`` whose content never reached the worktree.
+
+    The skill trees sit under the mount project when ``repo_root`` and ``project``
+    are both given (:func:`provision_roots`), at the worktree root otherwise;
+    containment stays judged against the whole worktree.
 
     Re-probes DISK, never the copier's bookkeeping: a user-authored
     ``scm.worktree_seed`` entry that happens to spell a skill rel can therefore
@@ -673,9 +1104,10 @@ def module_skills_seed_undelivered(
     """
     if skills_root is None:
         skills_root = resources.files("bmad_loop.data").joinpath("skills")
+    unresolved_worktree = worktree
     try:
         worktree = worktree.resolve()
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, ValueError):
         # This is a journal-only observation. Root uncertainty means every
         # bundled skill the wheel actually carries is coarsely undelivered.
         return [
@@ -688,7 +1120,7 @@ def module_skills_seed_undelivered(
     def contained(target: Path) -> bool:
         try:
             return target.resolve().is_relative_to(worktree)
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             return False
 
     def delivered(src: Traversable, dst: Path) -> bool:
@@ -707,13 +1139,16 @@ def module_skills_seed_undelivered(
             # such an entry either, so its absence is not a delivery failure.
         return True
 
+    dst_root = worktree
+    if repo_root is not None:
+        dst_root = provision_roots(unresolved_worktree, repo_root, project)[1]
     undelivered: list[str] = []
     for tree in dict.fromkeys(trees):
         for skill in MODULE_SKILLS:
             src = skills_root.joinpath(skill)
             if not (_is_file(src) or _is_dir(src)):
                 continue
-            if not delivered(src, worktree / tree / skill):
+            if not delivered(src, dst_root / tree / skill):
                 undelivered.append(f"{tree}/{skill}")
     return undelivered
 
@@ -726,6 +1161,8 @@ def provision_worktree(
     seed_globs: Sequence[str] = (),
     *,
     on_degraded: Callable[[str], None] | None = None,
+    on_pinned: Callable[[str, str, str], None] | None = None,
+    project: Path | None = None,
 ) -> list[str]:
     """Make a freshly-created git worktree a self-sufficient bmad-loop project.
 
@@ -783,9 +1220,9 @@ def provision_worktree(
     seed_files are copied BEFORE the hook step so a seeded settings file that is
     also a hook config_path (.claude/settings.json, .gemini/settings.json) keeps its
     real content rather than being created empty. Its relay entry is replaced, not
-    kept: the seeded copy carries the main repo's $CLAUDE_PROJECT_DIR-relative relay
-    command, which resolves to the worktree, so the hook step strips it and registers
-    its own absolute command in its place (#352). A config that is already there but
+    kept: a seeded copy can carry a legacy workspace relay or stale installed
+    command, so the hook step replaces it with this installation's absolute
+    command. A config that is already there but
     cannot be parsed refuses provisioning outright — `verify.GitError`, which the
     caller escalates as CRITICAL and pauses the run — rather than being replaced by
     a hooks-only file: an unparseable config is evidence of an earlier fault, and the
@@ -794,28 +1231,56 @@ def provision_worktree(
     seeding actually wrote, never inferred from the seed entry that covers the path
     (#592).
 
+    A TRACKED hook config the hook step rewrites is pinned skip-worktree in the
+    worktree's index so the machine-specific relay command stays out of story
+    commits (#352). After each successful pin, ``on_pinned`` is called with
+    ``(rel, dialect, text)`` — the worktree-relative config path, the profile's hook
+    dialect, and the exact text written — so the caller can later tell a story's
+    own edit to the pinned file from our rewrite (DW-368). It is not called for an
+    untracked config, a non-repo worktree, or a config the hook step left alone.
+
     The repo's `_bmad/` surface is also merge-seeded, excluding generated render
     output. Renderer and upstream-skill completeness failures share the return
     channel with ordinary no-op seeds so they are journaled, but the caller re-probes
     the skill result and content-gates the renderer sentinels before escalating.
 
+    `project` is the BMAD project (DW-379). Every project-local surface — the
+    `seed_files`/`seed_globs` entries, `_bmad/`, the skill trees, the hook configs —
+    is read under ``src_root`` and landed under ``dst_root``
+    (:func:`provision_roots`): the main project and the mount project at the same
+    offset inside `repo_root`, so the mount mirrors the main checkout; ``None``
+    keeps the checkout roots, and a project outside `repo_root` raises (that layout
+    is refused before any mount, #414). Containment stays checkout-wide (sources
+    inside `repo_root`, destinations inside `worktree`), and the shield patterns and
+    the pinned config rel handed to ``on_pinned`` are worktree-relative, offset
+    included. Returned entries keep the project-relative spelling they were given.
+
     Returns the `seed_files` entries that copied NOTHING because everything they
     name was already present, plus reserved completeness reports. A directory entry
     that seeded even one child is not a no-op and is not reported.
     """
-    if not profiles and not seed_files and not seed_globs and not _is_dir(repo_root / BMAD_DIR):
+    bmad_source = provision_roots(worktree, repo_root, project)[0] / BMAD_DIR
+    if not profiles and not seed_files and not seed_globs and not _is_dir(bmad_source):
         return []
     unresolved_worktree = worktree
     unresolved_repo_root = repo_root
+    unresolved_project = project
     try:
         worktree = worktree.resolve()
         repo_root = repo_root.resolve()
-    except (OSError, RuntimeError) as e:
+        project = project.resolve() if project is not None else None
+    except (OSError, RuntimeError, ValueError) as e:
         raise verify.GitError(
             "cannot resolve worktree provisioning roots safely "
-            f"(worktree={unresolved_worktree}, repo_root={unresolved_repo_root}): {e}"
+            f"(worktree={unresolved_worktree}, repo_root={unresolved_repo_root}"
+            + (f", project={unresolved_project}" if unresolved_project is not None else "")
+            + f"): {e}"
         ) from e
-    relay = repo_root / HOOK_SCRIPT_REL
+    src_root, dst_root = provision_roots(worktree, repo_root, project)
+
+    def shield(rel: str) -> str:
+        return _shield_rel(worktree, dst_root, rel)
+
     skills_root = resources.files("bmad_loop.data").joinpath("skills")
 
     # project gitignored MCP/CLI configs: copy from the main repo when absent.
@@ -846,11 +1311,11 @@ def provision_worktree(
     # misconfiguration, exactly like the glob-expanded matches below.
     skipped: list[str] = []
     for rel in seed_files:
-        raw = worktree / rel
+        raw = dst_root / rel
         try:
-            src = (repo_root / rel).resolve()
+            src = (src_root / rel).resolve()
             dst = raw.resolve()
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             continue
         if not src.is_relative_to(repo_root) or not dst.is_relative_to(worktree):
             continue
@@ -918,13 +1383,17 @@ def provision_worktree(
     # copy-when-absent semantics. rel is taken from the unresolved match so the
     # worktree path mirrors the repo layout; resolve only guards containment.
     for pattern in seed_globs:
-        for match in sorted(repo_root.glob(pattern)):
-            rel = match.relative_to(repo_root)
-            raw = worktree / rel
+        try:
+            matches = sorted(src_root.glob(pattern))
+        except (OSError, RuntimeError, ValueError):
+            continue
+        for match in matches:
+            rel = match.relative_to(src_root)
+            raw = dst_root / rel
             try:
                 src = match.resolve()
                 dst = raw.resolve()
-            except (OSError, RuntimeError):
+            except (OSError, RuntimeError, ValueError):
                 continue
             if not src.is_relative_to(repo_root) or not dst.is_relative_to(worktree):
                 continue
@@ -947,21 +1416,23 @@ def provision_worktree(
             _record_seeded(seeded_from, landed, src, raw)
             written.update(_written_rels(worktree, landed))
 
-    # Renderer-backed skills are handed the worktree as their project root. Merge
+    # Renderer-backed skills are handed the mount project as their project root (the
+    # worktree, or `<worktree>/<offset>` under a nested `repo_root`; the session cwd
+    # stays the checkout root either way, DW-379). Merge
     # the repo's project-local BMAD surface after explicit seeds (operator intent wins
     # on collisions) and reserve the two renderer sentinels for result-side checks.
-    seeded_bmad, bmad_written = _seed_bmad_tree(worktree, repo_root)
+    seeded_bmad, bmad_written = _seed_bmad_tree(worktree, repo_root, project=project)
     written.update(bmad_written)
     skipped = [rel for rel in skipped if rel not in RENDERER_SEED_SENTINELS]
-    if _bmad_scripts_seed_incomplete(worktree, repo_root):
+    if _bmad_scripts_seed_incomplete(worktree, repo_root, project=project):
         skipped.append(BMAD_SCRIPTS_SEED_REL)
-    if _central_config_seed_incomplete(worktree, repo_root):
+    if _central_config_seed_incomplete(worktree, repo_root, project=project):
         skipped.append(CENTRAL_CONFIG_REL)
 
     # bundled skills into each CLI's skill tree (deduped: codex+gemini share one);
     # never clobber a skill the checkout already carries (tracked or pre-existing).
     for tree in dict.fromkeys(p.skill_tree for p in profiles):
-        tree_dir = worktree / tree
+        tree_dir = dst_root / tree
         for skill in MODULE_SKILLS:
             dst = tree_dir / skill
             # `copied_paths` is read only by the shield: when this tree turns out to
@@ -1006,11 +1477,11 @@ def provision_worktree(
         # Validating a skill here and then not copying it is how preflight passes in
         # the main checkout while the isolated review fails on a skill that was
         # never there.
-        for skill in _worktree_skill_copy_candidates(repo_root, tree):
+        for skill in _worktree_skill_copy_candidates(src_root, tree):
             dst = tree_dir / skill
             try:
-                src = (repo_root / tree / skill).resolve()
-            except (OSError, RuntimeError):
+                src = (src_root / tree / skill).resolve()
+            except (OSError, RuntimeError, ValueError):
                 continue
             if not src.is_relative_to(repo_root) or not _is_dir(src):
                 continue
@@ -1029,7 +1500,7 @@ def provision_worktree(
     # can happen to spell a skill rel, so only this disk predicate may arm the gate.
     skipped.extend(
         base_skills_seed_incomplete(
-            worktree, repo_root, [profile.skill_tree for profile in profiles]
+            worktree, repo_root, [profile.skill_tree for profile in profiles], project=project
         )
     )
 
@@ -1039,7 +1510,7 @@ def provision_worktree(
     for profile in profiles:
         if profile.hookless:
             continue
-        raw_config_path = worktree / profile.hooks.config_path
+        raw_config_path = dst_root / profile.hooks.config_path
         # Refuse before mkdir, read, or write: hook commands are worktree-specific
         # and must never mutate a shared dotfile through a live or dangling link.
         # Inspect every component: a non-strict resolve either leaves a symlink cycle
@@ -1056,7 +1527,7 @@ def provision_worktree(
                     break
                 cursor = cursor.parent
             config_path = raw_config_path.resolve()
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             continue
         if refused or config_path != raw_config_path or not config_path.is_relative_to(worktree):
             continue
@@ -1128,18 +1599,17 @@ def provision_worktree(
                     "terminal, so repairing the file alone does not put the story "
                     "back in the run (#592)"
                 ) from e
-        host = get_process_host()
-        interp = host.hook_interpreter()
-        registrations = {
-            native: f"{interp} {host.shell_quote(str(relay))} {canonical}"
-            for native, canonical in profile.hooks.events.items()
-        }
+        try:
+            registrations = {
+                native: _hook_command(src_root, profile, canonical)
+                for native, canonical in profile.hooks.events.items()
+            }
+        except ProfileError as e:
+            raise verify.GitError(f"cannot register worktree relay: {e}") from e
         # A seeded config_path (.claude/settings.json is both a seeded file and the
-        # hook config) arrives carrying the MAIN repo's relay command, which for the
-        # claude dialect is $CLAUDE_PROJECT_DIR-relative and resolves to a path that
-        # does not exist inside the worktree. merge_hooks will not replace an
-        # already-registered relay, so strip it first and let this registration —
-        # baked to the main repo's relay, absolute — be authoritative. Strip only on
+        # hook config) may carry a legacy workspace relay or a stale installed
+        # command. Strip it first and register this installation's entry point.
+        # Strip only on
         # FIRST encounter per config file: profiles can share a config_path
         # (user-overlay aliases of one CLI), and a later profile's pass must not
         # tear out the relay events an earlier one just registered — merge_hooks
@@ -1150,9 +1620,8 @@ def provision_worktree(
             stripped_paths.add(config_path)
         config, _ = merge_hooks(config, registrations, profile.hooks.dialect)
         # Write — and pin — only when the strip+merge actually changed the parsed
-        # config. Non-claude dialects bake the absolute main-repo relay at init
-        # (_hook_command), so a tracked codex/gemini config often arrives already
-        # carrying exactly the command registered here: strip-then-merge nets to
+        # config. A tracked config may already carry exactly the installed command,
+        # so strip-then-merge nets to
         # zero, and a pin would claim orchestrator ownership of a file this run
         # never modified, hiding a story's own edit to it for no benefit.
         if config != baseline_config:
@@ -1177,14 +1646,18 @@ def provision_worktree(
             # reading `0444`. This is the operator's own settings file, round-tripped
             # through the parse above, so a read-only one earns the `PermissionError`
             # the `write_text` this replaced raised.
-            atomic_write_text(
-                config_path,
-                json.dumps(config, indent=2) + "\n",
-                require_writable_target=True,
-            )
-            pin_degrade = _pin_tracked_config_rewrite(worktree, profile.hooks.config_path)
+            written_text = json.dumps(config, indent=2) + "\n"
+            atomic_write_text(config_path, written_text, require_writable_target=True)
+            # Worktree-relative, offset included: the pin runs git from the worktree
+            # root, and the recorded rel is read back against it (DW-368).
+            pinned_rel = shield(profile.hooks.config_path)
+            pinned, pin_degrade = _pin_tracked_config_rewrite(worktree, pinned_rel)
             if pin_degrade is not None and on_degraded is not None:
                 on_degraded(pin_degrade)
+            if pinned and on_pinned is not None:
+                # Profiles may share a config_path: a later pass rewrites the same
+                # file, so its call supersedes the earlier one (last write wins).
+                on_pinned(pinned_rel, profile.hooks.dialect, written_text)
 
     # Shield exactly the paths we wrote (skill trees + hook configs + seeded
     # configs) from the unit's `git add -A`, in case a project doesn't gitignore
@@ -1197,23 +1670,27 @@ def provision_worktree(
     # inert (#392), and over a tracked DIRECTORY swaps the entry for one pattern per
     # file `written` recorded under it (#484). `written` is therefore not an
     # alternative source of patterns but the substitution ledger that step reads.
-    patterns = {f"/{p.skill_tree}" for p in profiles}
+    #
+    # Every rel below is spelled worktree-relative through `shield`: git reads the
+    # exclude from the worktree root, and a nested project's surfaces sit under its
+    # offset there (DW-379). `written` and `seeded_bmad` already are.
+    patterns = {f"/{shield(p.skill_tree)}" for p in profiles}
     # hookless profiles have no config_path, so there is nothing to shield: their
     # empty string would render as a bare "/", which git strips to a zero-length
     # pattern (the trailing slash becomes MUSTBEDIR) that matches nothing — inert,
     # unlike "/*" or "*", which do blanket. A junk line in a generated file, then,
     # not a worktree-wide exclusion.
-    patterns |= {f"/{p.hooks.config_path}" for p in profiles if not p.hookless}
-    patterns |= {f"/{rel}" for rel in seeded}
+    patterns |= {f"/{shield(p.hooks.config_path)}" for p in profiles if not p.hookless}
+    patterns |= {f"/{shield(rel)}" for rel in seeded}
     patterns |= {f"/{rel}" for rel in seeded_bmad}
-    if f"/{BMAD_DIR}" not in patterns:
+    if f"/{shield(BMAD_DIR)}" not in patterns:
         # The renderer may create or rewrite this generated directory during the
         # session, after provisioning has finished. Give it a dedicated transient
         # shield unless the blanket root shield already subsumes it: `/_bmad` prunes
         # the directory before git descends, so `/_bmad/render/` would provably never
         # be consulted. Avoiding that inert sibling keeps the worktree-local exclude
         # precise; the file and its lines disappear with this worktree.
-        patterns.add(f"/{RENDER_DIR_REL}/")
+        patterns.add(f"/{shield(RENDER_DIR_REL)}/")
     patterns, tracked_degrade = _reconcile_tracked_patterns(worktree, patterns, written)
     if tracked_degrade is not None and on_degraded is not None:
         on_degraded(tracked_degrade)
@@ -1225,6 +1702,44 @@ def provision_worktree(
     if reason is not None and on_degraded is not None:
         on_degraded(reason)
     return skipped
+
+
+@dataclass(frozen=True)
+class _AcceptedSpecEnds:
+    """What :meth:`WorktreeFlow._accepted_spec_pair` actually resolved.
+
+    Replaces the ``tuple | None`` the locator returned until DW-104, whose ``None``
+    collapsed four distinct outcomes into one silence: not applicable, a source that
+    would not resolve, a source resolving outside the project, and a destination
+    escaping the mount. Telling those apart is the whole point — two of them are
+    losses a unit dispatches straight through, and two of them are spellings this
+    path has no claim on at all.
+
+    Encoding, from least to most resolved:
+
+    - not applicable (empty/absolute ``spec_file``) or the source resolve raised:
+      every field ``None``. ``faulted`` is what separates the two — the locator
+      could not RESOLVE the spec at all (a swallowed filesystem fault, or a
+      spelling that no longer resolves because the path is gone) versus a spelling
+      that was never this path's business. It is deliberately not narrower than
+      that: one ``except`` covers the whole source resolve, and the two causes are
+      indistinguishable from inside it.
+    - source resolved but outside the project: ``source`` set, ``relative`` None.
+      An out-of-tree artifacts dir the mount reads directly; no claim, no record.
+    - destination escapes the mount (or the mount root will not resolve):
+      ``source`` and ``relative`` set, ``destination`` None. The containment
+      refusal — the rel IS known, which is what lets it be nominated as a seed.
+    - usable: every field set.
+
+    Existence of neither end is asserted here; that stays the caller's arm (the
+    seed copies only into an ABSENT destination, the supersession warning compares
+    only against a PRESENT one).
+    """
+
+    source: Path | None = None
+    relative: str | None = None
+    destination: Path | None = None
+    faulted: bool = False
 
 
 class WorktreeFlow:
@@ -1279,6 +1794,9 @@ class WorktreeFlow:
         self._pause = escalation_pause
         self._workspace_get = workspace_get
         self._workspace_set = workspace_set
+        verify.reconcile_integration_state_roots(
+            run_dir, (task.integration_attempt for task in state.tasks.values())
+        )
 
     @property
     def isolated(self) -> bool:
@@ -1349,6 +1867,89 @@ class WorktreeFlow:
                 seen[profile.name] = profile
         return list(seen.values())
 
+    def gate_codex_hook_trust(
+        self,
+        task: StoryTask,
+        worktree: Path,
+        *,
+        roles: tuple[str, ...] = DEV_PRIMITIVE_ROLES,
+    ) -> None:
+        """Escalate the unit unless Codex trusts its hooks in ``worktree`` (DW-341).
+
+        Provisioning writes a fresh ``.codex/hooks.json`` per worktree path, and
+        Codex silently skips hooks without a trust grant for that path — the
+        session's Stop would never arrive. So each Codex-dialect adapter among
+        ``roles`` is checked through the one trust oracle
+        (:func:`codex_trust.project_hook_trust`) with the binary it will launch.
+        Two callers: :meth:`run_isolated` checks every dev/review role at unit
+        entry, before any dev work is spent; ``Engine._run_session`` checks the
+        launching role before every worktree session, which covers the resume
+        arms that reopen a mounted unit without passing through unit entry.
+
+        A stage's ``extra_args`` replace the profile's ``bypass_args`` at launch,
+        so they are folded into the queried profile: args that may move hook
+        discovery come back ``unverifiable``. A failed ``hooks/list`` query
+        (:data:`codex_trust.QUERY_FAILED_REASON` — spawn error, timeout) is
+        retried exactly once; a real verdict never is. Fail closed — anything but
+        ``trusted`` escalates, leaving the worktree mounted at its deterministic
+        path so the operator can grant trust there, re-arm, and resume. Codex's
+        own trust state is never written. Adapters without a profile (test fakes)
+        and non-Codex dialects are skipped; main-checkout sessions never reach here.
+        """
+        adapters = self._adapters_get()
+        seen: set[tuple[str, str, tuple[str, ...] | None]] = set()
+        for role in roles:
+            adapter = adapters[role]
+            profile = getattr(adapter, "profile", None)
+            hooks = getattr(profile, "hooks", None)
+            if profile is None or getattr(hooks, "dialect", None) != "codex-hooks-json":
+                continue
+            binary = getattr(adapter, "binary", None) or profile.binary
+            extra_args = getattr(adapter, "extra_args", None)
+            key = (profile.name, binary, extra_args)
+            if key in seen:
+                continue
+            seen.add(key)
+            queried = (
+                profile
+                if extra_args is None
+                else dataclasses.replace(profile, bypass_args=extra_args)
+            )
+            trust = codex_trust.project_hook_trust(worktree, queried, binary=binary)
+            if trust.status == "unverifiable" and trust.reason == codex_trust.QUERY_FAILED_REASON:
+                # The query itself failed, not Codex's verdict: one retry absorbs a
+                # transient app-server spawn failure or timeout before escalating.
+                trust = codex_trust.project_hook_trust(worktree, queried, binary=binary)
+            if trust.status == "trusted":
+                continue
+            self.escalate_unit(  # always raises RunPaused
+                task, self._codex_trust_reason(role, worktree, trust.status, trust.reason)
+            )
+
+    def _codex_trust_reason(self, role: str, worktree: Path, status: str, reason: str) -> str:
+        """The operator-facing escalation text for a failed worktree trust query.
+
+        Status-specific: accepting a trust prompt clears ``untrusted``, but an
+        ``unverifiable`` verdict usually has a cause a prompt cannot fix, so that
+        text names the likely fixes first. Both end with the remediation and leave
+        out the recovery command: :meth:`escalate_unit` appends its own
+        "resolve, then resume" suffix, and docs/FEATURES.md spells out the exact
+        ``resolve --no-interactive`` + ``resume`` sequence.
+        """
+        head = (
+            f"Codex hook trust is {status} for the {role} session's worktree {worktree} "
+            f"({reason}) — Codex would skip its hooks and the session's Stop would never "
+            "reach the orchestrator. "
+        )
+        if status == "unverifiable":
+            head += (
+                "bmad-loop could not verify Codex's hook trust for that worktree. Likely "
+                "fixes: remove stage `extra_args` or profile `launch_args` that may move "
+                "Codex hook discovery, make sure the Codex binary is on PATH, and make "
+                "sure the worktree's hook config is readable. "
+            )
+        return head + "Open Codex in that worktree, accept its hook trust prompt"
+
     def engine_agent_ids(self) -> list[str]:
         """The Unity-MCP `setup-mcp` agent ids for every CLI that runs in a
         worktree (dev + review). A worktree can host more than one agent — e.g.
@@ -1361,6 +1962,20 @@ class WorktreeFlow:
             if agent not in ids:
                 ids.append(agent)
         return ids
+
+    def _mount_roots(self, worktree: Path) -> tuple[Path, Path]:
+        """:func:`provision_roots` for this run's project in the mount at ``worktree``:
+        ``(src_root, dst_root)``, the project-local roots in the main checkout and in
+        the mount. Lexical, over the spellings ``self.paths`` and ``worktree`` carry."""
+        return provision_roots(worktree, self.paths.repo_root, self.paths.project)
+
+    def _mount_project(self, worktree: Path) -> Path:
+        """The mount project for the mount at ``worktree`` — the tree a relative spec
+        spelling is anchored on there. The lexical form of
+        ``self.paths.rebased(worktree).project`` (both go through
+        :func:`mountpaths.rebased_project`): ``worktree`` itself by default,
+        ``<worktree>/<offset>`` for a project nested inside ``repo_root`` (DW-379)."""
+        return rebased_project(self.paths.project, self.paths.repo_root, worktree)
 
     def _ledger_seed(self, worktree: Path) -> tuple[str, ...]:
         """The deferred-work ledger, when a worktree checkout cannot deliver it.
@@ -1394,27 +2009,23 @@ class WorktreeFlow:
         seed loop itself decides on, and unlike ``verify.path_tracked`` it costs no
         subprocess and cannot raise.
 
-        A ledger that is itself a symlink keeps the dir in-tree, so ``rebased``
-        moves it and the worktree path does not exist: the exclusion is still right
-        for an out-of-repo target (``provision_worktree`` refuses that source
-        whatever rel it is handed), but an in-repo target is seeded to the WRONG
-        path and still hits #426 (#462). Resolving also names the target of a
-        TRACKED ledger symlink whose target is untracked — the only path the seed
-        loop will write, since it refuses to copy through a link. ``relative_to``
-        decides PLACEMENT; containment is re-checked against both roots at the copy
-        site.
+        A ledger that is itself a symlink is seeded at its CONFIGURED path — the
+        one ``ProjectPaths.rebased`` hands the worktree's readers — and never at
+        the link's target rel, which is where resolving the leaf used to put it,
+        so the gate read an absent file and the unit still hit #426 (DW-377, was
+        #462). The target is seeded only when the checkout already carries the
+        link as a tracked, dangling entry: the seed loop refuses to copy through
+        a link, so the target is the one path it will write, and the checked-out
+        link then reads the copy. An out-of-repo target stays excluded
+        (``provision_worktree`` refuses that source whatever rel it is handed).
+        That drop is no longer silent: :meth:`_artifact_seed_drops` names the
+        configured rel in ``worktree-seed-dropped`` (DW-432).
+        See :func:`_artifact_seed`; containment is re-checked against both roots
+        at the copy site.
 
         Deduped against ``scm.worktree_seed`` by the caller.
         """
-        ledger = self.paths.deferred_work
-        repo = self.paths.repo_root
-        try:
-            rel = ledger.resolve().relative_to(repo.resolve()).as_posix()
-        except (OSError, RuntimeError, ValueError):
-            return ()
-        if not _is_file(ledger) or _is_file(worktree / rel):
-            return ()
-        return (rel,)
+        return _artifact_seed(self.paths.deferred_work, *self._mount_roots(worktree))
 
     def _board_seed(self, worktree: Path) -> tuple[str, ...]:
         """The sprint board, when a worktree checkout cannot deliver it (#350).
@@ -1455,8 +2066,11 @@ class WorktreeFlow:
         WORKTREE, not of git, for the ledger's reason: it is the predicate the seed
         loop itself decides on, it costs no subprocess and it cannot raise.
 
-        A board that is itself a symlink inherits ``_ledger_seed``'s caveat verbatim
-        (#462); it is derived there and not repeated here.
+        A board that is itself a symlink is placed exactly as ``_ledger_seed``
+        places a symlinked ledger — at the configured path, or at the target only
+        behind a tracked dangling link (DW-377, was #462); both delegate to
+        :func:`_artifact_seed`. An out-of-project target is excluded as for the
+        ledger, and :meth:`_artifact_seed_drops` names that drop (DW-432).
 
         INHERITED LIMITATION — parity, not a regression, and NOT fixed here: a
         non-fixable rollback does not restore a seeded board. Rollback resets
@@ -1472,15 +2086,19 @@ class WorktreeFlow:
 
         Deduped against ``scm.worktree_seed`` by the caller.
         """
-        board = self.paths.sprint_status
-        repo = self.paths.repo_root
-        try:
-            rel = board.resolve().relative_to(repo.resolve()).as_posix()
-        except (OSError, RuntimeError, ValueError):
-            return ()
-        if not _is_file(board) or _is_file(worktree / rel):
-            return ()
-        return (rel,)
+        return _artifact_seed(self.paths.sprint_status, *self._mount_roots(worktree))
+
+    def _artifact_seed_drops(self, worktree: Path) -> list[str]:
+        """The ledger's and board's configured rels that :meth:`_ledger_seed` /
+        :meth:`_board_seed` excluded as out-of-project and the worktree still lacks
+        (DW-432) — project-relative, deduped, ledger first. Naming only; run after
+        provisioning. See :func:`_artifact_seed_dropped`."""
+        roots = self._mount_roots(worktree)
+        drops = [
+            *_artifact_seed_dropped(self.paths.deferred_work, *roots),
+            *_artifact_seed_dropped(self.paths.sprint_status, *roots),
+        ]
+        return list(dict.fromkeys(drops))
 
     def _accepted_spec_seed(
         self,
@@ -1499,10 +2117,97 @@ class WorktreeFlow:
         lacks its corresponding path. Absolute/external spellings pass through;
         prior-attempt binding fields remain authoritative until fresh binding
         replaces them after the mount is provisioned.
+
+        Both existence arms probe through ``_is_file``, total over ``OSError``,
+        rather than ``Path.is_file``: on Python <=3.13 the raw probe RAISES on an
+        entry below an unsearchable parent (3.14 answers false, as
+        :func:`install._is_file` records), and this call site sits outside every
+        ``except`` in ``run_isolated``, so such a fault killed the run instead of
+        allowing dispatch to continue.
+
+        Which arm a given fault can actually reach differs, because the locator
+        resolves the two ends differently. A parent that is merely unsearchable
+        does NOT reach the source arm on any interpreter: ``_accepted_spec_pair``
+        resolves the source ``strict=True``, which raises first and folds the pair
+        to ``None``. The source arm is reachable only by TOCTOU between that
+        resolve and this stat, or by a non-EACCES ``OSError``. The DESTINATION is
+        resolved ``strict=False``, which can leave an inaccessible suffix unresolved;
+        other resolution failures are still caught by the locator. A source probe
+        fault omits the seed; a destination probe fault treats that end as absent
+        and leaves delivery to the seed loop. This uses the same total probe as
+        :meth:`_ledger_seed`, :meth:`_board_seed` and
+        :meth:`_warn_accepted_spec_superseded` (DW-103).
+
+        A rel whose DESTINATION escapes the mount is nominated anyway (DW-104).
+        Until then the locator's containment refusal returned ``()``, so the rel
+        reached neither ``seed_files`` nor ``skipped_seeds`` nor
+        ``undelivered_seeds`` and no journal named it. Returning it is safe only
+        because the copier judges containment for itself: ``provision_worktree``
+        re-derives ``dst`` and ``continue``s on ``not dst.is_relative_to(worktree)``
+        before any copy, so nothing is written outside the mount, and
+        :func:`worktree_seed_undelivered` then reports the same rel because its own
+        ``contained(dst, worktree)`` arm fails. This return is a NOMINATION, not a
+        permission — never rely on this method's judgement to keep a copy inside
+        the mount.
+        """
+        ends = self._accepted_spec_pair(task, worktree, project_relative_only=project_relative_only)
+        relative, source = ends.relative, ends.source
+        # One narrowing, not a refusal: the locator sets `relative` only alongside
+        # `source`, so this pair is either both present or there is nothing to seed.
+        if relative is None or source is None:
+            return ()
+        # ONE existence arm for both branches below. A source that is not a regular
+        # file is nominated by neither: `provision_worktree` would recurse a DIRECTORY
+        # into the mount, and a containment refusal that came from an unresolvable
+        # mount root rather than a real escape can still leave the copier a contained
+        # `dst` to copy that tree onto.
+        if not _is_file(source):
+            return ()
+        if ends.destination is None:
+            return (relative,)
+        if _is_file(ends.destination):
+            return ()
+        return (relative,)
+
+    def _accepted_spec_pair(
+        self,
+        task: StoryTask,
+        worktree: Path,
+        *,
+        project_relative_only: bool = False,
+    ) -> _AcceptedSpecEnds:
+        """Locate the accepted project-local spec's (rel, main-checkout, mount) ends.
+
+        The ONE locator :meth:`_accepted_spec_seed`,
+        :meth:`_warn_accepted_spec_superseded` and
+        :meth:`_warn_accepted_spec_undelivered` all decide on. Extracted rather than
+        restated so a record can never report a loss against a pair the seed was
+        not looking at: two copies of this derivation drift the moment one of them
+        learns something about spec spellings the other does not, and the record
+        would then name a file whose delivery its own gate never measured.
+
+        Returns :class:`_AcceptedSpecEnds` rather than the ``tuple | None`` it
+        answered until DW-104 — see that class for the encoding. What changed is
+        only how much of the outcome is REPORTED: the refusals are the same
+        refusals, and every caller that wanted "usable or nothing" still gets it by
+        requiring the fields it needs. The two states the widening exists for are
+        ``destination is None`` with a known ``relative`` (the containment refusal,
+        which can now be nominated as a seed and named in `worktree-seed-dropped`)
+        and ``faulted`` — the source would not resolve at all, whether because a
+        filesystem fault was swallowed or because the spelling no longer resolves.
+        Either way it is not the same silence as a spelling this path has no claim
+        on.
+
+        Not a canonical project-local accepted artifact, and all-None with
+        ``faulted=False``: an empty or absolute ``spec_file`` (an external spelling
+        passes through untouched). Deliberately asserts the existence of NEITHER end
+        — that is the caller's arm, and the callers want opposite answers to it (the
+        seed copies only into an ABSENT destination; the supersession warning
+        compares only against a PRESENT one).
         """
         raw = task.spec_file
         if not raw or Path(raw).is_absolute():
-            return ()
+            return _AcceptedSpecEnds()
         try:
             project = self.paths.project.resolve(strict=True)
             source = (
@@ -1510,15 +2215,212 @@ class WorktreeFlow:
                 if project_relative_only
                 else verify.resolve_spec_path(raw, self.paths)
             ).resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            # The whole source resolve, so `faulted` means "could not resolve it",
+            # not "a filesystem fault occurred": a `strict=True` resolve of a path
+            # that is simply gone lands here too, and nothing inside can tell the
+            # two apart. The record it feeds says exactly that much and no more.
+            return _AcceptedSpecEnds(faulted=True)
+        try:
             relative = source.relative_to(project)
-            destination = (worktree / relative).resolve(strict=False)
+        except ValueError:
+            # Resolves outside the project: an out-of-tree artifacts dir the mount
+            # already reads directly. A spelling with no claim, not a fault.
+            return _AcceptedSpecEnds(source=source)
+        rel = relative.as_posix()
+        try:
+            # The mount project, not the mount root: `relative` is project-relative
+            # and the mount mirrors the main checkout (DW-379).
+            destination = (self._mount_project(worktree) / relative).resolve(strict=False)
             mounted_root = worktree.resolve(strict=True)
             destination.relative_to(mounted_root)
         except (OSError, RuntimeError, ValueError):
-            return ()
-        if not source.is_file() or destination.is_file():
-            return ()
-        return (relative.as_posix(),)
+            # The containment refusal (and an unresolvable mount root, which cannot
+            # prove containment either). The REL is known, which is what lets
+            # `_accepted_spec_seed` nominate it and `worktree_seed_undelivered`
+            # name it.
+            return _AcceptedSpecEnds(source=source, relative=rel)
+        return _AcceptedSpecEnds(source=source, relative=rel, destination=destination)
+
+    def _warn_accepted_spec_superseded(
+        self,
+        task: StoryTask,
+        worktree: Path,
+        *,
+        project_relative_only: bool = False,
+    ) -> None:
+        """Journal when a fresh mount's copy of the accepted spec is not the
+        operator's (DW-101).
+
+        The ``pause_after_spec`` approval gate hands the operator a spec that is
+        UNCOMMITTED by construction. For a TRACKED artifacts dir a re-drive's
+        ``git worktree add`` then delivers the COMMITTED bytes into the mount,
+        :meth:`_accepted_spec_seed` skips (its destination already exists) and the
+        ``accepted_delivered`` probe in :meth:`run_isolated` passes on existence and
+        containment alone — so the corrections the operator just made are silently
+        superseded by the pre-approval text. The escalation path already answers this
+        exact loss with ``rearm-spec-write-unreachable``; this is the approval path's
+        equivalent.
+
+        ADVISORY ONLY, and deliberately so on both counts: this method refuses,
+        pauses and rewrites NOTHING. It does not overwrite the mount's copy — a dirty
+        TRACKED file inside the mount is not covered by the worktree-local
+        ``info/exclude`` fold, so ``finalize_commit``'s ``git add -A`` would merge the
+        operator's in-progress edits into the story commit. And it does not refuse the
+        mount, which would hard-fail every isolated unit in a project that tracks its
+        artifacts dir. What happens to the unit afterwards is not this method's claim
+        to make (the ready gate may still veto the dispatch); the remedy is the
+        operator's, and it is the record's whole payload: commit the corrected spec on
+        the named branch.
+
+        Field shapes are routing decisions, not taste. ``spec_file`` carries the
+        MAIN-CHECKOUT absolute path — the file the operator has to commit, not the
+        mount's copy of it — and rides ``diagnostics._JOURNAL_ALIAS_FIELDS``' ``spec``
+        namespace. The branch is spelled ``target_branch`` rather than a fresh name
+        because that scrub routes by field NAME and ``target_branch`` is already
+        aliased to the ``branch`` namespace, while any new spelling falls through to
+        ``scrub_json``, which waves an identifier-shaped branch name through verbatim.
+        The discriminator is a bare boolean ``compared`` rather than a ``reason``/
+        ``error`` string for the mirror-image reason: both of those names are in
+        ``_JOURNAL_DROP_FIELDS`` and would ship as a presence marker instead of the
+        distinction the record exists to draw.
+
+        Silent for the two legs that are not this loss: a destination the mount never
+        delivered is the seed's own case (and a hard delivery fault has already
+        escalated above this call), and identical bytes are no loss at all. A read
+        that raises answers ``compared: false`` — the probe cannot PROVE the mount
+        reads the operator's bytes, and an unprovable delivery is exactly what this
+        record is for. Nothing here may raise out: the locator swallows its own
+        faults, ``_is_file`` is total over them, and the comparison is wrapped.
+
+        "Identical" is read with line endings normalized (CRLF ≡ LF). The mount is
+        a git CHECKOUT, so under Git-for-Windows' system ``core.autocrlf=true`` an
+        LF-authored spec comes back CRLF there while the main checkout keeps the
+        LF bytes the spec writer laid down — a difference git itself folds away on
+        the next commit, and one this record must not report as a lost correction.
+        Only that translation is folded: a lone CR, a missing final newline, or any
+        other byte still counts, since git would carry those into the commit.
+        """
+        ends = self._accepted_spec_pair(task, worktree, project_relative_only=project_relative_only)
+        source, destination = ends.source, ends.destination
+        # A FULLY USABLE pair or nothing. Every refusal the locator now reports in
+        # more detail (DW-104) is still a refusal here: there is nothing to compare
+        # against a destination that escapes the mount, and comparing against a
+        # source outside the project would name a file this path has no claim on.
+        if source is None or destination is None or ends.relative is None:
+            return
+        if not _is_file(source) or not _is_file(destination):
+            return
+        try:
+            identical = _crlf_normalized(source.read_bytes()) == _crlf_normalized(
+                destination.read_bytes()
+            )
+        except (OSError, RuntimeError, ValueError):
+            compared = False
+        else:
+            if identical:
+                return
+            compared = True
+        self.journal.append(
+            "accepted-spec-write-unreachable",
+            story_key=task.story_key,
+            spec_file=str(source),
+            target_branch=self.state.target_branch,
+            compared=compared,
+        )
+
+    def _warn_accepted_spec_undelivered(
+        self,
+        task: StoryTask,
+        worktree: Path,
+        *,
+        project_relative_only: bool = False,
+    ) -> None:
+        """Journal when the mount cannot be shown to carry the accepted spec at all
+        (DW-104 + DW-115).
+
+        The silence this record ends had two mouths and one shape. Before DW-104
+        :meth:`_accepted_spec_pair`'s containment arm refused a spec whose mounted
+        parent escapes the worktree, and :meth:`_accepted_spec_seed` returned ``()``
+        for it: the rel reached neither ``seed_files`` nor ``skipped_seeds`` nor
+        ``undelivered_seeds``. DW-115 is the second mouth: the locator's own
+        ``except`` swallows everything that stops the source RESOLVING — a real
+        filesystem fault, or a spelling that no longer resolves because the path is
+        gone — and produces the SAME ``()``. For
+        a spec already spelled project-relative — ``accepted_spec_relocated`` false,
+        which is the spelling a resume persists — the escalating ``accepted_delivered``
+        probe in :meth:`run_isolated` does not run either, so the unit dispatched
+        against a mount lacking the operator's spec, fell back to the bare story key,
+        and nothing in the journal named why. The seed widening restores the first
+        mouth's visibility through ``worktree-seed-dropped``; this record covers both,
+        and is the only thing that covers the swallowed fault.
+
+        ADVISORY ONLY. It refuses nothing, pauses nothing, writes nothing into the
+        mount and is read by no gate. The RELOCATED leg is deliberately not its
+        business: that leg already escalates on the same loss a few lines above the
+        call site, so a RECORD here as well would be a second advisory naming a unit
+        that never reaches a session. (The relocated leg does still emit a
+        ``worktree-seed-dropped`` entry for a containment refusal — that is the seed
+        report, not this one.) The human decision dated 2026-09-04 on DW-104 is record,
+        do not escalate — the escalating probe's ``if accepted_spec_relocated:`` gate
+        does not move.
+
+        Silent for the spellings this path has no claim on, which is why the locator's
+        detail is required rather than a bare "not delivered": an empty or absolute
+        ``spec_file`` and one resolving OUTSIDE the project (a shared out-of-tree
+        artifacts dir the mount reads directly) have no ``relative`` and are not
+        ``faulted``; an external source can still be set. They return before any probe. The two entry conditions are a project-local
+        rel the locator RESOLVED, and ``faulted`` — the source would not resolve at
+        all, so the rel is unknown and ``task.spec_file`` is the best spelling
+        available.
+
+        Field shapes are routing decisions, mirroring
+        :meth:`_warn_accepted_spec_superseded` for the reasons stated there:
+        ``spec_file`` carries the MAIN-CHECKOUT path (the locator's ``source`` when it
+        resolved, else ``self.paths.project / task.spec_file`` — both reduce to the
+        same basename alias in ``diagnostics``) and rides the ``spec`` namespace, and
+        the branch is spelled ``target_branch`` because that name is already aliased
+        to the ``branch`` namespace while a fresh spelling falls through to
+        ``scrub_json`` and ships an identifier-shaped branch name verbatim. The
+        discriminator is a bare boolean ``located`` — whether the locator resolved a
+        project-local rel at all, i.e. which of the two mouths this is: ``false``
+        says the spec could not be resolved (faulted or gone), ``true`` says it was
+        resolved and the MOUNT could not be shown to carry it — rather than a
+        ``reason``/``error`` string, because both of those names are in
+        ``diagnostics._JOURNAL_DROP_FIELDS`` and would ship as a presence marker
+        instead of the distinction the record exists to draw.
+
+        Nothing here may raise out: the locator swallows its own faults, ``_is_file``
+        is total over them, and the containment resolve is wrapped. A probe that
+        cannot resolve has not PROVEN delivery, which is exactly what the record is
+        for, so every fault answers "not delivered" rather than propagating.
+        """
+        ends = self._accepted_spec_pair(task, worktree, project_relative_only=project_relative_only)
+        if ends.relative is None and not ends.faulted:
+            return
+        probe = self._mount_project(worktree) / (ends.relative or str(task.spec_file))
+        # File-ness alone is not delivery, for the reason the escalating probe states:
+        # a parent that is a real directory in the main checkout but a committed
+        # OUTWARD symlink in the mounted commit lands the probe on an unrelated
+        # external artifact, which answers true. Require containment as well.
+        try:
+            delivered = _is_file(probe) and probe.resolve(strict=False).is_relative_to(
+                worktree.resolve()
+            )
+        except (OSError, RuntimeError, ValueError):
+            delivered = False
+        if delivered:
+            return
+        source = (
+            ends.source if ends.source is not None else self.paths.project / str(task.spec_file)
+        )
+        self.journal.append(
+            "accepted-spec-delivery-unreachable",
+            story_key=task.story_key,
+            spec_file=str(source),
+            target_branch=self.state.target_branch,
+            located=ends.relative is not None,
+        )
 
     def run_isolated(self, task: StoryTask, drive: Callable[[StoryTask], None]) -> None:
         """Run one unit's `drive` body in a fresh per-unit worktree, then merge
@@ -1582,10 +2484,23 @@ class WorktreeFlow:
             self._save()
             return
         task.worktree_path = str(unit.path)
+        # The mount's mint-time identity (DW-446), taken before any session runs
+        # and persisted with `worktree_path`: every mount writer's pin compares the
+        # mount it opens against this record, never a per-write `lstat`.
+        task.worktree_identity = root_identity_record(unit.path)
         self.journal.append(
             "worktree-opened", story_key=task.story_key, branch=unit.branch, path=str(unit.path)
         )
         task.branch = unit.branch
+        if task.dw_ids:
+            try:
+                try:
+                    artifact_publication.capture(task, self.paths)
+                finally:
+                    self._journal_unpinned_artifact_observations(task.story_key)
+            except (artifact_publication.PublicationError, OSError, ValueError) as exc:
+                self._save()
+                self._pause(f"artifact baseline capture failed: {exc}", task.story_key, cause=exc)
         # A worktree checks out tracked files only, but the bmad-loop-* skill
         # trees + signal-hook config are typically gitignored, so they are absent
         # from the fresh checkout. Re-lay them into the worktree so the bundled
@@ -1626,7 +2541,8 @@ class WorktreeFlow:
         seeds.extend(scm.worktree_seed)
         # the two orchestrator-owned artifacts a tracked-only checkout can leave
         # behind — each decides its own exclusions; see the methods.
-        seeds.extend(self._ledger_seed(unit.path))
+        ledger_seed = self._ledger_seed(unit.path)
+        seeds.extend(ledger_seed)
         seeds.extend(self._board_seed(unit.path))
         seeds.extend(
             self._accepted_spec_seed(
@@ -1642,6 +2558,11 @@ class WorktreeFlow:
         seeds.extend(self._registry.seed_files())
         seed_files = list(dict.fromkeys(seeds))  # dedupe, preserve order
         seed_globs = self._registry.seed_globs()
+        pinned_rewrites: dict[str, dict[str, str]] = {}
+
+        def _record_pin(rel: str, dialect: str, text: str) -> None:
+            pinned_rewrites[rel] = {"dialect": dialect, "text": text}
+
         try:
             skipped_seeds = provision_worktree(
                 unit.path,
@@ -1650,6 +2571,8 @@ class WorktreeFlow:
                 seed_files=seed_files,
                 seed_globs=seed_globs,
                 on_degraded=lambda msg: self._exclude_degraded(task.story_key, msg),
+                on_pinned=_record_pin,
+                project=self.paths.project,
             )
         except verify.GitError as e:
             # Every provisioning refusal carries its own cause — an unresolvable
@@ -1658,6 +2581,25 @@ class WorktreeFlow:
             # "why" to the inner message rather than asserting one of the three.
             reason = f"cannot safely provision the worktree for {task.story_key}: {e}"
             self.escalate_unit(task, reason)  # always raises RunPaused
+        # Before any session launches in the worktree: a CLI that gates sessions
+        # on a home-level exact-path allowlist would otherwise block on its trust
+        # dialog in this fresh path until the session timeout (DW-390).
+        self.seed_workspace_trust(task, unit.path, profiles)
+        # The seeded ledger's text as it landed, for the success-path teardown
+        # check (DW-375): the carry brings back only the writes the engine
+        # recorded, so anything else a session appends to this copy vanishes with
+        # the worktree. A fresh open, so always overwritten — None when no ledger
+        # was nominated, the seed was undelivered, or the read degraded.
+        task.ledger_seed_text = (
+            deferredwork.observe_ledger(unit.workspace.paths.deferred_work)[0]
+            if ledger_seed
+            else None
+        )
+        # Each tracked hook config provisioning rewrote and pinned, with the exact
+        # text written, for the success-path teardown check (DW-368): the pin hides
+        # a story's own edit to that file from the unit commit. A fresh open, so
+        # always overwritten.
+        task.pinned_config_rewrites = pinned_rewrites
         if skipped_seeds:
             # A seed entry whose destination already exists is a no-op. Harmless for
             # a file the checkout legitimately carries, but a directory entry is
@@ -1679,17 +2621,26 @@ class WorktreeFlow:
             seed_files=seed_files,
             seed_globs=seed_globs,
             config_paths=[p.hooks.config_path for p in profiles if not p.hookless],
+            project=self.paths.project,
         )
+        # A ledger/board the seed step excluded because its leaf link escapes the
+        # project is otherwise dropped without a word (DW-432): name it here.
+        for rel in self._artifact_seed_drops(unit.path):
+            if rel not in undelivered_seeds:
+                undelivered_seeds.append(rel)
         if undelivered_seeds:
             self.journal.append(
                 "worktree-seed-dropped", story_key=task.story_key, entries=undelivered_seeds
             )
 
         # The last guard standing over a relocated accepted spec, and the only one
-        # that can see this particular loss at all: `_accepted_spec_seed` refuses on
-        # its own containment arm SILENTLY — the rel reaches neither `seed_files` nor
-        # `skipped_seeds` nor `undelivered_seeds`, so neither journal above names it.
-        # File-ness alone is therefore not enough to call the spec delivered.
+        # that STOPS a bind to an outside file. `_accepted_spec_seed` refuses on its
+        # own containment arm — since DW-104 not silently: the refused rel is
+        # nominated into `seed_files` anyway, `provision_worktree` re-derives `dst`
+        # and copies nothing because it escapes, and `worktree-seed-dropped` above
+        # names it. That report is informational, though, and this probe is what
+        # keeps the unit from dispatching against someone else's bytes.
+        # File-ness alone is not enough to call the spec delivered.
         # `_is_file` follows symlinks and asks only "are there bytes here", so a
         # parent that is a real directory in the main checkout but a committed
         # OUTWARD symlink in the commit this mount was cut from lands the probe on an
@@ -1700,7 +2651,8 @@ class WorktreeFlow:
         # unresolvable probe cannot prove delivery, so every filesystem fault
         # escalates rather than binding.
         if accepted_spec_relocated:
-            accepted_probe = unit.path / str(task.spec_file)
+            # Project-relative spelling, so anchored on the mount project (DW-379).
+            accepted_probe = self._mount_project(unit.path) / str(task.spec_file)
             try:
                 accepted_delivered = _is_file(accepted_probe) and accepted_probe.resolve(
                     strict=False
@@ -1719,7 +2671,9 @@ class WorktreeFlow:
         # under their own kind so a user seed that spells a skill rel can neither forge
         # nor mask an entry. No MODULE_SKILLS entry has a worktree-resident consumer,
         # so an absence here cannot prove a stall and must never escalate.
-        undelivered_module_skills = module_skills_seed_undelivered(unit.path, trees)
+        undelivered_module_skills = module_skills_seed_undelivered(
+            unit.path, trees, repo_root=self.paths.repo_root, project=self.paths.project
+        )
         if undelivered_module_skills:
             self.journal.append(
                 "worktree-module-skills-dropped",
@@ -1731,7 +2685,9 @@ class WorktreeFlow:
         # renderer-era primitives. Re-probe disk rather than trusting skipped_seeds,
         # which a user-authored seed rel could otherwise forge. Check this first so a
         # wholly absent primitive is not misdiagnosed as a renderer-surface problem.
-        absent_skills = base_skills_seed_incomplete(unit.path, self.paths.repo_root, trees)
+        absent_skills = base_skills_seed_incomplete(
+            unit.path, self.paths.repo_root, trees, project=self.paths.project
+        )
         if absent_skills:
             reason = (
                 "the worktree is missing required upstream skill contract files the repo has "
@@ -1750,7 +2706,9 @@ class WorktreeFlow:
         # while a tracked stale worktree copy proves that existence alone is not
         # enough. Either shape would HALT a folder+id dispatch before writing a spec.
         stories_support = (
-            missing_stories_support(unit.path, trees) if self.state.source == "stories" else []
+            missing_stories_support(self._mount_roots(unit.path)[1], trees)
+            if self.state.source == "stories"
+            else []
         )
         if stories_support:
             short_dispatch = []
@@ -1782,6 +2740,42 @@ class WorktreeFlow:
             )
             self.escalate_unit(task, reason)  # always raises RunPaused
 
+        # Codex skips hooks it has not trusted for this exact worktree path, with no
+        # message, so its Stop would never reach the orchestrator. Escalating gate,
+        # so it sits above the advisory warnings below (DW-341).
+        self.gate_codex_hook_trust(task, unit.path)
+
+        # The residue the delivery probe above cannot see, stated as a warning rather
+        # than a write: a spec the mount DID deliver, whose bytes are the committed
+        # ones rather than the operator's uncommitted corrections (DW-101). Ungated by
+        # `accepted_spec_relocated` on purpose — a hard delivery fault has already
+        # escalated above, and a spec the task already spelled project-relative
+        # reaches exactly the same loss without ever passing through the normalizer.
+        #
+        # LAST, below every gate that escalates: each of the four above always raises,
+        # so a call placed among them would record "the mount superseded your spec" for
+        # a unit that then never got near a session. Here the only things left are the
+        # ready gate's veto and drive() itself.
+        self._warn_accepted_spec_superseded(
+            task, unit.path, project_relative_only=accepted_spec_relocated
+        )
+        # The residue neither the seed journals nor the probe above can see, for the
+        # ONE leg that has no escalating guard at all: a spec the task already spelled
+        # project-relative whose delivery the mount cannot PROVE (DW-104 + DW-115) —
+        # the locator refused on containment, or swallowed a filesystem fault, and
+        # either way the unit dispatches against a mount lacking the operator's spec.
+        # Gated on `not accepted_spec_relocated` because the relocated leg already
+        # escalated a few lines up, so a RECORD there too would be a second advisory
+        # naming a unit that never reaches a session — the `worktree-seed-dropped`
+        # entry that leg still emits is the seed's report, not this one.
+        # LAST, beside the DW-101 warning and for its stated
+        # reason: below every gate that raises, so the record cannot name a unit that
+        # never dispatched.
+        if not accepted_spec_relocated:
+            # `False` literally, not `accepted_spec_relocated`: inside this gate the
+            # flag cannot be anything else, and spelling it as a variable would read
+            # as if it varied the way it does at the call two lines above.
+            self._warn_accepted_spec_undelivered(task, unit.path, project_relative_only=False)
         self._save()
         prev = self._workspace_get()
         self._workspace_set(unit.workspace)
@@ -1868,6 +2862,7 @@ class WorktreeFlow:
                 on_teardown_degraded=lambda msg: self.journal.append(
                     "worktree-teardown-degraded", story_key=task.story_key, error=msg
                 ),
+                forensic_extra=self._pinned_config_forensic_extra(task, unit),
             )
             self.journal.append(
                 "unit-closed",
@@ -1876,8 +2871,36 @@ class WorktreeFlow:
                 kept=scm.keep_failed,
                 patch=str(patch) if patch else None,
             )
+            # The unit's work is discarded by design, so no uncarried-write check
+            # runs here (DW-375); drop the seed snapshot rather than keep it.
+            if task.ledger_seed_text is not None:
+                task.ledger_seed_text = None
+                self._save()
+            # A torn-down worktree takes the record's purpose with it; a kept one
+            # keeps the record, which gc_run_worktrees' refusal reads (DW-502).
+            self._drop_pinned_config_record(task)
 
-    def _carried_artifact_rels(self, repo: Path) -> tuple[str, ...]:
+    @staticmethod
+    def _pinned_config_forensic_extra(task: StoryTask, unit: UnitWorkspace) -> str:
+        """The ``forensic_extra`` every failed-unit teardown passes to
+        ``close_unit_workspace``: `git diff` reads a skip-worktree-pinned hook config
+        as clean, so a story's edit to one would miss ``changes.patch`` (DW-479).
+        Built while the worktree is still mounted; ``""`` without pins or a mount.
+        Shared by the DEFERRED arm of :meth:`integrate_unit` and
+        :meth:`keep_branch_and_escalate`, so both record the same edits (DW-501).
+        """
+        if not task.pinned_config_rewrites:
+            return ""
+        try:
+            mounted = unit.path.is_dir()
+        except OSError:
+            # an unprovable mount: the per-file reads name the fault
+            mounted = True
+        if not mounted:
+            return ""
+        return _pinned_config_forensics(unit.path, task.pinned_config_rewrites)
+
+    def _carried_artifact_rels(self, repo: Path, task: StoryTask) -> tuple[str, ...]:
         """The repo-relative posix paths the RUN commits for itself after the merge —
         ``clean_incoming_collisions``' ``protected`` operand (#618).
 
@@ -1892,6 +2915,28 @@ class WorktreeFlow:
         own bytes to commit under a `chore(...)` message. The blast radius is strictly
         same-path (`git commit -- <pathspec>` is implicitly `--only`), which is why
         this is an exact path set and not a policy.
+
+        OBLIGATION-GATED, one rule for both artifacts (DW-354): a path is protected
+        only when ``task`` actually carries a write to it, because a carry that never
+        runs never stages the path and an operator's unstaged edit there is then as
+        inert as any other stray — refusing the merge over it paused unattended runs
+        with no hazard to point at.
+
+        * The ledger is carried when the task holds a payload for it:
+          ``harvested_deferrals``, ``story_closes_intended``, or the sweep's
+          ``bundle_closes_intended`` — the operands ``_carry_isolated_ledger_writes``
+          and the ``SweepEngine`` override commit to ``paths.deferred_work``. NOT
+          ``harvest_carry_commit_pending``: that latch can outlive its payload (the
+          fresh-attempt reset clears ``harvested_deferrals`` without clearing it, and
+          ``_carry_harvested_deferrals`` returns early on an empty list), so it would
+          protect the ledger with nothing to carry. NOT refiles either: they are
+          written to the worktree ledger before the unit's commit and ride the branch
+          into the incoming set, never a post-merge carry.
+        * The board is carried when ``task.board_advance_intended`` is set — the only
+          guard ``_carry_board_advance`` checks ("the record IS the carry's guard").
+          ``SweepEngine`` and ``StoriesEngine`` never record one, nor does a generic
+          task with no recorded advance, so their merges tolerate an unrelated
+          operator board edit.
 
         ``self.paths``, not ``self.workspace.paths``: the carries read the MAIN
         checkout's copies (their docstrings say so explicitly), and this is the
@@ -1934,8 +2979,13 @@ class WorktreeFlow:
         being wrong that way is a refusal the operator can act on; the other way it is
         silent.
         """
+        artifacts: list[Path] = []
+        if task.board_advance_intended:
+            artifacts.append(self.paths.sprint_status)
+        if task.harvested_deferrals or task.story_closes_intended or task.bundle_closes_intended:
+            artifacts.append(self.paths.deferred_work)
         rels: list[str] = []
-        for artifact in (self.paths.sprint_status, self.paths.deferred_work):
+        for artifact in artifacts:
             try:
                 rel = artifact.resolve().relative_to(repo.resolve()).as_posix()
             except (OSError, RuntimeError, ValueError):
@@ -1948,6 +2998,402 @@ class WorktreeFlow:
                 rels.append(rel)
         return tuple(rels)
 
+    def _validated_integration_attempt(self, task: StoryTask) -> dict[str, Any] | None:
+        raw = task.integration_attempt
+        if raw is None:
+            return None
+        required = (
+            "version",
+            "target_ref",
+            "strategy",
+            "source_revision",
+            "operation_identity",
+            "pre_target_revision",
+            "snapshots",
+            "submodules",
+            "phase",
+            "cleanup_plan",
+        )
+        if not isinstance(raw, dict) or any(key not in raw for key in required):
+            raise verify.IntegrationEvidenceError(
+                "persisted target integration receipt is missing or malformed"
+            )
+        if raw["version"] != 3 or any(
+            not isinstance(raw.get(key), str) or not raw.get(key)
+            for key in required
+            if key not in {"version", "snapshots", "submodules", "cleanup_plan"}
+        ):
+            raise verify.IntegrationEvidenceError(
+                "persisted target integration receipt is missing or malformed"
+            )
+        if raw["strategy"] not in {"merge", "squash", "ff"}:
+            raise verify.IntegrationEvidenceError(
+                "persisted target integration receipt is missing or malformed"
+            )
+        target_ref = raw["target_ref"]
+        if (
+            not target_ref.startswith("refs/heads/")
+            or ".." in target_ref
+            or "\\" in target_ref
+            or any(ord(char) < 32 or ord(char) == 127 for char in target_ref)
+        ):
+            raise verify.IntegrationEvidenceError(
+                "persisted target integration receipt is missing or malformed"
+            )
+        operation = raw["operation_identity"]
+        revisions = (raw["source_revision"], raw["pre_target_revision"])
+        if (
+            len(operation) != 32
+            or any(char not in "0123456789abcdef" for char in operation)
+            or any(
+                len(value) not in (40, 64) or any(char not in "0123456789abcdef" for char in value)
+                for value in revisions
+            )
+        ):
+            raise verify.IntegrationEvidenceError(
+                "persisted target integration receipt is missing or malformed"
+            )
+        old = raw.get("old_revision")
+        new = raw.get("new_revision")
+        if (old is None) != (new is None) or any(
+            value is not None and (not isinstance(value, str) or not value) for value in (old, new)
+        ):
+            raise verify.IntegrationEvidenceError(
+                "persisted target integration receipt is missing or malformed"
+            )
+        if any(
+            value is not None
+            and (
+                len(value) not in (40, 64) or any(char not in "0123456789abcdef" for char in value)
+            )
+            for value in (old, new)
+        ):
+            raise verify.IntegrationEvidenceError(
+                "persisted target integration receipt is missing or malformed"
+            )
+        outcome = raw.get("outcome")
+        if outcome is not None and outcome != "refused-restored":
+            raise verify.IntegrationEvidenceError(
+                "persisted target integration receipt is missing or malformed"
+            )
+        phase = raw.get("phase")
+        cleanup_plan = raw.get("cleanup_plan")
+        if phase not in {"armed", "cleanup-pending", "cleanup-applied", "integrated"}:
+            raise verify.IntegrationEvidenceError(
+                "persisted target integration receipt is missing or malformed"
+            )
+        if cleanup_plan is not None:
+            if (
+                not isinstance(cleanup_plan, dict)
+                or set(cleanup_plan) != {"cleaned", "tolerated", "untracked"}
+                or any(
+                    not isinstance(cleanup_plan.get(key), list)
+                    or any(not isinstance(path, str) for path in cleanup_plan[key])
+                    for key in ("cleaned", "tolerated", "untracked")
+                )
+            ):
+                raise verify.IntegrationEvidenceError(
+                    "persisted target integration receipt is missing or malformed"
+                )
+            for key in ("cleaned", "tolerated", "untracked"):
+                verify.preflight_integration_paths(cleanup_plan[key])
+        if phase == "armed" and cleanup_plan is not None:
+            raise verify.IntegrationEvidenceError(
+                "persisted target integration receipt is missing or malformed"
+            )
+        if phase != "armed" and cleanup_plan is None:
+            raise verify.IntegrationEvidenceError(
+                "persisted target integration receipt is missing or malformed"
+            )
+        # `index_flags`, `ignored`: optional — a receipt armed before either
+        # was recorded reads without that reading
+        allowed = set(required) | {
+            "old_revision",
+            "new_revision",
+            "outcome",
+            "index_flags",
+            "ignored",
+        }
+        if set(raw) - allowed or (outcome is not None and old is None):
+            raise verify.IntegrationEvidenceError(
+                "persisted target integration receipt is missing or malformed"
+            )
+        if "index_flags" in raw:
+            verify.validate_index_flags_evidence(raw["index_flags"])
+        if "ignored" in raw:
+            verify.validate_ignored_entries_evidence(raw["ignored"])
+        verify.validate_integration_state_schema(
+            self.run_dir,
+            raw["snapshots"],
+            raw["submodules"],
+            operation,
+            payload_max_bytes=self.policy.limits.artifact_payload_max_mb * 1_048_576,
+        )
+        return raw
+
+    def _arm_integration_attempt(
+        self,
+        task: StoryTask,
+        *,
+        target_ref: str,
+        strategy: str,
+        source: str,
+        snapshot_paths: Collection[str],
+    ) -> dict[str, Any]:
+        previous = task.integration_attempt
+        verify.require_ref_reflog(self.paths.repo_root, target_ref)
+        operation_identity = secrets.token_hex(16)
+        pre_target_revision = verify.ref_revision(self.paths.repo_root, target_ref)
+        snapshots, submodules = verify.capture_integration_state(
+            self.paths.repo_root,
+            self.run_dir,
+            operation_identity,
+            snapshot_paths,
+            run_dir_identity=self.state.run_dir_identity,
+            payload_max_bytes=self.policy.limits.artifact_payload_max_mb * 1_048_576,
+        )
+        # The flag words of the index OUTSIDE the snapshot set — a hook's
+        # `update-index --assume-unchanged` on a clean tracked file there is
+        # invisible to every other reading (#796 review); captured after the
+        # snapshots, inside the same ref-revision bracket
+        # and the whole tree's ignored entries — a hook's gitignored write
+        # beside an incoming path in a directory the target already held
+        # populated is listed by no other reading (#796 review)
+        try:
+            index_flags = verify.capture_index_flags(
+                self.paths.repo_root, exclude=[str(entry["path"]) for entry in snapshots]
+            )
+            ignored = verify.capture_ignored_entries(
+                self.paths.repo_root,
+                self.run_dir,
+                operation_identity,
+                run_dir_identity=self.state.run_dir_identity,
+            )
+        except BaseException:
+            verify.discard_integration_state(
+                self.run_dir, {"operation_identity": operation_identity}
+            )
+            raise
+        if verify.ref_revision(self.paths.repo_root, target_ref) != pre_target_revision:
+            verify.discard_integration_state(
+                self.run_dir, {"operation_identity": operation_identity}
+            )
+            raise verify.IntegrationEvidenceError(
+                "target changed during integration snapshot capture"
+            )
+        attempt = {
+            "version": 3,
+            "target_ref": target_ref,
+            "strategy": strategy,
+            "source_revision": source,
+            "operation_identity": operation_identity,
+            "pre_target_revision": pre_target_revision,
+            "snapshots": snapshots,
+            "submodules": submodules,
+            "index_flags": index_flags,
+            "ignored": ignored,
+            "phase": "armed",
+            "cleanup_plan": None,
+        }
+        task.integration_attempt = attempt
+        try:
+            self._save()
+        except BaseException:
+            task.integration_attempt = previous
+            verify.discard_integration_state(
+                self.run_dir, {"operation_identity": operation_identity}
+            )
+            raise
+        verify.discard_integration_state(self.run_dir, previous)
+        return attempt
+
+    def _refuse_refused_residue(self, attempt: dict[str, Any], *, revision: str) -> None:
+        """Refuse a re-arm while the refused attempt's named residue stands.
+
+        The refusal restored the receipt's own paths and left a hook's write
+        outside them in place, named; `integration_restoration_complete` reads
+        only the former, so a resume after the hook was disabled — but before
+        the output it left was cleared — re-armed over the write and the retry
+        recorded ``unit-merged`` with it still there (#796 review). The refused
+        receipt's readings are taken again (`verify.refused_integration_residue`)
+        and keep their authority until nothing is named.
+        """
+        residue = verify.refused_integration_residue(
+            self.paths.repo_root, self.run_dir, attempt, revision=revision
+        )
+        if residue:
+            raise verify.IntegrationEvidenceError(
+                "the refused integration's residue is still in the target — the paths "
+                "its pause named as left in place, or work of yours since (the run "
+                "cannot tell them apart); clear it, or commit or stash what is yours, "
+                "then resume: " + ", ".join(residue)
+            )
+
+    def _integration_artifact_paths(self, task: StoryTask) -> tuple[str, ...]:
+        """The accepted artifact paths on the target, for the receipt's snapshot and
+        its restore. Raises rather than degrading: an ignored deliverable's
+        destination is never in the merge's own delta, so this entry is the only
+        thing that lets a target hook's write to it be seen and restored. A
+        resolver refusal (the target's artifact dir swapped for a symlink after
+        acceptance, or replayed authority the path validator rejects) therefore
+        has to pause BEFORE the receipt is armed and anything on the target moves
+        — `merge_local` resolves once, ahead of the snapshot, and threads the
+        result to the restore — never snapshot short and let the later
+        `validate_integrated` refusal claim an exact restore over it (#796 review)."""
+        if not task.dw_ids:
+            return ()
+        return artifact_publication.integrated_artifact_repo_paths(task, self.paths)
+
+    def _retire_unmoved_integration_attempt(self, task: StoryTask) -> None:
+        """Restore receipt cleanup, then retire a proven no-ref typed refusal."""
+        if not task.dw_ids or task.integration_attempt is None:
+            return
+        try:
+            attempt = self._validated_integration_attempt(task)
+            assert attempt is not None
+            update = verify.integration_ref_update(
+                self.paths.repo_root,
+                str(attempt["target_ref"]),
+                str(attempt["operation_identity"]),
+            )
+            pre = str(attempt["pre_target_revision"])
+            if (
+                update is not None
+                or verify.ref_revision(self.paths.repo_root, str(attempt["target_ref"])) != pre
+            ):
+                raise verify.IntegrationEvidenceError(
+                    "typed Git refusal did not prove the target ref remained unchanged"
+                )
+            verify.restore_integration_nonref_state(
+                self.paths.repo_root,
+                str(attempt["target_ref"]),
+                revision=pre,
+                run_dir=self.run_dir,
+                snapshots=attempt["snapshots"],
+                submodules=attempt["submodules"],
+                operation_identity=str(attempt["operation_identity"]),
+            )
+        except (verify.GitError, OSError, RuntimeError, ValueError) as exc:
+            # Preserve the caller's typed merge-failure classification and remedy;
+            # this companion record explains why receipt authority was retained.
+            self.journal.append(
+                "artifact-publication-refused",
+                story_key=task.story_key,
+                error=f"typed Git refusal target restoration failed: {exc}",
+            )
+            self._save()
+            return
+        retired = task.integration_attempt
+        task.integration_attempt = None
+        self._save()
+        verify.discard_integration_state(self.run_dir, retired)
+
+    def _pause_integration_evidence(
+        self, task: StoryTask, exc: BaseException, *, prefix: str
+    ) -> NoReturn:
+        self.journal.append(
+            "artifact-publication-refused", story_key=task.story_key, error=str(exc)
+        )
+        self._save()
+        self._pause(
+            f"{prefix}: {exc}; source retained at {task.worktree_path}",
+            task.story_key,
+            cause=exc,
+        )
+
+    def _refuse_integrated_artifacts(
+        self,
+        task: StoryTask,
+        attempt: dict[str, str],
+        update: verify.IntegrationRefUpdate | None,
+        exc: BaseException,
+        *,
+        artifact_paths: tuple[str, ...],
+    ) -> NoReturn:
+        try:
+            if update is not None:
+                if update.old_revision != attempt["pre_target_revision"]:
+                    raise verify.IntegrationRestoreError(
+                        "integration ref epoch differs from the snapshotted target; "
+                        "no non-ref restoration was attempted"
+                    )
+                verify.restore_integration_ref(
+                    self.paths.repo_root,
+                    attempt["target_ref"],
+                    old_revision=update.old_revision,
+                    new_revision=update.new_revision,
+                    extra_paths=artifact_paths,
+                    run_dir=self.run_dir,
+                    snapshots=attempt["snapshots"],
+                    submodules=attempt["submodules"],
+                    operation_identity=attempt["operation_identity"],
+                )
+            else:
+                pre = attempt["pre_target_revision"]
+                if verify.ref_revision(self.paths.repo_root, attempt["target_ref"]) != pre:
+                    raise verify.IntegrationRestoreError(
+                        "target changed without readable integration ownership evidence; "
+                        "no restoration was attempted"
+                    )
+                verify.restore_integration_nonref_state(
+                    self.paths.repo_root,
+                    attempt["target_ref"],
+                    revision=pre,
+                    run_dir=self.run_dir,
+                    snapshots=attempt["snapshots"],
+                    submodules=attempt["submodules"],
+                    operation_identity=attempt["operation_identity"],
+                )
+                if not verify.integration_restoration_complete(
+                    self.paths.repo_root,
+                    attempt["target_ref"],
+                    old_revision=pre,
+                    new_revision=pre,
+                    extra_paths=artifact_paths,
+                    run_dir=self.run_dir,
+                    snapshots=attempt["snapshots"],
+                    submodules=attempt["submodules"],
+                    operation_identity=attempt["operation_identity"],
+                ):
+                    raise verify.IntegrationRestoreError(
+                        "target non-ref state changed without a ref update; no restoration "
+                        "authority was inferred"
+                    )
+        except (verify.GitError, OSError, RuntimeError, ValueError) as restore_exc:
+            self.journal.append(
+                "artifact-publication-refused",
+                story_key=task.story_key,
+                error=f"{exc}; target restoration failed: {restore_exc}",
+            )
+            self._save()
+            self._pause(
+                "artifact target integration validation failed and the target could not "
+                f"be restored safely: {restore_exc}; source retained at {task.worktree_path}",
+                task.story_key,
+                cause=restore_exc,
+            )
+        if update is None:
+            # No ref update to own (an artifact-only bundle's squash stages
+            # nothing; a fast-forward of a source the target already holds):
+            # the transition is pre -> pre, and the receipt says so. An outcome
+            # without its revisions is the one shape `_validated_integration_attempt`
+            # refuses, and it used to be written here — every resume then read
+            # "receipt is missing or malformed" with no re-arm (#796 review).
+            attempt["old_revision"] = attempt["pre_target_revision"]
+            attempt["new_revision"] = attempt["pre_target_revision"]
+        attempt["outcome"] = "refused-restored"
+        task.integration_attempt = attempt
+        self.journal.append(
+            "artifact-publication-refused", story_key=task.story_key, error=str(exc)
+        )
+        self._save()
+        self._pause(
+            "artifact target integration validation failed and the exact pre-attempt "
+            f"target was restored: {exc}; source retained at {task.worktree_path}",
+            task.story_key,
+            cause=exc,
+        )
+
     def merge_local(
         self,
         task: StoryTask,
@@ -1955,16 +3401,49 @@ class WorktreeFlow:
         *,
         replay: bool = False,
         replay_strategy: str | None = None,
+        first_integration: bool = False,
     ) -> None:
         """Merge a DONE unit's branch into the target branch from the main repo."""
-        if not replay:
+        if first_integration:
+            self._emit("pre_integrate", task)
+        if task.dw_ids:
+            self.prepare_publication(task, unit.workspace.paths)
+        receipt_required = False
+        if task.dw_ids:
+            try:
+                receipt_required = artifact_publication.requires_target_integration_receipt(task)
+            except artifact_publication.PublicationError as exc:
+                self._pause_integration_evidence(
+                    task, exc, prefix="target integration evidence is unsafe"
+                )
+        if not replay or first_integration:
             self._emit("pre_merge", task)
         scm = self.policy.scm
         merge_strategy = scm.merge_strategy if replay_strategy is None else replay_strategy
         repo = self.paths.repo_root
         target = self.state.target_branch
+        if task.dw_ids and not target:
+            # Compatibility for persisted runs created before target_branch was
+            # stamped into state: integration historically used the branch checked
+            # out in the main repository.  Resolve and persist that same target
+            # before constructing receipt authority.
+            target = verify.current_branch(repo)
+            if target == "HEAD":
+                self._pause_integration_evidence(
+                    task,
+                    verify.IntegrationEvidenceError(
+                        "target branch is unavailable for integration receipt"
+                    ),
+                    prefix="target integration evidence is unsafe",
+                )
+            self.state.target_branch = target
+            self._save()
         source = task.commit_sha or verify.rev_parse_head(unit.path)
-        merge_ref = unit.branch
+        # The completed task's recorded commit is the only source revision this
+        # run accepted.  A pre_merge plugin (or another process) may advance the
+        # unit branch after final verification, so never let the movable branch
+        # name choose bytes for either the collision probe or the merge itself.
+        merge_ref = source
         if replay:
             current_source = verify.rev_parse_head(unit.path)
             if current_source != source:
@@ -1976,10 +3455,8 @@ class WorktreeFlow:
                 )
                 self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
                 return
-            # Pin both the collision allowlist and the merge operand to the
-            # write-ahead SHA. The branch can move after the check; replay must
-            # integrate only the commit the completed session actually proved.
-            merge_ref = source
+            # ``merge_ref`` stays pinned to the write-ahead SHA even after this
+            # diagnostic check; the branch can move again before Git runs.
         # A per_worktree Unity Editor can leak asset writes into the *main*
         # checkout (see the unity plugin's worktree setup), dirtying the target with the very
         # files this branch already committed. Reconcile that first: clean only
@@ -1989,9 +3466,99 @@ class WorktreeFlow:
         # inert and is tolerated and journaled while a staged one escalates. What the RUN
         # can commit is the second question, and `protected` is what asks it: the
         # post-merge carry stages the board and the ledger BY PATHSPEC, so any dirt on
-        # them — staged or not, whoever wrote it — would ride the run's own bookkeeping
-        # commit. Inert-under-merge and safe-to-proceed are not the same predicate.
+        # one this task carries into (`_carried_artifact_rels`, DW-354) — staged or not,
+        # whoever wrote it — would ride the run's own bookkeeping commit.
+        # Inert-under-merge and safe-to-proceed are not the same predicate.
+        target_ref = f"refs/heads/{target}" if receipt_required else ""
+        landed = False
+        update: verify.IntegrationRefUpdate | None = None
+        attempt: dict[str, Any] | None = None
+        if receipt_required and task.integration_attempt is not None:
+            try:
+                attempt = self._validated_integration_attempt(task)
+                assert attempt is not None
+                if (
+                    attempt["target_ref"] != target_ref
+                    or attempt["strategy"] != merge_strategy
+                    or attempt["source_revision"] != source
+                ):
+                    raise verify.IntegrationEvidenceError(
+                        "persisted target integration receipt does not match the replay"
+                    )
+                update = verify.integration_ref_update(
+                    repo, target_ref, attempt["operation_identity"]
+                )
+                if update is None and attempt["phase"] in {
+                    "cleanup-pending",
+                    "cleanup-applied",
+                }:
+                    pre = str(attempt["pre_target_revision"])
+                    if verify.ref_revision(repo, target_ref) != pre:
+                        raise verify.IntegrationEvidenceError(
+                            "cleanup-phase receipt no longer owns the target epoch"
+                        )
+                    if not verify.integration_cleanup_state_recoverable(
+                        repo,
+                        self.run_dir,
+                        attempt["snapshots"],
+                        cleaned=attempt["cleanup_plan"]["cleaned"],
+                        untracked=attempt["cleanup_plan"]["untracked"],
+                        revision=pre,
+                        operation_identity=str(attempt["operation_identity"]),
+                    ):
+                        raise verify.IntegrationEvidenceError(
+                            "receipt-owned collision changed outside the cleanup transaction"
+                        )
+                    verify.restore_integration_nonref_state(
+                        repo,
+                        target_ref,
+                        revision=pre,
+                        run_dir=self.run_dir,
+                        snapshots=attempt["snapshots"],
+                        submodules=attempt["submodules"],
+                        operation_identity=str(attempt["operation_identity"]),
+                        include_paths=attempt["cleanup_plan"]["cleaned"],
+                    )
+                    retired = task.integration_attempt
+                    task.integration_attempt = None
+                    self._save()
+                    verify.discard_integration_state(self.run_dir, retired)
+                    attempt = None
+                if update is not None:
+                    assert attempt is not None
+                    if update.old_revision != attempt["pre_target_revision"]:
+                        raise verify.IntegrationEvidenceError(
+                            "integration ref epoch differs from the snapshotted target"
+                        )
+                    persisted_old = attempt.get("old_revision")
+                    persisted_new = attempt.get("new_revision")
+                    if persisted_old is not None and (
+                        persisted_old != update.old_revision or persisted_new != update.new_revision
+                    ):
+                        raise verify.IntegrationEvidenceError(
+                            "persisted target transition disagrees with reflog evidence"
+                        )
+                    if persisted_old is None:
+                        attempt["old_revision"] = update.old_revision
+                        attempt["new_revision"] = update.new_revision
+                        attempt["phase"] = "integrated"
+                        task.integration_attempt = attempt
+                        self._save()
+                    landed = verify.ref_revision(repo, target_ref) == update.new_revision
+            except (verify.GitError, OSError, RuntimeError, ValueError) as exc:
+                self._pause_integration_evidence(
+                    task, exc, prefix="target integration evidence is unsafe"
+                )
         tolerated: list[str] = []
+        planned_target_revision = (
+            verify.ref_revision(repo, target_ref)
+            if attempt is not None and attempt.get("outcome") == "refused-restored"
+            else (
+                str(attempt["pre_target_revision"])
+                if attempt is not None
+                else verify.ref_revision(repo, target_ref) if receipt_required else target
+            )
+        )
 
         def note_tolerated(paths: list[str]) -> None:
             """Journal the guard's decision AND keep the paths for the arms below.
@@ -2014,14 +3581,84 @@ class WorktreeFlow:
                 paths=paths,
             )
 
-        try:
-            cleaned = verify.clean_incoming_collisions(
-                repo,
-                target,
-                merge_ref,
-                protected=self._carried_artifact_rels(repo),
-                on_tolerated=note_tolerated,
+        def note_preserved(ref: str, paths: list[str]) -> None:
+            """Journal the recovery ref parking operator bytes the cleanup restores.
+
+            A dirty TRACKED path in the incoming set is restored to the target's
+            committed version before the merge, and it may be an operator's own
+            uncommitted edit rather than an Editor leak — the ref is the only place
+            those bytes survive (DW-356), so the journal names it and the paths. The
+            event claims only that the bytes were parked; restoration is
+            ``merge-target-cleaned``'s claim."""
+            self.journal.append(
+                "merge-target-preserved",
+                story_key=task.story_key,
+                branch=unit.branch,
+                ref=ref,
+                paths=paths,
             )
+
+        def preserve_failed_reason(*, receipt: bool) -> str:
+            """What a snapshot failure's ``str(exc)`` does not say — the merge, that
+            nothing was cleaned, and (receipt leg) the remedy — for the arms to join
+            with ``: <exc>`` (the no-receipt arm directly, then its own remedy; the
+            receipt arm through ``_pause_integration_evidence``'s ``prefix``). The
+            exception carries the paths, the ref family and git's detail once.
+
+            The remedies differ. Without a receipt the unit escalates and the
+            operator's edit is theirs to save or discard; ``escalate_unit`` already
+            appends the resume instruction. With one the receipt stays
+            ``cleanup-pending``: committing moves the target ref (the replay then
+            refuses the epoch) and discarding is undone by the replay's restore of
+            the captured pre-clean bytes, so the paths must be left as they are and
+            only the fault fixed — the resume replays the receipt and parks them
+            again."""
+            head = (
+                f"merge of {unit.branch} into {target} blocked before its pre-flight "
+                "cleanup, nothing was cleaned"
+            )
+            if not receipt:
+                return head
+            return (
+                f"{head}; leave those paths exactly as they are, fix the underlying "
+                f"fault, then `bmad-loop resume {self.state.run_id}` — the resume "
+                "replays the integration receipt and parks them again"
+            )
+
+        try:
+            if landed:
+                collision_plan = verify.IncomingCollisionPlan((), (), ())
+                cleaned_without_receipt: list[str] | None = []
+            elif receipt_required:
+                collision_plan = verify.plan_incoming_collisions(
+                    repo,
+                    planned_target_revision,
+                    merge_ref,
+                    protected=self._carried_artifact_rels(repo, task),
+                    on_tolerated=note_tolerated,
+                )
+                cleaned_without_receipt = None
+            else:
+                cleaned_without_receipt = verify.clean_incoming_collisions(
+                    repo,
+                    target,
+                    merge_ref,
+                    protected=self._carried_artifact_rels(repo, task),
+                    on_tolerated=note_tolerated,
+                    on_preserved=note_preserved,
+                )
+                collision_plan = verify.IncomingCollisionPlan((), (), ())
+        except verify.MergePreflightPreserveError as e:
+            # Ahead of the generic arm, which would word this as the stray-dirt
+            # guard's refusal: these paths lie INSIDE the incoming set, and nothing
+            # was mutated — the snapshot failed before the first restore (DW-356).
+            self.keep_branch_and_escalate(
+                task,
+                unit,
+                f"{preserve_failed_reason(receipt=False)}: {e}; save or discard your "
+                "uncommitted edits to those paths (or fix the underlying fault)",
+            )
+            return
         except (verify.GitError, OSError, RuntimeError) as e:
             # OSError/RuntimeError join GitError because clean_incoming_collisions
             # mutates the checkout directly (resolve/unlink/iterdir/rmdir) — non-spawn
@@ -2053,6 +3690,307 @@ class WorktreeFlow:
                 )
             self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
             return
+        prospective_paths: tuple[str, ...] = ()
+        artifact_paths: tuple[str, ...] = ()
+        if receipt_required:
+            try:
+                prospective_paths = verify.preflight_integration_paths(
+                    verify.branch_incoming_paths(repo, planned_target_revision, merge_ref)
+                )
+            except (verify.GitError, OSError, RuntimeError, ValueError) as exc:
+                self._pause_integration_evidence(
+                    task, exc, prefix="target integration path preflight failed"
+                )
+            # Resolved once, here, and threaded to the restore: a refusal pauses
+            # before the receipt is armed and before cleanup or git touch the
+            # target (see `_integration_artifact_paths`).
+            try:
+                artifact_paths = self._integration_artifact_paths(task)
+            except (
+                artifact_publication.PublicationError,
+                OSError,
+                RuntimeError,
+                ValueError,
+            ) as exc:
+                self._pause_integration_evidence(
+                    task, exc, prefix="target integration evidence is unsafe"
+                )
+        snapshot_paths = tuple(
+            dict.fromkeys(
+                [
+                    *prospective_paths,
+                    *collision_plan.cleaned,
+                    *collision_plan.tolerated,
+                    *artifact_paths,
+                ]
+            )
+        )
+        if receipt_required:
+            try:
+                attempt = self._validated_integration_attempt(task)
+                if attempt is not None:
+                    if (
+                        attempt["target_ref"] != target_ref
+                        or attempt["strategy"] != merge_strategy
+                        or attempt["source_revision"] != source
+                    ):
+                        raise verify.IntegrationEvidenceError(
+                            "persisted target integration receipt does not match the replay"
+                        )
+                    update = verify.integration_ref_update(
+                        repo, target_ref, attempt["operation_identity"]
+                    )
+                    current = verify.ref_revision(repo, target_ref)
+                    if update is not None:
+                        if update.old_revision != attempt["pre_target_revision"]:
+                            raise verify.IntegrationEvidenceError(
+                                "integration ref epoch differs from the snapshotted target"
+                            )
+                        persisted_old = attempt.get("old_revision")
+                        persisted_new = attempt.get("new_revision")
+                        if persisted_old is not None and (
+                            persisted_old != update.old_revision
+                            or persisted_new != update.new_revision
+                        ):
+                            raise verify.IntegrationEvidenceError(
+                                "persisted target transition disagrees with reflog evidence"
+                            )
+                        if persisted_old is None:
+                            attempt["old_revision"] = update.old_revision
+                            attempt["new_revision"] = update.new_revision
+                            attempt["phase"] = "integrated"
+                            task.integration_attempt = attempt
+                            self._save()
+                        if current == update.new_revision:
+                            landed = True
+                        elif current == update.old_revision:
+                            restored = verify.integration_restoration_complete(
+                                repo,
+                                target_ref,
+                                old_revision=update.old_revision,
+                                new_revision=update.new_revision,
+                                extra_paths=artifact_paths,
+                                run_dir=self.run_dir,
+                                snapshots=attempt["snapshots"],
+                                submodules=attempt["submodules"],
+                                operation_identity=attempt["operation_identity"],
+                            )
+                            if restored:
+                                # Complete for the receipt's own paths; what
+                                # the refusal named and left in place is
+                                # outside them, and re-arming over it made
+                                # it the retry's baseline (#796 review).
+                                self._refuse_refused_residue(attempt, revision=current)
+                                attempt = self._arm_integration_attempt(
+                                    task,
+                                    target_ref=target_ref,
+                                    strategy=merge_strategy,
+                                    source=source,
+                                    snapshot_paths=snapshot_paths,
+                                )
+                                update = None
+                            else:
+                                raise verify.IntegrationEvidenceError(
+                                    "restored target receipt state is incomplete"
+                                )
+                        elif attempt.get("outcome") == "refused-restored":
+                            # The durable outcome is written only after guarded
+                            # restoration succeeded. A later target commit is an
+                            # operator/concurrent advance, not the refused result;
+                            # preserve it and make it the next attempt's baseline
+                            # — the refused residue, still outside every set the
+                            # commit could have taken up, is not (#796 review).
+                            self._refuse_refused_residue(attempt, revision=current)
+                            attempt = self._arm_integration_attempt(
+                                task,
+                                target_ref=target_ref,
+                                strategy=merge_strategy,
+                                source=source,
+                                snapshot_paths=snapshot_paths,
+                            )
+                            update = None
+                        else:
+                            raise verify.IntegrationEvidenceError(
+                                "target no longer matches the receipt-owned integration result"
+                            )
+                    elif current != attempt["pre_target_revision"]:
+                        raise verify.IntegrationEvidenceError(
+                            "target changed without the receipt-owned ref-update evidence"
+                        )
+                    else:
+                        existing_snapshot_paths = [
+                            str(entry["path"])
+                            for entry in attempt["snapshots"]
+                            if isinstance(entry, dict) and "path" in entry
+                        ]
+                        covered_cleanup = set(collision_plan.cleaned) & set(existing_snapshot_paths)
+                        if covered_cleanup and not verify.integration_nonref_state_unchanged(
+                            repo,
+                            self.run_dir,
+                            attempt["snapshots"],
+                            attempt["submodules"],
+                            exclude_paths=set(existing_snapshot_paths) - covered_cleanup,
+                            operation_identity=attempt["operation_identity"],
+                        ):
+                            raise verify.IntegrationEvidenceError(
+                                "receipt-owned collision state changed before cleanup"
+                            )
+                        missing_coverage = set(snapshot_paths) - set(existing_snapshot_paths)
+                        if missing_coverage:
+                            if not verify.integration_nonref_state_unchanged(
+                                repo,
+                                self.run_dir,
+                                attempt["snapshots"],
+                                attempt["submodules"],
+                                operation_identity=attempt["operation_identity"],
+                            ):
+                                raise verify.IntegrationEvidenceError(
+                                    "persisted target receipt changed before cleanup coverage "
+                                    "could be extended"
+                                )
+                            attempt = self._arm_integration_attempt(
+                                task,
+                                target_ref=target_ref,
+                                strategy=merge_strategy,
+                                source=source,
+                                snapshot_paths=tuple(
+                                    dict.fromkeys([*existing_snapshot_paths, *snapshot_paths])
+                                ),
+                            )
+                else:
+                    attempt = self._arm_integration_attempt(
+                        task,
+                        target_ref=target_ref,
+                        strategy=merge_strategy,
+                        source=source,
+                        snapshot_paths=snapshot_paths,
+                    )
+                if attempt["pre_target_revision"] != planned_target_revision:
+                    raise verify.IntegrationEvidenceError(
+                        "target changed while collision planning was being captured; "
+                        "integration was not attempted"
+                    )
+            except (verify.GitError, OSError, RuntimeError, ValueError) as exc:
+                self._pause_integration_evidence(
+                    task, exc, prefix="target integration evidence is unsafe"
+                )
+        if receipt_required and not landed:
+            assert attempt is not None
+            plan_payload = {
+                "cleaned": list(collision_plan.cleaned),
+                "tolerated": list(collision_plan.tolerated),
+                "untracked": list(collision_plan.untracked),
+            }
+            try:
+                if attempt["phase"] != "armed":
+                    raise verify.IntegrationEvidenceError(
+                        "target cleanup receipt phase is not re-armable"
+                    )
+                if not verify.integration_nonref_state_unchanged(
+                    repo,
+                    self.run_dir,
+                    attempt["snapshots"],
+                    attempt["submodules"],
+                    operation_identity=attempt["operation_identity"],
+                ):
+                    raise verify.IntegrationEvidenceError(
+                        "target changed after collision planning and before cleanup"
+                    )
+                attempt["cleanup_plan"] = plan_payload
+                attempt["phase"] = "cleanup-pending"
+                task.integration_attempt = attempt
+                self._save()
+            except (verify.GitError, OSError, RuntimeError, ValueError) as exc:
+                self._pause_integration_evidence(
+                    task, exc, prefix="target collision cleanup could not be armed"
+                )
+        # What the cleanup has TOUCHED, for the restore in the except arm: the
+        # paths it finished plus the one in flight when it failed. Never the
+        # whole plan — a path still ahead may hold fresh operator state by then,
+        # and the snapshot would flatten it (#796 review). The identity error's
+        # own `cleaned` is this inventory minus the in-flight path, which that
+        # error proved untouched. Bound before the `try` so a probe fault ahead
+        # of the cleanup restores nothing rather than naming an unbound list.
+        progress: list[str] = []
+        try:
+            if receipt_required and not landed:
+                assert attempt is not None
+                if not verify.integration_nonref_state_unchanged(
+                    repo,
+                    self.run_dir,
+                    attempt["snapshots"],
+                    attempt["submodules"],
+                    operation_identity=attempt["operation_identity"],
+                ):
+                    self._pause_integration_evidence(
+                        task,
+                        verify.IntegrationEvidenceError(
+                            "target collision identity changed immediately before cleanup"
+                        ),
+                        prefix="target collision cleanup evidence is unsafe",
+                    )
+
+            def cleanup_identity_unchanged(path: str) -> bool:
+                if attempt is None:
+                    return True
+                return verify.integration_nonref_state_unchanged(
+                    repo,
+                    self.run_dir,
+                    attempt["snapshots"],
+                    attempt["submodules"],
+                    exclude_paths={
+                        str(entry["path"])
+                        for entry in attempt["snapshots"]
+                        if str(entry["path"]) != path
+                    },
+                    operation_identity=attempt["operation_identity"],
+                )
+
+            cleaned = (
+                verify.apply_incoming_collision_plan(
+                    repo,
+                    collision_plan,
+                    before_mutate=cleanup_identity_unchanged,
+                    progress=progress,
+                    on_preserved=note_preserved,
+                )
+                if cleaned_without_receipt is None
+                else cleaned_without_receipt
+            )
+        except verify.MergePreflightPreserveError as e:
+            # Raised before the first mutation (`progress` is empty), so there is
+            # nothing to restore; the receipt stays `cleanup-pending` and the resume
+            # replays it like any other interrupted cleanup (DW-356).
+            self._pause_integration_evidence(task, e, prefix=preserve_failed_reason(receipt=True))
+        except (verify.GitError, OSError, RuntimeError) as e:
+            if receipt_required and attempt is not None:
+                try:
+                    verify.restore_integration_nonref_state(
+                        repo,
+                        target_ref,
+                        revision=str(attempt["pre_target_revision"]),
+                        run_dir=self.run_dir,
+                        snapshots=attempt["snapshots"],
+                        submodules=attempt["submodules"],
+                        operation_identity=str(attempt["operation_identity"]),
+                        include_paths=(
+                            e.cleaned
+                            if isinstance(e, verify.IntegrationCleanupChangedError)
+                            else tuple(progress)
+                        ),
+                    )
+                except (verify.GitError, OSError, RuntimeError, ValueError) as restore_exc:
+                    e = verify.IntegrationRestoreError(
+                        f"{e}; partial collision cleanup restoration failed: {restore_exc}"
+                    )
+            self._pause_integration_evidence(
+                task, e, prefix="target collision cleanup failed after receipt capture"
+            )
+        if receipt_required and not landed:
+            assert attempt is not None
+            attempt["phase"] = "cleanup-applied"
+            task.integration_attempt = attempt
+            self._save()
         if cleaned:
             self.journal.append(
                 "merge-target-cleaned",
@@ -2060,11 +3998,23 @@ class WorktreeFlow:
                 branch=unit.branch,
                 paths=cleaned,
             )
-        if not replay:
-            # The task is already terminal and durable here. Record integration
-            # intent immediately before git so a host loss after merge success but
-            # before `unit-merged` can safely re-run the merge instead of losing a
-            # gitignored ledger when the stale worktree is reclaimed.
+        if receipt_required and not landed:
+            assert attempt is not None
+            # state.json is the durable authority; this record is a diagnostic
+            # mirror only and may be the torn final journal line after a crash.
+            self.journal.append(
+                "unit-merge-started",
+                story_key=task.story_key,
+                branch=unit.branch,
+                target=target,
+                strategy=merge_strategy,
+                source=source,
+                operation_id=attempt["operation_identity"],
+                pre_target_revision=attempt["pre_target_revision"],
+            )
+        elif not receipt_required and (not replay or first_integration):
+            # Released ordinary-story behavior: journal intent and replay the
+            # exact strategy idempotently without target-reflog dependency.
             self.journal.append(
                 "unit-merge-started",
                 story_key=task.story_key,
@@ -2073,14 +4023,48 @@ class WorktreeFlow:
                 strategy=merge_strategy,
                 source=source,
             )
+        if receipt_required and not landed:
+            assert attempt is not None
+            try:
+                if verify.ref_revision(repo, target_ref) != attempt["pre_target_revision"]:
+                    raise verify.IntegrationEvidenceError(
+                        "target changed after integration snapshot capture"
+                    )
+                if not verify.integration_nonref_state_unchanged(
+                    repo,
+                    self.run_dir,
+                    attempt["snapshots"],
+                    attempt["submodules"],
+                    exclude_paths=collision_plan.cleaned,
+                    operation_identity=attempt["operation_identity"],
+                ):
+                    raise verify.IntegrationEvidenceError(
+                        "target non-ref state changed after integration snapshot capture"
+                    )
+            except (verify.GitError, OSError, RuntimeError, ValueError) as exc:
+                self._pause_integration_evidence(
+                    task, exc, prefix="target integration evidence is unsafe"
+                )
+        # The tree the squash leg staged before its own commit sealed it; the
+        # receipt block below proves the sealed commit against it. None on the
+        # other legs and on a replay that found the result already landed.
+        squash_staged_tree: str | None = None
         try:
-            verify.merge_branch(
-                repo,
-                merge_ref,
-                strategy=merge_strategy,
-                message=self.merge_message(task),
-                allow_empty_squash=replay,
-            )
+            if not landed:
+                squash_staged_tree = verify.merge_branch(
+                    repo,
+                    merge_ref,
+                    strategy=merge_strategy,
+                    message=self.merge_message(task),
+                    allow_empty_squash=(
+                        replay or (bool(task.dw_ids) and source == task.baseline_commit)
+                    ),
+                    reflog_action=(
+                        f"bmad-loop-integrate:{attempt['operation_identity']}"
+                        if attempt is not None
+                        else None
+                    ),
+                )
         except verify.MergePreflightError as e:
             # Subclass arm, so it must precede the GitError one below. git declined
             # before the merge began: nothing was merged and the target checkout is
@@ -2110,6 +4094,7 @@ class WorktreeFlow:
                     tolerated=tolerated,
                     error=str(e),
                 )
+            self._retire_unmoved_integration_attempt(task)
             self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
             return  # defensive: never fall through to the success teardown below
         except verify.MergeHalfAppliedError as e:
@@ -2182,6 +4167,7 @@ class WorktreeFlow:
                 f"required clean/smudge filter that cannot run is the measured cause — "
                 f"and `bmad-loop resume {self.state.run_id}`. {e}"
             )
+            self._retire_unmoved_integration_attempt(task)
             self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
             return  # defensive: never fall through to the success teardown below
         except verify.MergeResidueUnreadError as e:
@@ -2256,6 +4242,7 @@ class WorktreeFlow:
                     f"names both failures. Then `bmad-loop resume {self.state.run_id}`. "
                     f"{e}"
                 )
+            self._retire_unmoved_integration_attempt(task)
             self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
             return  # defensive: never fall through to the success teardown below
         except verify.MergeConflictError as e:
@@ -2268,6 +4255,7 @@ class WorktreeFlow:
                 f"(content conflict against the target): resolve it by hand, then "
                 f"`bmad-loop resume {self.state.run_id}`. {e}"
             )
+            self._retire_unmoved_integration_attempt(task)
             self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
             return  # defensive: never fall through to the success teardown below
         except verify.GitError as e:
@@ -2289,15 +4277,463 @@ class WorktreeFlow:
             )
             self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
             return  # defensive: never fall through to the success teardown below
-        self.journal.append(
-            "unit-merged",
-            story_key=task.story_key,
-            branch=unit.branch,
-            target=self.state.target_branch,
-            strategy=merge_strategy,
-            source=source,
-        )
+        if receipt_required:
+            assert attempt is not None
+            try:
+                if update is None:
+                    update = verify.integration_ref_update(
+                        repo, target_ref, attempt["operation_identity"]
+                    )
+                if update is None:
+                    current = verify.ref_revision(repo, target_ref)
+                    if current != attempt["pre_target_revision"]:
+                        raise verify.IntegrationEvidenceError(
+                            "integration changed the target without readable ref-update evidence"
+                        )
+                    expected_revision = current
+                else:
+                    if update.old_revision != attempt["pre_target_revision"]:
+                        raise verify.IntegrationEvidenceError(
+                            "integration ref epoch differs from the snapshotted target"
+                        )
+                    attempt["old_revision"] = update.old_revision
+                    attempt["new_revision"] = update.new_revision
+                    attempt["phase"] = "integrated"
+                    task.integration_attempt = attempt
+                    self._save()
+                    current = verify.ref_revision(repo, target_ref)
+                    if current != update.new_revision:
+                        raise verify.IntegrationEvidenceError(
+                            "target moved after the receipt-owned integration"
+                        )
+                    expected_revision = update.new_revision
+                artifact_publication.validate_integrated(task, self.paths, expected_revision)
+                # Three readings, one per place a TARGET hook can put its output.
+                # Outside the incoming set the snapshot is the authority (below);
+                # on it the integrated commit is — the merge changed those paths
+                # by design — so the post-hook index and checkout must hold each
+                # one as that commit has it; and the squash leg's commit, which
+                # re-reads the index after `pre-commit`, must have sealed the tree
+                # git resolved, since a rewrite landed THERE matches index and
+                # checkout alike (#796 review). Path-only evidence throughout.
+                if squash_staged_tree is not None:
+                    if verify.revision_tree_oid(repo, expected_revision) != squash_staged_tree:
+                        raise verify.IntegrationEvidenceError(
+                            "target commit hook changed the squash result after the merge "
+                            "resolved it"
+                        )
+                # The submodule reading goes first: a populated checkout git
+                # left behind when the commit deleted its gitlink is git's, not
+                # a hook's, and only that reading can say so to the probe.
+                retained_checkouts = verify.validate_integrated_submodule_state(
+                    repo,
+                    attempt["submodules"],
+                    prospective_paths=prospective_paths,
+                    revision=expected_revision,
+                )
+                drifted = verify.integrated_paths_drift(
+                    repo,
+                    expected_revision,
+                    prospective_paths,
+                    retained_checkouts=retained_checkouts,
+                )
+                if drifted:
+                    raise verify.IntegrationEvidenceError(
+                        "target hook changed incoming paths after integration: "
+                        + ", ".join(sorted(drifted))
+                    )
+                # The diff readings compare blobs; an index flag a hook set on an
+                # incoming path (`update-index --assume-unchanged`, which hides
+                # later edits from git) changes none, so the post-hook flag word
+                # of every incoming entry is read against what a fresh entry may
+                # carry or what the receipt captured — and an entry git trusts
+                # unread under an accepted word is read from disk against the
+                # integrated commit, the diff reading above having trusted the
+                # bit (#796 review).
+                flagged = verify.integrated_index_flags_drift(
+                    repo,
+                    self.run_dir,
+                    attempt["snapshots"],
+                    prospective_paths,
+                    revision=expected_revision,
+                    operation_identity=attempt["operation_identity"],
+                )
+                if flagged:
+                    raise verify.IntegrationEvidenceError(
+                        "target hook changed index flags on incoming paths after "
+                        "integration: " + ", ".join(flagged)
+                    )
+                if not verify.integration_nonref_state_unchanged(
+                    repo,
+                    self.run_dir,
+                    attempt["snapshots"],
+                    attempt["submodules"],
+                    exclude_paths=prospective_paths,
+                    operation_identity=attempt["operation_identity"],
+                ):
+                    raise verify.IntegrationEvidenceError(
+                        "target hook changed receipt-owned index, worktree, ignored, "
+                        "or submodule state"
+                    )
+                # The fourth place: a clean tracked file outside every set
+                # above has no baseline in the receipt, so the whole-tree
+                # reading closes it — after the hooks the target may hold
+                # exactly the strays the guard tolerated before the merge,
+                # plus an ignored file that was already there and that an
+                # incoming `.gitignore` change uncovered (the receipt's
+                # ignored listing holds it at its identity), and nothing
+                # else (#796 review). The plan is read from the receipt,
+                # not the local variable: a replay that finds the ref
+                # already moved plans no collisions of its own.
+                cleanup_plan = attempt.get("cleanup_plan") or {}
+                strays = verify.integrated_stray_paths(
+                    repo,
+                    tolerated=cleanup_plan.get("tolerated", ()),
+                    incoming=prospective_paths,
+                    retained_checkouts=retained_checkouts,
+                    run_dir=self.run_dir,
+                    ignored=attempt.get("ignored"),
+                )
+                if strays:
+                    raise verify.IntegrationEvidenceError(
+                        "target hook changed paths outside the incoming set after "
+                        "integration (staged changes restored; unstaged and untracked "
+                        "entries left in place): " + ", ".join(strays)
+                    )
+                # What status cannot list: an index flag word a hook flipped on
+                # a clean tracked file outside the incoming set, proved unchanged
+                # by the receipt's digest and named from its map — and the file
+                # behind an entry the index already trusted unread (assume-
+                # unchanged, skip-worktree), which a hook can overwrite with no
+                # word, blob, or status reading moving, named from the receipt's
+                # `lstat` identity of it (#796 review). After the stray reading,
+                # which owns an entry added or removed. Left in place by the
+                # restore, like unstaged dirt, and named.
+                if attempt.get("index_flags") is not None:
+                    flipped = verify.integrated_index_flags_outside_drift(
+                        repo,
+                        attempt["index_flags"],
+                        exclude=[str(entry["path"]) for entry in attempt["snapshots"]],
+                    )
+                    if flipped:
+                        raise verify.IntegrationEvidenceError(
+                            "target hook changed index flags, or files the index trusts "
+                            "unread, outside the incoming set after integration (left in "
+                            "place): " + ", ".join(flipped)
+                        )
+                # And the one place none of those list: a directory the commit
+                # created where the receipt proved nothing was — or proved a
+                # file, a symlink, or an unpopulated gitlink — walked on disk
+                # — a hook's gitignored write or nested `.git` there is
+                # attempt-era with everything else in it (#796 review).
+                residue = verify.integrated_introduced_directories_drift(
+                    repo,
+                    expected_revision,
+                    self.run_dir,
+                    attempt["snapshots"],
+                    submodules=attempt["submodules"],
+                    operation_identity=attempt["operation_identity"],
+                )
+                if residue:
+                    raise verify.IntegrationEvidenceError(
+                        "target hook wrote into a directory the integration created: "
+                        + ", ".join(residue)
+                    )
+                # And wherever else: an ignored entry the receipt's whole-tree
+                # listing did not record, recorded under another identity, or
+                # recorded and now gone — a hook's write beside an incoming
+                # path in a directory the target already held populated, over
+                # an ignored file that was already there, or its deletion of
+                # one, which no reading above lists — and a nested `.git`
+                # anywhere, which git lists in no reading at all, a checkout
+                # the submodule reading accepted at a gitlink the commit
+                # introduced excepted, and a write inside a nested repository
+                # git tracks nothing under (the tolerated `vendor` among
+                # them), which git never descends into; the incoming set is
+                # the commit's own, an ignored entry git clobbered on its way
+                # in included, and the leftover of a deleted gitlink is the
+                # captured checkout's reading's below (#796 review). Left as
+                # found by the restore, like unstaged dirt, and named.
+                if attempt.get("ignored") is not None:
+                    added = verify.integrated_ignored_additions(
+                        repo,
+                        self.run_dir,
+                        attempt["ignored"],
+                        tolerated=cleanup_plan.get("tolerated", ()),
+                        incoming=prospective_paths,
+                        introduced_checkouts=verify.integrated_introduced_gitlinks(
+                            repo,
+                            self.run_dir,
+                            attempt["submodules"],
+                            revision=expected_revision,
+                        ),
+                        retained_checkouts=retained_checkouts,
+                    )
+                    if added:
+                        raise verify.IntegrationEvidenceError(
+                            "target hook wrote, changed or removed ignored entries after "
+                            "integration (left as found): " + ", ".join(added)
+                        )
+                # And inside a captured submodule checkout, which that listing
+                # never descends into and whose own reading takes `status`
+                # without `--ignored`: against the listing the receipt sealed
+                # beside its HEAD (#796 review). Left as found the same way.
+                added = verify.integrated_submodule_ignored_additions(
+                    repo,
+                    self.run_dir,
+                    attempt["submodules"],
+                    revision=expected_revision,
+                )
+                if added:
+                    raise verify.IntegrationEvidenceError(
+                        "target hook wrote, changed or removed ignored entries in a captured "
+                        "submodule checkout after integration (left as found): " + ", ".join(added)
+                    )
+                if verify.ref_revision(repo, target_ref) != expected_revision:
+                    raise verify.IntegrationEvidenceError(
+                        "target moved during artifact integration validation"
+                    )
+            except artifact_publication.PublicationError as exc:
+                self._refuse_integrated_artifacts(
+                    task, attempt, update, exc, artifact_paths=artifact_paths
+                )
+            except (verify.GitError, OSError, RuntimeError, ValueError) as exc:
+                self._refuse_integrated_artifacts(
+                    task, attempt, update, exc, artifact_paths=artifact_paths
+                )
+            self.journal.append(
+                "unit-merged",
+                story_key=task.story_key,
+                branch=unit.branch,
+                target=self.state.target_branch,
+                strategy=merge_strategy,
+                source=source,
+                operation_id=attempt["operation_identity"],
+            )
+            # The validated completion record is durable before rollback authority is
+            # retired. A crash between these writes replays from unit-merged and may
+            # safely clear the leftover receipt without touching Git.
+            completed_attempt = task.integration_attempt
+            task.integration_attempt = None
+            self._save()
+            verify.discard_integration_state(self.run_dir, completed_attempt)
+        else:
+            self.journal.append(
+                "unit-merged",
+                story_key=task.story_key,
+                branch=unit.branch,
+                target=self.state.target_branch,
+                strategy=merge_strategy,
+                source=source,
+            )
         self._emit("post_merge", task)
+        self.finish_publication(task, unit)
+
+    def _journal_unpinned_artifact_observations(self, story_key: str) -> None:
+        """Journal each artifacts root whose fallback observation ran unpinned.
+
+        DW-444, recorded decision "Degrade observation, journaled": on a host
+        without descriptor-relative reads, an artifacts root whose ``lstat``
+        carries no inode is pinned only weakly, and ``artifact_publication``
+        counts each such read (and each identity-less leaf ``capture`` accepts
+        under it). One ``artifact-observation-unpinned`` event per root keeps the
+        degrade visible: ``filesystem`` is the full label (volume path included),
+        ``fs_type`` its type alone. Draining clears the count, so a later drain
+        journals only newer degrades — including any counted from an entry point
+        that does not drain itself."""
+        for root, filesystem, count in artifact_publication.drain_unpinned_observations():
+            self.journal.append(
+                "artifact-observation-unpinned",
+                story_key=story_key,
+                root=root,
+                filesystem=filesystem,
+                fs_type=filesystem_type(filesystem),
+                count=count,
+            )
+
+    def prepare_publication(self, task: StoryTask, source: ProjectPaths) -> None:
+        """Persist accepted bytes before merge can consume the unit."""
+        try:
+            limits = self.policy.limits
+            try:
+                artifact_publication.prepare(
+                    task,
+                    self.paths,
+                    source,
+                    file_max_bytes=limits.artifact_file_max_mb * 1_048_576,
+                    payload_max_bytes=limits.artifact_payload_max_mb * 1_048_576,
+                )
+            finally:
+                self._journal_unpinned_artifact_observations(task.story_key)
+            self._save()
+        except artifact_publication.PublicationSizeError as exc:
+            self.journal.append(
+                "artifact-publication-refused",
+                story_key=task.story_key,
+                error=str(exc),
+                publication_cause=exc.cause,
+                measured_bytes=exc.measured_bytes,
+                limit_bytes=exc.limit_bytes,
+                measurement_is_lower_bound=exc.measurement_is_lower_bound,
+            )
+            self._save()
+            self._pause(
+                f"artifact publication preparation failed: {exc}", task.story_key, cause=exc
+            )
+        except (artifact_publication.PublicationError, verify.GitError, OSError, ValueError) as exc:
+            self.journal.append(
+                "artifact-publication-refused", story_key=task.story_key, error=str(exc)
+            )
+            self._save()
+            self._pause(
+                f"artifact publication preparation failed: {exc}", task.story_key, cause=exc
+            )
+
+    def bind_publication(
+        self, task: StoryTask, source: ProjectPaths, acceptance_identity: str
+    ) -> None:
+        """Persist final-verification source authority for one accepted result.
+
+        Arm and save the append-only session identity before reading source
+        bytes. If the process dies during the read, replay sees the same identity
+        with no digest map and refuses rather than blessing whatever bytes are
+        present after restart.
+        """
+        if task.artifact_acceptance_identity == acceptance_identity:
+            if task.artifact_source_digests is None or task.artifact_tracked_source_oids is None:
+                exc = artifact_publication.PublicationError(
+                    "accepted artifact source binding is unavailable for replay"
+                )
+                self.journal.append(
+                    "artifact-publication-refused", story_key=task.story_key, error=str(exc)
+                )
+                self._save()
+                self._pause(
+                    f"artifact publication binding failed: {exc}",
+                    task.story_key,
+                    cause=exc,
+                )
+            return
+        try:
+            artifact_publication.arm_binding(task, acceptance_identity)
+            self._save()
+            limits = self.policy.limits
+            try:
+                artifact_publication.bind_armed(
+                    task,
+                    source,
+                    file_max_bytes=limits.artifact_file_max_mb * 1_048_576,
+                    payload_max_bytes=limits.artifact_payload_max_mb * 1_048_576,
+                )
+            finally:
+                self._journal_unpinned_artifact_observations(task.story_key)
+            self._save()
+        except artifact_publication.PublicationSizeError as exc:
+            self.journal.append(
+                "artifact-publication-refused",
+                story_key=task.story_key,
+                error=str(exc),
+                publication_cause=exc.cause,
+                measured_bytes=exc.measured_bytes,
+                limit_bytes=exc.limit_bytes,
+                measurement_is_lower_bound=exc.measurement_is_lower_bound,
+            )
+            self._save()
+            self._pause(f"artifact publication binding failed: {exc}", task.story_key, cause=exc)
+        except (artifact_publication.PublicationError, verify.GitError, OSError, ValueError) as exc:
+            self.journal.append(
+                "artifact-publication-refused", story_key=task.story_key, error=str(exc)
+            )
+            self._save()
+            self._pause(f"artifact publication binding failed: {exc}", task.story_key, cause=exc)
+
+    def validate_staged_publication(self, task: StoryTask, source: ProjectPaths) -> dict[str, str]:
+        """Validate final staged Git deliverables or retain the unit mount."""
+        try:
+            try:
+                return artifact_publication.validate_staged(task, source)
+            finally:
+                self._journal_unpinned_artifact_observations(task.story_key)
+        except (artifact_publication.PublicationError, verify.GitError, OSError, ValueError) as exc:
+            self.journal.append(
+                "artifact-publication-refused", story_key=task.story_key, error=str(exc)
+            )
+            self._save()
+            self._pause(
+                f"artifact publication staging failed: {exc}",
+                task.story_key,
+                cause=exc,
+            )
+
+    def validate_committed_publication(
+        self,
+        task: StoryTask,
+        source: ProjectPaths,
+        revision: str,
+        staged_snapshot: object,
+    ) -> None:
+        """Validate the committed tree or roll back while retaining the mount."""
+        try:
+            if not isinstance(staged_snapshot, dict) or not all(
+                isinstance(rel, str) and isinstance(identity, str)
+                for rel, identity in staged_snapshot.items()
+            ):
+                raise artifact_publication.PublicationError(
+                    "validated staged artifact snapshot is missing or malformed"
+                )
+            try:
+                artifact_publication.validate_committed(task, source, revision, staged_snapshot)
+            finally:
+                self._journal_unpinned_artifact_observations(task.story_key)
+        except (artifact_publication.PublicationError, verify.GitError, OSError, ValueError) as exc:
+            self.journal.append(
+                "artifact-publication-refused", story_key=task.story_key, error=str(exc)
+            )
+            self._save()
+            self._pause(
+                f"artifact publication commit validation failed: {exc}",
+                task.story_key,
+                cause=exc,
+            )
+
+    def finish_publication(self, task: StoryTask, unit: UnitWorkspace | None) -> None:
+        """Publish and latch before successful teardown, including merge replay."""
+        if task.dw_ids:
+            try:
+                try:
+                    artifact_publication.publish(task, self.paths)
+                finally:
+                    self._journal_unpinned_artifact_observations(task.story_key)
+                self._save()
+            except (
+                artifact_publication.PublicationError,
+                verify.GitError,
+                OSError,
+                ValueError,
+            ) as exc:
+                self.journal.append(
+                    "artifact-publication-refused", story_key=task.story_key, error=str(exc)
+                )
+                self._save()
+                self._pause(
+                    f"artifact publication failed: {exc}; source retained at {task.worktree_path}",
+                    task.story_key,
+                    cause=exc,
+                )
+        if unit is None:
+            # journal-proven merge can publish from durable bytes alone. With the
+            # mount gone there is nothing left to check, so drop the snapshot rather
+            # than keep it in state.json; a still-mounted worktree gets a follow-up
+            # call with its reopened unit, whose check needs the snapshot.
+            if task.ledger_seed_text is not None and not (
+                task.worktree_path and Path(task.worktree_path).is_dir()
+            ):
+                task.ledger_seed_text = None
+                self._save()
+            return
+        self._warn_isolated_ledger_uncarried(task, unit)
+        self._refuse_pinned_config_edits(task, unit.path)
+        scm = self.policy.scm
         close_unit_workspace(
             unit,
             success=True,
@@ -2309,13 +4745,148 @@ class WorktreeFlow:
                 "worktree-teardown-degraded", story_key=task.story_key, error=msg
             ),
         )
+        self._drop_pinned_config_record(task)
+
+    def _drop_pinned_config_record(self, task: StoryTask) -> None:
+        """Forget the pinned-config record once the worktree is really gone.
+
+        It holds a full copy of the operator's settings text, so it must not sit in
+        state.json for every finished unit; while the worktree is still mounted
+        (teardown degraded or kept it) it stays, so a later pass still refuses.
+        """
+        if not task.pinned_config_rewrites:
+            return
+        try:
+            mounted = Path(task.worktree_path).is_dir() if task.worktree_path else False
+        except OSError:
+            mounted = True
+        if mounted:
+            return
+        task.pinned_config_rewrites = {}
+        self._save()
+
+    def _warn_isolated_ledger_uncarried(self, task: StoryTask, unit: UnitWorkspace) -> None:
+        """Journal the seeded-ledger writes the post-merge carry will not bring back.
+
+        Under worktree isolation a gitignored ledger reaches the unit only as the
+        seeded copy, the unit commit is shielded from it, and
+        ``_carry_isolated_ledger_writes`` re-applies only what the engine recorded
+        on the task — harvested deferrals and story/bundle closes. Anything else
+        the session wrote to that copy (a canonical entry of its own, an edit to a
+        seeded entry, a flat block) is lost when teardown removes the worktree
+        (DW-375). The decision is warn-only: nothing is carried back.
+
+        Runs here, before ``close_unit_workspace``, because ``merge_local`` has
+        already consumed the merge but the worktree is still mounted; the carry
+        runs later, against the main ledger. OBSERVATION: never raises, never
+        pauses, never writes a ledger — a read fault is journaled under the same
+        kind with an ``error`` field. The snapshot is cleared and SAVED right after
+        the record, so a replay after that save cannot record the same loss twice;
+        a crash in the narrow window between the journal append and the save can
+        still replay it once more. Engine
+        ``seen-again:`` stamps are excused (their loss is accepted); a
+        review-timeout salvage refile is not, since it is never carried.
+        """
+        seed = task.ledger_seed_text
+        if seed is None:
+            return
+        try:
+            mounted = unit.path.is_dir()
+        except OSError:
+            mounted = False
+        if not mounted:
+            # replay after the worktree was already removed
+            task.ledger_seed_text = None
+            self._save()
+            return
+        current, fault = deferredwork.observe_ledger(unit.workspace.paths.deferred_work)
+        ledger = str(self.paths.deferred_work)
+        if fault is not None:
+            self.journal.append(
+                "isolated-ledger-writes-uncarried",
+                story_key=task.story_key,
+                ledger=ledger,
+                error=fault,
+            )
+        else:
+            harvested = [
+                (str(item.get("origin", "")), str(item.get("source_spec", "")))
+                for item in task.harvested_deferrals
+            ]
+            closed = [*task.story_closes_intended, *task.bundle_closes_intended]
+            dw_ids, count = _uncarried_ledger_changes(
+                seed, current or "", harvested=harvested, closed=closed
+            )
+            if dw_ids or count:
+                self.journal.append(
+                    "isolated-ledger-writes-uncarried",
+                    story_key=task.story_key,
+                    ledger=ledger,
+                    dw_ids=dw_ids,
+                    count=count,
+                )
+        task.ledger_seed_text = None
+        self._save()
+
+    def _refuse_pinned_config_edits(self, task: StoryTask, worktree: Path) -> None:
+        """Pause rather than tear down a worktree holding an edit to a pinned config.
+
+        Provisioning pins a rewritten TRACKED hook config skip-worktree
+        (``_pin_tracked_config_rewrite``), which hides a story's own edit to that
+        file from ``git add -A``: it never reaches the unit commit, and removing
+        the worktree would delete it silently (DW-368). Recorded decision: detect
+        and refuse. Each pinned file is compared with the rewrite recorded on the
+        task, relay hooks ignored (``_pinned_config_edits``); any other difference
+        journals ``pinned-config-edit-refused`` and pauses with the worktree kept.
+
+        The merge has already landed, so the phase stays DONE (never ESCALATED —
+        that would skip the resume ledger carry) and nothing here carries, commits
+        or copies the edit, nor touches the pin. The record is never cleared, so the
+        refusal fires again on every retry while the edit remains; removing the
+        worktree is the operator's acknowledgement, after which this is a no-op.
+        """
+        pins = task.pinned_config_rewrites
+        if not pins:
+            return
+        try:
+            mounted = worktree.is_dir()
+        except OSError:
+            # teardown is irreversible: an unprovable "gone" checks, and the
+            # read below reports whatever fault stands in the way
+            mounted = True
+        if not mounted:
+            return
+        edits = _pinned_config_edits(worktree, pins)
+        if not edits:
+            return
+        self.journal.append(
+            "pinned-config-edit-refused",
+            story_key=task.story_key,
+            worktree=str(worktree),
+            edits=edits,
+        )
+        self._save()
+        self._pause(
+            f"{task.story_key} left an edit to a pinned hook config in its worktree "
+            f"{worktree}, outside the bmad-loop relay hooks; the skip-worktree pin kept it "
+            "out of the unit commit, so tearing the worktree down would delete it "
+            f"(DW-368): {'; '.join(edits)}. Carry the change into "
+            f"{self.state.target_branch} by hand — the pin hides it from `git diff`, so "
+            f"compare the file with `git -C {worktree} show HEAD:<file>`, and leave the "
+            "bmad-loop relay hook entries out (#352) — then `git worktree remove --force "
+            f"{worktree}`, delete branch {task.branch} if you do not keep it, and "
+            f"`bmad-loop resume {self.state.run_id}`",
+            task.story_key,
+        )
 
     def keep_branch_and_escalate(self, task: StoryTask, unit: UnitWorkspace, reason: str) -> None:
         """Preserve a DONE unit's branch (no delete, kept for manual merge) and
         escalate. Shared by every merge-back failure path: a target dirtied with
         stray work, a merge git refused at pre-flight, a merge that died part-way
         through its checkout, a merge whose COMMIT git refused, a genuine content
-        conflict, and a failure nothing classified."""
+        conflict, and a failure nothing classified. Its ``changes.patch`` records
+        pinned-config edits as the DEFERRED arm's does (DW-501); the worktree is kept,
+        so the pinned-config record stays."""
         close_unit_workspace(
             unit,
             success=False,
@@ -2324,16 +4895,78 @@ class WorktreeFlow:
             unit_key=task.story_key,
             delete_branch=False,
             diff_max_file_bytes=self.failed_diff_max_bytes(),
+            forensic_extra=self._pinned_config_forensic_extra(task, unit),
         )
         self.escalate_unit(task, reason)  # always raises RunPaused
+
+    def seed_workspace_trust(
+        self, task: StoryTask, worktree: Path, profiles: Sequence[CLIProfile]
+    ) -> None:
+        """Extend the operator's workspace-trust grant for the main checkout to
+        ``worktree``, for every loaded profile declaring ``[workspace_trust]``
+        (DW-390). See :mod:`bmad_loop.workspace_trust` for the confinement and the
+        root-trust rule. Profiles without the table touch nothing under ``~``.
+
+        Seeded → ``worktree-trust-seeded``; root not trusted or file/key missing →
+        ``worktree-trust-unseeded`` with the reason (a degrade, the run goes on —
+        the session will meet the CLI's trust dialog); a malformed settings file or
+        a write fault escalates the unit (repair writes raise)."""
+        # spec -> the first declaring profile's binary, named in the remedy
+        specs: dict[WorkspaceTrustSpec, str] = {}
+        for p in profiles:
+            if p.workspace_trust is not None:
+                specs.setdefault(p.workspace_trust, p.binary)
+        for spec, binary in specs.items():
+            try:
+                outcome, detail = workspace_trust.seed(
+                    spec, worktree, trusted_root=self.paths.repo_root
+                )
+            except workspace_trust.WorkspaceTrustError as e:
+                self.escalate_unit(  # always raises RunPaused
+                    task,
+                    f"cannot seed workspace trust for {task.story_key} in "
+                    f"{spec.settings_path} ({spec.key}): {e}; resolve that fault, then "
+                    "re-arm this escalation with `bmad-loop resolve <run-id> "
+                    "--no-interactive`: ESCALATED is terminal",
+                )
+                raise  # unreachable: escalate_unit always raises RunPaused
+            if outcome == "seeded":
+                self.journal.append(
+                    "worktree-trust-seeded",
+                    story_key=task.story_key,
+                    key=spec.key,
+                    path=str(worktree),
+                )
+            elif outcome == "root-untrusted":
+                self.journal.append(
+                    "worktree-trust-unseeded",
+                    story_key=task.story_key,
+                    key=spec.key,
+                    path=str(worktree),
+                    reason=detail,
+                )
+                # The run goes on, but the session will sit on the CLI's trust
+                # dialog until timeout — tell the operator now, not after.
+                gates.notify(
+                    self.policy,
+                    self.run_dir,
+                    f"workspace trust not seeded: {task.story_key}",
+                    f"{detail}. The worktree session will block on the {binary} trust "
+                    f"dialog: run `{binary}` once in the project root and trust it — "
+                    "every later worktree (and a resumed in-flight one) is seeded "
+                    "from that grant.",
+                )
 
     def escalate_unit(self, task: StoryTask, reason: str) -> None:
         """Mark a unit ESCALATED, notify, and pause the run.
 
-        Callers escalate outside a legal transition, before dispatch or after a
-        completed merge attempt, so the phase is set directly rather than advanced.
+        Callers escalate outside a legal transition, so the phase is set directly
+        rather than advanced: before dispatch, after a completed merge attempt, at a
+        session launch (the Codex hook-trust gate, :meth:`gate_codex_hook_trust`,
+        which can fire mid-drive), and from :meth:`reopen_unit` for in-flight units.
         """
         task.phase = Phase.ESCALATED
+        task.adopt_pending = False  # an escalation spends any adoption (DW-386)
         self.journal.append("story-escalated", story_key=task.story_key, reason=reason)
         gates.notify(
             self.policy,
@@ -2350,19 +4983,30 @@ class WorktreeFlow:
     def gc_run_worktrees(self) -> None:
         """Reclaim this run's worktree scaffolding once it finishes cleanly.
 
-        DONE units drop their worktree at merge time; this is a safety net for a
-        worktree leaked by a crash between merge and teardown, plus it prunes
-        stale git admin entries and removes the now-empty run worktree dir.
+        DONE and AWAITING_OPERATOR units drop their worktree at merge time; this
+        is a safety net for a worktree leaked by a crash between merge and
+        teardown, plus it prunes stale git admin entries and removes the now-empty
+        run worktree dir.
         Worktrees deliberately kept for inspection (a kept-failed/escalated unit)
         are left in place and journaled so the operator can find them."""
         if not self.isolated:
             return
         repo = self.paths.repo_root
         for task in self.state.tasks.values():
-            if task.phase == Phase.DONE and task.worktree_path:
+            if task.phase in (Phase.DONE, Phase.AWAITING_OPERATOR) and task.worktree_path:
                 wt = Path(task.worktree_path)
                 if wt.is_dir():
+                    if task.dw_ids and not task.artifact_publication_complete:
+                        self._pause(
+                            f"artifact publication incomplete; source retained at {task.worktree_path}",
+                            task.story_key,
+                        )
+                    # a resume does not replay finish_publication for every merged
+                    # unit, so this is where a pinned-config edit would be lost
+                    self._refuse_pinned_config_edits(task, wt)
                     discard_worktree(repo, task.worktree_path, task.branch, run_dir=self.run_dir)
+                # also once the operator removed a refused worktree by hand
+                self._drop_pinned_config_record(task)
             elif task.terminal and task.worktree_path and Path(task.worktree_path).is_dir():
                 # kept on purpose (keep_failed): leave it, but surface where.
                 self.journal.append(
@@ -2405,13 +5049,17 @@ class WorktreeFlow:
                 f"worktree for {task.story_key} is on {mounted_branch!r}, not recorded "
                 f"branch {task.branch!r}; cannot resume in place",
             )
-        # Spec paths are persisted relative to the worktree (model.to_dict) so
+        # Spec paths are persisted relative to the mount PROJECT (model.to_dict) so
         # state stays portable; re-absolutize both accepted/result ownership and
-        # the current/last attempt's dispatch ownership against the reopened tree.
+        # the current/last attempt's dispatch ownership against the reopened tree's
+        # project — the checkout root itself unless the project is nested (DW-379).
         # Absolute outside-worktree paths pass through unchanged. The rule itself
         # lives on the class that creates the relative spelling, so this and
         # `Engine._finish_inflight`'s pre-discard re-anchor cannot drift apart.
-        task.rebase_spec_paths_on(wt)
+        task.rebase_spec_paths_on(self._mount_project(wt))
+        # A unit first provisioned while the root was untrusted (or whose entry
+        # the operator pruned) must pick up the grant on resume (DW-390).
+        self.seed_workspace_trust(task, wt, self.worktree_profiles())
         return UnitWorkspace(
             workspace=Workspace(root=wt, paths=self.paths.rebased(wt)),
             repo_root=self.paths.repo_root,

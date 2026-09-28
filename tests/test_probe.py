@@ -944,3 +944,124 @@ def test_probe_launcher_pins_the_window_to_this_state_root(tmp_path, monkeypatch
         tmp_path / "log.txt",
     )
     assert mux.window_env == {"CALLER": "1"}
+
+
+# ------------------------------------------------ --workspace (DW-390)
+
+
+@pytest.fixture
+def agy_home(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    settings = home / ".gemini" / "antigravity-cli" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    return settings
+
+
+def _agy_workspace(tmp_path):
+    ws = (tmp_path / "proj" / "wt-1").resolve()
+    ws.mkdir(parents=True)
+    return ws
+
+
+def _probe_ws(tmp_path, ws, *extra):
+    project = tmp_path / "proj"
+    return [
+        "probe-adapter",
+        "antigravity",
+        "--project",
+        str(project),
+        "--workspace",
+        str(ws),
+        *extra,
+    ]
+
+
+def test_cli_workspace_trusted_exits_zero(tmp_path, capsys, agy_home):
+    ws = _agy_workspace(tmp_path)
+    agy_home.write_text(json.dumps({"trustedWorkspaces": [str(ws)]}), encoding="utf-8")
+
+    rc = cli.main(_probe_ws(tmp_path, ws))
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "- **workspace trust:** trusted" in out
+    assert str(ws) not in out
+
+
+@pytest.mark.parametrize("state", ["absent", "file-missing"])
+def test_cli_workspace_untrusted_exits_one_with_next_step(tmp_path, capsys, agy_home, state):
+    ws = _agy_workspace(tmp_path)
+    if state == "absent":
+        agy_home.write_text(json.dumps({"trustedWorkspaces": ["/elsewhere"]}), encoding="utf-8")
+
+    rc = cli.main(_probe_ws(tmp_path, ws))
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "- **workspace trust:** untrusted" in out
+    assert "workspace trust untrusted for the requested workspace" in out
+    assert "Run `agy` in the project root and trust it" in out
+    assert str(ws) not in out
+    if state == "file-missing":
+        assert not agy_home.exists()  # read-only
+
+
+def test_cli_workspace_malformed_is_unverifiable(tmp_path, capsys, agy_home):
+    ws = _agy_workspace(tmp_path)
+    agy_home.write_text("{broken", encoding="utf-8")
+
+    rc = cli.main(_probe_ws(tmp_path, ws))
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "- **workspace trust:** unverifiable" in out
+    assert agy_home.read_text(encoding="utf-8") == "{broken"
+
+
+@pytest.mark.parametrize(
+    ("argv_cli", "detail"),
+    [
+        (["claude"], "profile 'claude' declares none"),
+        (["no-such-cli", "--binary", "true"], "no loadable profile for 'no-such-cli'"),
+    ],
+    ids=["no-decl", "unknown"],
+)
+def test_cli_workspace_without_declaration_fails(tmp_path, capsys, argv_cli, detail):
+    rc = cli.main(
+        ["probe-adapter", *argv_cli, "--project", str(tmp_path), "--workspace", str(tmp_path)]
+    )
+    out, err = capsys.readouterr()
+    assert rc == 1
+    assert out == ""
+    assert "FAIL:" in err and "[workspace_trust]" in err
+    assert detail in err
+
+
+@pytest.mark.parametrize("trusted", [True, False])
+def test_cli_workspace_json_carries_the_verdict(tmp_path, capsys, agy_home, trusted):
+    ws = _agy_workspace(tmp_path)
+    listed = [str(ws)] if trusted else []
+    agy_home.write_text(json.dumps({"trustedWorkspaces": listed}), encoding="utf-8")
+
+    doc = machine_json(
+        _probe_ws(tmp_path, ws, "--json"),
+        capsys,
+        rc=0 if trusted else 1,
+        err_contains="ok:" if trusted else "FAIL:",
+    )
+
+    assert doc["workspace_trust"] == ("trusted" if trusted else "untrusted")
+    assert doc["schema_version"] == probe.SCHEMA_VERSION
+    assert str(ws) not in json.dumps(doc)
+
+
+def test_cli_json_without_workspace_reports_null(tmp_path, capsys):
+    doc = machine_json(
+        ["probe-adapter", "antigravity", "--project", str(tmp_path), "--json"],
+        capsys,
+        err_contains="ok:",
+    )
+    assert doc["workspace_trust"] is None

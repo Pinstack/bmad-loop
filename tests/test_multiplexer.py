@@ -321,6 +321,339 @@ def test_seam_methods_never_leak_raw_subprocess_error(boom_run, tmp_path):
     assert mux.current_pane_id() is None
 
 
+# --------------------------------------------- proved-gone vs unknowable (#525)
+#
+# The seam's `[]` is a positive claim: the backend listed the session and found
+# no windows, OR established that the session is gone. Every OTHER non-zero exit
+# is a listing that could not be taken, and answering `[]` there reports a live
+# session as empty — a death the engine acts on, a kill the prune calls verified.
+#
+# The rows below are a TRANSCRIPT, not invented fixtures. Measured 2026-08-31
+# against the real binaries, tmux 3.4 (WSL) and psmux 3.3.8 (66cf613):
+#
+#   tmux  list-windows -t =ghost        rc 1  "can't find session: ghost"
+#   tmux  list-windows, no server       rc 1  "no server running on /tmp/tmux-1000/default"
+#   psmux list-windows -t =ghost        rc 1  "psmux: no server running on session 'ghost'"
+#   psmux, tampered .key, WINDOWS ALIVE rc 1  "psmux: Invalid session key"
+#   psmux, wrong .port,   WINDOWS ALIVE rc 1  "psmux: connection timed out"
+#
+# The last two are why an exit code cannot make this call: identical rc, live
+# windows. A rejected `-F` format is NOT on the list because neither binary
+# fails on one — both exit 0 (tmux prints nothing, psmux echoes the literal), so
+# there is no "rejected format" arm to discriminate.
+
+_PROVED_GONE_STDERR = [
+    "can't find session: ghost",
+    "no server running on /tmp/tmux-1000/default",
+    "psmux: no server running on session 'ghost'",
+]
+_UNPROVEN_STDERR = [
+    "psmux: Invalid session key",
+    "psmux: connection timed out",
+    "psmux: no response from server (timed out)",
+    "",  # a non-zero exit that said nothing at all proves nothing at all
+]
+
+
+def _failing_listing(monkeypatch, stderr: str) -> None:
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda _name: "/usr/bin/tmux")
+    monkeypatch.setattr(
+        tmux_base.subprocess,
+        "run",
+        lambda argv, **_k: subprocess.CompletedProcess(argv, 1, stdout="", stderr=stderr),
+    )
+
+
+@pytest.mark.parametrize("stderr", _PROVED_GONE_STDERR)
+def test_list_window_ids_answers_empty_when_the_session_is_proved_gone(monkeypatch, stderr):
+    """A vanished session is an ANSWER, not a fault: `[]`, no exception.
+
+    Raising here instead would be the same dishonest report from the other
+    side — prune_ctl_windows would invent a phantom survivor that every
+    subsequent cleanup re-reports and nothing ever clears."""
+    _failing_listing(monkeypatch, stderr)
+    assert TmuxMultiplexer().list_window_ids("s") == []
+    assert TmuxMultiplexer().window_alive("s", "@1") is False
+
+
+@pytest.mark.parametrize("stderr", _UNPROVEN_STDERR)
+def test_list_window_ids_raises_when_a_nonzero_exit_proves_nothing(monkeypatch, stderr):
+    """The bug (#525): a listing that failed while the windows are alive must not
+    read as an empty session.
+
+    Both live-window rows come from a psmux server that was still serving its
+    windows — one refused the auth, one was unreachable — and folding either to
+    `[]` tells the engine's liveness probe the window died and the prune that
+    its kills are verified.
+
+    Ablation: replace the `_session_proved_gone` guard with a bare `return []`
+    and every row here fails, while the proved-gone sibling above still passes.
+    """
+    _failing_listing(monkeypatch, stderr)
+    with pytest.raises(MultiplexerError):
+        TmuxMultiplexer().list_window_ids("s")
+    with pytest.raises(MultiplexerError):
+        TmuxMultiplexer().window_alive("s", "@1")
+
+
+def test_gone_stderr_match_is_case_insensitive_and_substring(monkeypatch):
+    """The fragments are matched inside a longer line and without regard to case:
+    every measured wording embeds them in a sentence (`psmux: no server running
+    on session 'x'`), and a backend that capitalizes its first word must not
+    thereby turn a vanished session into an unverifiable one."""
+    _failing_listing(monkeypatch, "PSMUX: No Server Running on session 'ghost'\n")
+    assert TmuxMultiplexer().list_window_ids("s") == []
+
+
+def test_a_leaf_may_override_the_proved_gone_wordings(monkeypatch):
+    """The rule is a class attribute so a tmux-family leaf whose multiplexer words
+    absence differently can replace it without touching a method body — the same
+    swap-a-class-attr contract as `_BINARY` / `_ENCODING`.
+
+    psmux deliberately does NOT override (its measured wordings are covered by
+    the base tuple); this locks the seam open for the leaf that isn't."""
+
+    class Dialect(TmuxMultiplexer):
+        # Mixed case ON THE FRAGMENT, deliberately: the case-folding is a promise
+        # to the leaf, and folding only the captured text keeps the base's own
+        # (lower-case) tuple working while silently breaking every override that
+        # spelled its fragment the way its binary prints it — a vanished session
+        # read as unverifiable, i.e. a phantom survivor forever.
+        _SESSION_GONE_STDERR = ("Session Vanished",)
+
+    _failing_listing(monkeypatch, "the session vanished, sorry")
+    assert Dialect().list_window_ids("s") == []
+    # ...and the base's own wordings stop counting once replaced
+    _failing_listing(monkeypatch, "can't find session: ghost")
+    with pytest.raises(MultiplexerError):
+        Dialect().list_window_ids("s")
+
+
+@pytest.mark.parametrize("blank", ["", " ", "\t", "\n"])
+def test_a_blank_gone_fragment_never_matches(monkeypatch, blank):
+    """A blank fragment in the tuple must be dropped, not matched.
+
+    `"" in err` is true for every error there is, and `" " in err` for very
+    nearly as many — any message with a space in it, which is all of them. So
+    one stray element (a trailing comma, a leaf building its tuple from config)
+    folds EVERY failed listing back to `[]`: #525 restored in full, in the
+    silent direction, from a slip no reviewer would see.
+
+    The whitespace rows are the point — an emptiness check that only rejects
+    `""` leaves the more likely slip live. Ablation: weaken `if f.strip()` to
+    `if f` and the space and newline rows fail. The tab row passes either way,
+    because no message these binaries emit contains one; it is here to pin the
+    rule, not to drive the ablation. The stderr below keeps its trailing newline
+    for the same reason the wordings are verbatim — that is how a real binary
+    hands it over, and it is what makes the `"\\n"` row a live threat rather than
+    a hypothetical one."""
+
+    class Sloppy(TmuxMultiplexer):
+        _SESSION_GONE_STDERR = ("no server running", blank)
+
+    _failing_listing(monkeypatch, "psmux: Invalid session key\n")
+    with pytest.raises(MultiplexerError):
+        Sloppy().list_window_ids("s")
+    # the real sibling still counts — the filter drops the element, not the rule
+    _failing_listing(monkeypatch, "no server running on /tmp/tmux-1000/default")
+    assert Sloppy().list_window_ids("s") == []
+
+
+@pytest.mark.parametrize("stderr", _UNPROVEN_STDERR)
+def test_metadata_listings_keep_their_sentinel_but_say_so(monkeypatch, capsys, stderr):
+    """Same lens, opposite conclusion (#525). `list_windows` and `session_options`
+    read metadata, not liveness, and their sentinel degrades toward doing
+    NOTHING — an empty candidate list prunes nothing, an unread tag reads as
+    untagged and is left alone — so the documented `[]` / `{}` stays.
+
+    What was missing is the signal: a server erroring on every call made the
+    tool behave as if the sessions it manages had stopped existing, silently.
+
+    `list_sessions` joins them (DW-458): its `[]` is what the #419 removal guard
+    reads as "no live session", so a listing that could not be taken let
+    delete/archive/clean remove a run dir under a live session unrecorded.
+    Ablation: drop its `_warn_unproven_listing` call and the count reads 2."""
+    _failing_listing(monkeypatch, stderr)
+    mux = TmuxMultiplexer()
+    assert mux.list_windows("s", ["window_id"]) == []
+    assert mux.session_options("@opt") == {}
+    assert mux.list_sessions() == []
+    err = capsys.readouterr().err
+    assert err.count("without proving the session gone") == 3
+    # A non-zero exit that said NOTHING proves nothing either, and the warning has
+    # to survive having no detail to quote — the row this parametrization used to
+    # drop, under which a silent-on-blank-stderr regression passed.
+    assert (stderr.strip() or "(no stderr)") in err
+
+
+def test_metadata_listings_warn_when_the_transport_itself_failed(boom_run, capsys):
+    """A timeout / a spawn that died proves no more about the session than an
+    unrecognized non-zero exit, and the sentinel is identical — so the signal has
+    to be too, or the seam's "say when the failure proved nothing" is only half
+    true and the quietest failures are the ones that stay quiet.
+
+    The `shutil.which` pre-gate is the deliberate exception and is covered by
+    test_seam_methods_never_leak_raw_subprocess_error's no-binary case: a box
+    with no multiplexer has no sessions to report on."""
+    mux = TmuxMultiplexer()
+    assert mux.list_windows("s", ["window_id"]) == []
+    assert mux.session_options("@opt") == {}
+    assert mux.list_sessions() == []  # DW-458
+    err = capsys.readouterr().err
+    assert err.count("without proving the session gone") == 3
+    assert type(boom_run).__name__ in err
+
+
+def test_metadata_listings_contain_a_decode_fault(monkeypatch, capsys):
+    """A strict-codec leaf must get the documented sentinel here too, not a raw
+    UnicodeDecodeError out of a method the seam calls best-effort.
+
+    `list_window_ids` has named this arm since #380 — a leaf overriding `_ERRORS`
+    back to a strict handler raises a ValueError-family decode error that neither
+    `SubprocessError` nor `OSError` covers. The metadata siblings promise `[]` /
+    `{}` on a transport failure and a decode fault is one, so the same arm belongs
+    here; without it the promise holds for every failure except this one."""
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda _name: "/usr/bin/tmux")
+
+    def boom(*_a, **_k):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", boom)
+    mux = TmuxMultiplexer()
+    assert mux.list_windows("s", ["window_id"]) == []
+    assert mux.session_options("@opt") == {}
+    assert mux.list_sessions() == []  # DW-458: same arm, same reason
+    assert capsys.readouterr().err.count("without proving the session gone") == 3
+
+
+def test_metadata_listings_are_silent_without_a_binary(monkeypatch, capsys):
+    """No multiplexer installed is an ANSWER, not a fault: both metadata listings
+    answer their sentinel and say nothing.
+
+    Uniformity is the assertion. A sibling that warned here would fire on every
+    call on such a box while the other stayed quiet, and a diagnostic that fires
+    for one method and not its twin teaches the reader to ignore it.
+
+    Silent, NOT spawnless, and the difference is the whole point. The silence is
+    gated inside `_warn_unproven_listing`, after `_run` has been asked; gating it
+    by short-circuiting ahead of `_run` would decide the RETURN VALUE from the
+    ambient PATH, which makes the seam unreachable through its own spawn
+    primitive — the injected transport below would never be consulted, and the
+    resulting behavior would differ by platform rather than by contract. That
+    was a real regression: it left `list_windows` answering `[]` for every
+    psmux test on Linux, where the binary does not exist, while staying green on
+    Windows, where it does.
+
+    Ablation: drop the `shutil.which` guard in `_warn_unproven_listing` and this
+    fails on the two warnings it must not print."""
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(
+        tmux_base.subprocess,
+        "run",
+        lambda argv, **_k: (_ for _ in ()).throw(FileNotFoundError(argv[0])),
+    )
+    mux = TmuxMultiplexer()
+    assert mux.list_windows("s", ["window_id"]) == []
+    assert mux.session_options("@opt") == {}
+    assert mux.list_sessions() == []
+    assert capsys.readouterr().err == ""
+
+
+def test_list_windows_answer_comes_from_run_not_from_path(monkeypatch):
+    """`list_windows` must consult `_run` even when the binary is absent from PATH.
+
+    The seam documents `_run` as the ONE place a spawn happens and the source of
+    every answer. A `shutil.which` short-circuit ahead of it silently substitutes
+    the ambient PATH for the transport, so a caller (or a test) that injects a
+    transport is never asked — which is exactly how the same suite passed on
+    Windows and failed 15 ways on Linux.
+
+    Ablation: reinstate an early `if not shutil.which(...): return []` in
+    `list_windows` and this fails on the injected rows never arriving."""
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(
+        tmux_base.subprocess,
+        "run",
+        lambda argv, **_k: subprocess.CompletedProcess(argv, 0, stdout="@1\tshell\n", stderr=""),
+    )
+    assert TmuxMultiplexer().list_windows("s", ["window_id", "window_name"]) == [("@1", "shell")]
+
+
+def test_metadata_listings_stay_silent_for_a_gone_session(monkeypatch, capsys):
+    """A vanished session is an answer, not a fault — warning about it would put
+    noise on the ordinary path (`cleanup` after the last session ends)."""
+    _failing_listing(monkeypatch, "no server running on /tmp/tmux-1000/default")
+    mux = TmuxMultiplexer()
+    assert mux.list_windows("s", ["window_id"]) == []
+    assert mux.session_options("@opt") == {}
+    assert mux.list_sessions() == []
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        # measured 2026-09-27, tmux 3.7c: the socket a server left behind
+        # after its last session ended (and a stale one whose server was killed)
+        "no server running on /tmp/tmux-1001/default\n",
+        # the psmux wording of the same answer
+        "psmux: no server running on session 'ghost'\n",
+    ],
+)
+def test_list_sessions_is_silent_on_a_box_with_no_server(monkeypatch, capsys, stderr):
+    """A tmux binary with no server behind it is an ANSWER — there are no
+    sessions — so `list_sessions` answers `[]` without a word (DW-458).
+    "no server running" is in `_SESSION_GONE_STDERR`, which is what keeps it
+    quiet; the warning is for a listing that could not be taken."""
+    _failing_listing(monkeypatch, stderr)
+    assert TmuxMultiplexer().list_sessions() == []
+    assert capsys.readouterr().err == ""
+
+
+def test_list_sessions_warns_on_an_absent_socket_file(monkeypatch, capsys):
+    """The other no-server wording tmux 3.7c prints — for a socket FILE that
+    does not exist, measured 2026-09-27 — is deliberately NOT read as an
+    answer: a tmp cleaner can unlink a live server's socket, so this exit does
+    not prove that nothing is running. It warns (loud, and self-clearing once a
+    server of this boot has left its socket behind), and the value is
+    unchanged."""
+    _failing_listing(
+        monkeypatch, "error connecting to /tmp/tmux-1001/default (No such file or directory)\n"
+    )
+    assert TmuxMultiplexer().list_sessions() == []
+    err = capsys.readouterr().err
+    assert err.startswith("warning: tmux list-sessions exited 1 without proving")
+    assert "No such file or directory" in err
+
+
+def test_list_sessions_reporting_hands_the_fault_to_the_sink(monkeypatch, capsys, boom_run):
+    """With a sink, the DW-458 fault goes there instead of stderr — one route,
+    not both — for the unproven exit and the transport raise alike; without
+    one, `list_sessions_reporting()` warns exactly as `list_sessions()` does.
+    The value is `[]` either way."""
+    mux = TmuxMultiplexer()
+    faults: list[str] = []
+    assert mux.list_sessions_reporting(on_fault=faults.append) == []  # boom_run
+    assert faults == [
+        "tmux list-sessions failed without proving the session gone: "
+        f"{type(boom_run).__name__}: {boom_run}"
+    ]
+    assert capsys.readouterr().err == ""
+
+    _failing_listing(monkeypatch, "error connecting to /tmp/x (Permission denied)\n")
+    faults.clear()
+    assert mux.list_sessions_reporting(on_fault=faults.append) == []
+    assert faults == [
+        "tmux list-sessions exited 1 without proving the session gone: "
+        "error connecting to /tmp/x (Permission denied)"
+    ]
+    assert capsys.readouterr().err == ""
+    assert mux.list_sessions_reporting() == []
+    unrouted = capsys.readouterr().err
+    assert mux.list_sessions() == []
+    assert capsys.readouterr().err == unrouted != ""
+
+
 def test_list_window_ids_decode_fault_raises_the_seam_type(monkeypatch):
     """A byte the codec cannot decode is a transport failure like a timeout: the
     liveness probe must answer MultiplexerError ("unknowable"), not leak the raw
@@ -454,18 +787,174 @@ def test_tmux_list_windows_keeps_tabs_inside_the_trailing_field(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "outcome",
+    ("outcome", "said"),
     [
-        lambda argv: (_ for _ in ()).throw(subprocess.TimeoutExpired(argv, 30)),
-        lambda argv: subprocess.CompletedProcess(argv, 1, stdout="", stderr="no window"),
-        lambda argv: subprocess.CompletedProcess(argv, 0, stdout="not-a-pid\n", stderr=""),
+        (
+            lambda argv: (_ for _ in ()).throw(subprocess.TimeoutExpired(argv, 30)),
+            "failed: TimeoutExpired",
+        ),
+        (
+            lambda argv: (_ for _ in ()).throw(
+                UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+            ),
+            "failed: UnicodeDecodeError",
+        ),
+        (
+            lambda argv: subprocess.CompletedProcess(
+                argv, 1, stdout="", stderr="psmux: connection timed out\n"
+            ),
+            "exited 1 without proving the window gone: psmux: connection timed out",
+        ),
+        (
+            lambda argv: subprocess.CompletedProcess(argv, 1, stdout="", stderr=""),
+            "exited 1 without proving the window gone: (no stderr)",
+        ),
+        (
+            lambda argv: subprocess.CompletedProcess(argv, 0, stdout="not-a-pid\n", stderr=""),
+            "answered unparsable output",
+        ),
     ],
-    ids=["timeout", "dead-window", "garbage-output"],
+    ids=["timeout", "strict-decode", "unproven-exit", "silent-exit", "garbage-output"],
 )
-def test_tmux_window_pane_pids_degrades_to_empty(monkeypatch, outcome):
+def test_tmux_window_pane_pids_degrades_to_empty(monkeypatch, capsys, outcome, said):
+    """The `[]` sentinel stays — this feeds the kill escalation, which must not
+    raise — but a fault is not silent (DW-463): `[]` makes kill() skip the
+    straggler harvest and journal `kill-escalated pids=[]`, which reads like a
+    pane with no processes.
+
+    Ablation: drop any one `_warn_unknown_pane_pids` call and its rows fail."""
     mux = TmuxMultiplexer()
     monkeypatch.setattr(tmux_base.subprocess, "run", lambda argv, **k: outcome(argv))
     assert mux.window_pane_pids("@7") == []
+    err = capsys.readouterr().err
+    assert err.startswith("warning: tmux list-panes on @7 ")
+    assert said in err
+    assert err.rstrip().endswith("reading its pane pids as unknown")
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "can't find window: @7\n",  # measured, tmux 3.7c `list-panes -t @999`
+        "psmux: can't find window: @7\n",
+        "can't find session: ghost\n",
+        "no server running on /tmp/tmux-1001/default\n",
+    ],
+)
+def test_tmux_window_pane_pids_is_silent_for_a_gone_window(monkeypatch, capsys, stderr):
+    """A dead window is an ANSWER, and the common one: kill() runs in a
+    `finally` on every session, including every session that completed by
+    window death, so warning here would print on the ordinary path. A window
+    whose session or server is gone went with it.
+
+    Ablation: drop the `_window_proved_gone` gate and every row fails."""
+    mux = TmuxMultiplexer()
+    monkeypatch.setattr(
+        tmux_base.subprocess,
+        "run",
+        lambda argv, **k: subprocess.CompletedProcess(argv, 1, stdout="", stderr=stderr),
+    )
+    assert mux.window_pane_pids("@7") == []
+    assert capsys.readouterr().err == ""
+
+
+def test_window_gone_fragments_follow_the_session_matching_rule(monkeypatch, capsys):
+    """`_WINDOW_GONE_STDERR` is an overridable allowlist on the same terms as
+    `_SESSION_GONE_STDERR`: case-folded on both sides, blank fragments dropped
+    rather than matching every error."""
+
+    class Dialect(TmuxMultiplexer):
+        _WINDOW_GONE_STDERR = ("Window Vanished", " ")
+
+    def failing(stderr):
+        monkeypatch.setattr(
+            tmux_base.subprocess,
+            "run",
+            lambda argv, **k: subprocess.CompletedProcess(argv, 1, stdout="", stderr=stderr),
+        )
+
+    failing("the window vanished\n")
+    assert Dialect().window_pane_pids("@7") == []
+    assert capsys.readouterr().err == ""
+    failing("server temporarily unavailable\n")  # has a space; " " must not match it
+    assert Dialect().window_pane_pids("@7") == []
+    assert "without proving the window gone" in capsys.readouterr().err
+
+
+def _completed(monkeypatch, rc: int, stdout: str = "", stderr: str = ""):
+    monkeypatch.setattr(
+        tmux_base.subprocess,
+        "run",
+        lambda argv, **k: subprocess.CompletedProcess(argv, rc, stdout=stdout, stderr=stderr),
+    )
+
+
+def test_show_window_option_transport_fault_warns(boom_run, capsys):
+    """DW-463: a hang or a spawn that died still reads as unset (`""`), but says
+    so — the psmux `@`-option channel already did; this is the same fold one
+    layer down. Ablation: drop the transport-arm warning and this fails."""
+    assert TmuxMultiplexer().show_window_option("@1", "@bmad_return_pane") == ""
+    err = capsys.readouterr().err
+    assert err.startswith("warning: show-options @bmad_return_pane failed on @1; treating as unset")
+    assert type(boom_run).__name__ in err
+
+
+def test_show_window_option_unproven_exit_warns(monkeypatch, capsys):
+    """Under `-q` every target-level miss exits 0 (measured on tmux 3.7c: an
+    unset option, a dead window and a missing session alike), so a non-zero
+    exit means the server itself could not be read — a fault, not "unset".
+    Ablation: drop the non-zero-arm warning and this fails."""
+    _completed(
+        monkeypatch, 1, stderr="error connecting to /tmp/tmux-1001/default (Permission denied)\n"
+    )
+    assert TmuxMultiplexer().show_window_option("@1", "@bmad_return_pane") == ""
+    err = capsys.readouterr().err
+    assert "treating as unset: exited 1: error connecting" in err
+
+
+@pytest.mark.parametrize(
+    ("rc", "stdout", "stderr", "answer"),
+    [
+        (0, "", "", ""),  # unset (and, under -q, a dead window or session)
+        (0, "=ctl:%3\n", "", "=ctl:%3"),
+        (1, "", "no server running on /tmp/tmux-1001/default\n", ""),
+    ],
+    ids=["unset", "set", "no-server"],
+)
+def test_show_window_option_answers_stay_silent(monkeypatch, capsys, rc, stdout, stderr, answer):
+    """The answers: an option read (set or unset), and a server that is gone —
+    the window went with it, so unset is right. None of them warns."""
+    _completed(monkeypatch, rc, stdout=stdout, stderr=stderr)
+    assert TmuxMultiplexer().show_window_option("@1", "@bmad_return_pane") == answer
+    assert capsys.readouterr().err == ""
+
+
+def test_display_message_transport_fault_warns(boom_run, monkeypatch, capsys):
+    """DW-463: inside tmux, a probe that could not be asked still answers None,
+    but None there reads as "not attached" — `return_attached_client` goes
+    ATTENDED on it — so the fault says so. Ablation: drop the warning in
+    `BaseTmuxBackend._display_message` and this fails."""
+    monkeypatch.setenv("TMUX", "/tmp/tmux-1001/default,123,0")
+    assert TmuxMultiplexer().current_window_id() is None
+    err = capsys.readouterr().err
+    assert err.startswith("warning: tmux display-message #{window_id} failed: ")
+    assert type(boom_run).__name__ in err
+
+
+def test_display_message_answers_stay_silent(monkeypatch, capsys):
+    """Not inside tmux (no spawn at all) and a non-zero exit (a dead pane) are
+    answers, not faults: None, and nothing on stderr."""
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.setattr(
+        tmux_base.subprocess,
+        "run",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("spawned outside tmux")),
+    )
+    assert TmuxMultiplexer().current_window_id() is None
+    monkeypatch.setenv("TMUX", "/tmp/tmux-1001/default,123,0")
+    _completed(monkeypatch, 1, stderr="can't find pane: %9\n")
+    assert TmuxMultiplexer().current_pane_id() is None
+    assert capsys.readouterr().err == ""
 
 
 def _kill_fake(monkeypatch, *, kill_rc: int, kill_err: str = "", live: str = "", probe_rc: int = 0):
@@ -851,7 +1340,17 @@ def test_new_session_argv_byte_identical(monkeypatch, tmp_path):
 
     TmuxMultiplexer().new_session("s", tmp_path)
 
-    assert rec.argv == ["tmux", "new-session", "-d", "-s", "s", "-c", str(tmp_path)]
+    assert rec.argv == [
+        "tmux",
+        "new-session",
+        "-d",
+        "-s",
+        "s",
+        "-n",
+        "shell",
+        "-c",
+        str(tmp_path),
+    ]
 
 
 def test_new_window_posix_argv_byte_identical(monkeypatch, tmp_path):

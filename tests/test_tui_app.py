@@ -11,22 +11,27 @@ import dataclasses
 import json
 import os
 import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
 import pytest
 from conftest import (
+    BMAD_CONFIG_REL,
+    READABLE_LEDGER,
+    UNDECODABLE_LEDGER,
     assert_run_state_lock_held,
     git,
     install_bmad_config,
     make_validate_document,
+    nested_repo_root_paths,
     refuse_to_resolve,
     write_sprint,
 )
 from rich.console import Console
 from rich.text import Text
 from textual.events import MouseMove
-from textual.geometry import Offset, Size
+from textual.geometry import Offset, Region, Size
 from textual.selection import Selection
 from textual.widgets import (
     Button,
@@ -40,12 +45,12 @@ from textual.widgets import (
     TabbedContent,
 )
 
-from bmad_loop import bmadconfig, documents
+from bmad_loop import bmadconfig, documents, platform_util
 from bmad_loop import policy as policy_mod
 from bmad_loop import runs as runs_mod
 from bmad_loop import verify
-from bmad_loop.adapters.multiplexer import MultiplexerError
-from bmad_loop.journal import Journal, save_state
+from bmad_loop.adapters.multiplexer import MultiplexerError, TerminalMultiplexer
+from bmad_loop.journal import UNREADABLE_LINE_KIND, Journal, save_state
 from bmad_loop.model import Phase, RunState, SessionRecord, StoryTask, TokenUsage
 from bmad_loop.runs import RUNS_DIR
 from bmad_loop.tui import data, launch, widgets
@@ -164,6 +169,13 @@ def make_run(
 
 def notifications(app: BmadLoopApp) -> list[str]:
     return [n.message for n in app._notifications]
+
+
+def notifications_with_severity(app: BmadLoopApp) -> list[tuple[str, str]]:
+    """`notifications()` discards severity, so a refusal that softened from `error`
+    to an information toast still matches on text alone. Rows that are ABOUT a
+    refusal read this instead."""
+    return [(n.message, n.severity) for n in app._notifications]
 
 
 async def until(pilot, condition, timeout: float = 10.0) -> None:
@@ -456,6 +468,58 @@ async def test_journal_pane_updates_after_poll(project):
 
         await until(pilot, has_entry)
         assert any("1-2-search" in row for row in journal_rows(journal))
+
+
+def test_journal_line_renders_the_unreadable_marker_red_without_restyling_producers():
+    """The reader-minted marker must not fall through to `dim`: a lost record is the
+    one journal line an operator must not read as background noise.
+
+    The rest is the trap the rule had to dodge. `_JOURNAL_STYLES` matches by
+    SUBSTRING, first match wins, and four PRODUCER kinds already end in
+    `-unreadable` — so a bare `("unreadable", "red")` rule would have silently
+    restyled all of them (and, sitting first, overridden
+    `deferred-close-declaration-unreadable`'s yellow). Spelling the full kind as a
+    `_JOURNAL_STYLES` row would still match by containment, reddening any kind that
+    merely CONTAINS it; `journal_line` therefore matches `UNREADABLE_LINE_KIND` by
+    EQUALITY, ahead of the table. This pins both halves: the four producer kinds are
+    untouched, and a longer lookalike stays dim.
+
+    Ablation: change the equality check to a `_JOURNAL_STYLES` row spelling the full
+    kind and the lookalike assertion reddens; change it to the bare substring
+    `"unreadable"` and the producer-kind assertions redden — verified."""
+
+    def kind_style(kind: str):
+        console = Console(width=80)
+        entry = {"ts": 1_750_000_000, "kind": kind}
+        segments = [s for s in console.render(journal_line(entry)) if kind[:12] in s.text]
+        assert segments, f"no rendered segment carried {kind!r}"
+        return segments[0].style
+
+    assert kind_style(UNREADABLE_LINE_KIND).color is not None
+    assert kind_style(UNREADABLE_LINE_KIND).color.name == "red"
+
+    # producer kinds that also end in "-unreadable" keep exactly the styling they
+    # had before the marker rule existed
+    assert kind_style("story-gate-unreadable").dim is True
+    assert kind_style("stories-manifest-unreadable").dim is True
+    assert kind_style("rollback-owned-spec-unreadable").dim is True
+    declaration = kind_style("deferred-close-declaration-unreadable")
+    assert declaration.color is not None and declaration.color.name == "yellow"
+
+    # a kind that CONTAINS the marker kind is not the marker: equality, not
+    # containment, is what keeps red meaning "this line was lost"
+    assert kind_style(f"{UNREADABLE_LINE_KIND}-followup").dim is True
+
+
+def test_journal_line_renders_an_adopted_escalation_green():
+    """DW-386: `escalation-adopted` records an operator-approved completion, so it
+    must not fall to the `"escalat"` -> red substring rule.
+
+    Ablation, performed: drop its `_JOURNAL_STYLES` row and this reddens."""
+    console = Console(width=80)
+    entry = {"ts": 1_750_000_000, "kind": "escalation-adopted"}
+    [segment] = [s for s in console.render(journal_line(entry)) if "escalation-ad" in s.text]
+    assert segment.style.color is not None and segment.style.color.name == "green"
 
 
 def test_journal_line_wraps_fields_with_hanging_indent():
@@ -1373,6 +1437,29 @@ async def test_answer_decisions_none_notifies(project):
         await until(pilot, lambda: any("no unanswered decisions" in m for m in notifications(app)))
 
 
+async def test_answer_decisions_read_fault_toasts_the_fault_not_none(project):
+    """DW-473: with no loadable BMAD config nothing could be read, so `d` toasts the
+    fault as an error and never claims "no unanswered decisions"; the Deferred Work
+    badge says unreadable rather than showing no count.
+
+    Ablation: treat `missed.fault` as an empty answer in `action_answer_decisions`
+    and the "could not read" wait times out."""
+    app = BmadLoopApp(project.project)  # no install_bmad_config: config not found
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        deferred = dashboard(app).query_one("#deferred", OptionList)
+        await until(pilot, lambda: "decisions unreadable" in str(deferred.border_title))
+        await pilot.press("d")
+        await until(
+            pilot,
+            lambda: any(
+                "could not read past sweeps' decisions" in m and sev == "error"
+                for m, sev in notifications_with_severity(app)
+            ),
+        )
+        assert not any("no unanswered decisions" in m for m in notifications(app))
+
+
 # ------------------------------------- #275 modal bodies scroll, buttons stay
 
 
@@ -1845,35 +1932,78 @@ async def test_tall_terminal_dialog_height_unchanged(project):
 # published figure honest: it is asserted for every dialog it covers, so a modal
 # cannot quietly stop meeting the size the guide says it was measured at.
 #
-# What was measured is a dialog's own CHROME, not the text it is handed, and the
-# cases below are parametrised with short titles for exactly that reason.
-# Titles, headers, warnings and paths dock OUTSIDE the scrolling body, so every
-# line they wrap to costs a row the body cannot give back — it floors at 1 — and
-# the `-short`/`-narrow` rules cannot shrink content the way they shrink padding.
-# Nothing bounds that caller-supplied text, so a dialog handed a long enough
-# value has no floor to state at all. Measured at 39 columns: a ~150-character
-# deferred-work heading still fits 9 rows, ~300 characters wraps to 9 rows of
-# title and clips the close button; the validate header grows with its
-# document's spec folder; the spec viewer's `copy path` plus its action verbs
-# overflow 39 columns outright. That is one family with three faces, not three
-# defects — tracked in #628 (row too wide) and #629 (docked wrapping text steals
-# rows). The tests below pin the bounded case here, each unbounded case at a
-# size measured to work, and 80x24 as a size that was sufficient for the
-# examples measured — not one an unbounded value cannot overrun.
+# Caller text cannot move the pair. Titles, headers, subtitles and paths dock
+# OUTSIDE the scrolling body, and each of their lines is held to one row with an
+# ellipsis (BaseDialog `.title`; the SpecReviewModal and PauseReasonModal
+# subtitles; `_TailPath`), so a docked block costs its LINE count in rows, never
+# its length (DW-358). Docked warnings and hints are module text and are NOT so
+# held: they are sized to fit instead — every EscalationModal hint arm stays
+# within 3 rows at 35 columns, and ConfirmResumeModal's `-short` body yields
+# its rows to the warning (DW-414, DW-415). The spec viewer's action row wraps
+# into a two-column grid below 80 columns instead of clipping its right-most
+# buttons (DW-359). The rows below pin each face:
+#
+# - every covered dialog at 39x9, including the spec viewer (long subtitle and
+#   path), the pause-reason viewer (long subtitle), the validate viewer, every
+#   escalation hint arm and the resume confirmation's double-drive warning over
+#   a long pause reason: title, one body row and every docked control visible;
+# - a 300- and 2000-character ledger heading at 39x9: a one-row `.title`, and
+#   the done/legacy markers on lines of their own;
+# - a 63- and 300-character validate spec folder at 39x9: a three-row header
+#   that still holds the full folder;
+# - the spec viewer at 39/43/59/60/79 columns (grid, whole 3-row buttons) and at
+#   80 (one row, no `-narrow`), with a 300-character path;
+# - `_TailPath` keeping the file name when the path is cut, and the whole path
+#   when it fits.
+#
+# Visibility is asserted with `_fully_visible`, which reads the compositor's
+# clip: a widget cut by `#dialog` is still inside the SCREEN, so `_on_screen`
+# alone passes for a button the dialog has already clipped away.
 
 _MIN_COLS, _MIN_ROWS = 39, 9
+
+
+def _fully_visible(app, w) -> bool:
+    """A widget's region is non-empty and entirely visible — the compositor's
+    clipped region (screen AND every ancestor container, `#dialog` included)
+    equals its laid-out region, so nothing of it is cut off."""
+    r = w.region
+    return r.width > 0 and r.height > 0 and app.screen.find_widget(w).visible_region == r
+
+
+_LONG_SPEC_PATH = "/" + "/".join(["a-long-directory-name"] * 13) + "/spec-epic-1-story-2.md"
+assert len(_LONG_SPEC_PATH) > 290
+
+_PLAN_CHECKPOINT_ACTIONS = [
+    ("approve", "Approve & resume", "primary"),
+    ("replan", "Request replan", "warning"),
+]
+
+_LONG_SUBTITLE = ("a long stories.yaml story title " * 10).strip()
+assert len(_LONG_SUBTITLE) > 290
 
 _MIN_SIZE_CASES = (
     "confirm",
     "confirm-warning",
+    # `confirm-warning` passes a one-character warning; this is the real
+    # double-drive warning, which wraps to three rows at 39 columns (DW-415)
+    "confirm-resume-warning",
     "start-run",
     "start-sweep",
     "decision",
     "deferred-entry",
     "story-checkpoint",
+    # One row per `#hint` arm (DW-414): at 39 columns the three-button row must
+    # fit 35 content columns, and 2 border + title + 1 body row + hint + 1 button
+    # must fit the 8-row (90%-of-9) dialog, so no arm may pass 3 rows.
     "escalation",
+    "escalation-unreadable",
+    "escalation-ready",
+    "escalation-plain",
     "pause-reason",
     "text-output",
+    "spec-review",
+    "validate-findings",
 )
 
 
@@ -1892,6 +2022,22 @@ def _minimum_size_case(name: str, project):
         # inherits it), so losing it off-screen is a safety defect, not cosmetic
         return (
             ConfirmModal("t", "line\n" * 80, warning="w"),
+            ("#ok", "#cancel", "#warning"),
+            "#body",
+        )
+    if name == "confirm-resume-warning":
+        # the real modal and its real warning, over a pause reason far longer
+        # than the body's rows, so the body has to scroll rather than push the
+        # warning and buttons out of the dialog
+        state = RunState(
+            run_id="r1",
+            project=str(project.project),
+            started_at="now",
+            paused_stage="dev",
+            paused_reason="a long pause reason " * 20,
+        )
+        return (
+            ConfirmResumeModal("r1", state, engine_alive=True),
             ("#ok", "#cancel", "#warning"),
             "#body",
         )
@@ -1919,7 +2065,15 @@ def _minimum_size_case(name: str, project):
             ("#act-continue", "#act-stop", "#cancel"),
             "#body",
         )
-    if name == "escalation":
+    if name.startswith("escalation"):
+        # `escalation` is the restore-patch arm, the one that gates an enabled
+        # Re-arm; the suffixed rows are the other three arms of the same hint
+        arm = {
+            "escalation": {"resolution_ready": True, "restore_recorded": True},
+            "escalation-unreadable": {"resolution_ready": False, "unreadable": True},
+            "escalation-ready": {"resolution_ready": True},
+            "escalation-plain": {"resolution_ready": False},
+        }[name]
         return (
             EscalationModal(
                 story_key="e-1-s",
@@ -1927,28 +2081,69 @@ def _minimum_size_case(name: str, project):
                 description="d",
                 blocking="b",
                 sentinel_kind="",
-                resolution_ready=True,
                 engine_live=False,
-                restore_recorded=True,
+                **arm,
             ),
             ("#act-resolve", "#act-rearm", "#cancel", "#hint"),
             "#body",
         )
     if name == "pause-reason":
         return (
-            PauseReasonModal(title="t", subtitle="s", reason="line\n" * 80),
+            PauseReasonModal(title="t", subtitle=_LONG_SUBTITLE, reason="line\n" * 80),
             ("#act-resume", "#cancel"),
             "#reason",
+        )
+    if name == "spec-review":
+        # the widest action set the modal is given, and a path far longer than
+        # the row: both faces of this dialog's floor at once
+        return (
+            SpecReviewModal(
+                title="review the spec",
+                # a multi-line stories.yaml title: two lines, one row
+                subtitle=_LONG_SUBTITLE + "\nsecond line",
+                spec_path=Path(_LONG_SPEC_PATH),
+                spec_text="line\n" * 40,
+                actions=_PLAN_CHECKPOINT_ACTIONS,
+            ),
+            ("#copy-path", "#act-approve", "#act-replan", "#cancel"),
+            "#spec",
+        )
+    if name == "validate-findings":
+        return (
+            ValidateFindingsModal(
+                make_validate_document([("bmad-config", "problem", "a finding", None)])
+            ),
+            ("#ok",),
+            "#findings",
         )
     assert name == "text-output", name
     return TextOutputModal("validate", 0, "out\n" * 40), ("#ok",), "#output"
 
 
+async def test_resume_confirm_without_warning_stays_compact_on_a_short_terminal(project):
+    """DW-415's `-short` fix gives the WARNED resume confirm a `1fr` body, which
+    grows the auto dialog to the full screen. Without the warning it is a
+    bounded-tier confirm that already fits, so it must keep its content height
+    rather than balloon to the 15 rows available here."""
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(64, 15)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        state = RunState(run_id="r1", project=str(project.project), started_at="now")
+        modal = ConfirmResumeModal("r1", state, engine_alive=False)
+        app.push_screen(modal)
+        await until(pilot, lambda: app.screen is modal)
+        await ready(pilot, "#body")
+        assert "-short" in app.screen.classes
+        # 2 border + title + 2 body rows + 1-row button row
+        assert app.screen.query_one("#dialog").region.height == 6
+
+
 @pytest.mark.parametrize("case", _MIN_SIZE_CASES)
 async def test_measured_terminal_size_keeps_dialogs_operable(project, case):
     """At the 39x9 pair the guide records as measured, every covered dialog still
-    shows its title, a row of body and all of its docked controls (#281). Short
-    titles, so this pins the chrome; caller text is unbounded and has no floor.
+    shows its title, a row of body and all of its docked controls, fully — not
+    merely inside the screen but unclipped by `#dialog` too (#281, DW-358,
+    DW-359).
 
     Both breakpoint classes are asserted present first, so the test fails loudly
     if a future threshold change means this size no longer exercises the compact
@@ -1963,13 +2158,16 @@ async def test_measured_terminal_size_keeps_dialogs_operable(project, case):
         await ready(pilot, body)
         assert "-narrow" in app.screen.classes, case
         assert "-short" in app.screen.classes, case
-        assert _on_screen(app, app.screen.query(".title").first()), case
-        assert app.screen.query_one(body).region.height >= 1, case
+        assert _fully_visible(app, app.screen.query(".title").first()), case
+        body_widget = app.screen.query_one(body)
+        assert app.screen.find_widget(body_widget).visible_region.height >= 1, case
+        # inside any frame too: a bordered body can fill its slot with border alone
+        assert body_widget.content_size.height >= 1, case
         for selector in controls:
-            assert _on_screen(app, app.screen.query_one(selector)), f"{case} {selector}"
+            assert _fully_visible(app, app.screen.query_one(selector)), f"{case} {selector}"
 
 
-@pytest.mark.parametrize(
+_SPEC_REVIEW_ACTION_SETS = pytest.mark.parametrize(
     ("actions", "controls"),
     [
         (
@@ -1977,118 +2175,192 @@ async def test_measured_terminal_size_keeps_dialogs_operable(project, case):
             ("#copy-path", "#act-resume", "#cancel"),
         ),
         (
-            [
-                ("approve", "Approve & resume", "primary"),
-                ("replan", "Request replan", "warning"),
-            ],
+            _PLAN_CHECKPOINT_ACTIONS,
             ("#copy-path", "#act-approve", "#act-replan", "#cancel"),
         ),
     ],
     ids=["gate", "plan-checkpoint"],
 )
+
+
+def _spec_review_modal(actions, spec_path=_LONG_SPEC_PATH) -> SpecReviewModal:
+    return SpecReviewModal(
+        title="review the spec",
+        # a long, multi-line stories.yaml title: `.subtitle` must still be 1 row
+        subtitle=_LONG_SUBTITLE + "\nsecond line",
+        spec_path=Path(spec_path),
+        spec_text="line\n" * 40,
+        actions=actions,
+    )
+
+
+@_SPEC_REVIEW_ACTION_SETS
 async def test_spec_review_modal_operable_on_a_standard_terminal(project, actions, controls):
-    """The spec viewer is the one dialog outside the measured 39x9 pair, so pin
-    what WAS measured: a standard 80x24 terminal shows either action row in full
-    at the path length used here. That is sufficiency for this case, not a size
-    the dialog will meet for every spec path — nothing bounds one (#629).
-
-    It has no single floor to pin instead. Two things push it around, and one of
-    them is not a width at all: the docked `copy path` button plus the caller's
-    action verbs overflow a 39-column dialog horizontally, AND the full spec path
-    printed above the body wraps, so a long path costs rows and can drop the
-    action row off the bottom of a 9-row screen (measured: a 59-character path
-    puts the row at y=9 on a 9-row screen, while a short one leaves it at y=8).
-    Its floor is therefore a function of the path and the verbs, which is why
-    docs/tui-guide.md quotes this size rather than a minimum, and why wrapping
-    the row is tracked in #628 instead of being pinned here.
-
-    Asserting a size that WORKS, rather than that a narrower one fails, keeps the
-    contract pinned without freezing the defect: fixing #628 cannot redden it."""
+    """At 80 columns the widest action row — copy path + Approve & resume +
+    Request replan + close, 74 columns with margins — exactly fills the dialog's
+    content region (80 - 2 border - 4 padding), so the modal keeps its one-row
+    layout: no `-narrow`, every button on the same row, all fully visible, with
+    a 300-character spec path held to one row above the body (DW-358, DW-359).
+    One column less and the row would clip, which is what the narrow-width test
+    below pins."""
     app = BmadLoopApp(project.project)
     async with app.run_test(size=(80, 24)) as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
-        modal = SpecReviewModal(
-            title="review the spec",
-            subtitle="epic-1 story-2",
-            spec_path=project.project / "spec.md",
-            spec_text="line\n" * 40,
-            actions=actions,
-        )
+        modal = _spec_review_modal(actions)
         app.push_screen(modal)
         await until(pilot, lambda: app.screen is modal)
         await ready(pilot, "#spec")
+        assert "-narrow" not in app.screen.classes
+        assert app.screen.query_one(".path").region.height == 1
+        rows = {app.screen.query_one(selector).region.y for selector in controls}
+        assert len(rows) == 1, rows
         for selector in controls:
-            assert _on_screen(app, app.screen.query_one(selector)), selector
+            assert _fully_visible(app, app.screen.query_one(selector)), selector
 
 
-_LONG_SPEC_FOLDER = "docs/specs/epics/epic-1/stories/generated/very-long-folder-name"
+@_SPEC_REVIEW_ACTION_SETS
+@pytest.mark.parametrize("rows", [20, 24])
+@pytest.mark.parametrize("cols", [_MIN_COLS, 43, 59, 60, 79])
+async def test_spec_review_modal_action_row_wraps_below_80_columns(
+    project, actions, controls, cols, rows
+):
+    """Below 80 columns the one-row action row cannot fit (see the 80x24 test),
+    so the modal's own `-narrow` turns `.buttons` into a two-column grid (DW-359).
+    43 is where the longest label first fits a half-width cell; 59 and 60
+    straddle BaseDialog's threshold, which this modal overrides; 79 is one column
+    under its own.
 
+    The buttons must actually sit in two rows of at most two — a one-row
+    `1fr` strip would also keep every button visible, just too narrow to read.
+    Each button must keep its full 3-row height: a label that wrapped would make
+    its grid row taller and push the next row off the dialog, so the height is
+    the check that the labels stay on one line. From 43 columns a half-width
+    cell holds the longest label whole, so there every label is asserted
+    unclipped; below it "Approve & resume" may lose its tail to `…`, which is
+    accepted — the button stays whole and operable.
 
-@pytest.mark.parametrize(
-    ("kwargs", "size"),
-    [
-        ({}, (_MIN_COLS, _MIN_ROWS + 1)),
-        ({"stories_on": True, "spec_folder": _LONG_SPEC_FOLDER}, (_MIN_COLS, _MIN_ROWS + 3)),
-        ({"stories_on": True, "spec_folder": _LONG_SPEC_FOLDER}, (80, 24)),
-    ],
-    ids=["plain-39x10", "long-spec-folder-39x12", "long-spec-folder-80x24"],
-)
-async def test_validate_findings_modal_floor_moves_with_its_header(project, kwargs, size):
-    """The other documented exception, and its floor is content-dependent (#629).
+    20 rows is the shortest terminal without `-short`: the grid's second row of
+    3-row buttons must still fit, with a row of spec showing.
 
-    `.title` is `widgets.validate_header(doc)`, docked outside the scrolling
-    `#findings` body, so every line it wraps to costs the button row a row that
-    `-short` cannot buy back — collapsing padding and margins does not shrink
-    content. At 39 columns a plain document's header wraps to 5 rows and puts
-    the button row at y=9 on a screen whose rows are 0-8, so it needs 10.
-
-    But the header also carries `spec: <spec_folder>`, and that path is
-    user-controlled (widgets.py:582-585). A 63-character folder takes the header
-    to 7 rows and the floor with it: `#ok` is still clipped at BOTH 39x10 and
-    39x11, and only clears at 39x12. So the three cases here pin the dependence
-    itself rather than a single minimum — which is why docs/tui-guide.md
-    describes this floor as content-dependent and quotes the standard 80x24
-    terminal, the last case, which absorbed both headers measured here. A longer
-    folder would move it again; nothing bounds one (#629)."""
-    cols, rows = size
+    Ablations: delete the `SpecReviewModal.-narrow .buttons` grid rule and every
+    row here fails on the two-row assertion; drop `.subtitle` from the modal's
+    one-row selector, or that rule's `max-height: 1`, and rows fail on the
+    subtitle height; drop `-narrow` from the modal's `height: 100%` selector and
+    the 20-row cases fail."""
     app = BmadLoopApp(project.project)
     async with app.run_test(size=(cols, rows)) as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        modal = _spec_review_modal(actions)
+        app.push_screen(modal)
+        await until(pilot, lambda: app.screen is modal)
+        await ready(pilot, "#spec")
+        assert "-narrow" in app.screen.classes
+        assert "-short" not in app.screen.classes
+        for selector in (".title", ".subtitle", ".path"):
+            widget = app.screen.query_one(selector)
+            assert widget.region.height == 1, selector
+            assert _fully_visible(app, widget), selector
+        assert app.screen.query_one("#spec").content_size.height >= 1, (cols, rows)
+        buttons = [app.screen.query_one(selector, Button) for selector in controls]
+        rows = sorted({button.region.y for button in buttons})
+        assert len(rows) == 2, (cols, rows)
+        for row in rows:
+            assert sum(button.region.y == row for button in buttons) <= 2, (cols, row)
+        for selector, button in zip(controls, buttons):
+            assert _fully_visible(app, button), f"{cols} {selector}"
+            assert button.region.height == 3, f"{cols} {selector}"
+            if cols >= 43:
+                label = str(button.label)
+                assert button.content_size.width >= len(label), f"{cols} {selector}"
+
+
+@pytest.mark.parametrize(
+    ("cols", "path"),
+    [(_MIN_COLS, _LONG_SPEC_PATH), (80, "/specs/spec-epic-1-story-2.md")],
+    ids=["cut-keeps-file-name", "fits-whole"],
+)
+async def test_spec_review_path_keeps_its_file_name(project, cols, path):
+    """`text-overflow: ellipsis` cuts a path's END, which is its file name — the
+    part that says which spec this is. `_TailPath` cuts the head instead: a path
+    wider than its row renders as `…` plus a tail that fills the row exactly and
+    ends in the file name, and a path that fits renders whole (DW-358).
+
+    Ablation: make `_TailPath.render` return the whole path unconditionally and
+    the cut row fails on the missing leading `…`."""
+    path = str(Path(path))  # the modal takes a `Path`: platform separators
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(cols, 24)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        modal = _spec_review_modal([("resume", "Approve & resume", "primary")], path)
+        app.push_screen(modal)
+        await until(pilot, lambda: app.screen is modal)
+        await ready(pilot, "#spec")
+        widget = app.screen.query_one(".path")
+        assert str(widget.content) == path  # the cut is render-only
+        rendered = str(widget.render())
+        width = widget.content_size.width
+        if len(path) > width:
+            assert rendered.startswith("…"), rendered
+            assert rendered.endswith(f"{os.sep}spec-epic-1-story-2.md"), rendered
+            assert len(rendered) == width, (rendered, width)
+            assert path.endswith(rendered[1:])
+        else:
+            assert rendered == path
+
+
+@pytest.mark.parametrize("chars", [63, 300])
+async def test_validate_findings_modal_fixed_floor_with_long_spec_folder(project, chars):
+    """`.title` is `widgets.validate_header(doc)`: a verdict line, a meta line
+    carrying the user-controlled `spec: <spec_folder>`, and — a problem being
+    present — the dim gates footer. Each line is held to one row, so the header
+    is three rows whatever the folder's length and the dialog meets the 39x9 pair
+    like every other (DW-358). The ellipsis is render-only: the widget's content
+    still holds the whole folder.
+
+    Ablations: delete BaseDialog `.title`'s `text-wrap: nowrap` and both rows fail
+    on the header height; delete `ValidateFindingsModal.-short #dialog`'s
+    `height: 100%` and both fail on `#ok`, clipped by the 7-row dialog."""
+    folder = ("docs/specs/epics/epic-1/stories/generated/" * 10)[: chars - 1] + "x"
+    assert len(folder) == chars
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(_MIN_COLS, _MIN_ROWS)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         modal = ValidateFindingsModal(
-            make_validate_document([("bmad-config", "problem", "a finding", None)], **kwargs)
+            make_validate_document(
+                [("bmad-config", "problem", "a finding", None)],
+                stories_on=True,
+                spec_folder=folder,
+            )
         )
         app.push_screen(modal)
         await until(pilot, lambda: app.screen is modal)
         await ready(pilot, "#findings")
-        # the header is the thing that moves this floor, so assert it too: a
-        # regression that clipped it would otherwise leave #ok reachable and
-        # pass
-        assert _on_screen(app, app.screen.query(".title").first())
-        assert _on_screen(app, app.screen.query_one("#ok"))
+        header = app.screen.query(".title").first()
+        assert header.region.height == 3
+        assert _fully_visible(app, header)
+        assert _fully_visible(app, app.screen.query_one("#ok"))
+        assert folder in str(header.content)
 
 
-@pytest.mark.parametrize("chars", [150, 300], ids=["fits-the-floor", "overflows-the-floor"])
-async def test_long_docked_title_still_fits_a_standard_terminal(project, chars):
-    """The third face of the same family, and the size the guide falls back on:
-    80x24 absorbed a docked title no 39-column screen could — at these lengths.
-
-    `DeferredEntryModal` renders the ledger heading as the docked `.title`,
+@pytest.mark.parametrize("chars", [300, 2000])
+async def test_long_docked_title_holds_one_row(project, chars):
+    """`DeferredEntryModal` renders the ledger heading as the docked `.title`,
     outside the scrolling `#entry`, and `parse_ledger` does not bound that text.
-    At 39 columns a ~150-character heading still clears the floor, but ~300
-    characters wraps to nine rows of title and pushes `#ok` off a nine-row
-    screen — `#entry` is already at its one-row minimum and has nothing left to
-    give. Both lengths are asserted at 80x24 rather than at 39 columns, because
-    the point is the fallback size, not another content-specific minimum that a
-    longer heading would falsify (#629). A longer heading falsifies 80x24 too —
-    `parse_ledger` bounds nothing — which is why the guide states 80x24 as
-    sufficient for the lengths measured here rather than as a size to rely on."""
+    Unbounded, a ~300-character heading wrapped to nine rows at 39 columns and
+    pushed `#ok` off a nine-row screen. Held to one row it cannot: the title is
+    one row and fully visible, `#ok` too, at the 39x9 pair (DW-358). The full
+    heading stays in the widget, and the scrolling body repeats it.
+
+    Ablation: delete BaseDialog `.title`'s `text-wrap: nowrap` and both rows fail
+    on the title height."""
+    title = ("word " * 500)[:chars].strip()
     app = BmadLoopApp(project.project)
-    async with app.run_test(size=(80, 24)) as pilot:
+    async with app.run_test(size=(_MIN_COLS, _MIN_ROWS)) as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         modal = DeferredEntryModal(
             data.DeferredItem(
                 id="DW-1",
-                title=("word " * 200)[:chars].strip(),
+                title=title,
                 status="open",
                 done=False,
                 severity="high",
@@ -2098,10 +2370,47 @@ async def test_long_docked_title_still_fits_a_standard_terminal(project, chars):
         app.push_screen(modal)
         await until(pilot, lambda: app.screen is modal)
         await ready(pilot, "#entry")
-        # the wrapped heading is what costs the rows here, so a clipped title is
-        # the regression this test exists to catch, not just an unreachable #ok
-        assert _on_screen(app, app.screen.query(".title").first())
-        assert _on_screen(app, app.screen.query_one("#ok"))
+        heading = app.screen.query(".title").first()
+        assert heading.region.height == 1
+        assert _fully_visible(app, heading)
+        assert _fully_visible(app, app.screen.query_one("#ok"))
+        assert title in str(heading.content)
+
+
+async def test_long_docked_title_keeps_its_markers(project):
+    """The `✓ done` and legacy markers used to follow the heading on its line, so
+    a heading long enough to ellipsize cut them away — and they appear nowhere
+    else. Each now opens a line of its own in the title, so at 39x9 the rendered
+    title rows show both (DW-358). Read off the rendered strips, not `.content`:
+    the content always held them; the question is whether they reach the screen.
+
+    Ablation: append the markers after the heading on its line again and this
+    test fails on the missing `✓ done`."""
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(_MIN_COLS, _MIN_ROWS)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        modal = DeferredEntryModal(
+            data.DeferredItem(
+                id="DW-1",
+                title=("word " * 60).strip(),
+                status="done",
+                done=True,
+                severity="high",
+                body="line\n" * 40,
+                legacy=True,
+            )
+        )
+        app.push_screen(modal)
+        await until(pilot, lambda: app.screen is modal)
+        await ready(pilot, "#entry")
+        heading = app.screen.query(".title").first()
+        assert heading.region.height == 3
+        assert _fully_visible(app, heading)
+        assert _fully_visible(app, app.screen.query_one("#ok"))
+        size = heading.size
+        rows = [strip.text for strip in heading.render_lines(Region(0, 0, size.width, size.height))]
+        assert any("✓ done" in row for row in rows), rows
+        assert any("· legacy" in row for row in rows), rows
 
 
 # ------------------------------------------------------------- run control
@@ -2170,29 +2479,43 @@ async def test_dirty_worktree_blocks_launch(project, monkeypatch):
         assert not calls
 
 
-def _split_root_tui_project(project):
-    """The #414 pair, written where the guard reads them. Deliberately left
-    UNCOMMITTED: the guard is ordered ahead of the clean-tree gate exactly as
-    `cmd_run` orders it, and a committed fixture could not tell the two orders
-    apart."""
+def _split_root_tui_project(project, shape="inside"):
+    """The #414 pair, written where the guard reads them: `isolation = "worktree"`
+    beside a DISJOINT `repo_root` — inside the project (``git-root``, created so the
+    clean-tree probe of it answers rather than raising) or a sibling git checkout.
+    Deliberately left UNCOMMITTED: the guard is ordered ahead of the clean-tree gate
+    exactly as `cmd_run` orders it, and a committed fixture could not tell the two
+    orders apart."""
     install_bmad_config(project)
+    if shape == "sibling":
+        code_root = project.project.parent / f"{project.project.name}-code"
+        code_root.mkdir()
+        git(code_root, "init", "-q")
+        spelled = code_root.as_posix()
+    else:
+        (project.project / "git-root").mkdir()
+        spelled = "{project-root}/git-root"
     cfg = project.project / "_bmad" / "bmm" / "config.yaml"
-    cfg.write_text(cfg.read_text() + "repo_root: '{project-root}/git-root'\n", encoding="utf-8")
+    cfg.write_text(cfg.read_text() + f"repo_root: '{spelled}'\n", encoding="utf-8")
     (project.project / ".bmad-loop").mkdir(parents=True, exist_ok=True)
     (project.project / ".bmad-loop" / "policy.toml").write_text(
         '[adapter]\nname = "claude"\n\n[scm]\nisolation = "worktree"\n', encoding="utf-8"
     )
 
 
-async def test_worktree_isolation_under_a_repo_root_override_blocks_launch(project, monkeypatch):
+@pytest.mark.parametrize("shape", ["inside", "sibling"])
+async def test_worktree_isolation_under_a_repo_root_override_blocks_launch(
+    project, monkeypatch, shape
+):
     """#414: the TUI launches a detached CLI, and that CLI refuses this combination
     itself — this guard exists so the operator gets a toast instead of a pane that
     dies immediately. Asserted against the sole producer of the text rather than a
-    literal, so a reworded message cannot drift this test away from the CLI's."""
+    literal, so a reworded message cannot drift this test away from the CLI's. Both
+    disjoint layouts refuse."""
     calls = []
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "start_run_detached", lambda *a, **kw: calls.append(a))
-    _split_root_tui_project(project)
+    _split_root_tui_project(project, shape)
     expected = bmadconfig.worktree_isolation_conflict(
         bmadconfig.load_paths(project.project), "worktree"
     )
@@ -2240,6 +2563,90 @@ async def test_unreadable_policy_falls_through_the_isolation_guard(project, monk
         await pilot.click(await ready(pilot, "#ok"))
         await until(pilot, lambda: calls)
         assert not any("isolation" in m for m in notifications(app))
+
+
+async def test_worktree_isolation_beside_a_nested_repo_root_launches(project, monkeypatch):
+    """DW-379: the nested layout (`<repo>/app`, `repo_root` the checkout) is supported,
+    so the guard lets the launch through — graded on the detached launch happening.
+
+    Ablation: widen `worktree_isolation_conflict` back to "any `repo_root` override"
+    and the guard toasts the refusal instead of launching."""
+    calls = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "start_run_detached", lambda *a, **kw: calls.append(a))
+    paths = nested_repo_root_paths(project)
+    (paths.project / ".bmad-loop").mkdir(parents=True, exist_ok=True)
+    (paths.project / ".bmad-loop" / "policy.toml").write_text(
+        '[adapter]\nname = "claude"\n\n[scm]\nisolation = "worktree"\n', encoding="utf-8"
+    )
+    assert verify.worktree_clean(paths.repo_root, project=paths.project), "premise: clean"
+
+    app = BmadLoopApp(paths.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("r")
+        await until(pilot, lambda: isinstance(app.screen, StartRunModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: calls)
+        assert not any("needs the project directory" in m for m in notifications(app))
+
+
+async def test_a_nested_projects_policy_edit_does_not_block_launch(project, monkeypatch):
+    """The launch guard's clean probe of `repo_root` excludes the PROJECT's policy.toml
+    at its offset (`app/.bmad-loop/policy.toml`), as run/sweep/validate do, so a
+    settings edit under nested roots still launches.
+
+    Ablation: drop `project=` from `_guarded`'s `worktree_clean` call and the guard
+    toasts "not clean" instead of launching."""
+    calls = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "start_run_detached", lambda *a, **kw: calls.append(a))
+    paths = nested_repo_root_paths(project)
+    policy_file = paths.project / ".bmad-loop" / "policy.toml"
+    policy_file.parent.mkdir(parents=True, exist_ok=True)
+    policy_file.write_text('[adapter]\nname = "claude"\n', encoding="utf-8")
+    git(paths.repo_root, "add", "-f", "app/.bmad-loop/policy.toml")
+    git(paths.repo_root, "commit", "-qm", "track the nested policy")
+    policy_file.write_text(policy_file.read_text() + "# edited\n", encoding="utf-8")
+    assert not verify.worktree_clean(paths.repo_root), "premise: the edit is a real change"
+
+    app = BmadLoopApp(paths.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("r")
+        await until(pilot, lambda: isinstance(app.screen, StartRunModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: calls)
+        assert not any("not clean" in m for m in notifications(app))
+
+
+async def test_a_dirty_code_root_blocks_launch_under_a_nested_project(project, monkeypatch):
+    """The launch guard probes the CODE root, as `cmd_run`/`cmd_sweep` do (DW-379): in
+    the nested monorepo layout the project `app/` is clean while a tracked file OUTSIDE
+    it — in the checkout the run's git work happens in — is dirty, and the guard must
+    refuse exactly as the detached CLI's `worktree_clean(paths.repo_root)` would.
+
+    Ablation: probe `self.project` in `_guarded` instead of the loaded `repo_root` and
+    this fails — `worktree_clean` is pathspec-scoped to its cwd, so `app/` reads clean
+    and the launch goes through."""
+    calls = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "start_run_detached", lambda *a, **kw: calls.append(a))
+    paths = nested_repo_root_paths(project)
+    outer = paths.repo_root / "src.txt"
+    assert git(paths.repo_root, "ls-files", "--error-unmatch", "src.txt"), "premise: tracked"
+    outer.write_text("dirty outside the project\n", encoding="utf-8")
+    assert verify.worktree_clean(paths.project), "premise: the project itself is clean"
+    assert not verify.worktree_clean(paths.repo_root)
+
+    app = BmadLoopApp(paths.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("r")
+        await until(pilot, lambda: isinstance(app.screen, StartRunModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: any("not clean" in m for m in notifications(app)))
+        assert not calls
 
 
 def _fake_tui_git_version(monkeypatch, reported=None, *, boom=None):
@@ -2858,10 +3265,13 @@ async def test_cleanup_warns_about_sessions_left_in_the_legacy_registry(project,
     monkeypatch.setattr(
         runs,
         "legacy_registry_leftovers",
-        lambda _p: {
-            runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl"],
-            r"D:	heir-own-registry": ["bmad-loop-old-1"],
-        },
+        lambda _p: (
+            {
+                runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl"],
+                r"D:	heir-own-registry": ["bmad-loop-old-1"],
+            },
+            [],
+        ),
     )
     make_run(project.project, "20260611-100000-aaaa")
     app = BmadLoopApp(project.project)
@@ -2889,6 +3299,88 @@ async def test_cleanup_warns_about_sessions_left_in_the_legacy_registry(project,
                 for m in notifications(app)
             ),
         )
+
+
+async def test_cleanup_warns_about_a_legacy_registry_that_could_not_be_asked(project, monkeypatch):
+    """DW-469, the cli arm's twin: a registry whose listing raised used to toast
+    exactly what an empty one toasts — nothing. Ablate the `unverified` toast and
+    this fails."""
+    from bmad_loop import runs
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p: ([], [], set()))
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+    monkeypatch.setattr(
+        runs,
+        "legacy_registry_leftovers",
+        lambda _p: ({}, ["/reg/broken: could not be listed: no server"]),
+    )
+    make_run(project.project, "20260611-100000-aaaa")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("c")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(
+            pilot,
+            lambda: any(
+                "not checked" in m and "/reg/broken" in m and "no server" in m
+                for m in notifications(app)
+            ),
+        )
+
+
+async def test_dashboard_names_an_incomplete_run_listing(project, monkeypatch):
+    """DW-468: an empty runs table over an unreadable runs dir is not "no runs" —
+    the border title says the listing is incomplete and a toast names the fault.
+    Ablate the fault arm in `_apply_runs` and this fails."""
+    from bmad_loop import runs
+
+    monkeypatch.setattr(
+        runs, "list_run_dirs", lambda _p: ([], "/x/runs: cannot list the runs dir: EACCES")
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        table = dashboard(app).query_one("#runs", DataTable)
+        await until(pilot, lambda: "listing incomplete" in str(table.border_title))
+        await until(
+            pilot,
+            lambda: any(
+                "run listing incomplete" in m and "EACCES" in m for m in notifications(app)
+            ),
+        )
+
+
+async def test_launch_asks_before_launching_over_an_incomplete_run_listing(project, monkeypatch):
+    """DW-468: a run the listing could not read may be a live engine, so with no
+    readable live run the launch guard still asks, naming the fault, rather than
+    reading the listing as "none live" and launching a second engine unprompted.
+    Ablate `or listing_fault is not None` in `_guarded` and this fails — the
+    launch goes straight through."""
+    from bmad_loop import runs
+
+    calls = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "start_run_detached", lambda *a, **kw: calls.append(a))
+    monkeypatch.setattr(
+        runs, "list_run_dirs", lambda _p: ([], "/x/runs: cannot list the runs dir: EACCES")
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("r")
+        await until(pilot, lambda: isinstance(app.screen, StartRunModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        body = app.screen._body.plain
+        assert "live or unknown: none readable" in body
+        assert "run listing incomplete: /x/runs: cannot list the runs dir: EACCES" in body
+        assert not calls
+        # the ask is a real gate: confirming launches
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: calls)
 
 
 async def test_cleanup_warns_about_ctl_windows_that_survived_the_kill(project, monkeypatch):
@@ -3103,8 +3595,11 @@ async def test_attach_uses_the_recorded_ctl_window(project, monkeypatch):
     # The one attach test that does NOT replace ctl_window_id, so it pins the
     # seam every other one stubs out: that the TUI hands it the same project root
     # the launch recorded the window under (#482). Point app.py at anything else
-    # — the run dir, an unresolved path — and the record is unfindable, the scan
-    # answers the parked `run-` corpse, and attach + return-stamp both go there.
+    # — the run dir, an unresolved path — and the record is unfindable under that
+    # root, so these untagged rows prove nothing and the lookup answers None
+    # (#531). session_exists is stubbed True here, so `a` then takes the live
+    # agent session instead of the ctl window: nothing is selected and nothing is
+    # stamped, and both assertions below fail.
     import subprocess as _subprocess
 
     from bmad_loop.adapters import tmux_base
@@ -3529,6 +4024,9 @@ def _stories_paused_run(
         spec.parent.mkdir(parents=True, exist_ok=True)
         spec.write_text(body.replace("# plan for", "# worktree plan for"), encoding="utf-8")
         task.spec_file = str(spec)  # to_dict re-persists this RELATIVE to the mount
+    if worktree_path:
+        # the mount's mint-time identity (DW-446), as `run_isolated` records it
+        task.worktree_identity = platform_util.root_identity_record(Path(worktree_path))
     task.review_cycle = review_cycle
     if commit_sha:
         task.commit_sha = commit_sha
@@ -3804,6 +4302,91 @@ async def test_plan_checkpoint_replan_writes_the_worktree_spec_not_the_main_twin
     assert "## Auto Run Result" not in spec.read_text(encoding="utf-8")
     assert twin.read_bytes() == untouched
     assert roots == [wt, wt]
+
+
+@pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES or sys.platform == "win32",
+    reason="dir-fd anchoring and POSIX symlinks",
+)
+async def test_plan_checkpoint_replan_refuses_a_worktree_mount_swapped_for_a_link(
+    project, monkeypatch
+):
+    """DW-423 end-to-end: the isolated run's mount is replaced by a link to an outside
+    tree carrying the same spec subpath while the review modal is open. The replan
+    must refuse — error notice, no resume — and the outside spec copy is unchanged.
+
+    Ablation: pass `None` instead of `_paused_spec_root_identity(state)` from `done()`
+    (or drop the forward to `reset_spec_for_replan`) and the replan resets the outside
+    copy to draft and resumes."""
+    import shutil
+
+    calls: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    wt = _unit_worktree(project.project)
+    _run_dir, spec = _stories_paused_run(
+        project.project,
+        stage="plan-checkpoint",
+        worktree_path=str(wt),
+        blocked_result="stale terminal result",
+    )
+    outside = project.project.parent / "outside-mount"
+    outside_spec = outside / spec.relative_to(wt)
+    monkeypatch.chdir(project.project)
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        shutil.copytree(wt, outside)
+        wt.rename(wt.with_name(wt.name + "-aside"))
+        wt.symlink_to(outside, target_is_directory=True)
+        untouched = outside_spec.read_bytes()
+        await pilot.click(await ready(pilot, "#act-replan"))
+        await until(pilot, lambda: any("replan failed" in m for m in notifications(app)))
+    assert calls == []
+    assert outside_spec.read_bytes() == untouched
+
+
+async def test_plan_checkpoint_replan_refuses_a_legacy_mount_with_no_identity_record(
+    project, monkeypatch
+):
+    """DW-446: a paused isolated run whose state.json predates the mint-time record
+    (``worktree_identity`` absent) cannot replan from the TUI — the observer never
+    writes the record, so the pin has nothing to compare against and refuses:
+    error notice, no resume, the spec untouched. A resume or re-arm records it.
+
+    Ablation: map a missing record to a fresh `lstat` in `runs.mount_root_identity`
+    and the replan resets the spec to draft and resumes."""
+    calls: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    wt = _unit_worktree(project.project)
+    run_dir, spec = _stories_paused_run(
+        project.project,
+        stage="plan-checkpoint",
+        worktree_path=str(wt),
+        blocked_result="stale terminal result",
+    )
+    raw = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    for task in raw["tasks"].values():
+        task.pop("worktree_identity")  # the pre-DW-446 shape
+    (run_dir / "state.json").write_text(json.dumps(raw), encoding="utf-8")
+    untouched = spec.read_bytes()
+    monkeypatch.chdir(project.project)
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        await pilot.click(await ready(pilot, "#act-replan"))
+        await until(pilot, lambda: any("replan failed" in m for m in notifications(app)))
+    assert calls == []
+    assert spec.read_bytes() == untouched
+    assert (
+        "worktree_identity"
+        not in json.loads((run_dir / "state.json").read_text(encoding="utf-8"))["tasks"]["1"]
+    )  # the observer wrote no record
 
 
 async def test_plan_checkpoint_replan_confines_on_the_project_for_an_out_of_mount_spec(
@@ -4269,6 +4852,394 @@ async def test_tui_rearm_refuses_a_control_alias_run_before_mutating(project, mo
         assert rearms == []
 
 
+@pytest.mark.parametrize("fault", ["decode", "os"])
+async def test_resume_confirm_refuses_unreadable_sweep_ledger(project, monkeypatch, fault):
+    """DW-270: plain resume displays the real probe's refusal on the dashboard.
+
+    Ablation: remove the ledger refusal block from `_do_resume`; both rows fail
+    because the detached-launch recorder fills.
+    Ablation: remove `markup=False` from the refusal toast; its rendered text
+    loses the literal `[red]` path component.
+    """
+    install_bmad_config(project)
+    config = project.project / BMAD_CONFIG_REL
+    config.write_text(
+        config.read_text().replace("implementation-artifacts'", "implementation-artifacts/[red]'"),
+        encoding="utf-8",
+    )
+    ledger = project.implementation_artifacts / "[red]" / "deferred-work.md"
+    ledger.parent.mkdir()
+    ledger.write_bytes(UNDECODABLE_LEDGER if fault == "decode" else READABLE_LEDGER)
+    read_refused = True
+    if fault == "os":
+        read_text = Path.read_text
+
+        def refused_read(path, *args, **kwargs):
+            if path == ledger and read_refused:
+                raise PermissionError(13, "Permission denied", str(path))
+            return read_text(path, *args, **kwargs)
+
+        # Refuse only this sandbox file's text read, through the real reader and
+        # probe. chmod is not reliable under root or on Windows.
+        monkeypatch.setattr(Path, "read_text", refused_read)
+
+    resumes = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: resumes.append(rid) or "@1")
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    run_dir = _escalated_sweep_run(project.project)
+    original_state = (run_dir / "state.json").read_bytes()
+    refusal = runs_mod.unreadable_sweep_ledger(project.project, run_dir)
+    assert refusal is not None
+    app = BmadLoopApp(project.project)
+    async with app.run_test(notifications=True) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await until(pilot, lambda: dashboard(app).selected_run_id == run_dir.name)
+        await pilot.press("e")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmResumeModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await pilot.pause()
+        assert resumes == []
+        assert (run_dir / "state.json").read_bytes() == original_state
+        assert (refusal, "error") in notifications_with_severity(app)
+        assert str(app.screen.query_one("Toast", Static).render()) == refusal
+        assert str(ledger) in refusal
+        assert "bmad-loop sweep" in refusal
+        assert "stays resumable" in refusal
+        if fault == "os":
+            assert "permissions or storage" in refusal
+
+        # Repair and retry in this same dashboard, retaining the paused run.
+        read_refused = False
+        ledger.write_bytes(READABLE_LEDGER)
+        await pilot.press("e")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmResumeModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: resumes == [run_dir.name])
+        await pilot.pause()
+        assert resumes == [run_dir.name]
+
+
+@pytest.mark.parametrize("case", ["readable", "story", "absent", "config", "state"])
+async def test_resume_confirm_ledger_probe_preserves_handoff(project, monkeypatch, case):
+    """The real probe permits readable sweeps and declines outside its scope.
+
+    Unavailable state is introduced AFTER opening the modal so the confirmation
+    reaches the probe; action_resume_run owns the earlier state-read refusal.
+    """
+    if case != "config":
+        install_bmad_config(project)
+    if case != "absent":
+        project.deferred_work.write_bytes(
+            READABLE_LEDGER if case == "readable" else UNDECODABLE_LEDGER
+        )
+    resumes = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: resumes.append(rid) or "@1")
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    run_dir = make_run(
+        project.project,
+        "20260611-100000-aaaa",
+        run_type="story" if case == "story" else "sweep",
+        paused_stage="DEV_VERIFY",
+        paused_reason="verify failed",
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await until(pilot, lambda: dashboard(app).selected_run_id == run_dir.name)
+        await pilot.press("e")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmResumeModal))
+        if case == "state":
+            (run_dir / "state.json").unlink()
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: resumes == [run_dir.name])
+        await pilot.pause()
+        assert any(f"resume of {run_dir.name} launched" in m for m in notifications(app))
+
+
+@pytest.mark.parametrize("guard", ["mux", "alive", "unknown"])
+async def test_resume_confirm_guards_precede_ledger_probe(project, monkeypatch, guard):
+    """Earlier guards win even if the sweep ledger is unreadable.
+
+    Ablation: move the ledger block above the mux/liveness guards in `_do_resume`;
+    the probe recorder fills instead of the existing guard owning the refusal.
+    """
+    install_bmad_config(project)
+    project.deferred_work.write_bytes(UNDECODABLE_LEDGER)
+    probes = []
+    resumes = []
+    probe = runs_mod.unreadable_sweep_ledger
+
+    def record_probe(root, run_dir):
+        probes.append(run_dir)
+        return probe(root, run_dir)
+
+    monkeypatch.setattr(runs_mod, "unreadable_sweep_ledger", record_probe)
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: resumes.append(rid) or "@1")
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    run_dir = _escalated_sweep_run(project.project)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await until(pilot, lambda: dashboard(app).selected_run_id == run_dir.name)
+        await pilot.press("e")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmResumeModal))
+        # Change the guard at confirmation time to exercise `_do_resume` itself.
+        if guard == "mux":
+            monkeypatch.setattr(launch, "mux_available", lambda: False)
+            message, severity = "multiplexer backend unavailable", "error"
+        else:
+            monkeypatch.setattr(data, "liveness", lambda run_dir: guard)
+            if guard == "unknown":
+                (run_dir / "engine.pid").write_text("4242 123.0", encoding="utf-8")
+            message, severity = "may still be live", "warning"
+        await pilot.click(await ready(pilot, "#ok"))
+        await pilot.pause()
+        assert probes == []
+        assert resumes == []
+        assert any(message in m and s == severity for m, s in notifications_with_severity(app))
+
+
+def _escalated_sweep_run(root: Path, run_id: str = "20260611-100000-aaaa") -> Path:
+    """A SWEEP run paused at a CRITICAL escalation — the only run shape
+    `runs.unreadable_sweep_ledger` is scoped to, and the shape `_do_rearm`'s ledger
+    probe is graded on. Sweeps really do park at `PAUSE_ESCALATION` (an escalated
+    bundle resolves like a story escalation), so this is a reachable state, not a
+    fixture-only one."""
+    from bmad_loop.model import PAUSE_ESCALATION
+
+    return make_run(
+        root,
+        run_id,
+        run_type="sweep",
+        tasks={"s1": StoryTask(story_key="s1", epic=1, phase=Phase.ESCALATED)},
+        paused_stage=PAUSE_ESCALATION,
+        paused_reason="CRITICAL escalation",
+        paused_story_key="s1",
+    )
+
+
+async def test_tui_rearm_refuses_a_sweep_run_whose_ledger_does_not_decode(project, monkeypatch):
+    """DW-230: the readable-ledger refusal `cli.cmd_resume`/`cli.cmd_resolve` make,
+    made HERE too.
+
+    This gesture re-arms and then hands off to `launch.resume_detached`, so without
+    the probe the detached child refuses for the same reason — but only after
+    `rearm_escalation` has spent the escalation, and into a pane nobody opens. The
+    toast is the point: on screen, with the escalation still armed.
+
+    Ablation: delete the `runs.unreadable_sweep_ledger` block from `_do_rearm` and the
+    re-arm recorder fills instead of returning the ledger refusal. The persisted
+    phase assertion complements that recorder; the stub itself does not mutate state."""
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state
+
+    install_bmad_config(project)
+    project.implementation_artifacts.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_bytes(UNDECODABLE_LEDGER)  # conftest's, so the CLI rows share it
+
+    rearms: list = []
+    resumes: list = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: resumes.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(
+        runs,
+        "rearm_escalation",
+        lambda rd, sk, **kw: rearms.append((rd, sk)) or _rearm_outcome(sk),
+    )
+    run_dir = _escalated_sweep_run(project.project)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app._do_rearm("20260611-100000-aaaa", run_dir, "s1")
+        await pilot.pause()
+        assert rearms == []  # the escalation is not spent
+        assert resumes == []  # and no detached child to bounce off the CLI gate
+        assert load_state(run_dir).tasks["s1"].phase == Phase.ESCALATED
+        # Severity, not just text: a refusal softened to an information toast reads
+        # as advice beside a gesture that appeared to work, and matching on wording
+        # alone would not notice.
+        toast, severity = next(
+            (m, s) for m, s in notifications_with_severity(app) if "bmad-loop sweep" in m
+        )
+        assert severity == "error"
+        assert str(project.deferred_work) in toast
+        assert "stays resumable" in toast
+
+
+async def test_tui_rearm_proceeds_on_a_readable_ledger(project, monkeypatch):
+    """The probe's happy path at this call site: a ledger that decodes is not the
+    fault it screens for, so the gesture re-arms and resumes exactly as before.
+
+    Without this row the refusal row above passes just as well against a `_do_rearm`
+    that refused EVERY escalated sweep. Ablation: make the probe return a refusal
+    unconditionally and this reddens on both recorders."""
+    from bmad_loop import runs
+
+    install_bmad_config(project)
+    project.implementation_artifacts.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_bytes(READABLE_LEDGER)
+
+    rearms: list = []
+    resumes: list = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: resumes.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(
+        runs,
+        "rearm_escalation",
+        lambda rd, sk, **_k: rearms.append(sk) or _rearm_outcome(sk),
+    )
+    run_dir = _escalated_sweep_run(project.project)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app._do_rearm("20260611-100000-aaaa", run_dir, "s1")
+        # `_do_rearm` is synchronous, so its recorders fill before the message pump has
+        # delivered a single toast — pump first, or `notifications(app)` reads empty and
+        # every "no such toast" assertion below passes for the wrong reason.
+        await pilot.pause()
+        await until(pilot, lambda: rearms == ["s1"] and resumes == ["20260611-100000-aaaa"])
+        assert any("re-armed s1" in m for m in notifications(app))  # toasts ARE captured
+        assert not any("bmad-loop sweep" in m for m in notifications(app))
+
+
+async def test_tui_rearm_ledger_gate_declines_when_it_cannot_answer(project, monkeypatch):
+    """The probe cannot locate a ledger without the BMAD config, so it declines and
+    the gesture proceeds — the fault's own owner answers for it (here `_do_rearm`'s
+    existing "cannot read the project config" warning, which re-arms against the
+    root the run recorded). A gate that answered for it would report a ledger it
+    never managed to find."""
+    from bmad_loop import runs
+
+    # The corrupt ledger IS on disk; what is missing is _bmad/bmm/config.yaml, so
+    # `bmadconfig.load_paths` raises inside the probe before it can resolve a path.
+    project.implementation_artifacts.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_bytes(UNDECODABLE_LEDGER)
+
+    rearms: list = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: None)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(
+        runs,
+        "rearm_escalation",
+        lambda rd, sk, **_k: rearms.append(sk) or _rearm_outcome(sk),
+    )
+    run_dir = _escalated_sweep_run(project.project)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app._do_rearm("20260611-100000-aaaa", run_dir, "s1")
+        await pilot.pause()  # deliver the toasts the synchronous call queued
+        await until(pilot, lambda: rearms == ["s1"])
+        assert any("cannot read the project config" in m for m in notifications(app))
+        assert not any("bmad-loop sweep" in m for m in notifications(app))
+
+
+async def test_tui_rearm_live_refusal_wins_over_the_ledger_gate(project, monkeypatch):
+    """The probe sits AFTER the alias/liveness gates, and that ordering is load-bearing
+    rather than incidental: a provably-live engine is the stronger fact (re-driving one
+    corrupts the run itself, while an unreadable ledger only costs an arm), and
+    repairing the ledger would not make THIS re-arm safe. Mirrors
+    `test_resolve_live_refusal_wins_over_the_ledger_gate` on the CLI side.
+
+    Without this row, hoisting the probe above `_resolve_blocked_by_liveness` keeps the
+    whole suite green. Ablation: move the probe block above that gate and this reddens
+    on the ledger toast it must not produce. An early probe whose result is discarded
+    instead fails the read recorder while preserving the live-engine toast."""
+    from bmad_loop import deferredwork, runs
+    from bmad_loop.journal import load_state
+
+    install_bmad_config(project)
+    project.implementation_artifacts.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_bytes(UNDECODABLE_LEDGER)
+
+    ledger_reads = []
+    read_for_write = deferredwork.read_for_write
+
+    def record_read(path):
+        ledger_reads.append(path)
+        return read_for_write(path)
+
+    monkeypatch.setattr(deferredwork, "read_for_write", record_read)
+
+    rearms: list = []
+    resumes: list = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: resumes.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "alive")
+    monkeypatch.setattr(runs, "rearm_escalation", lambda rd, sk, **kw: rearms.append((rd, sk)))
+    run_dir = _escalated_sweep_run(project.project)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app._do_rearm("20260611-100000-aaaa", run_dir, "s1")
+        await pilot.pause()
+        assert any("may still be live" in m for m in notifications(app))
+        assert not any("bmad-loop sweep" in m for m in notifications(app))
+        assert ledger_reads == []  # includes probes whose refusal was discarded
+        assert rearms == []
+        assert resumes == []
+        assert load_state(run_dir).tasks["s1"].phase == Phase.ESCALATED
+
+
+async def test_tui_rearm_refuses_an_os_refused_ledger_read_with_the_probe_route(
+    project, monkeypatch
+):
+    """The DW-234 row on the TUI surface. `runs.unreadable_sweep_ledger` now refuses an
+    OS-refused read itself, with the permissions-or-storage repair and the
+    `bmad-loop sweep` route, so `_do_rearm`'s stopgap `except OSError` (which toasted
+    the bare fault "rather than waiting for DW-234") is gone: the probe's refusal
+    reaches the error toast through the same `refusal is not None` arm the decode
+    refusal takes, and nothing is re-armed or launched.
+
+    Ablation: delete the probe's `except OSError` arm and the row fails on the
+    PermissionError escaping `_do_rearm` — there is no local catch left to absorb it,
+    which is the point: one arm, in the shared helper, for all three entry points."""
+    from bmad_loop import deferredwork, runs
+    from bmad_loop.journal import load_state
+
+    install_bmad_config(project)
+    project.implementation_artifacts.mkdir(parents=True, exist_ok=True)
+    # DECODABLE bytes on disk: the refused read is the only fault in play. Monkeypatched
+    # rather than chmod'd — a mode bit does not hold as root and does not exist on
+    # Windows, so the row would silently stop testing anything.
+    project.deferred_work.write_bytes(READABLE_LEDGER)
+
+    def _refused(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    rearms: list = []
+    resumes: list = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: resumes.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(runs, "rearm_escalation", lambda rd, sk, **kw: rearms.append((rd, sk)))
+    monkeypatch.setattr(deferredwork, "read_for_write", _refused)
+    run_dir = _escalated_sweep_run(project.project)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app._do_rearm("20260611-100000-aaaa", run_dir, "s1")  # must not raise
+        await pilot.pause()
+        toast, severity = next(
+            (m, s) for m, s in notifications_with_severity(app) if "Errno 13" in m
+        )
+        assert severity == "error"
+        # The probe's own refusal, route included — not a locally-worded toast.
+        assert str(project.deferred_work) in toast
+        assert "permissions or storage" in toast
+        assert "bmad-loop sweep" in toast
+        assert "stays resumable" in toast
+        assert rearms == []
+        assert resumes == []
+        assert load_state(run_dir).tasks["s1"].phase == Phase.ESCALATED
+
+
 async def test_story_checkpoint_continue_resumes(project, monkeypatch):
     calls: list[str] = []
     monkeypatch.setattr(launch, "mux_available", lambda: True)
@@ -4428,7 +5399,9 @@ async def test_archive_run_archives_and_forgets(project, monkeypatch):
     forgotten: list[str] = []
     dest = project.project / ".bmad-loop" / "archive" / "20260611-100000-aaaa.tar.gz"
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
-    monkeypatch.setattr(runs, "archive_run", lambda proj, rd: archived.append((proj, rd)) or dest)
+    monkeypatch.setattr(
+        runs, "archive_run", lambda proj, rd, **_kw: archived.append((proj, rd)) or dest
+    )
     monkeypatch.setattr(DashboardScreen, "forget_run", lambda self, rid: forgotten.append(rid))
     make_run(project.project, "20260611-100000-aaaa", finished=True)
     app = BmadLoopApp(project.project)
@@ -4456,7 +5429,9 @@ async def test_archive_live_run_refused_without_calling(project, monkeypatch):
 
     archived: list[tuple[Path, Path]] = []
     monkeypatch.setattr(data, "liveness", lambda run_dir: "alive")
-    monkeypatch.setattr(runs, "archive_run", lambda proj, rd: archived.append((proj, rd)) or proj)
+    monkeypatch.setattr(
+        runs, "archive_run", lambda proj, rd, **_kw: archived.append((proj, rd)) or proj
+    )
     make_run(project.project, "20260611-100000-aaaa", alive=True)
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
@@ -4513,6 +5488,149 @@ async def test_lifecycle_workers_report_authoritative_failures_and_keep_the_run_
         assert dashboard(app).selected_run_id == run_dir.name
 
     assert run_dir.is_dir()
+
+
+class _UnaskableMux:
+    """A backend whose session listing raises — the out-of-tree seam shape the
+    removal guard's DW-466 arm exists for. Tmux-shaped otherwise."""
+
+    def session_name_key(self, name):
+        return name
+
+    def has_registry_namespace(self):
+        return False
+
+    def list_sessions(self):
+        raise MultiplexerError("simulated transport failure")
+
+    list_sessions_reporting = TerminalMultiplexer.list_sessions_reporting
+
+
+def _unselectable_mux():
+    raise MultiplexerError("[mux] backend = 'ghost' matches no registered backend")
+
+
+@pytest.mark.parametrize(
+    "select, what",
+    [
+        (_unselectable_mux, "the multiplexer backend could not be selected"),
+        (_UnaskableMux, "the session listing raised"),
+    ],
+    ids=["unselectable", "listing-raised"],
+)
+@pytest.mark.parametrize(
+    "key, removed",
+    [("D", "run 20260611-100000-aaaa deleted"), ("A", "run 20260611-100000-aaaa archived")],
+    ids=["delete", "archive"],
+)
+async def test_lifecycle_workers_toast_an_unasked_session_guard(
+    project, monkeypatch, select, what, key, removed
+):
+    """The #419 guard could not ask the multiplexer, so the removal went ahead
+    as if no session were live (DW-466). The CLI says so on stderr, but Textual
+    captures stderr for the app's whole run, so under the TUI that print reached
+    nobody: the run dir vanished with nothing shown. The worker now hands
+    `delete_run`/`archive_run` a sink and toasts the note as a warning — and the
+    stderr print does not fire on top of it (one route per frontend).
+
+    Drives the real removal helpers; only the multiplexer seam is faked.
+
+    Ablation: drop `_notify_guard_notes` from either worker and its rows fail at
+    the toast wait (the removal toast arrives, the warning never does). Verified."""
+    monkeypatch.setattr(data, "liveness", lambda _run_dir: "dead")
+    monkeypatch.setattr(runs_mod, "get_multiplexer", select)
+    run_dir = make_run(project.project, "20260611-100000-aaaa", finished=True)
+    # Textual redirects stderr while the app runs, so capsys cannot see a print
+    # made under it; spy on the runs module's own `print` instead.
+    printed: list[str] = []
+    monkeypatch.setattr(
+        runs_mod, "print", lambda *a, **_kw: printed.append(" ".join(map(str, a))), raising=False
+    )
+    note = f"run 20260611-100000-aaaa: could not check for a live agent session — {what}: "
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: dashboard(app).selected_run_id == run_dir.name)
+        await pilot.press(key)
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: any(removed in m for m in notifications(app)))
+        await until(
+            pilot,
+            lambda: any(
+                m.startswith(note) and sev == "warning"
+                for m, sev in notifications_with_severity(app)
+            ),
+        )
+
+    assert not run_dir.exists()
+    assert not [p for p in printed if "could not check for a live agent session" in p]
+
+
+@pytest.mark.parametrize(
+    "stderr, faulted",
+    [
+        ("error connecting to /tmp/tmux-1001/default (Permission denied)\n", True),
+        ("no server running on /tmp/tmux-1001/default\n", False),
+    ],
+    ids=["unproven", "no-server"],
+)
+@pytest.mark.parametrize(
+    "key, removed",
+    [("D", "run 20260611-100000-aaaa deleted"), ("A", "run 20260611-100000-aaaa archived")],
+    ids=["delete", "archive"],
+)
+async def test_lifecycle_workers_toast_a_folded_session_listing(
+    project, monkeypatch, stderr, faulted, key, removed
+):
+    """The stock backends never raise from the listing: a failed `list-sessions`
+    folds into `[]` with a stderr warning (DW-458), and Textual captures stderr,
+    so a D/A past it removed the run dir with nothing shown. The guard now
+    reads the listing with the worker's sink, so the fault is toasted like the
+    DW-466 raise — and neither the backend nor the guard prints on top of it.
+    A gone server is an answer, not a fault: no warning toast.
+
+    Drives the real removal helpers and the real tmux-family fold; only the
+    spawn is faked (see test_runs._folding_tmux).
+
+    Ablation: pass `on_fault=None` unconditionally from the guard and the
+    `unproven` rows fail at the toast wait. Verified."""
+    from test_runs import _folding_tmux
+
+    from bmad_loop.adapters import tmux_base
+
+    monkeypatch.setattr(data, "liveness", lambda _run_dir: "dead")
+    monkeypatch.setattr(runs_mod, "get_multiplexer", lambda: _folding_tmux(stderr))
+    run_dir = make_run(project.project, "20260611-100000-aaaa", finished=True)
+    printed: list[str] = []
+    for module in (runs_mod, tmux_base):
+        monkeypatch.setattr(
+            module, "print", lambda *a, **_kw: printed.append(" ".join(map(str, a))), raising=False
+        )
+    note = (
+        "run 20260611-100000-aaaa: could not check for a live agent session — the "
+        f"session listing failed: {sys.executable} list-sessions exited 1 without "
+        "proving the session gone: error connecting to"
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: dashboard(app).selected_run_id == run_dir.name)
+        await pilot.press(key)
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: any(removed in m for m in notifications(app)))
+        if faulted:
+            await until(
+                pilot,
+                lambda: any(
+                    m.startswith(note) and sev == "warning"
+                    for m, sev in notifications_with_severity(app)
+                ),
+            )
+        warnings = [m for m, sev in notifications_with_severity(app) if sev == "warning"]
+
+    assert not run_dir.exists()
+    assert len(warnings) == (1 if faulted else 0)
+    assert printed == []
 
 
 # ------------------------------------------------------------ graceful stop (S)
@@ -4705,6 +5823,113 @@ async def test_header_counts_parked_stories_only_when_there_are_any(project):
         assert "done 1" in content  # the park did not absorb the done story
 
 
+async def test_header_shows_a_refused_auto_sweep_apart_from_one_that_ran(project):
+    """DW-366: a refused auto-sweep gets its own warning line (reason slug plus the
+    `bmad-loop sweep` hint), and a delivered one gets only a dim `ran` line, so
+    the two never look the same. A run with neither shows no sweep line at all.
+
+    Ablation: drop the `sweeps.refused` branch in `show_run` — the first block's
+    `not run` assert fails while the triggered-only block still passes."""
+
+    def _state(**kw):
+        return RunState(run_id="r1", project=str(project.project), started_at="now", **kw)
+
+    def style_at(content, needle: str) -> str:
+        start = str(content).index(needle)
+        styles = [str(s.style) for s in content.spans if s.start <= start < s.end]
+        assert len(styles) == 1, styles
+        return styles[0]
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test():
+        header = dashboard(app).query_one("#runheader", RunHeader)
+
+        # run-end carries the engine's `failed` shape: latched (child started),
+        # then refused (child failed) — it must read "not run", never "ran".
+        header.show_run(
+            "r1",
+            data.FINISHED,
+            _state(sweeps_triggered=["epic-1", "run-end"], sweeps_refused={"run-end": "failed"}),
+        )
+        content = str(header.content)
+        assert "⚠ auto-sweep not run: run-end (failed) — deferred work is untouched" in content
+        assert "run `bmad-loop sweep` with a clean worktree" in content
+        assert "auto-sweep ran: epic-1\n" in content + "\n"
+        assert "run-end" not in content.split("auto-sweep ran:")[1]  # refused is not "ran"
+        # "differs" is the style too, not just the words: warning vs dim
+        assert style_at(header.content, "⚠ auto-sweep not run") == "bold yellow"
+        assert style_at(header.content, "auto-sweep ran:") == "dim"
+
+        header.show_run("r1", data.FINISHED, _state(sweeps_triggered=["epic-1", "run-end"]))
+        content = str(header.content)
+        assert "auto-sweep ran: epic-1, run-end" in content
+        assert "not run" not in content
+        assert "bmad-loop sweep" not in content
+
+        header.show_run("r1", data.FINISHED, _state())
+        assert "auto-sweep" not in str(header.content)
+
+
+async def test_refused_auto_sweep_reaches_the_dashboard_header(project):
+    # End to end: a refusal in state.json flows RunWatcher -> snapshot -> header.
+    run_dir = make_run(project.project, "20260611-100000-aaaa", finished=True)
+    state = RunState(
+        run_id=run_dir.name,
+        project=str(project.project),
+        started_at="2026-06-11T10:00:00",
+        finished=True,
+        sweeps_refused={"run-end": "dirty"},
+    )
+    save_state(run_dir, state)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        screen = dashboard(app)
+        await until(pilot, lambda: screen.selected_run_id == "20260611-100000-aaaa")
+        header = screen.query_one("#runheader", RunHeader)
+        await until(pilot, lambda: "auto-sweep not run: run-end (dirty)" in str(header.content))
+
+
+async def test_tui_pause_surfaces_bound_critical_reason_and_name_the_spec(project):
+    from bmad_loop.escalation import CRITICAL_DISPLAY_MAX, display_pause_reason
+
+    spec = project.implementation_artifacts / "spec-1-1-alpha.md"
+    task = StoryTask(
+        story_key="1-1-alpha",
+        epic=1,
+        phase=Phase.ESCALATED,
+        spec_file=str(spec),
+    )
+    tail = "RECOVERY-TAIL"
+    reason = "CRITICAL escalation from dev session: " + "x" * 2500 + tail
+    state = RunState(
+        run_id="r1",
+        project=str(project.project),
+        started_at="now",
+        tasks={task.story_key: task},
+        paused_stage="escalation",
+        paused_reason=reason,
+        paused_story_key=task.story_key,
+    )
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        header = dashboard(app).query_one("#runheader", RunHeader)
+        header.show_run("r1", data.PAUSED, state)
+        rendered_header = str(header.content)
+        assert "[… truncated; full detail in journal.jsonl]" in rendered_header
+        assert f"[recovery trail: {spec}]" in rendered_header
+        assert tail not in rendered_header
+
+        app.push_screen(ConfirmResumeModal("r1", state, False))
+        await until(pilot, lambda: isinstance(app.screen, ConfirmResumeModal))
+        await ready(pilot, "#body Static")
+        modal_body = app.screen._body.plain
+        assert "[… truncated; full detail in journal.jsonl]" in modal_body
+        assert f"[recovery trail: {spec}]" in modal_body
+        assert tail not in modal_body
+        assert len(display_pause_reason(state)) <= CRITICAL_DISPLAY_MAX
+
+
 async def test_active_agent_shows_in_header_and_task_cell(project, monkeypatch):
     # End to end: a RUNNING run with an open, adapter-stamped session-start paints
     # the header's live agent line and the task row's agent cell
@@ -4740,6 +5965,111 @@ async def test_active_agent_shows_in_header_and_task_cell(project, monkeypatch):
                 and tasks_table.get_cell("1-1-alpha", "agent") == "claude·opus"
             ),
         )
+
+
+async def test_header_agent_line_shows_open_idle_stretch(project, monkeypatch):
+    """#680: with a `session-idle` open for the live session the agent line ends
+    `· idle <age>`; after the matching `session-active` the text is gone. Drives
+    `show_run` with an `ActiveAgent` directly (the derivation is
+    `test_tui_data`'s) and pins the age formatter's two shapes.
+
+    ABLATION E: drop the `idle_since` branch in `show_run` and the first
+    assertion reddens; the negative rows hold on their own only because the
+    positive one passes."""
+    monkeypatch.setattr(widgets.time, "time", lambda: 10_000.0)
+    state = RunState(
+        run_id="r1",
+        project=str(project.project),
+        started_at="now",
+        tasks={"1-1-alpha": StoryTask(story_key="1-1-alpha", epic=1, phase=Phase.DEV_RUNNING)},
+    )
+    working = data.ActiveAgent(
+        task_id="1-1-alpha-dev-1", story_key="1-1-alpha", role="dev", name="claude", model="opus"
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test():
+        header = dashboard(app).query_one("#runheader", RunHeader)
+        header.show_run("r1", data.RUNNING, state, agent=working)
+        assert "claude · opus · dev" in str(header.content)
+        assert "idle" not in str(header.content)
+
+        idle = dataclasses.replace(working, idle_since=10_000.0 - 12 * 60 - 5)
+        header.show_run("r1", data.RUNNING, state, agent=idle)
+        assert "claude · opus · dev · idle 12m" in str(header.content)
+
+        long_idle = dataclasses.replace(working, idle_since=10_000.0 - 65 * 60)
+        header.show_run("r1", data.RUNNING, state, agent=long_idle)
+        assert "· idle 1h05m" in str(header.content)
+
+        # a stamp from the future (a clock stepped back between the adapter's
+        # stamp and this render) clamps to 0m rather than rendering a minus sign
+        future = dataclasses.replace(working, idle_since=10_000.0 + 5)
+        header.show_run("r1", data.RUNNING, state, agent=future)
+        assert "· idle 0m" in str(header.content)
+
+        header.show_run("r1", data.RUNNING, state, agent=working)  # session-active
+        assert "idle" not in str(header.content)
+        header.show_run("r1", data.RUNNING, state, agent=None)  # session-end
+        assert "idle" not in str(header.content)
+
+
+async def test_header_marks_stale_state_unreadable_agent_and_read_faults(project):
+    """DW-472/474/475 at the header: a stale last-good state gets its own warning
+    line, a state never parsed names why, an unreadable agent says so instead of
+    falling back to the configured-agents line, and each read fault is listed.
+
+    Ablation: drop any one branch in `show_run` and its assertion reddens."""
+    state = RunState(
+        run_id="r1",
+        project=str(project.project),
+        started_at="now",
+        policy_snapshot={"adapter": {"name": "claude", "model": "opus"}},
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test():
+        header = dashboard(app).query_one("#runheader", RunHeader)
+
+        header.show_run("r1", data.RUNNING, state)
+        content = str(header.content)
+        assert "stale" not in content and "unreadable" not in content and "⚠" not in content
+
+        header.show_run("r1", data.RUNNING, state, state_fault="state.json unreadable (X: y)")
+        assert "⚠ state stale — state.json unreadable (X: y); showing the last good read" in str(
+            header.content
+        )
+
+        header.show_run("r1", data.UNKNOWN, None, state_fault="state.json unreadable (X: y)")
+        assert "state unavailable — state.json unreadable (X: y)" in str(header.content)
+
+        header.show_run("r1", data.RUNNING, state, agent=data.UnreadableAgent("bad entry"))
+        content = str(header.content)
+        assert "agent unreadable — bad entry" in content
+        assert "agents claude" not in content  # not the no-session fallback
+
+        header.show_run(
+            "r1",
+            data.RUNNING,
+            state,
+            read_faults=("journal.jsonl cannot be stat'd (E)", "ATTENTION unreadable (F)"),
+        )
+        content = str(header.content)
+        assert "⚠ journal.jsonl cannot be stat'd (E)" in content
+        assert "⚠ ATTENTION unreadable (F)" in content
+
+
+async def test_stale_state_reaches_the_dashboard_header(project):
+    # End to end (DW-472): a state.json that stops parsing flows RunWatcher ->
+    # snapshot -> header as a stale marker, while the last good read stays shown.
+    run_dir = make_run(project.project, "20260611-100000-aaaa", finished=True)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        screen = dashboard(app)
+        await until(pilot, lambda: screen.selected_run_id == "20260611-100000-aaaa")
+        header = screen.query_one("#runheader", RunHeader)
+        await until(pilot, lambda: "started 2026-06-11T10:00:00" in str(header.content))
+        (run_dir / "state.json").write_text("{ broken", encoding="utf-8")
+        await until(pilot, lambda: "⚠ state stale" in str(header.content))
+        assert "started 2026-06-11T10:00:00" in str(header.content)
 
 
 async def test_idle_run_shows_configured_agents_and_cell_falls_back(project, monkeypatch):
@@ -5249,7 +6579,7 @@ async def test_escalation_rearm_aims_the_code_root_before_it_rearms(project, mon
         await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
 
     assert seen == [moved.resolve()]
-    assert any("the code root in _bmad/bmm/config.yaml has changed" in n for n in notes)
+    assert any("the code root in the BMAD config has changed" in n for n in notes)
 
 
 def test_escalation_rearm_rechecks_liveness_inside_state_lock(project, monkeypatch):
@@ -5649,8 +6979,9 @@ def test_escalation_rearm_reports_state_lock_failures(project, monkeypatch, fail
     assert notes == [(f"re-arm failed: {failure}", "error")]
 
 
+@pytest.mark.parametrize("shape", ["inside", "sibling"])
 async def test_escalation_rearm_refuses_the_isolation_conflict_before_it_mutates(
-    project, monkeypatch
+    project, monkeypatch, shape
 ):
     """Parity with `cli.cmd_resolve` on the hoisted refusal, and for the same reason this
     surface needed the re-stamp parity above: it re-arms and resumes in ONE click.
@@ -5688,7 +7019,7 @@ async def test_escalation_rearm_refuses_the_isolation_conflict_before_it_mutates
         "notify",
         lambda self, msg, **kw: notes.append(str(msg)) or orig_notify(self, msg, **kw),
     )
-    _split_root_tui_project(project)
+    _split_root_tui_project(project, shape)
     expected = bmadconfig.worktree_isolation_conflict(
         bmadconfig.load_paths(project.project), "worktree"
     )
@@ -5715,6 +7046,49 @@ async def test_escalation_rearm_refuses_the_isolation_conflict_before_it_mutates
 
     assert not calls  # the resume folded into this gesture never fired
     assert load_state(run_dir).repo_root == recorded  # the mirror was never re-pointed
+
+
+def test_escalation_rearm_proceeds_beside_a_nested_repo_root(project, monkeypatch):
+    """DW-379: the re-arm guard's copy of the refusal stays silent for a `repo_root`
+    that CONTAINS the project (here its parent), so the gesture re-arms — with
+    `isolated_redrive=True`, the live worktree mode — graded on the re-arm happening.
+
+    Ablation: widen `worktree_isolation_conflict` back to "any `repo_root` override"
+    and this reddens: the guard toasts the refusal and never re-arms."""
+    from conftest import write_repo_root_override
+
+    from bmad_loop import runs
+
+    install_bmad_config(project)
+    write_repo_root_override(project, project.project.parent)
+    (project.project / ".bmad-loop").mkdir(parents=True, exist_ok=True)
+    (project.project / ".bmad-loop" / "policy.toml").write_text(
+        '[adapter]\nname = "claude"\n\n[scm]\nisolation = "worktree"\n', encoding="utf-8"
+    )
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision.",
+    )
+    rearms: list[bool] = []
+    notes: list[str] = []
+    monkeypatch.setattr(BmadLoopApp, "_resolve_blocked_by_liveness", lambda *_a: False)
+
+    def recording_rearm(_rd, key, *, isolated_redrive=False, **_kwargs):
+        rearms.append(isolated_redrive)
+        return _rearm_outcome(key)
+
+    monkeypatch.setattr(runs, "rearm_escalation", recording_rearm)
+    app = BmadLoopApp(project.project)
+    monkeypatch.setattr(app, "notify", lambda message, **_k: notes.append(str(message)))
+    monkeypatch.setattr(app, "_do_resume", lambda _run_id: None)
+
+    app._do_rearm(run_dir.name, run_dir, "1")
+
+    assert rearms == [True]
+    assert not any("needs the project directory" in note for note in notes)
 
 
 async def test_escalation_rearm_surfaces_the_kinds_it_used_to_drop(project, monkeypatch):
@@ -6271,14 +7645,34 @@ _GATE_REASON = (
         # sweep's ledger-migration gate (sweep.py): the task IS registered, it just
         # has no spec_file — the other arm of _paused_spec's (None, "") return
         ("sweep-migrate", {"sweep-migrate": StoryTask(story_key="sweep-migrate", epic=0)}),
+        # DW-243: a sweep bundle re-armed after a dev escalation KEEPS its spec_file,
+        # and its intent-regeneration refusal pauses at the story gate. The gate is
+        # about the ledger, never the spec, so the reason (with its repair steer)
+        # must show — not the spec viewer's "Approve & resume". Ablation: drop the
+        # story-gate shortcut before `_paused_spec` in `_review_gate`
+        # and this case attempts the forbidden spec read.
+        ("dw-fix", {"dw-fix": "with-spec-file"}),
     ],
-    ids=["task-unregistered", "task-without-spec-file"],
+    ids=["task-unregistered", "task-without-spec-file", "task-with-spec-file"],
 )
 async def test_story_gate_pause_shows_reason_and_resumes(project, monkeypatch, story_key, tasks):
+    spec_reads: list[bool] = []
+
+    def unused_spec_read(*args):
+        spec_reads.append(True)
+        return None, "", True
+
+    monkeypatch.setattr(BmadLoopApp, "_paused_spec", unused_spec_read)
     calls: list[str] = []
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    if tasks.get("dw-fix") == "with-spec-file":
+        spec = project.implementation_artifacts / "spec-dw-fix.md"
+        spec.write_text("# spec-dw-fix\n", encoding="utf-8")
+        tasks = {
+            "dw-fix": StoryTask(story_key="dw-fix", epic=0, dw_ids=["DW-1"], spec_file=str(spec))
+        }
     make_run(
         project.project,
         "20260611-100000-aaaa",
@@ -6290,6 +7684,7 @@ async def test_story_gate_pause_shows_reason_and_resumes(project, monkeypatch, s
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, PauseReasonModal)  # routed away from the spec viewer
+        assert spec_reads == [], "a story-gate reason viewer must not read the unused spec"
         await ready(pilot, "#reason Static")
         body = render(app.screen.query_one("#reason Static", Static).content)
         assert "gated by unlanded deferred work" in body
@@ -7022,6 +8417,501 @@ async def test_decision_modal_survives_lock_and_state_root_failures(project, mon
         # Survived both: still running, still on the dashboard, with the whole
         # walk behind it. The `run_test` context exiting without raising is the
         # other half — an escape into the event loop surfaces there, not here.
+        assert app.is_running
+
+
+async def test_decision_modal_survives_a_ledger_corrupted_while_it_is_open(project):
+    """The same degradation for the ledger-read fault DW-146 retyped, reproduced
+    without patching anything: the modal blocks on the human, so the ledger can go
+    undecodable *between* the read that found this decision pending and the write
+    that records the answer.
+
+    That fault used to arrive as a `ValueError` — a `UnicodeDecodeError` is one —
+    and `_record_decision`'s tuple caught it. DW-146 retyped it to
+    `deferredwork.LedgerReadError`, a plain `Exception` deliberately, which dropped
+    it out of every `except OSError`/`except ValueError` in the tree including this
+    one. Here that is not cosmetic: an uncaught raise in this callback escapes into
+    the Textual event loop and takes the dashboard down mid-walk.
+
+    Ablation: drop `deferredwork.LedgerReadError` from `_record_decision`'s catch
+    tuple and this reddens, with the exception coming out of `run_test` instead of
+    arriving as a notification.
+    Byte-preservation ablation: rewrite the heading before raising LedgerReadError;
+    the exact-byte assertion fails even though the status line remains open.
+    """
+    install_bmad_config(project)
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: first thing\n\norigin: t\nlocation: a.py:1\nreason: t.\nstatus: open\n\n"
+        "### DW-2: second thing\n\norigin: t\nlocation: b.py:1\nreason: t.\nstatus: open\n",
+        encoding="utf-8",
+    )
+    _write_two_triage_decisions(make_run(project.project, "20260101-000000-aaaa", run_type="sweep"))
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("d")
+        await until(pilot, lambda: isinstance(app.screen, DecisionModal))
+        # The human is looking at the modal; the ledger goes bad underneath them.
+        corrupted = b"# Deferred Work\n\n### DW-1: bad \xff byte\n\nstatus: open\n"
+        project.deferred_work.write_bytes(corrupted)
+        await pilot.click(await ready(pilot, "#opt-1"))
+
+        await until(pilot, lambda: any("failed to record DW-1" in m for m in notifications(app)))
+        toasts = [n for n in app._notifications if "failed to record" in n.message]
+        assert toasts and toasts[0].severity == "error"
+        assert "not valid UTF-8" in toasts[0].message
+        # The walk carried on rather than ending on the failure...
+        await until(
+            pilot,
+            lambda: isinstance(app.screen, DecisionModal) and app.screen._decision.id == "DW-2",
+        )
+        # ...and nothing was written to the ledger it could not read.
+        assert project.deferred_work.read_bytes() == corrupted
+        assert app.is_running
+
+
+async def test_decision_modal_counts_the_answers_the_ledger_did_take(project):
+    """The positive half of the same boolean (DW-198), and the row that keeps its
+    negative sibling below honest: a walk whose entries are all there records both
+    answers and says so. Without this, an assertion that no `decision(s)`
+    notification appears would also pass for a notification that simply changed
+    wording or stopped firing at all.
+
+    Nothing is patched here either — the ledger really holds both ids, so
+    `record_decision` writes both `decision:` lines and answers True twice."""
+    install_bmad_config(project)
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: first thing\n\norigin: t\nlocation: a.py:1\nreason: t.\nstatus: open\n\n"
+        "### DW-2: second thing\n\norigin: t\nlocation: b.py:1\nreason: t.\nstatus: open\n",
+        encoding="utf-8",
+    )
+    _write_two_triage_decisions(make_run(project.project, "20260101-000000-aaaa", run_type="sweep"))
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("d")
+        await until(pilot, lambda: isinstance(app.screen, DecisionModal))
+        await pilot.click(await ready(pilot, "#opt-1"))
+        await until(
+            pilot,
+            lambda: isinstance(app.screen, DecisionModal) and app.screen._decision.id == "DW-2",
+        )
+        await pilot.click(await ready(pilot, "#opt-1"))
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+
+        await until(pilot, lambda: any("recorded 2 decision(s)" in m for m in notifications(app)))
+        assert not any("no decision line was written" in m for m in notifications(app))
+        # ...and both lines really did land on the entries the ledger still held.
+        ledger = project.deferred_work.read_text(encoding="utf-8")
+        assert ledger.count("decision:") == 2
+        assert app.is_running
+
+
+@pytest.mark.parametrize("effect", ["build", "close"])
+@pytest.mark.parametrize("ledger_missing", [False, True], ids=["retired-entry", "absent-ledger"])
+async def test_decision_modal_toasts_a_ledger_that_took_no_decision_line(
+    project, effect, ledger_missing
+):
+    """The lie DW-198 removes on this surface: `apply_pre_answer` discarded
+    `record_decision`'s False, so `_record_decision` returned True for a write that
+    never happened and `_walk_decisions` folded it into `recorded N decision(s)` —
+    the dashboard announcing closures the ledger never took.
+
+    Nothing is patched, deliberately (the sibling rows above patch a raise; this
+    hazard needs no fault at all). The modal blocks on the human, so a rival writer
+    really can retire the entries between the read that found them pending and the
+    click that records the answer — and `record_decision` then answers False off a
+    perfectly good read, with no exception for the existing `except` arm to catch.
+
+    Both entries are retired so the walk ends having recorded nothing, which is what
+    makes the absent `recorded ... decision(s)` notification an assertion rather than
+    an accident of ordering. `warning`, not `error`, and worded apart from the raise
+    arm: nothing failed here — for these `build` options the pre-answer store write
+    landed; the toast makes no promise about future sweep execution. Close options
+    save no store answer, so their warnings must not claim one was saved.
+
+    Ablation: hardcode `recorded=True` on `apply_pre_answer`'s `PreAnswerResult`,
+    or drop `_record_decision`'s `if not result.recorded` arm, and this reddens on
+    both the toast and the `recorded 2 decision(s)` that then appears.
+    """
+    install_bmad_config(project)
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: first thing\n\norigin: t\nlocation: a.py:1\nreason: t.\nstatus: open\n\n"
+        "### DW-2: second thing\n\norigin: t\nlocation: b.py:1\nreason: t.\nstatus: open\n",
+        encoding="utf-8",
+    )
+    import json
+
+    from bmad_loop import decisions
+
+    run_dir = make_run(project.project, "20260101-000000-aaaa", run_type="sweep")
+    _write_two_triage_decisions(run_dir)
+    if effect == "close":
+        triage_path = run_dir / "triage.json"
+        triage = json.loads(triage_path.read_text(encoding="utf-8"))
+        for decision in triage["decisions"]:
+            decision["options"][0] = {
+                "key": "1",
+                "label": "Close",
+                "effect": "close",
+                "resolution": "superseded",
+            }
+        triage_path.write_text(json.dumps(triage), encoding="utf-8")
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("d")
+        await until(pilot, lambda: isinstance(app.screen, DecisionModal))
+        # A rival writer removes both targets while the human reads the modal.
+        if ledger_missing:
+            project.deferred_work.unlink()
+        else:
+            project.deferred_work.write_text(
+                "# Deferred Work\n\n"
+                "### DW-9: unrelated\n\norigin: t\nlocation: c.py:1\nreason: t.\nstatus: open\n",
+                encoding="utf-8",
+            )
+        await pilot.click(await ready(pilot, "#opt-1"))
+
+        await until(
+            pilot,
+            lambda: any("DW-1: no decision line was written" in m for m in notifications(app)),
+        )
+        # The walk carried on rather than ending on the non-write...
+        await until(
+            pilot,
+            lambda: isinstance(app.screen, DecisionModal) and app.screen._decision.id == "DW-2",
+        )
+        await pilot.click(await ready(pilot, "#opt-1"))
+        await until(
+            pilot,
+            lambda: any("DW-2: no decision line was written" in m for m in notifications(app)),
+        )
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+
+        toasts = [n for n in app._notifications if "no decision line was written" in n.message]
+        assert len(toasts) == 2
+        assert {n.severity for n in toasts} == {"warning"}
+        # Ablation: make the saved-answer suffix unconditional in _record_decision;
+        # the close variants fail because no store write occurred.
+        # Independently remove apply_pre_answer's non-close store-write guard;
+        # these variants fail on the empty-store assertion.
+        if effect == "close":
+            assert all("saved to the pre-answer store" not in n.message for n in toasts)
+            assert decisions.load_pre_answers(project.project) == {}
+        else:
+            assert all("saved to the pre-answer store" in n.message for n in toasts)
+            assert set(decisions.load_pre_answers(project.project)) == {"DW-1", "DW-2"}
+        assert not any("build" in n.message for n in toasts)
+        # ...and worded apart from the raise arm, which is an `error` about a fault.
+        assert not any("failed to record" in m for m in notifications(app))
+        # The whole point: nothing claims these two were recorded.
+        assert not any("decision(s)" in m for m in notifications(app))
+        assert app.is_running
+
+
+@pytest.mark.parametrize(
+    "cause,error",
+    [
+        ("target-absent", None),
+        ("target-unreadable", "cannot open /tmp/[/]/[red]/decisions.json"),
+        ("target-not-a-file", None),  # DW-211/228: present, wrong type, no fault text
+        (
+            "target-undecodable",
+            "deferred-work.md is not valid UTF-8",
+        ),  # DW-237: ledger decode fault
+    ],
+)
+async def test_decision_modal_toast_carries_both_a_non_write_and_a_refusal(
+    project, monkeypatch, cause, error
+):
+    """The COMBINED arm, which neither sibling reaches: the ledger took no
+    `decision:` line AND the one operand this call did write — the pre-answer
+    store, since the effect is not `close` — could not be published.
+
+    Both facts belong in the ONE toast the walk raises for that decision. Its
+    siblings each exercise a single clause (one patches nothing, so there is no
+    refusal; the other keeps the entries open, so `recorded` is True and control
+    takes the standalone-toast arm), which left `{unpublished}` in the non-write
+    f-string deletable with `-k decision` fully green.
+
+    Ablation: delete `{unpublished}` from `_record_decision`'s non-write
+    `self.notify(...)` and this reds on the `not committed to git` clause, while
+    both sibling rows still pass.
+    """
+    # Ablation: remove markup=False from this toast arm; the bracketed fault
+    # then raises MarkupError in the real notification renderer.
+    from bmad_loop import verify
+
+    install_bmad_config(project)
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: first thing\n\norigin: t\nlocation: a.py:1\nreason: t.\nstatus: open\n\n"
+        "### DW-2: second thing\n\norigin: t\nlocation: b.py:1\nreason: t.\nstatus: open\n",
+        encoding="utf-8",
+    )
+    _write_two_triage_decisions(make_run(project.project, "20260101-000000-aaaa", run_type="sweep"))
+    monkeypatch.setattr(verify, "unpublishable_target", lambda _t, _f: (cause, error))
+
+    detail = cause if error is None else f"{cause}: {error}"
+    app = BmadLoopApp(project.project)
+    async with app.run_test(notifications=True) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("d")
+        await until(pilot, lambda: isinstance(app.screen, DecisionModal))
+        # A rival writer retires both entries while the human reads the modal, so
+        # no `decision:` line lands — while the `build` answer still writes the
+        # store, which is then refused publication.
+        project.deferred_work.write_text(
+            "# Deferred Work\n\n"
+            "### DW-9: unrelated\n\norigin: t\nlocation: c.py:1\nreason: t.\nstatus: open\n",
+            encoding="utf-8",
+        )
+        await pilot.click(await ready(pilot, "#opt-1"))
+        await until(
+            pilot,
+            lambda: any("DW-1: no decision line was written" in m for m in notifications(app)),
+        )
+        await until(
+            pilot,
+            lambda: isinstance(app.screen, DecisionModal) and app.screen._decision.id == "DW-2",
+        )
+        await pilot.click(await ready(pilot, "#opt-1"))
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+
+        toasts = [n for n in app._notifications if "DW-1" in n.message]
+        assert len(toasts) == 1  # ONE toast, not the non-write one plus a second
+        [toast] = toasts
+        assert toast.severity == "warning"
+        assert "no decision line was written to the ledger" in toast.message
+        assert "your answer was saved to the pre-answer store" in toast.message
+        assert f"not committed to git: decisions.json ({detail})" in toast.message
+        # Neither answer was recorded, so nothing claims otherwise.
+        assert not any("decision(s)" in m for m in notifications(app))
+        assert app.is_running
+
+
+@pytest.mark.parametrize(
+    "cause,error",
+    [
+        ("target-absent", None),
+        ("target-unreadable", "cannot open /tmp/[/]/[red]/decisions.json"),
+        ("target-not-a-file", None),  # DW-211/228: present, wrong type, no fault text
+        (
+            "target-undecodable",
+            "deferred-work.md is not valid UTF-8",
+        ),  # DW-237: ledger decode fault
+    ],
+)
+async def test_decision_modal_toasts_an_answer_it_could_not_publish(
+    project, monkeypatch, cause, error
+):
+    """DW-209/213 on this surface. `apply_pre_answer` commits only the operands the
+    call actually wrote, so a publishable-target refusal means an answer that really
+    landed on disk went unpublished — its own `warning` toast, orthogonal to the
+    non-write one.
+
+    What it must NOT change is the count: the ledger line landed, so the answer is
+    answered, and `recorded 2 decision(s)` still fires. The walk advances the same
+    way, and nothing reads as an `error`.
+
+    Ablation: drop `_record_decision`'s `if note is not None:` arm and this reddens
+    on the toast while `recorded 2 decision(s)` still passes; hand the refusal to
+    the `recorded` boolean instead and it reddens on the count.
+    """
+    # Ablation: remove markup=False from this toast arm; the bracketed fault
+    # then raises MarkupError in the real notification renderer.
+    from bmad_loop import verify
+
+    install_bmad_config(project)
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: first thing\n\norigin: t\nlocation: a.py:1\nreason: t.\nstatus: open\n\n"
+        "### DW-2: second thing\n\norigin: t\nlocation: b.py:1\nreason: t.\nstatus: open\n",
+        encoding="utf-8",
+    )
+    _write_two_triage_decisions(make_run(project.project, "20260101-000000-aaaa", run_type="sweep"))
+    # The race the guard exists for: the written operands go unpublishable between
+    # the write and the staging.
+    monkeypatch.setattr(verify, "unpublishable_target", lambda _t, _f: (cause, error))
+
+    detail = cause if error is None else f"{cause}: {error}"
+    app = BmadLoopApp(project.project)
+    async with app.run_test(notifications=True) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("d")
+        await until(pilot, lambda: isinstance(app.screen, DecisionModal))
+        await pilot.click(await ready(pilot, "#opt-1"))
+        await until(
+            pilot,
+            lambda: any("DW-1: not committed to git" in m for m in notifications(app)),
+        )
+        await until(
+            pilot,
+            lambda: isinstance(app.screen, DecisionModal) and app.screen._decision.id == "DW-2",
+        )
+        await pilot.click(await ready(pilot, "#opt-1"))
+        # Wait for DW-2's toast as the sibling no-decision-line row waits for its
+        # own, not merely for the dashboard: `Screen.dismiss` swaps `app.screen`
+        # and hands the result callback to `call_next`, so the modal is gone one
+        # message before `_record_decision` runs for DW-2 — a window the Windows
+        # runners hit (`assert 1 == 2`, DW-1's toast alone).
+        await until(
+            pilot,
+            lambda: any("DW-2: not committed to git" in m for m in notifications(app)),
+        )
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+
+        toasts = [n for n in app._notifications if "not committed to git" in n.message]
+        assert len(toasts) == 2
+        assert {n.severity for n in toasts} == {"warning"}
+        assert all(f"deferred-work.md ({detail})" in n.message for n in toasts)
+        # The line DID land, so the answer is answered: the refusal changes neither
+        # the count nor the walk, and it is not the non-write toast.
+        await until(pilot, lambda: any("recorded 2 decision(s)" in m for m in notifications(app)))
+        assert not any("no decision line was written" in m for m in notifications(app))
+        assert not any("failed to record" in m for m in notifications(app))
+        assert app.is_running
+
+
+async def test_decision_modal_toasts_an_answer_git_could_not_commit(project, monkeypatch):
+    """DW-226 on this surface — the mirror of the refusal row beside it, for the
+    OTHER unpublished lane. `verify.commit_paths` raises `GitError` (a gitignored
+    operand, a parent in no repository, git absent), which used to be swallowed
+    silently, so an answer written to disk and missing from git history reached
+    neither the CLI nor this dashboard.
+
+    What it must NOT change is the count: the ledger line landed, so the answer is
+    answered and `recorded 2 decision(s)` still fires. The walk advances the same
+    way, and nothing reads as an `error` — a failed publish is a degrade, not a
+    fault of the recording.
+
+    Ablation: drop `_record_decision`'s `if note is not None:` arm and this reds on
+    the toast while `recorded 2 decision(s)` still passes; hand the failure to the
+    `recorded` boolean instead and it reds on the count; restore
+    `except verify.GitError: pass` in `apply_pre_answer` and it reds on both toasts.
+    """
+    # Ablation: remove markup=False from this toast arm; the bracketed git error
+    # then raises MarkupError in the real notification renderer — git's own stderr
+    # is where the brackets come from, so this is the arm that needs it most.
+    from bmad_loop import verify
+
+    install_bmad_config(project)
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: first thing\n\norigin: t\nlocation: a.py:1\nreason: t.\nstatus: open\n\n"
+        "### DW-2: second thing\n\norigin: t\nlocation: b.py:1\nreason: t.\nstatus: open\n",
+        encoding="utf-8",
+    )
+    _write_two_triage_decisions(make_run(project.project, "20260101-000000-aaaa", run_type="sweep"))
+    # Multi-line, as git's stderr is: `publish_note` renders on ONE line, so the
+    # collapse is part of what this row grades.
+    error = "git add failed:\n  The following paths are ignored by [red]one[/red] of your .gitignore files"
+
+    def boom(*_a, **_k):
+        raise verify.GitError(error)
+
+    monkeypatch.setattr(verify, "commit_paths", boom)
+    collapsed = " ".join(error.split())
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test(notifications=True) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("d")
+        await until(pilot, lambda: isinstance(app.screen, DecisionModal))
+        await pilot.click(await ready(pilot, "#opt-1"))
+        await until(
+            pilot,
+            lambda: any("DW-1: not committed to git" in m for m in notifications(app)),
+        )
+        await until(
+            pilot,
+            lambda: isinstance(app.screen, DecisionModal) and app.screen._decision.id == "DW-2",
+        )
+        await pilot.click(await ready(pilot, "#opt-1"))
+        # DW-2's toast, not merely the dashboard: see the sibling row above for
+        # the `dismiss`/`call_next` window the Windows runners hit.
+        await until(
+            pilot,
+            lambda: any("DW-2: not committed to git" in m for m in notifications(app)),
+        )
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+
+        toasts = [n for n in app._notifications if "not committed to git" in n.message]
+        assert len(toasts) == 2
+        assert {n.severity for n in toasts} == {"warning"}
+        assert all(
+            f"deferred-work.md (commit-unavailable: {collapsed})" in n.message for n in toasts
+        )
+        assert all(f"decisions.json (commit-unavailable: {collapsed})" in n.message for n in toasts)
+        assert not any("\n" in n.message for n in toasts)  # one line at this surface
+        # The line DID land, so the answer is answered: the failure changes neither
+        # the count nor the walk, and it is not the non-write toast.
+        await until(pilot, lambda: any("recorded 2 decision(s)" in m for m in notifications(app)))
+        assert not any("no decision line was written" in m for m in notifications(app))
+        assert not any("failed to record" in m for m in notifications(app))
+        assert app.is_running
+
+
+async def test_decision_walk_counts_only_the_answer_the_ledger_took(project):
+    """A mixed walk records DW-1, then retires DW-2 before its answer is written.
+
+    The zero-of-two sibling catches unconditional counting. This row additionally
+    requires a partial-success notification to retain the one recorded answer.
+
+    Ablation: hardcode `recorded=True` on `apply_pre_answer`'s `PreAnswerResult`,
+    or drop `_record_decision`'s `if not result.recorded` arm, and this reddens on
+    `recorded 2 decision(s)`.
+    """
+    install_bmad_config(project)
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: first thing\n\norigin: t\nlocation: a.py:1\nreason: t.\nstatus: open\n\n"
+        "### DW-2: second thing\n\norigin: t\nlocation: b.py:1\nreason: t.\nstatus: open\n",
+        encoding="utf-8",
+    )
+    _write_two_triage_decisions(make_run(project.project, "20260101-000000-aaaa", run_type="sweep"))
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("d")
+        # DW-1 comes first and records against an intact ledger: this one counts.
+        await until(
+            pilot,
+            lambda: isinstance(app.screen, DecisionModal) and app.screen._decision.id == "DW-1",
+        )
+        await pilot.click(await ready(pilot, "#opt-1"))
+
+        # ...then a rival writer retires DW-2 while its modal is up: this one must not.
+        await until(
+            pilot,
+            lambda: isinstance(app.screen, DecisionModal) and app.screen._decision.id == "DW-2",
+        )
+        project.deferred_work.write_text(
+            "# Deferred Work\n\n"
+            "### DW-1: first thing\n\norigin: t\nlocation: a.py:1\nreason: t.\n"
+            "status: open\n\ndecision: 2026-06-13 Widen — widen it\n",
+            encoding="utf-8",
+        )
+        await pilot.click(await ready(pilot, "#opt-1"))
+
+        await until(
+            pilot,
+            lambda: any("DW-2: no decision line was written" in m for m in notifications(app)),
+        )
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+
+        # ONE of the two, not both and not neither.
+        await until(pilot, lambda: any("recorded 1 decision(s)" in m for m in notifications(app)))
+        assert not any("recorded 2 decision(s)" in m for m in notifications(app))
+        assert not any("DW-1: no decision line was written" in m for m in notifications(app))
         assert app.is_running
 
 

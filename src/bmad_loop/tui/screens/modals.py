@@ -11,6 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from rich.cells import cell_len
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -20,6 +21,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Input, Label, Select, Static
 
 from ... import stories
+from ...escalation import display_pause_reason
 from ...model import RunState
 from .. import data, widgets
 
@@ -62,6 +64,8 @@ class BaseDialog(ModalScreen):
     BaseDialog .title {
         text-style: bold;
         margin-bottom: 1;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
     }
     BaseDialog .buttons {
         height: auto;
@@ -122,7 +126,8 @@ class BaseDialog(ModalScreen):
     # = 54) still fits a clamped dialog's content region (60 - 2 border
     # - 4 padding = 54). Declaring this here scopes it to dialogs: the App and
     # DashboardScreen leave their breakpoints at the default, so the dashboard
-    # is unaffected.
+    # is unaffected. SpecReviewModal overrides the threshold to 80 columns — see
+    # its own HORIZONTAL_BREAKPOINTS.
     HORIZONTAL_BREAKPOINTS = [(0, "-narrow"), (60, "-wide")]
 
     # Same mechanism on the other axis: `-short` means "the terminal is under 20
@@ -134,15 +139,18 @@ class BaseDialog(ModalScreen):
     # #body). The compact layout has to engage before anything clips, not at the
     # moment it does, so the threshold is above 14 rather than on it. It is also
     # below the 24 rows of a default terminal, so an ordinary window still gets
-    # the full chrome. Every figure above is a CHROME measurement, taken with
-    # short titles: a title, header, warning or path is docked outside the
-    # scrolling body, so a long enough one wraps and costs rows this layout
-    # cannot reclaim — the body is already at its 1-row minimum. Nothing bounds
-    # that caller-supplied text, so a long enough value clips the docked controls
-    # at ANY fixed size and those dialogs have no floor to state. That is why
-    # docs/tui-guide.md gives its figures as sizes measured to be sufficient for
-    # the content it exercised rather than as a minimum — 80x24 included
-    # (#628, #629).
+    # the full chrome. A title, header, subtitle or path docked outside the
+    # scrolling body is caller text of unbounded length, so the `.title` rule
+    # above holds each of its lines to one row with an ellipsis (SpecReviewModal
+    # and PauseReasonModal do the same for their subtitles, SpecReviewModal for
+    # its path). Such a block's height is therefore its LINE count, never its
+    # length, and caller text cannot move a dialog's floor off the 39x9 pair
+    # tests/test_tui_app.py pins and docs/tui-guide.md quotes (DW-358). Docked
+    # warnings and hints are module text and are NOT held to one row; each is
+    # sized to fit that pair instead — EscalationModal keeps every #hint arm
+    # within 3 rows at 39 columns (DW-414), and ConfirmResumeModal's `-short`
+    # body yields its rows to the double-drive warning (DW-415). The full caller
+    # text stays in the widget — the ellipsis is render-only.
     VERTICAL_BREAKPOINTS = [(0, "-short"), (20, "-tall")]
 
     BINDINGS = [Binding("escape", "cancel", "cancel")]
@@ -380,6 +388,21 @@ class ConfirmResumeModal(ConfirmModal):
     """Resume confirmation with pause details and a double-drive warning when
     the recorded engine pid may still be live."""
 
+    # The warning wraps to three rows at 39 columns, and ConfirmModal's auto
+    # #body keeps its own rows (up to its 60% cap), so on a short terminal the
+    # docked warning and buttons were clipped by #dialog (DW-415). Under
+    # `-short` #body takes only the rows left over, so the auto dialog grows to
+    # BaseDialog's `-short` max-height (the full screen) and a long pause reason
+    # scrolls instead of pushing the warning out. Scoped to `-warned` on
+    # purpose: without the warning this is a bounded-tier confirm that already
+    # fits, and the `1fr` body would balloon it (see BaseDialog's #dialog note).
+    DEFAULT_CSS = """
+    ConfirmResumeModal.-short.-warned #body {
+        height: 1fr;
+        max-height: 100%;
+    }
+    """
+
     def __init__(self, run_id: str, state: RunState, engine_alive: bool):
         body = Text()
         body.append("resume run ")
@@ -388,7 +411,7 @@ class ConfirmResumeModal(ConfirmModal):
         if state.paused:
             body.append(f"paused at {state.paused_stage or '?'}", style="yellow")
             if state.paused_reason:
-                body.append(f" — {state.paused_reason}", style="yellow")
+                body.append(f" — {display_pause_reason(state)}", style="yellow")
         else:
             body.append("run is not paused — it looks interrupted", style="dim")
         warning = (
@@ -397,6 +420,8 @@ class ConfirmResumeModal(ConfirmModal):
             else None
         )
         super().__init__("resume run", body, confirm_label="resume", warning=warning)
+        if warning:
+            self.add_class("-warned")
 
 
 class DeferredEntryModal(BaseDialog):
@@ -421,10 +446,12 @@ class DeferredEntryModal(BaseDialog):
         item = self._item
         title = Text()
         title.append(f"{item.id} — {item.title}", style="bold")
+        # Each marker gets its own line: the heading is held to one row and
+        # ellipsized, which would cut anything appended after it (DW-358).
         if item.done:
-            title.append("  ✓ done", style="green")
+            title.append("\n✓ done", style="green")
         if item.legacy:
-            title.append("  · legacy — converted to DW format on next sweep", style="dim")
+            title.append("\n· legacy — converted to DW format on next sweep", style="dim")
         with Vertical(id="dialog"):
             yield Static(title, classes="title")
             with VerticalScroll(id="entry"):
@@ -501,6 +528,26 @@ class DecisionModal(BaseDialog):
             self.dismiss(None)
 
 
+class _TailPath(Static):
+    """A one-row file path that, when too long for its width, drops the HEAD
+    behind a leading "…" rather than the tail. `text-overflow: ellipsis` cuts the
+    end, which for a spec path is the file name — the part that says which spec
+    this is. The full path stays one `copy path` away."""
+
+    def __init__(self, path: str, **kwargs: Any):
+        # the whole path is the widget's content; only render() cuts it
+        super().__init__(path, markup=False, **kwargs)
+
+    def render(self) -> Text:
+        width = self.content_size.width
+        path = str(self.content)
+        if width <= 0 or cell_len(path) <= width:
+            return Text(path)
+        while path and cell_len(path) > width - 1:
+            path = path[1:]
+        return Text("…" + path)
+
+
 class SpecReviewModal(BaseDialog):
     """Read-only story-spec viewer with a configurable action row.
 
@@ -521,11 +568,67 @@ class SpecReviewModal(BaseDialog):
         border: solid $primary-darken-2;
         padding: 0 1;
     }
+    /* The subtitle (a story title from stories.yaml) and the path are caller
+       text docked outside the scrolling #spec, so each is held to one row —
+       see BaseDialog .title (DW-358). The path keeps its tail, see _TailPath. */
+    SpecReviewModal .subtitle, SpecReviewModal .path {
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
+        max-height: 1;
+    }
     SpecReviewModal .path {
         color: $text-muted;
         margin-bottom: 1;
     }
+    /* Under -short the #spec frame and the path margin go too — the modal's own
+       share of the chrome BaseDialog.-short collapses. That is what brings this
+       dialog inside the measured 39x9 pair: 2 border + title + subtitle + path
+       + 1 row of body + the 2-row wrapped action grid = 8. The definite 85%
+       height is lifted to 100% alongside it — 85% of 9 rows is 7, one short.
+       Under -narrow too, with BaseDialog's 90% max-height lifted as -short
+       does: the grid's second row of full 3-row buttons makes the chrome 18
+       rows, so at 20-22 rows a shorter dialog clipped `Request replan` and
+       `close` or left no body row at all. */
+    SpecReviewModal.-short #dialog, SpecReviewModal.-narrow #dialog {
+        height: 100%;
+    }
+    SpecReviewModal.-narrow #dialog {
+        max-height: 100%;
+    }
+    SpecReviewModal.-short #spec {
+        border: none;
+    }
+    SpecReviewModal.-short .path {
+        margin-bottom: 0;
+    }
+    /* The action row wraps into two columns instead of clipping (DW-359). Labels
+       stay on one line: a wrapped label would make its grid row taller and push
+       the next row off the dialog, which is the defect again one level down. */
+    SpecReviewModal.-narrow .buttons {
+        layout: grid;
+        grid-size: 2;
+        grid-columns: 1fr;
+        grid-rows: auto;
+        grid-gutter: 0 1;
+    }
+    SpecReviewModal.-narrow .buttons Button {
+        width: 1fr;
+        margin-left: 0;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
+    }
     """
+
+    # `-narrow` here means "the action row does not fit on one line", not
+    # BaseDialog's "under 60 columns". The widest row this modal is given — copy
+    # path + Approve & resume + Request replan + close — is 16 + 18 + 16 + 16
+    # columns of button plus 4 * 2 of margin = 74, exactly the content region of
+    # an 80-column terminal (80 - 2 border - 4 padding), so from 79 columns down
+    # the row would clip its right-most buttons (DW-359). Under it the row becomes
+    # a two-column grid. A half-width cell holds an 18-column button from 43
+    # columns up; below that the longest label ellipsizes rather than wrapping —
+    # the button stays whole and operable.
+    HORIZONTAL_BREAKPOINTS = [(0, "-narrow"), (80, "-wide")]
 
     def __init__(
         self,
@@ -548,13 +651,11 @@ class SpecReviewModal(BaseDialog):
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
             yield Label(self._title, classes="title")
-            yield Static(self._subtitle)
-            path_line = Text()
+            yield Static(self._subtitle, classes="subtitle")
             if self._spec_path is not None:
-                path_line.append(str(self._spec_path))
+                yield _TailPath(str(self._spec_path), classes="path")
             else:
-                path_line.append("(no spec file resolved)", style="dim")
-            yield Static(path_line, classes="path")
+                yield Static(Text("(no spec file resolved)", style="dim"), classes="path")
             with VerticalScroll(id="spec"):
                 body = self._spec_text.strip()
                 if self._unreadable:
@@ -604,6 +705,13 @@ class PauseReasonModal(BaseDialog):
     PauseReasonModal #reason {
         height: auto;
         max-height: 60%;
+    }
+    /* The subtitle is the same caller text SpecReviewModal docks (a story
+       title), so it is held to one row the same way (DW-358). */
+    PauseReasonModal #subtitle {
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
+        max-height: 1;
     }
     """
 
@@ -709,6 +817,13 @@ class EscalationModal(BaseDialog):
         border: solid $primary-darken-2;
         padding: 0 1;
     }
+    /* At 39 columns the row is 9 + 17 + 7 plus three 1-column `-narrow`
+       margins = 36 against 35 content columns, so `close` lost its right edge
+       (DW-414). The row is right-aligned, so the first button's margin is dead
+       space: dropping it makes the row exactly 35. */
+    EscalationModal.-narrow #act-resolve {
+        margin-left: 0;
+    }
     """
 
     def __init__(
@@ -786,16 +901,23 @@ class EscalationModal(BaseDialog):
                     )
             # The restore-discard branch below gates an enabled Re-arm, so the hint
             # is docked outside #body (never scrolled off) — directly above the buttons.
+            #
+            # Every arm stays within 3 rows at 35 columns, the content width of a
+            # 39-column dialog: 2 border + title + 1 body row + hint + 1-row button
+            # row must fit the 8-row (90%-of-9) dialog at the 39x9 pair (DW-414).
+            # The reasons behind each arm live in the comments and in
+            # docs/tui-guide.md, not in the hint.
             hint = Text()
             if self._unreadable:
                 # Precedence over both branches below: they explain when Re-arm
                 # unlocks, and neither is true while the evidence cannot be read.
+                # Re-arm would flip the frontmatter, strip the result and re-stamp
+                # the baseline on evidence nobody could read. Resolve stays OPEN: it
+                # is the non-destructive remedy, and a bad anchor is exactly what it
+                # repairs.
                 hint.append(
-                    "re-arm is refused while the spec is unreadable — it flips the "
-                    "frontmatter, strips the result and re-stamps the baseline on "
-                    "evidence nobody could read. Resolve stays OPEN: it is the "
-                    "non-destructive remedy, and a bad anchor is exactly what it "
-                    "repairs — `bmad-loop resolve` does the same from the CLI",
+                    "⚠ spec unreadable — Re-arm is refused; Resolve (or "
+                    "`bmad-loop resolve`) repairs it",
                     style="red",
                 )
             elif self._restore_recorded:
@@ -803,17 +925,16 @@ class EscalationModal(BaseDialog):
                 # indistinguishable from a fresh one), so Re-arm stays a plain
                 # from-scratch re-drive — but never a silent drop of the decision.
                 hint.append(
-                    "⚠ the resolution records a restore patch — Re-arm here re-drives "
-                    "from scratch and drops it; run `bmad-loop resolve` to honor the "
-                    "restore",
+                    "⚠ restore patch recorded — Re-arm re-drives from scratch and "
+                    "drops it; `bmad-loop resolve` honors it",
                     style="yellow",
                 )
             elif self._resolution_ready:
                 hint.append("resolution recorded — re-arm & resume when ready", style="green")
             else:
                 hint.append(
-                    "resolve opens an interactive agent to fix the frozen spec; "
-                    "re-arm unlocks once it records a resolution",
+                    "Resolve opens an agent to fix the frozen spec; Re-arm unlocks "
+                    "once it records a resolution",
                     style="dim",
                 )
             yield Static(hint, id="hint")
@@ -872,6 +993,14 @@ class ValidateFindingsModal(BaseDialog):
     }
     ValidateFindingsModal #findings {
         height: 1fr;
+    }
+    /* The header is three docked rows (verdict, meta, gates footer), each held
+       to one by BaseDialog .title, and the detail hint is a fourth. With 2 border
+       rows, 1 row of #findings and the 1-row -short button that is 8, and 80% of
+       a 9-row terminal is 7 — so under -short the definite height is lifted to
+       100%, as SpecReviewModal does, to fit the measured 39x9 pair (DW-358). */
+    ValidateFindingsModal.-short #dialog {
+        height: 100%;
     }
     """
 

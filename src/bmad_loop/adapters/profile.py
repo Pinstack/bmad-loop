@@ -47,6 +47,7 @@ from ..platform_util import (
     names_tree_root,
     names_win32_alias,
 )
+from ..policy import PROFILE_ALIASES
 from .entrypoints import record_load_error
 
 USAGE_PARSERS = {"claude-jsonl", "codex-rollout", "gemini-chat", "copilot-events", "none"}
@@ -60,11 +61,23 @@ HOOK_DIALECTS = {
     # no hook config is ever written, so config_path/events must stay empty.
     "none",
 }
-CANONICAL_EVENTS = {"SessionStart", "Stop", "SessionEnd", "PreCompact"}
+# Parked-session kinds (DW-348): the CLI is waiting on a human — a permission,
+# idle or quota prompt. A parked event never completes a session; the generic
+# adapter latches it and, only where the stall logic would otherwise type a wake
+# nudge into the pane, withholds the nudge and ends the session as parked
+# (`SessionResult.parked`). A profile reaches these either by mapping a native
+# event straight to one, or through the `Notification` carrier plus
+# `hooks.notification_types` (native subtype -> parked kind).
+PARKED_EVENTS = frozenset({"PermissionPrompt", "IdlePrompt", "QuotaPrompt"})
+CANONICAL_EVENTS = {"SessionStart", "Stop", "SessionEnd", "PreCompact", "Notification"} | set(
+    PARKED_EVENTS
+)
 USER_PROFILES_REL = Path(".bmad-loop") / "profiles"
 
-# legacy adapter names from older policy.toml files, plus friendly short names
-ALIASES = {"claude-code-tmux": "claude", "opencode": "opencode-http"}
+# Legacy adapter names from older policy.toml files, plus friendly short names.
+# The table itself lives in `policy` (see `PROFILE_ALIASES` there for why) and
+# is re-exported here under the name `get_profile` and `install` always used.
+ALIASES = PROFILE_ALIASES
 
 
 class ProfileError(Exception):
@@ -89,6 +102,33 @@ class HookSpec:
     dialect: str
     config_path: str  # project-relative, e.g. ".claude/settings.json"
     events: dict[str, str]  # native event name -> canonical event name
+    # Subtypes of the canonical `Notification` carrier that mean "parked on a
+    # human" (DW-348): the relay forwards the payload's `notification_type`, and
+    # this table maps it onto a PARKED_EVENTS kind — e.g. claude's
+    # `permission_prompt` -> `PermissionPrompt`. An unmapped subtype is ignored.
+    # Non-empty requires some native event mapped to `Notification`. APPENDED
+    # with a default so every positional HookSpec construction stays valid.
+    notification_types: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class WorkspaceTrustSpec:
+    """Where a CLI records the workspaces it trusts (DW-390).
+
+    Some CLIs gate every workspace on an exact-path allowlist in a home-level
+    settings file (agy: ``~/.gemini/antigravity-cli/settings.json``
+    ``trustedWorkspaces``), so a freshly provisioned worktree blocks on an
+    interactive trust dialog no spawned session can answer. Declaring the file
+    and its top-level list key lets :mod:`bmad_loop.workspace_trust` extend the
+    grant the operator already gave the project root to each unit worktree.
+
+    ``settings_path`` must be ``~/``-anchored (home-relative, no ``..``, no
+    Windows-alias component) and ``key`` names ONE top-level key — never a nested
+    path. Both are validated in :func:`_validate_profile`, so both profile routes
+    enforce the same shape."""
+
+    settings_path: str  # "~/"-prefixed, e.g. "~/.gemini/antigravity-cli/settings.json"
+    key: str  # a top-level key holding a list of path strings
 
 
 @dataclass(frozen=True)
@@ -170,6 +210,16 @@ class CLIProfile:
     # across every tracked file. Override/extend via a project profile in
     # .bmad-loop/profiles/.
     env_fault_patterns: tuple[str, ...] = ()
+    # Patterns matched line-by-line against the ANSI-stripped VISIBLE pane
+    # (`mux.capture_pane`), only at the moment a stall wake nudge is about to be
+    # typed into it (DW-350). A match means the CLI is parked on a prompt only a
+    # human should answer — the nudge's trailing Enter could confirm it (#727:
+    # Enter chose "No, exit" on Claude Code's Bypass Permissions dialog) — so the
+    # nudge is withheld and the session ends as parked instead. Same evidentiary
+    # bar as env_fault_patterns: seed only lines captured from the CLI's own
+    # screen, with single-character classes so the profile line does not match
+    # itself. Compiled and validated at parse time; empty = inert.
+    parked_prompt_patterns: tuple[str, ...] = ()
     # Did this profile ship INSIDE the package (bmad_loop/data/profiles/*.toml)?
     # Provenance, not configuration: it is stamped by `load_profiles` at the one
     # place that knows which directory a file came from, and no TOML key sets it —
@@ -188,6 +238,11 @@ class CLIProfile:
     # Provenance is that boundary; it answers "who wrote this", which is the
     # question actually being asked.
     packaged: bool = False
+    # Home-level workspace-trust allowlist this CLI gates sessions on (DW-390);
+    # None = the CLI has none, and provisioning never reads or writes under `~`.
+    # APPENDED with a default so every positional CLIProfile construction stays
+    # valid.
+    workspace_trust: WorkspaceTrustSpec | None = None
 
     @property
     def hookless(self) -> bool:
@@ -207,6 +262,20 @@ class CLIProfile:
             head, _, rest = prompt[1:].partition(" ")
             skill, args = head, rest.strip()
         return self.prompt_template.format(prompt=prompt, skill=skill, args=args)
+
+    def missing_bypass_tokens(self, extra_args: tuple[str, ...] | None) -> tuple[str, ...]:
+        """The ``bypass_args`` tokens a policy ``extra_args`` override drops (DW-349).
+
+        The replace rule (``GenericAdapter.interactive_argv``): a non-None
+        ``extra_args`` REPLACES ``bypass_args`` rather than extending it, so any
+        bypass token that is not an exact element of ``launch_args + extra_args``
+        is absent from the launched argv. ``None`` means "inherit the profile's
+        bypass flags" and drops nothing; ``()`` is an explicit override and drops
+        them all. Order kept, duplicates collapsed."""
+        if extra_args is None:
+            return ()
+        present = {*self.launch_args, *extra_args}
+        return tuple(t for t in dict.fromkeys(self.bypass_args) if t not in present)
 
 
 def _validate_profile(profile: CLIProfile, source: str) -> None:
@@ -242,8 +311,11 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
     if hooks.dialect == "none":
         # hookless: nothing is ever registered, so a config_path or events map
         # is a contradiction — reject rather than silently ignore.
-        if hooks.config_path or hooks.events:
-            raise fail('hookless profiles (dialect = "none") must not set hooks.config_path/events')
+        if hooks.config_path or hooks.events or hooks.notification_types:
+            raise fail(
+                'hookless profiles (dialect = "none") must not set '
+                "hooks.config_path/events/notification_types"
+            )
     else:
         if (
             names_tree_root(hooks.config_path)
@@ -265,6 +337,18 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
             raise fail(
                 f"hooks.events values must be canonical {sorted(CANONICAL_EVENTS)}: got {bad}"
             )
+        if hooks.notification_types:
+            bad_kinds = sorted(set(hooks.notification_types.values()) - PARKED_EVENTS)
+            if bad_kinds:
+                raise fail(
+                    "hooks.notification_types values must be parked kinds "
+                    f"{sorted(PARKED_EVENTS)}: got {bad_kinds}"
+                )
+            if "Notification" not in hooks.events.values():
+                raise fail(
+                    "hooks.notification_types needs a native event mapped to the "
+                    "canonical 'Notification' carrier in hooks.events"
+                )
 
     # Shape only — membership against the registered kinds is deliberately NOT
     # checked here (see the module docstring): that set is open-ended and lives in
@@ -367,11 +451,48 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
                 f"in a period or space: got {seed!r}"
             )
 
+    trust = profile.workspace_trust
+    if trust is not None:
+        settings_path = trust.settings_path
+        rest = settings_path[2:]
+        # Home-anchored and nothing else: the file lives outside the project, so
+        # the confinement is "under ~", and the remainder must name something
+        # inside home — not home itself, not an absolute path smuggled after the
+        # prefix (`~//etc/passwd` joins to `/etc/passwd`), not a `..` climb out.
+        if (
+            not settings_path.startswith("~/")
+            or names_tree_root(rest)
+            or is_absolute_path(rest)
+            or has_parent_ref(rest)
+        ):
+            raise fail(
+                "workspace_trust.settings_path must be a '~/'-prefixed path inside the "
+                f"home directory: got {settings_path!r}"
+            )
+        if names_win32_alias(rest):
+            raise fail(
+                "workspace_trust.settings_path must not name a Windows device or end a "
+                f"component in a period or space: got {settings_path!r}"
+            )
+        if not trust.key.strip() or trust.key != trust.key.strip():
+            raise fail(
+                "workspace_trust.key must name one top-level key (non-empty, no "
+                f"surrounding whitespace): got {trust.key!r}"
+            )
+
     for pattern in profile.env_fault_patterns:
         try:
             regex.compile(pattern)  # same engine the adapter matches with (timeout-guarded)
-        except regex.error as e:
+        except (regex.error, RecursionError) as e:
             raise fail(f"env_fault_patterns entry is not a valid regex: {pattern!r} ({e})") from e
+
+    for pattern in profile.parked_prompt_patterns:
+        try:
+            regex.compile(pattern)  # same engine the stall gate matches with (timeout-guarded)
+        except (regex.error, RecursionError) as e:
+            raise fail(
+                f"parked_prompt_patterns entry is not a valid regex: {pattern!r} ({e})"
+            ) from e
 
 
 def _legacy_adapter_default(dialect: str) -> str:
@@ -425,6 +546,27 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
     events_d = hooks_d.get("events", {})
     if not isinstance(events_d, dict):
         raise fail("hooks.events must map native event names to canonical ones")
+    notification_d = hooks_d.get("notification_types", {})
+    if not isinstance(notification_d, dict) or not all(
+        isinstance(v, str) for v in notification_d.values()
+    ):
+        raise fail("hooks.notification_types must map notification subtypes to parked kinds")
+
+    # Optional table; SHAPE here (a table of two strings), values in
+    # `_validate_profile`. A bare `str()` coercion would turn an array into the
+    # literal "['x']" and carry it to the filesystem as a path.
+    trust_d = doc.get("workspace_trust")
+    workspace_trust: WorkspaceTrustSpec | None = None
+    if trust_d is not None:
+        if not isinstance(trust_d, dict):
+            raise fail("workspace_trust must be a table")
+        unknown = sorted(set(trust_d) - {"settings_path", "key"})
+        if unknown:
+            raise fail(f"workspace_trust has unknown keys: {unknown}")
+        settings_path, key = trust_d.get("settings_path"), trust_d.get("key")
+        if not isinstance(settings_path, str) or not isinstance(key, str):
+            raise fail("workspace_trust.settings_path and workspace_trust.key must be strings")
+        workspace_trust = WorkspaceTrustSpec(settings_path=settings_path, key=key)
 
     # A dedicated shape check rather than the `str()` coercion the neighbouring
     # scalars get, because `adapter` has no parse-time membership test to land in
@@ -445,6 +587,7 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
             dialect=str(hooks_d.get("dialect", "")),
             config_path=str(hooks_d.get("config_path", "")),
             events={str(k): str(v) for k, v in events_d.items()},
+            notification_types={str(k): v for k, v in notification_d.items()},
         ),
         adapter=raw_adapter.strip(),
         skill_tree=str(doc.get("skill_tree", ".claude/skills")),
@@ -465,6 +608,8 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         first_run_note=str(doc.get("first_run_note", "")),
         seed_files=str_list("seed_files"),
         env_fault_patterns=str_list("env_fault_patterns"),
+        parked_prompt_patterns=str_list("parked_prompt_patterns"),
+        workspace_trust=workspace_trust,
     )
     _validate_profile(profile, source)
     return profile

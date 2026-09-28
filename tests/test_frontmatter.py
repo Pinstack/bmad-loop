@@ -14,7 +14,9 @@ RAISES rather than returning a `False` nobody reads when the reader can see a
 status it cannot safely move.
 """
 
+import os
 import sys
+from pathlib import Path
 
 import pytest
 import yaml
@@ -489,7 +491,7 @@ def test_set_frontmatter_status_write_failure_raises_and_keeps_the_spec(tmp_path
     spec = _spec(tmp_path, _PLAIN)
     before = spec.read_bytes()
 
-    def boom(path, data, *, confine_root, require_writable_target=False):
+    def boom(path, data, *, confine_root, require_writable_target=False, root_identity=None):
         raise OSError("no space left on device")
 
     monkeypatch.setattr(frontmatter, "atomic_write_bytes_confined", boom)
@@ -528,7 +530,7 @@ def test_set_frontmatter_status_hands_the_helper_bytes_not_text(tmp_path, monkey
     seen: list[bytes | str] = []
     real = frontmatter.atomic_write_bytes_confined
 
-    def record(path, data, *, confine_root, require_writable_target=False):
+    def record(path, data, *, confine_root, require_writable_target=False, root_identity=None):
         seen.append(data)
         blob = data if isinstance(data, bytes) else data.encode("utf-8")
         real(
@@ -536,6 +538,7 @@ def test_set_frontmatter_status_hands_the_helper_bytes_not_text(tmp_path, monkey
             blob,
             confine_root=confine_root,
             require_writable_target=require_writable_target,
+            root_identity=root_identity,
         )
 
     monkeypatch.setattr(frontmatter, "atomic_write_bytes_confined", record)
@@ -790,3 +793,656 @@ def test_auto_dev_baseline_of_precedence(fm, expected):
     empty-legacy-key row reads back ``""``.
     """
     assert frontmatter.auto_dev_baseline_of(fm) == expected
+
+
+# ============================================================ anchored writer
+#
+# `set_frontmatter_status_anchored` (DW-319/DW-323): the same edit, bound to one
+# target inode from the read through staging, publication and acceptance. One row
+# per I/O-matrix scenario of the spec that introduced it.
+
+requires_anchored = pytest.mark.skipif(
+    not platform_util.HANDLE_ANCHORED_WRITES, reason="needs a handle-anchored write arm"
+)
+_CRLF = _PLAIN.replace("\n", "\r\n")
+
+
+def _anchored_tree(tmp_path):
+    """`_tree`, canonicalized: the external arm demands a canonical parent, and a
+    tmp_path behind a link (macOS /var -> /private/var) would otherwise read as
+    an unsafe spelling rather than as the row being tested."""
+    return _tree(tmp_path.resolve())
+
+
+def _swap_in(spec, data: bytes) -> None:
+    """Replace ``spec`` with a NEW inode holding ``data`` — an editor's save."""
+    staged = spec.with_name(spec.name + ".swap")
+    staged.write_bytes(data)
+    os.replace(staged, spec)
+
+
+@requires_anchored
+def test_anchored_in_project_normalize_keeps_every_other_byte(tmp_path):
+    """Matrix row "in-project normalize": CRLF intact, only the status moved, and
+    the returned identity is the inode now at the name with the bytes it holds."""
+    root, _ = _anchored_tree(tmp_path)
+    spec = _spec(root / "artifacts", _CRLF)
+
+    published = frontmatter.set_frontmatter_status_anchored(spec, "done", confine_root=root)
+
+    expected = _CRLF.replace("status: in-review", "status: done").encode("utf-8")
+    assert spec.read_bytes() == expected
+    assert published.data == expected
+    assert os.path.samestat(published.stat, os.stat(spec))
+    assert list((root / "artifacts").glob("*.tmp")) == []
+
+
+@requires_anchored
+def test_anchored_external_normalize_walks_from_the_filesystem_root(tmp_path, monkeypatch):
+    """Matrix row "external normalize": a spec outside ``confine_root`` is no
+    longer handed to the plain path writer (DW-323). It is reached by a
+    filesystem-root walk, and the parent is re-walked after publication.
+
+    Ablation: route the external arm back to `set_frontmatter_status` and this
+    fails on ``roots`` (no anchored walk at all)."""
+    root, outside = _anchored_tree(tmp_path)
+    spec = _spec(outside, _PLAIN)
+    roots: list[tuple] = []
+    real_open = frontmatter.open_dir_confined
+
+    def record(walk_root, target, **kwargs):
+        roots.append((walk_root, target, kwargs.get("search_only", False)))
+        return real_open(walk_root, target, **kwargs)
+
+    monkeypatch.setattr(frontmatter, "open_dir_confined", record)
+
+    frontmatter.set_frontmatter_status_anchored(spec, "done", confine_root=root)
+
+    anchor = Path(spec.anchor)
+    assert roots == [(anchor, outside, True), (anchor, outside, True)]  # walk + re-probe
+    assert spec.read_bytes() == _PLAIN.replace("in-review", "done").encode("utf-8")
+
+
+@requires_anchored
+def test_anchored_already_at_target_writes_nothing(tmp_path):
+    """Matrix row "already at target": no write, same inode and version, and the
+    returned identity is the file as read."""
+    root, _ = _anchored_tree(tmp_path)
+    spec = _spec(root / "artifacts", _PLAIN)
+    before = os.stat(spec)
+
+    current = frontmatter.set_frontmatter_status_anchored(spec, "in-review", confine_root=root)
+
+    after = os.stat(spec)
+    assert os.path.samestat(before, after)
+    assert (before.st_mtime_ns, before.st_ctime_ns) == (after.st_mtime_ns, after.st_ctime_ns)
+    assert current.data == _PLAIN.encode("utf-8")
+    assert os.path.samestat(current.stat, after)
+
+
+@requires_anchored
+@pytest.mark.parametrize("edit", ["in-place", "new-inode-same-bytes", "same-stat-other-bytes"])
+def test_anchored_refuses_a_target_changed_since_expected(tmp_path, edit):
+    """Matrix row "restore then operator edit", at the primitive: an ``expected``
+    identity the file no longer matches refuses before any write. The
+    same-bytes swap pins that bytes alone are not the identity; the
+    same-stat case (an ``expected`` carrying the file's live stat but other
+    bytes — what one mtime tick can hide) pins that the bytes are compared, not
+    just the stat. The in-place edit is the ordinary operator save.
+
+    Ablation: drop the ``expected`` comparison and every case rewrites the
+    operator's file to ``status: done``; compare stats only and the
+    same-stat case does."""
+    root, _ = _anchored_tree(tmp_path)
+    spec = _spec(root / "artifacts", _PLAIN)
+    established = frontmatter.set_frontmatter_status_anchored(spec, "in-review", confine_root=root)
+    if edit == "same-stat-other-bytes":
+        operator = _PLAIN.encode("utf-8")
+        established = frontmatter.FileIdentity(established.stat, b"other")
+    elif edit == "in-place":
+        operator = _PLAIN.replace("# Spec", "# Operator").encode("utf-8")
+        with open(spec, "r+b") as fh:
+            fh.write(operator)
+    else:
+        operator = _PLAIN.encode("utf-8")
+        _swap_in(spec, operator)
+
+    with pytest.raises(frontmatter.FrontmatterTargetChangedError):
+        frontmatter.set_frontmatter_status_anchored(
+            spec, "done", confine_root=root, expected=established
+        )
+
+    assert spec.read_bytes() == operator
+
+
+@requires_anchored
+def test_anchored_accepts_the_identity_it_was_handed(tmp_path):
+    """The positive control for the row above: an unchanged ``expected`` writes."""
+    root, _ = _anchored_tree(tmp_path)
+    spec = _spec(root / "artifacts", _PLAIN)
+    established = frontmatter.set_frontmatter_status_anchored(spec, "in-review", confine_root=root)
+
+    frontmatter.set_frontmatter_status_anchored(
+        spec, "done", confine_root=root, expected=established
+    )
+
+    assert frontmatter.read_frontmatter(spec)["status"] == "done"
+
+
+def _hooked_writer(monkeypatch, hook: str, action):
+    """Wrap the anchored writer so ``action`` runs just before ``hook`` does."""
+    real = frontmatter.atomic_write_bytes_at
+
+    def wrapped(dir_fd, name, data, **kwargs):
+        inner = kwargs[hook]
+
+        def racing(*args):
+            action()
+            return inner(*args)
+
+        kwargs[hook] = racing
+        return real(dir_fd, name, data, **kwargs)
+
+    monkeypatch.setattr(frontmatter, "atomic_write_bytes_at", wrapped)
+
+
+@requires_anchored
+@pytest.mark.parametrize("hook", ["_before_staging", "_before_replace"])
+@pytest.mark.parametrize("race", ["swap", "edit"])
+def test_anchored_refuses_a_swap_before_publication(tmp_path, monkeypatch, hook, race):
+    """Matrix row "swap mid-transaction": a replace or in-place edit of the target
+    between the read and either pre-publication hook publishes nothing and
+    leaves no temp behind.
+
+    Ablation: drop the ``_before_staging``/``_before_replace`` revalidation and
+    the operator's bytes are overwritten with the stale edit."""
+    root, _ = _anchored_tree(tmp_path)
+    spec = _spec(root / "artifacts", _PLAIN)
+    operator = _PLAIN.replace("# Spec", "# Operator").encode("utf-8")
+
+    def interfere():
+        if race == "swap":
+            _swap_in(spec, operator)
+        else:
+            with open(spec, "r+b") as fh:
+                fh.write(operator)
+
+    _hooked_writer(monkeypatch, hook, interfere)
+
+    with pytest.raises(frontmatter.FrontmatterTargetChangedError):
+        frontmatter.set_frontmatter_status_anchored(spec, "done", confine_root=root)
+
+    assert spec.read_bytes() == operator
+    assert list((root / "artifacts").glob("*.tmp")) == []
+
+
+@requires_anchored
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows may refuse to replace a name whose inode the writer still holds open",
+)
+def test_anchored_post_publication_swap_fails_acceptance(tmp_path, monkeypatch):
+    """A name swapped away from the published inode fails acceptance loudly —
+    the writer never reports a publication the name no longer carries."""
+    root, _ = _anchored_tree(tmp_path)
+    spec = _spec(root / "artifacts", _PLAIN)
+    operator = b"---\nstatus: draft\n---\nlate operator save\n"
+    _hooked_writer(monkeypatch, "_after_replace", lambda: _swap_in(spec, operator))
+
+    with pytest.raises(frontmatter.FrontmatterTargetChangedError):
+        frontmatter.set_frontmatter_status_anchored(spec, "done", confine_root=root)
+
+    assert spec.read_bytes() == operator
+
+
+@requires_anchored
+@pytest.mark.skipif(sys.platform == "win32", reason="directory symlinks may need elevation")
+def test_anchored_external_parent_retarget_fails_acceptance(tmp_path, monkeypatch):
+    """The external arm's last acceptance step: a parent renamed and replaced by
+    a link after publication fails the fresh root walk."""
+    root, outside = _anchored_tree(tmp_path)
+    spec = _spec(outside, _PLAIN)
+    moved = outside.with_name("moved")
+
+    def retarget():
+        outside.rename(moved)
+        outside.symlink_to(moved, target_is_directory=True)
+
+    real_accept = frontmatter._accept_published
+
+    def accept_then_retarget(*args):
+        identity = real_accept(*args)
+        retarget()
+        return identity
+
+    monkeypatch.setattr(frontmatter, "_accept_published", accept_then_retarget)
+
+    with pytest.raises(frontmatter.FrontmatterTargetChangedError):
+        frontmatter.set_frontmatter_status_anchored(spec, "done", confine_root=root)
+
+
+@requires_anchored
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("where", ["in-project", "external"])
+def test_anchored_refuses_a_link_at_the_final_name(tmp_path, where):
+    """Matrix row "link target": a symlink at the spec name is never followed —
+    the file it points at is neither read into the edit nor written."""
+    root, outside = _anchored_tree(tmp_path)
+    victim = _spec(tmp_path.resolve(), _PLAIN, name="victim.md")
+    home = root / "artifacts" if where == "in-project" else outside
+    spec = home / "spec.md"
+    spec.symlink_to(victim)
+
+    with pytest.raises(frontmatter.FrontmatterTargetChangedError):
+        frontmatter.set_frontmatter_status_anchored(spec, "done", confine_root=root)
+
+    assert spec.is_symlink()
+    assert victim.read_bytes() == _PLAIN.encode("utf-8")
+
+
+@requires_anchored
+@pytest.mark.parametrize("swapped", ["payload-bytes", "other-bytes"])
+def test_anchored_settled_readback_refuses_a_swapped_inode(tmp_path, monkeypatch, swapped):
+    """The returned identity is read back after the writer releases the
+    published inode, and it must still BE that inode holding the payload. A
+    name swapped to a new inode in that window — even one carrying the payload
+    bytes — raises rather than being reported as what was published.
+
+    Ablation: drop the samestat/bytes conditions of the settled read-back and
+    both cases return the swapped file's identity."""
+    root, _ = _anchored_tree(tmp_path)
+    spec = _spec(root / "artifacts", _PLAIN)
+    payload = _PLAIN.replace("in-review", "done").encode("utf-8")
+    replacement = payload if swapped == "payload-bytes" else b"---\nstatus: draft\n---\nlate\n"
+    real_writer = frontmatter.atomic_write_bytes_at
+
+    def write_then_swap(*args, **kwargs):
+        real_writer(*args, **kwargs)
+        _swap_in(spec, replacement)
+
+    monkeypatch.setattr(frontmatter, "atomic_write_bytes_at", write_then_swap)
+
+    with pytest.raises(frontmatter.FrontmatterTargetChangedError, match="right after"):
+        frontmatter.set_frontmatter_status_anchored(spec, "done", confine_root=root)
+
+    assert spec.read_bytes() == replacement
+
+
+@requires_anchored
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs FIFOs")
+def test_anchored_fifo_racing_the_name_stat_is_opened_without_blocking(tmp_path, monkeypatch):
+    """The name stat passes (a regular file stood there), then the open meets a
+    FIFO. ``AT_NONBLOCK`` makes that open return at once — a read-only
+    nonblocking FIFO open succeeds, and the descriptor's own fstat then refuses
+    it — instead of waiting forever for a writer.
+
+    Ablation: drop ``AT_NONBLOCK`` from the target open and the call never
+    returns (the thread below is still blocked when the join times out)."""
+    import threading
+
+    root, _ = _anchored_tree(tmp_path)
+    regular = _spec(tmp_path.resolve(), _PLAIN, name="regular.md")
+    spec = root / "artifacts" / "spec.md"
+    os.mkfifo(spec)
+    real_stat = frontmatter._named_regular_stat
+    calls: list[int] = []
+
+    def regular_first(dir_fd, name, path):
+        calls.append(1)
+        if len(calls) == 1:
+            return os.stat(regular)
+        return real_stat(dir_fd, name, path)
+
+    monkeypatch.setattr(frontmatter, "_named_regular_stat", regular_first)
+    outcome: list[BaseException] = []
+
+    def attempt():
+        try:
+            frontmatter.set_frontmatter_status_anchored(spec, "done", confine_root=root)
+        except BaseException as exc:  # noqa: BLE001 — handed back to the test thread
+            outcome.append(exc)
+
+    worker = threading.Thread(target=attempt, daemon=True)
+    worker.start()
+    worker.join(timeout=10)
+    if worker.is_alive():
+        with open(spec, "wb"):  # release the blocked open so the thread can end
+            pass
+        pytest.fail("the anchored read blocked on a FIFO")
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], frontmatter.FrontmatterTargetChangedError)
+
+
+@requires_anchored
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_anchored_link_racing_the_name_stat_is_refused_by_the_open(tmp_path, monkeypatch):
+    """The name stat reports the link's TARGET (as if a regular file stood
+    there), then the open meets the link. ``AT_NOFOLLOW`` fails that open with
+    ``ELOOP``, and the errno is translated to `FrontmatterTargetChangedError`.
+
+    Ablation: drop ``AT_NOFOLLOW`` and the open follows the link — every check
+    agrees with the patched stat and the link is replaced by a write; drop the
+    errno translation and a raw ``OSError`` escapes instead."""
+    import errno
+
+    root, _ = _anchored_tree(tmp_path)
+    victim = _spec(tmp_path.resolve(), _PLAIN, name="victim.md")
+    spec = root / "artifacts" / "spec.md"
+    spec.symlink_to(victim)
+    monkeypatch.setattr(frontmatter, "_named_regular_stat", lambda *_a: os.stat(victim))
+
+    with pytest.raises(frontmatter.FrontmatterTargetChangedError) as raised:
+        frontmatter.set_frontmatter_status_anchored(spec, "done", confine_root=root)
+
+    assert isinstance(raised.value.__cause__, OSError)
+    assert raised.value.__cause__.errno == errno.ELOOP
+    assert spec.is_symlink()
+    assert victim.read_bytes() == _PLAIN.encode("utf-8")
+
+
+@requires_anchored
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs FIFOs")
+def test_anchored_refuses_a_fifo_without_blocking(tmp_path):
+    """Matrix row "non-regular target": a reader-less FIFO at the name raises
+    instead of wedging the read forever."""
+    root, _ = _anchored_tree(tmp_path)
+    spec = root / "artifacts" / "spec.md"
+    os.mkfifo(spec)
+
+    with pytest.raises(frontmatter.FrontmatterTargetChangedError):
+        frontmatter.set_frontmatter_status_anchored(spec, "done", confine_root=root)
+
+
+@requires_anchored
+@pytest.mark.skipif(sys.platform == "win32", reason="directory symlinks may need elevation")
+@pytest.mark.parametrize("where", ["in-project", "external"])
+def test_anchored_refuses_a_symlinked_parent(tmp_path, where):
+    """Matrix row "symlinked parent component": the walk refuses and nothing
+    lands behind the link. External arm included — the plain path writer it
+    replaces would have followed this link."""
+    root, outside = _anchored_tree(tmp_path)
+    elsewhere = tmp_path.resolve() / "elsewhere"
+    elsewhere.mkdir()
+    victim = _spec(elsewhere, _PLAIN)
+    if where == "in-project":
+        parent = root / "artifacts"
+        parent.rmdir()
+    else:
+        parent = outside / "linked"
+    parent.symlink_to(elsewhere, target_is_directory=True)
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        frontmatter.set_frontmatter_status_anchored(parent / "spec.md", "done", confine_root=root)
+
+    assert victim.read_bytes() == _PLAIN.encode("utf-8")
+    assert sorted(p.name for p in elsewhere.iterdir()) == ["spec.md"]
+
+
+@requires_anchored
+def test_anchored_refuses_a_readonly_spec(tmp_path):
+    """Matrix row "read-only spec": the kernel's `PermissionError`, as the path
+    writer raises (#597), and nothing staged."""
+    root, _ = _anchored_tree(tmp_path)
+    spec = _spec(root / "artifacts", _PLAIN)
+    spec.chmod(0o444)
+    try:
+        with pytest.raises(PermissionError):
+            frontmatter.set_frontmatter_status_anchored(spec, "done", confine_root=root)
+    finally:
+        spec.chmod(0o644)
+
+    assert spec.read_bytes() == _PLAIN.encode("utf-8")
+    assert list((root / "artifacts").glob("*.tmp")) == []
+
+
+@requires_anchored
+def test_anchored_keeps_the_unrewritable_shape_refusal(tmp_path):
+    """The edit semantics are shared, refusal included."""
+    root, _ = _anchored_tree(tmp_path)
+    text, _reads_as = _UNREWRITABLE["block-scalar"]
+    spec = _spec(root / "artifacts", text)
+
+    with pytest.raises(frontmatter.FrontmatterWriteError) as raised:
+        frontmatter.set_frontmatter_status_anchored(spec, "done", confine_root=root)
+
+    assert not isinstance(raised.value, frontmatter.FrontmatterTargetChangedError)
+    assert spec.read_bytes() == text.encode("utf-8")
+
+
+def test_anchored_without_handle_anchored_writes_raises_before_reading(tmp_path, monkeypatch):
+    """Matrix row "no anchored writes": no path-based fallback — the primitive
+    raises before it walks, reads, or writes anything."""
+    root, _ = _anchored_tree(tmp_path)
+    spec = _spec(root / "artifacts", _PLAIN)
+    monkeypatch.setattr(frontmatter, "HANDLE_ANCHORED_WRITES", False)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("the anchored writer walked without handle-anchored writes")
+
+    monkeypatch.setattr(frontmatter, "open_dir_confined", forbidden)
+    monkeypatch.setattr(frontmatter, "atomic_write_bytes", forbidden)
+    monkeypatch.setattr(frontmatter, "atomic_write_bytes_confined", forbidden)
+
+    with pytest.raises(frontmatter.FrontmatterWriteError):
+        frontmatter.set_frontmatter_status_anchored(spec, "done", confine_root=root)
+
+    assert spec.read_bytes() == _PLAIN.encode("utf-8")
+
+
+# ============================================================ worktree-mount pin (DW-423)
+#
+# `root_identity=` on `set_frontmatter_status`'s confined arm pins an
+# orchestrator-minted worktree mount. The swap: the mount renamed aside and a link
+# planted at its name to an outside tree carrying the same spec subpath.
+
+requires_symlinked_mount_swap = pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES or sys.platform == "win32",
+    reason="dir-fd anchoring and POSIX symlinks",
+)
+
+
+def _mount_swap_pair(tmp_path, text: str) -> tuple[Path, Path, os.stat_result]:
+    """A mount holding ``specs/6-4.md``, its accepted ``lstat`` identity, then the
+    mount swapped for a link to an outside copy. Returns (mount, outside spec,
+    identity)."""
+    mount = tmp_path / "project" / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    (mount / "specs").mkdir(parents=True)
+    (mount / "specs" / "6-4.md").write_text(text, encoding="utf-8")
+    identity = os.lstat(mount)
+    outside = tmp_path / "outside"
+    (outside / "specs").mkdir(parents=True)
+    (outside / "specs" / "6-4.md").write_text(text, encoding="utf-8")
+    mount.rename(mount.with_name("1-aside"))
+    mount.symlink_to(outside, target_is_directory=True)
+    return mount, outside / "specs" / "6-4.md", identity
+
+
+@requires_symlinked_mount_swap
+def test_set_frontmatter_status_pinned_mount_refuses_a_mount_swapped_for_a_link(tmp_path):
+    """The pinned write refuses a swapped mount and leaves the outside bytes alone;
+    the unpinned control shows the same swap really lands outside.
+
+    Ablation: drop the `root_identity=` forward in `set_frontmatter_status` and the
+    pinned call lands outside instead of raising."""
+    text = "---\nstatus: blocked\n---\nbody\n"
+    mount, outside_spec, identity = _mount_swap_pair(tmp_path, text)
+    spec = mount / "specs" / "6-4.md"
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        frontmatter.set_frontmatter_status(
+            spec, "in-progress", confine_root=mount, root_identity=identity
+        )
+    assert outside_spec.read_text(encoding="utf-8") == text
+
+    # Control: unpinned, the swap carries the write outside the repository.
+    assert frontmatter.set_frontmatter_status(spec, "in-progress", confine_root=mount)
+    assert "status: in-progress" in outside_spec.read_text(encoding="utf-8")
+
+
+@requires_symlinked_mount_swap
+def test_set_frontmatter_status_anchored_pinned_mount_refuses_a_mount_swapped_for_a_link(
+    tmp_path,
+):
+    """DW-445: the descriptor-anchored writer (recovery's attempt-owned
+    normalization) pins its in-project root the same way — a swapped mount refuses
+    with `UnconfinedWriteError` and the outside bytes are unchanged; the unpinned
+    control shows the same swap really lands outside.
+
+    Ablation: drop the `root_identity` forward from `set_frontmatter_status_anchored`
+    to `_open_anchored_parent` (or from there to `open_dir_confined`) and the pinned
+    call rewrites the outside copy instead of raising."""
+    text = "---\nstatus: done\n---\nbody\n"
+    mount, outside_spec, identity = _mount_swap_pair(tmp_path, text)
+    spec = mount / "specs" / "6-4.md"
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        frontmatter.set_frontmatter_status_anchored(
+            spec, "ready-for-dev", confine_root=mount, root_identity=identity
+        )
+    assert outside_spec.read_text(encoding="utf-8") == text
+
+    # Control: unpinned, the swap carries the write outside the repository.
+    frontmatter.set_frontmatter_status_anchored(spec, "ready-for-dev", confine_root=mount)
+    assert "status: ready-for-dev" in outside_spec.read_text(encoding="utf-8")
+
+
+@requires_symlinked_mount_swap
+def test_set_frontmatter_status_anchored_pinned_intact_mount_writes(tmp_path):
+    """The pin binds nothing extra on an intact mount: the identity matches and the
+    write lands in the mount."""
+    mount = tmp_path / "project" / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    (mount / "specs").mkdir(parents=True)
+    spec = mount / "specs" / "6-4.md"
+    spec.write_text("---\nstatus: done\n---\nbody\n", encoding="utf-8")
+
+    frontmatter.set_frontmatter_status_anchored(
+        spec, "ready-for-dev", confine_root=mount, root_identity=os.lstat(mount)
+    )
+    assert "status: ready-for-dev" in spec.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------- external-arm pin pre-check (DW-445)
+#
+# A pinned writer handed a path OUTSIDE its `confine_root` — here the spec's resolved
+# spelling after the mount was swapped for a link, which is what a reset or a relative
+# binding resolved through the swap produces — pre-checks that the root is still the
+# pinned directory. An intact mount whose `_bmad-output` is a link resolving outside
+# it passes that check and writes exactly as unpinned.
+
+
+def _external_after_swap(tmp_path, text: str) -> tuple[Path, Path, os.stat_result]:
+    """(mount, the spec's canonical OUTSIDE path, the mount's accepted identity) —
+    the mount already swapped for a link to the outside copy."""
+    mount, outside_spec, identity = _mount_swap_pair(tmp_path, text)
+    return mount, outside_spec.resolve(), identity
+
+
+def _external_behind_linked_output(tmp_path, text: str) -> tuple[Path, Path, os.stat_result]:
+    """(intact mount, the spec's canonical path under a `_bmad-output` link resolving
+    outside the mount, the mount's identity)."""
+    mount = tmp_path / "project" / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    mount.mkdir(parents=True)
+    shared = tmp_path / "shared-output"
+    (shared / "specs").mkdir(parents=True)
+    (shared / "specs" / "6-4.md").write_text(text, encoding="utf-8")
+    (mount / "_bmad-output").symlink_to(shared, target_is_directory=True)
+    return mount, (shared / "specs" / "6-4.md").resolve(), os.lstat(mount)
+
+
+@requires_symlinked_mount_swap
+def test_set_frontmatter_status_external_arm_refuses_a_swapped_pinned_root(tmp_path):
+    """The path writer's external arm pre-checks a given pin: the mount swapped
+    before the path was resolved refuses and the outside bytes are unchanged; the
+    unpinned control (None) writes them as before.
+
+    Ablation: drop the `require_root_pinned` pre-check from the external arm and
+    the pinned call rewrites the outside copy."""
+    text = "---\nstatus: done\n---\nbody\n"
+    mount, outside_spec, identity = _external_after_swap(tmp_path, text)
+
+    with pytest.raises(platform_util.UnconfinedWriteError, match="pinned to"):
+        frontmatter.set_frontmatter_status(
+            outside_spec, "in-progress", confine_root=mount, root_identity=identity
+        )
+    assert outside_spec.read_text(encoding="utf-8") == text
+
+    assert frontmatter.set_frontmatter_status(outside_spec, "in-progress", confine_root=mount)
+    assert "status: in-progress" in outside_spec.read_text(encoding="utf-8")
+
+
+@requires_symlinked_mount_swap
+def test_set_frontmatter_status_external_arm_writes_through_an_intact_pinned_root(tmp_path):
+    """An intact pinned mount whose `_bmad-output` resolves outside it: the external
+    arm's pre-check passes and the write lands as it does unpinned."""
+    text = "---\nstatus: done\n---\nbody\n"
+    mount, spec, identity = _external_behind_linked_output(tmp_path, text)
+
+    assert frontmatter.set_frontmatter_status(
+        spec, "in-progress", confine_root=mount, root_identity=identity
+    )
+    assert "status: in-progress" in spec.read_text(encoding="utf-8")
+
+
+@requires_symlinked_mount_swap
+def test_set_frontmatter_status_anchored_external_arm_refuses_a_swapped_pinned_root(tmp_path):
+    """The anchored writer's external arm (recovery's binding resolved through a
+    swapped mount is canonical OUTSIDE it) pre-checks a given pin: refused, outside
+    bytes unchanged; the unpinned control rewrites them.
+
+    Ablation: drop the `require_root_pinned` pre-check from `_open_anchored_parent`'s
+    external arm (or the `root_identity` forward from `set_frontmatter_status_anchored`)
+    and the pinned call rewrites the outside copy."""
+    text = "---\nstatus: done\n---\nbody\n"
+    mount, outside_spec, identity = _external_after_swap(tmp_path, text)
+
+    with pytest.raises(platform_util.UnconfinedWriteError, match="pinned to"):
+        frontmatter.set_frontmatter_status_anchored(
+            outside_spec, "ready-for-dev", confine_root=mount, root_identity=identity
+        )
+    assert outside_spec.read_text(encoding="utf-8") == text
+
+    frontmatter.set_frontmatter_status_anchored(outside_spec, "ready-for-dev", confine_root=mount)
+    assert "status: ready-for-dev" in outside_spec.read_text(encoding="utf-8")
+
+
+@requires_symlinked_mount_swap
+def test_set_frontmatter_status_anchored_external_arm_writes_through_an_intact_pinned_root(
+    tmp_path,
+):
+    """An intact pinned mount with a linked `_bmad-output`: the anchored external
+    arm writes as it does unpinned."""
+    text = "---\nstatus: done\n---\nbody\n"
+    mount, spec, identity = _external_behind_linked_output(tmp_path, text)
+
+    frontmatter.set_frontmatter_status_anchored(
+        spec, "ready-for-dev", confine_root=mount, root_identity=identity
+    )
+    assert "status: ready-for-dev" in spec.read_text(encoding="utf-8")
+
+
+@requires_symlinked_mount_swap
+def test_set_frontmatter_field_external_arm_refuses_a_swapped_pinned_root(tmp_path):
+    """`verify.set_frontmatter_field` shares the rule: a pinned external write
+    through a swapped mount refuses, outside bytes unchanged; the unpinned control
+    lands; an intact pinned mount behind a linked `_bmad-output` lands too.
+
+    Ablation: drop the `require_root_pinned` pre-check from its external arm and the
+    pinned call rewrites the outside copy."""
+    text = "---\nstatus: done\n---\nbody\n"
+    mount, outside_spec, identity = _external_after_swap(tmp_path / "swap", text)
+
+    with pytest.raises(platform_util.UnconfinedWriteError, match="pinned to"):
+        verify.set_frontmatter_field(
+            outside_spec, "baseline_revision", "abc", confine_root=mount, root_identity=identity
+        )
+    assert outside_spec.read_text(encoding="utf-8") == text
+    assert verify.set_frontmatter_field(
+        outside_spec, "baseline_revision", "abc", confine_root=mount
+    )
+    assert "baseline_revision: abc" in outside_spec.read_text(encoding="utf-8")
+
+    mount, spec, identity = _external_behind_linked_output(tmp_path / "intact", text)
+    assert verify.set_frontmatter_field(
+        spec, "baseline_revision", "abc", confine_root=mount, root_identity=identity
+    )
+    assert "baseline_revision: abc" in spec.read_text(encoding="utf-8")

@@ -49,7 +49,8 @@ from bmad_loop.adapters.profile import get_profile
 # `opencode` because the file it scans (`<task_id>.server.out`) is the serve
 # process's own stdout, which the model cannot write to at all; `claude` because
 # its log IS model-written (a tmux pane capture) and each of its patterns instead
-# reproduces one complete captured CLI sentence, which a paraphrase cannot reach.
+# reproduces the whole first sentence of a captured CLI error (a prefix match),
+# which a paraphrase cannot reach.
 # Both are held to the full BAIT corpus.
 SEEDED_PROFILES = ("opencode", "claude")
 # The seeded profiles whose scanned log is a tmux PANE CAPTURE — bytes the model
@@ -85,8 +86,9 @@ OPENCODE_REAL = [
 ]
 
 # Claude Code surfaces provider failures behind its own "API Error" prefix, and
-# claude.toml reproduces each of these sentences WHOLE rather than pairing the
-# prefix with a loose cause — that completeness is the only thing separating an
+# claude.toml reproduces each message's first sentence WHOLE (as a prefix match —
+# the rest of the message is not required) rather than pairing the prefix with a
+# loose cause — that completeness is the only thing separating an
 # emitted line from a story writing about one, because this profile's log is a
 # pane capture of the model's own output (#507).
 #
@@ -159,13 +161,13 @@ ANCHOR_REACHING_BAIT = [
     # patterns matched none of BAIT and none of the nine lines above even
     # BEFORE the fix, so promoting claude into SEEDED_PROFILES proves nothing on
     # its own. Do not "simplify" them back out of the corpus: they are the
-    # paraphrases the complete-sentence patterns exist to reject.
+    # paraphrases the first-sentence patterns exist to reject.
     '  assert log == "API Error: Connection refused"',
     'docs: explain the "API Error: Unable to connect" retry path',
     "- [ ] AC-5: show a banner on API Error: Connection timed out",
     'expect(msg).toBe("API Error: Connection error")',
     "// handle API Error: ECONNREFUSED by retrying with backoff",
-    # The 5xx half of the same rule, and the one place a COMPLETE sentence is
+    # The 5xx half of the same rule, and the one place a whole first sentence is
     # still not enough on its own: the status is a field, so ranging over it
     # (`5[0-9][0-9]`) re-admits the paraphrase the sentence was meant to exclude.
     # Only two pairings were ever captured (`529 Overloaded`, `500 Internal
@@ -207,11 +209,62 @@ INSEPARABLE_VERBATIM_CITATIONS = [
     "expect(parse(line)).toEqual({error: 'error.error=\"AI_APICallError: quota exceeded\"'})",
 ]
 
-# The literal each seeded profile's patterns key on. Used to prove the corpus
-# above actually reaches them, rather than trusting that it does.
+# The literal each seeded profile's patterns key on, DERIVED from the live
+# patterns rather than hand-copied (DW-373): a hand copy only proved the corpus
+# below reached the COPY, and nothing noticed when a pattern edit moved the anchor
+# away from it. Used to prove the corpus actually reaches the anchor, rather than
+# trusting that it does. `test_anchor_literal_is_the_live_patterns_anchor` guards
+# the derivation itself against going vacuous (an empty anchor is `in` every line).
+_REGEX_METACHARS = frozenset(".^$*+?{}[]()|\\")
+_QUANTIFIERS = frozenset("?*+{")
+_SINGLE_CHAR_CLASS = regex.compile(r"\[([^\\\]^])\]")
+MIN_ANCHOR_LEN = 8
+
+
+def _leading_literal(pattern: str) -> list[tuple[str, str]]:
+    """The (raw spelling, literal char) tokens a pattern opens with: plain chars, a
+    single-character class `[x]`, and a backslash-escaped punctuation char each
+    read as that literal char; anything else ends the run. A token followed by a
+    quantifier is optional (or repeated), so it and everything after it are not a
+    guaranteed prefix — the run ends before it."""
+    tokens: list[tuple[str, str]] = []
+    i = 0
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "\\" and i + 1 < len(pattern) and not pattern[i + 1].isalnum():
+            raw, lit = pattern[i : i + 2], pattern[i + 1]
+        elif c == "[":
+            m = _SINGLE_CHAR_CLASS.match(pattern, i)
+            if m is None:
+                break
+            raw, lit = m.group(0), m.group(1)
+        elif c in _REGEX_METACHARS:
+            break
+        else:
+            raw, lit = c, c
+        i += len(raw)
+        if i < len(pattern) and pattern[i] in _QUANTIFIERS:
+            break
+        tokens.append((raw, lit))
+    return tokens
+
+
+def _derive_anchor(patterns: tuple[str, ...]) -> str:
+    """Longest common prefix of the patterns' leading literal runs."""
+    literals = ["".join(lit for _, lit in _leading_literal(p)) for p in patterns]
+    if not literals:
+        return ""
+    anchor = literals[0]
+    for lit in literals[1:]:
+        n = 0
+        while n < min(len(anchor), len(lit)) and anchor[n] == lit[n]:
+            n += 1
+        anchor = anchor[:n]
+    return anchor
+
+
 PROFILE_ANCHOR_LITERAL = {
-    "opencode": 'error.error="AI_APICallError: ',
-    "claude": "API Error: ",
+    name: _derive_anchor(get_profile(name).env_fault_patterns) for name in SEEDED_PROFILES
 }
 
 # Ordinary output from a healthy session working on a story that involves rate
@@ -439,6 +492,34 @@ def test_anchor_reaching_bait_is_not_vacuous(name: str) -> None:
     anchor = PROFILE_ANCHOR_LITERAL[name]
     reaching = [line for line in ANCHOR_REACHING_BAIT if anchor in line]
     assert reaching, f"no ANCHOR_REACHING_BAIT line contains {name}'s anchor {anchor!r}"
+
+
+@pytest.mark.parametrize("name", SEEDED_PROFILES)
+def test_anchor_literal_is_the_live_patterns_anchor(name: str) -> None:
+    """DW-373: guards the derivation of `PROFILE_ANCHOR_LITERAL`. The vacuity guard
+    above is only as good as its input — an empty or trivially short anchor is
+    `in` every bait line, so a derivation that silently went vacuous would pass it
+    for every reason. Assert the derived anchor is meaningful, and that every live
+    pattern opens with a regex spelling of it: the pattern's own leading tokens,
+    run through the regex engine, must match the anchor exactly — so a decoding
+    slip in `_leading_literal` cannot fake the prefix.
+
+    ABLATION: make `_derive_anchor` return "" (or stop decoding `[.]`) and this
+    reddens; move a live pattern's anchor off the corpus and the guard above does."""
+    patterns = get_profile(name).env_fault_patterns
+    assert patterns, f"{name} ships no env_fault_patterns"
+    anchor = PROFILE_ANCHOR_LITERAL[name]
+    assert (
+        len(anchor) >= MIN_ANCHOR_LEN
+    ), f"{name}: derived anchor {anchor!r} is shorter than {MIN_ANCHOR_LEN} chars"
+    for pattern in patterns:
+        tokens = _leading_literal(pattern)[: len(anchor)]
+        spelling = "".join(raw for raw, _ in tokens)
+        assert pattern.startswith(spelling), (name, pattern)
+        assert regex.fullmatch(spelling, anchor), (
+            f"{name}: live pattern {pattern!r} does not open with anchor {anchor!r} "
+            f"(its leading spelling {spelling!r})"
+        )
 
 
 @pytest.mark.parametrize(("name", "line"), REAL_BY_PROFILE)

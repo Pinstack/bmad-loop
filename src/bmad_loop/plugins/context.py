@@ -94,6 +94,8 @@ class HookContext:
         verification_stage: str | None = None,
         verification_sequence: int | None = None,
         decision_action: str | None = None,
+        delivery_id: str | None = None,
+        rollback_outcome: str | None = None,
         settings: dict[str, Any] | None = None,
         shared: dict[str, Any] | None = None,
         proposed_prompt: str | None = None,
@@ -136,10 +138,14 @@ class HookContext:
         # The journal correlation keys for the pass those records came from —
         # `verification_stage` is also the dev-vs-repair discriminator, which
         # neither `stage` (both legs emit `post_dev_verify`) nor `phase` (both
-        # are DEV_VERIFY) nor `attempt` (one counter, shared) can supply.
+        # are DEV_VERIFY) nor `attempt` (one counter, shared) can supply. The
+        # review gate publishes the same pair on `post_review_verify`, always
+        # under `"review"` when its command pass ran.
         self._verification_stage = verification_stage
         self._verification_sequence = verification_sequence
         self._decision_action = decision_action
+        self._delivery_id = delivery_id
+        self._rollback_outcome = rollback_outcome
         self._settings = dict(settings) if settings is not None else {}
         # free-form, persisted across stages (engine backs it with plugin_shared)
         self.shared: dict[str, Any] = shared if shared is not None else {}
@@ -220,7 +226,8 @@ class HookContext:
     def command_results(self) -> tuple[CommandResult, ...]:
         """The verifier ``CommandResult`` records from this attempt's verify pass,
         in the order the commands ran. Read-only observability for
-        ``post_dev_verify``; nothing here feeds an engine decision.
+        ``post_dev_verify`` (dev and repair legs) and ``post_review_verify``
+        (review verify gate); nothing here feeds an engine decision.
 
         Each record carries ``command``, ``returncode``, the merged bounded
         ``output_tail``, the separate ``stdout`` / ``stderr`` streams with their
@@ -255,20 +262,30 @@ class HookContext:
           empty. No journal record exists for it either.
         * ``verification_stage`` set with an int ``verification_sequence`` — those
           commands ran, and each has a matching journal entry (see that property).
+
+        On ``post_review_verify`` the ``None``-stage case has a single cause: one
+        of the gate's artifact checks refused before the command pass ran, and
+        ``verify_reason`` names it. There ``session_status`` describes the review
+        session whose product was gated, and is ``None`` on the skip-review path,
+        where no review session ran. The other two cases read as above.
         """
         return self._command_results
 
     @property
     def verification_stage(self) -> str | None:
         """Which leg produced :attr:`command_results` — ``"dev"`` for the initial
-        dev verification, ``"fix"`` for a feedback-driven repair one, ``None``
-        when no verify pass ran (see :attr:`command_results`).
+        dev verification, ``"fix"`` for a feedback-driven repair one, ``"review"``
+        for a review verify gate (``post_review_verify``), ``None`` when no
+        verify pass ran (see :attr:`command_results`).
 
-        This is the ONLY discriminator between the two. ``stage`` and ``phase``
-        are literally identical across them (``post_dev_verify`` from
-        ``Phase.DEV_VERIFY``), and ``attempt`` is one per-story counter the
-        repair leg CONTINUES rather than restarts — so its value orders the two
-        but never names either, and a human re-arm reuses the numbers outright.
+        On ``post_dev_verify`` this is the ONLY discriminator between dev and
+        fix. ``stage`` and ``phase`` are literally identical across them
+        (``post_dev_verify`` from ``Phase.DEV_VERIFY``), and ``attempt`` is one
+        per-story counter the repair leg CONTINUES rather than restarts — so its
+        value orders the two but never names either, and a human re-arm reuses
+        the numbers outright. ``post_review_verify`` only ever carries
+        ``"review"`` or ``None``; which of its gate visits fired is told by the
+        neighbouring journal entries, not by this field.
         """
         return self._verification_stage
 
@@ -289,6 +306,43 @@ class HookContext:
     @property
     def decision_action(self) -> str | None:
         return self._decision_action
+
+    @property
+    def delivery_id(self) -> str | None:
+        """Stable identity of the event this emit delivers, or ``None`` on stages
+        that carry none. Today only ``post_migrate`` sets it (DW-317).
+
+        Such a stage gets **at least one delivery attempt**: the engine records
+        the event durably before firing the hook and replays the emit on resume
+        until an emit has returned, so a process or host death can make the SAME
+        event fire again with the SAME ``delivery_id``. A returned emit counts as
+        delivered even when a handler failed: a Python raise, a declarative
+        error, timeout or non-zero exit is absorbed by the bus and never retried,
+        and a veto on ``post_migrate`` is ignored. A handler with non-idempotent
+        side effects should deduplicate on this value. A genuinely new event
+        (e.g. a later re-migration) always carries a new id. Declarative hooks
+        read it as ``BMAD_LOOP_DELIVERY_ID``.
+        """
+        return self._delivery_id
+
+    @property
+    def rollback_outcome(self) -> str | None:
+        """How the rollback this ``post_rollback`` closes ended, or ``None`` on
+        every other stage (``pre_rollback`` included). Set only on
+        ``post_rollback`` (DW-322), which fires exactly once for every emitted
+        ``pre_rollback`` — even when the rollback does not finish:
+
+        * ``"completed"`` — the rollback ran to its end;
+        * ``"paused"`` — it stopped to pause the run for manual recovery (an
+          owned-spec recovery, a preservation failure, or a refused reset); the
+          tree may be partially reset;
+        * ``"failed"`` — an unexpected error escaped it; the tree may be
+          partially reset and the run's error propagates after this emit.
+
+        Observe-only: the engine never reads a hook's reaction to it. Declarative
+        hooks read it as ``BMAD_LOOP_ROLLBACK_OUTCOME``.
+        """
+        return self._rollback_outcome
 
     @property
     def settings(self) -> dict[str, Any]:

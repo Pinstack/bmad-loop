@@ -11,10 +11,17 @@ the modals; this is the last-resort observability net that tells a human one sli
 through and is now freezing the MCP dispatch loop.
 
 Report on a fresh detection (deduped per window id, per probe lifetime):
-  1. a JSONL line to ``<run_dir>/unity-dialog-probe.jsonl`` — ``{ts, window, title}``;
-  2. a line to ``<run_dir>/ATTENTION`` in the same format as ``gates.notify``;
+  1. a JSONL line to ``<run_dir>/unity-dialog-probe.jsonl`` — ``{ts, window, title}``
+     with the RAW window title (``json.dumps`` escapes it; the full-detail record);
+  2. ONE line to ``<run_dir>/ATTENTION`` in the same format as ``gates.notify``, and
+     shaped like it: the untrusted X11 window title goes through
+     ``gates.notice_line`` (control/surrogate characters escaped, line breaks
+     folded, backstop cap), so a hostile title cannot forge extra ATTENTION lines;
   3. a best-effort ``notify-send`` desktop notification (guarded by ``shutil.which``,
-     gated by ``BMAD_LOOP_UNITY_DIALOG_PROBE_NOTIFY``), mirroring ``gates.notify``.
+     gated by ``BMAD_LOOP_UNITY_DIALOG_PROBE_NOTIFY``) carrying the same shaped text,
+     with ``--`` before the positionals as defense-in-depth mirroring
+     ``gates._notifier_argv`` (the summary is a constant and the body always starts
+     ``window <id>: ``, so no positional can begin with ``-`` today).
 
 Lifecycle: launched detached by ``UnityPlugin`` (shared mode: at ``pre_run``;
 per_worktree: at ``pre_worktree_setup``) with the project/worktree path in argv, so
@@ -51,8 +58,10 @@ import sys
 import time
 from pathlib import Path
 
-# bmad-loop's own dep-free liveness/pid helpers (run under sys.executable, so the
-# package is importable — same contract unity_teardown.py relies on for process_host).
+# bmad-loop's own dep-free liveness/pid helpers and notice shaping (run under
+# sys.executable, so the package is importable — same contract unity_teardown.py
+# relies on for process_host).
+from bmad_loop.gates import notice_line
 from bmad_loop.runs import engine_alive, write_named_pid
 
 PROBE_PID_FILE = "unity-dialog-probe.pid"
@@ -106,7 +115,14 @@ def _interval() -> float:
 
 
 def _run_xdotool(args: list[str], timeout: float = 10.0) -> subprocess.CompletedProcess:
-    return subprocess.run(["xdotool", *args], capture_output=True, text=True, timeout=timeout)
+    return subprocess.run(
+        ["xdotool", *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+    )
 
 
 def _unity_window_ids(run) -> list[str]:
@@ -157,12 +173,17 @@ def _report(run_dir: Path, wid: str, name: str, *, notify: bool) -> None:
             fh.write(json.dumps({"ts": ts, "window": wid, "title": name}) + "\n")
     except OSError:
         pass
-    # ATTENTION line: identical shape to gates.notify's file sink.
+    # ATTENTION line: identical shape AND shaping to gates.notify's file sink. The
+    # window title is untrusted, so title and message pass through notice_line
+    # (one line, controls/surrogates escaped); the JSONL above keeps the raw title.
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    message = f"window {wid}: {name}"
+    title = notice_line(_TITLE)
+    message = notice_line(f"window {wid}: {name}")
     try:
-        with (run_dir / ATTENTION_FILE).open("a", encoding="utf-8") as fh:
-            fh.write(f"[{stamp}] {_TITLE}: {message}\n")
+        with (run_dir / ATTENTION_FILE).open(
+            "a", encoding="utf-8", errors="backslashreplace"
+        ) as fh:
+            fh.write(f"[{stamp}] {title}: {message}\n")
     except OSError:
         pass
     # portability: notify-send is Linux-only; the shutil.which guard makes this a
@@ -170,7 +191,10 @@ def _report(run_dir: Path, wid: str, name: str, *, notify: bool) -> None:
     if notify and shutil.which("notify-send"):
         try:
             subprocess.run(
-                ["notify-send", "--app-name=bmad-loop", _TITLE, message],
+                # `--` is defense-in-depth mirroring gates._notifier_argv: neither
+                # positional can begin with `-` today (constant summary, body
+                # starts `window <id>: `), but option parsing ends here regardless.
+                ["notify-send", "--app-name=bmad-loop", "--", title, message],
                 timeout=10,
                 capture_output=True,
             )

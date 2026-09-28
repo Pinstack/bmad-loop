@@ -80,12 +80,29 @@ def _usage_block(entry: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def tally(transcript_path: Path) -> TokenUsage:
+_CLAUDE_USAGE_KEYS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+)
+
+
+def tally(transcript_path: Path) -> TokenUsage | None:
+    """Sum every assistant `usage` block, or None when the transcript holds none.
+
+    None (a missing file, or no usage-bearing line) is "no usage signal" and must
+    never read as free (DW-364): a zeroed TokenUsage is reserved for a transcript
+    that did report usage — an all-zero block still counts as seen — so a caller
+    can tell tracked zero spend from untracked."""
     total = TokenUsage()
+    seen = False
     for entry in _jsonl_entries(transcript_path):
         usage = _usage_block(entry)
-        if not usage:
+        # Absent, empty `{}`, or no recognized token key: no usage signal here.
+        if not usage or not any(key in usage for key in _CLAUDE_USAGE_KEYS):
             continue
+        seen = True
         total.add(
             TokenUsage(
                 input_tokens=_int(usage.get("input_tokens")),
@@ -94,7 +111,7 @@ def tally(transcript_path: Path) -> TokenUsage:
                 cache_creation_tokens=_int(usage.get("cache_creation_input_tokens")),
             )
         )
-    return total
+    return total if seen else None
 
 
 # ----------------------------------------------------------- codex-rollout

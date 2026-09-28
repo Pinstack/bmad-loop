@@ -29,9 +29,13 @@
 # "Do you trust the contents of this project?" dialog until answered.
 # `--dangerously-skip-permissions` does NOT bypass it — that flag covers tool
 # permissions only. Matching is EXACT-PATH: trusting /tmp does not cover
-# /tmp/foo. Consequences: `isolation = "none"` (the default) works once the
-# project root is trusted; `isolation = "worktree"` does NOT — each worktree is
-# a fresh path under .bmad-loop/runs/, so every session would hang on the dialog.
+# /tmp/foo. `isolation = "none"` (the default) works once the project root is
+# trusted. `isolation = "worktree"` works too, via [workspace_trust] below: after
+# provisioning each unit worktree, bmad-loop appends its path to
+# `trustedWorkspaces` — only when the project root is already listed there (the
+# worktree inherits the operator's grant; it never creates trust from nothing).
+# Entries accumulate one per unit; teardown does not remove them. Verify a path
+# with `bmad-loop probe-adapter antigravity --workspace <path>` (DW-390, ex-#169).
 name = "antigravity"
 binary = "agy"
 prompt_template = "{prompt}"
@@ -39,7 +43,7 @@ launch_args = ["-i"]
 bypass_args = ["--dangerously-skip-permissions"]
 model_flag = "--model"
 usage_parser = "none"
-first_run_note = "run `agy` once in the project and authenticate + answer 'Yes, I trust this folder' before `bmad-loop run` — spawned sessions can't answer first-run dialogs, and a pending one reads as a session timeout. Requires Antigravity CLI (agy >= 1.1.3). Trust is exact-path (settings.json trustedWorkspaces): trusting a parent does NOT cover subdirectories, and --dangerously-skip-permissions does not bypass it — so antigravity requires isolation = \"none\" (the default); isolation = \"worktree\" will hang, as each worktree is an untrusted path."
+first_run_note = "run `agy` once in the project and authenticate + answer 'Yes, I trust this folder' before `bmad-loop run` — spawned sessions can't answer first-run dialogs, and a pending one reads as a session timeout. Requires Antigravity CLI (agy >= 1.1.3). Trust is exact-path (settings.json trustedWorkspaces) and --dangerously-skip-permissions does not bypass it. isolation = \"worktree\" works once the project root is trusted: each unit worktree is appended to trustedWorkspaces before its sessions launch. Verify with `bmad-loop probe-adapter antigravity --workspace <path>`."
 skill_tree = ".agents/skills"
 # .agents/hooks.json is agy's lifecycle-hook config. Seeded first, then the Stop
 # relay is merged in, so a worktree checkout keeps any user/plugin hook groups
@@ -50,3 +54,9 @@ seed_files = [".agents/hooks.json"]
 dialect = "antigravity-hooks-json"
 config_path = ".agents/hooks.json"
 events = { Stop = "Stop" }
+
+# agy's exact-path workspace allowlist (see TRUST above). Seeded per worktree,
+# only when the project root is already trusted.
+[workspace_trust]
+settings_path = "~/.gemini/antigravity-cli/settings.json"
+key = "trustedWorkspaces"

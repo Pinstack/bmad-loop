@@ -11,6 +11,8 @@ def test_defaults_when_file_missing(tmp_path):
     pol = policy.load(tmp_path / "nope.toml")
     assert pol.gates.mode == "per-epic"
     assert pol.limits.max_review_cycles == 3
+    assert pol.limits.artifact_file_max_mb == 5
+    assert pol.limits.artifact_payload_max_mb == 10
     assert pol.adapter.name == "claude"
     assert pol.adapter.extra_args is None  # None = use the profile's bypass flags
     assert pol.dev.skill == "bmad-dev-auto"  # the sole supported dev skill
@@ -173,6 +175,123 @@ name = "codex"
     assert review == policy.ResolvedAdapter("codex", "", None)
 
 
+def test_stage_client_switch_drops_base_effort(tmp_path):
+    """Effort is client-specific like `model`: its legal names belong to one
+    provider's models, so a stage that switches client must NOT inherit the base
+    value and falls back to "" (provider default).
+
+    ABLATION: replace the `same_client` fallback for effort in `resolved()` with a
+    plain `self.effort` and the review assert reddens."""
+    p = tmp_path / "policy.toml"
+    p.write_text("""
+[adapter]
+name = "opencode-http"
+effort = "max"
+[adapter.review]
+name = "claude"
+""")
+    pol = policy.load(p)
+    assert pol.adapter.resolved("review").effort == ""
+    # controls: the stages that keep the client inherit the base value
+    assert pol.adapter.resolved("dev").effort == "max"
+    assert pol.adapter.resolved("triage").effort == "max"
+
+
+@pytest.mark.parametrize(
+    ("base", "stage"),
+    [("opencode", "opencode-http"), ("opencode-http", "opencode"), ("claude-code-tmux", "claude")],
+)
+def test_stage_naming_an_alias_of_the_base_client_is_not_a_switch(tmp_path, base, stage):
+    """`get_profile` resolves an alias and its canonical name to ONE profile, so a
+    stage spelling the base client the other way runs the same client and must
+    inherit the client-specific keys (model, effort, extra_args) rather than
+    falling back to that profile's defaults.
+
+    ABLATION: compare raw names in `resolved()`'s `same_client` and every row
+    reddens on all three keys."""
+    p = tmp_path / "policy.toml"
+    p.write_text(f"""
+[adapter]
+name = "{base}"
+model = "anthropic/claude-x"
+effort = "max"
+extra_args = ["--foo"]
+[adapter.review]
+name = "{stage}"
+""")
+    review = policy.load(p).adapter.resolved("review")
+    assert review.name == stage  # the stage's own spelling is kept for get_profile
+    assert review.model == "anthropic/claude-x"
+    assert review.effort == "max"
+    assert review.extra_args == ("--foo",)
+
+
+def test_profile_aliases_are_the_table_get_profile_uses():
+    """`resolved()`'s same-client test and `get_profile`'s lookup must collapse
+    the same aliases: one table, re-exported, never two copies that can drift."""
+    from bmad_loop.adapters import profile as profile_mod
+
+    assert profile_mod.ALIASES is policy.PROFILE_ALIASES
+    for alias, canonical in policy.PROFILE_ALIASES.items():
+        assert profile_mod.get_profile(alias).name == canonical
+        assert policy.canonical_profile_name(alias) == canonical
+    assert policy.canonical_profile_name("claude") == "claude"  # canonical is a fixed point
+
+
+def test_base_effort_inherits_into_every_stage(tmp_path):
+    p = tmp_path / "policy.toml"
+    p.write_text("""
+[adapter]
+name = "opencode-http"
+effort = "high"
+""")
+    pol = policy.load(p)
+    assert pol.adapter.effort == "high"
+    for role in ("dev", "review", "triage", "retro"):
+        assert pol.adapter.resolved(role).effort == "high"
+    # the base-only (unknown role) branch constructs ResolvedAdapter positionally
+    # and must carry effort too. (Not "retro": that became a stage in DW-389.)
+    assert pol.adapter.resolved("no-such-role").effort == "high"
+
+
+def test_stage_effort_overrides_base(tmp_path):
+    p = tmp_path / "policy.toml"
+    p.write_text("""
+[adapter]
+effort = "low"
+[adapter.review]
+effort = "max"
+""")
+    pol = policy.load(p)
+    assert pol.adapter.resolved("review").effort == "max"
+    assert pol.adapter.resolved("dev").effort == "low"
+    assert pol.adapter.resolved("triage").effort == "low"
+
+
+def test_effort_defaults_empty_everywhere(tmp_path):
+    pol = policy.load(None)
+    assert pol.adapter.effort == ""
+    for role in ("dev", "review", "triage", "retro"):
+        assert pol.adapter.resolved(role).effort == ""
+
+
+@pytest.mark.parametrize(
+    ("body", "match"),
+    [
+        ("[adapter]\neffort = 3\n", r"adapter\.effort must be a string"),
+        ("[adapter.dev]\neffort = 3\n", r"adapter\.dev\.effort must be a string"),
+        ("[adapter.review]\neffort = true\n", r"adapter\.review\.effort must be a string"),
+    ],
+)
+def test_effort_wrong_type_rejected(tmp_path, body, match):
+    """Effort is free-form (no catalog validation) but it IS typed: a non-string is
+    loud at policy load, like every other `[adapter]` string key."""
+    p = tmp_path / "policy.toml"
+    p.write_text(body)
+    with pytest.raises(policy.PolicyError, match=match):
+        policy.load(p)
+
+
 def test_stage_same_client_inherits_and_overrides(tmp_path):
     p = tmp_path / "policy.toml"
     p.write_text("""
@@ -231,6 +350,12 @@ def _roundtrip_snapshot(pol):
         # (c) a stage name override — the client switch resets model to ""
         '[adapter]\nname = "claude"\nmodel = "opus"\n'
         'extra_args = ["--permission-mode", "plan"]\n[adapter.review]\nname = "codex"\n',
+        # (d) base effort inherited by every stage
+        '[adapter]\nname = "opencode-http"\neffort = "high"\n',
+        # (e) a stage effort override beside a base one
+        '[adapter]\nname = "opencode-http"\neffort = "low"\n[adapter.review]\neffort = "max"\n',
+        # (f) a stage name override — the client switch resets effort to ""
+        '[adapter]\nname = "opencode-http"\neffort = "max"\n[adapter.review]\nname = "claude"\n',
     ],
 )
 def test_adapter_policy_from_snapshot_roundtrips_resolved(body):
@@ -239,7 +364,7 @@ def test_adapter_policy_from_snapshot_roundtrips_resolved(body):
     pol = policy.loads(body)
     rebuilt = policy.adapter_policy_from_snapshot(_roundtrip_snapshot(pol))
     assert rebuilt is not None
-    for role in ("dev", "review", "triage"):
+    for role in ("dev", "review", "triage", "retro"):
         assert rebuilt.resolved(role) == pol.adapter.resolved(role)
 
 
@@ -430,6 +555,24 @@ def test_git_timeout_default_parse_and_template():
     assert doc["limits"]["git_timeout_s"] == 120
 
 
+def test_artifact_publication_limits_parse_validate_and_render():
+    import tomllib
+
+    loaded = policy.loads("[limits]\nartifact_file_max_mb = 7\nartifact_payload_max_mb = 21\n")
+    assert loaded.limits.artifact_file_max_mb == 7
+    assert loaded.limits.artifact_payload_max_mb == 21
+    template = tomllib.loads(policy.POLICY_TEMPLATE)["limits"]
+    assert template["artifact_file_max_mb"] == policy.LimitsPolicy.artifact_file_max_mb
+    assert template["artifact_payload_max_mb"] == policy.LimitsPolicy.artifact_payload_max_mb
+
+
+@pytest.mark.parametrize("key", ["artifact_file_max_mb", "artifact_payload_max_mb"])
+@pytest.mark.parametrize("bad", [0, -1])
+def test_artifact_publication_limits_must_be_positive(key, bad):
+    with pytest.raises(policy.PolicyError, match=rf"limits\.{key}"):
+        policy.loads(f"[limits]\n{key} = {bad}\n")
+
+
 @pytest.mark.parametrize("bad", [0, -5])
 def test_git_timeout_must_be_positive(bad):
     with pytest.raises(policy.PolicyError, match=r"limits\.git_timeout_s"):
@@ -506,6 +649,8 @@ def test_dev_contract_nudge_rejects_non_boolean():
     [
         "max_review_cycles",
         "max_dev_attempts",
+        "artifact_file_max_mb",
+        "artifact_payload_max_mb",
         "max_followup_reviews",
         "session_timeout_min",
         "git_timeout_s",
@@ -702,6 +847,7 @@ def test_boolean_policy_fields_accept_a_real_toml_false(section, key):
         ("scm", "target_branch"),
         ("scm", "merge_strategy"),
         ("scm", "commit_message_template"),
+        ("operator", "on_review_demotion"),
         ("mux", "backend"),
     ],
 )
@@ -931,6 +1077,39 @@ def test_triage_client_switch_uses_profile_defaults(tmp_path):
     # base model/extra_args are client-specific and must not follow a client switch
     assert pol.adapter.resolved("triage") == policy.ResolvedAdapter("gemini", "", None)
     assert pol.adapter.resolved("dev") == policy.ResolvedAdapter("claude", "opus", ("--foo",))
+
+
+def test_retro_stage_adapter_parses_resolves_and_roundtrips():
+    """`[adapter.retro]` (DW-389) is a stage like `[adapter.triage]`: it parses,
+    resolves with the same client-switch rule, and survives the snapshot rebuild.
+
+    Ablation: drop `retro=_stage_adapter(adapter_d, "retro")` from `loads` and the
+    first assert fails (the stage falls back to the base `claude`); drop it from
+    `adapter_policy_from_snapshot` and the round-trip assert fails."""
+    pol = policy.loads(
+        '[adapter]\nmodel = "opus"\nextra_args = ["--foo"]\n'
+        '[adapter.retro]\nname = "codex"\nmodel = "gpt-5-codex"\n'
+    )
+    assert pol.adapter.resolved("retro").name == "codex"
+    assert pol.adapter.resolved("retro") == policy.ResolvedAdapter("codex", "gpt-5-codex", None)
+    # the other stages are untouched
+    assert pol.adapter.resolved("dev") == policy.ResolvedAdapter("claude", "opus", ("--foo",))
+    rebuilt = policy.adapter_policy_from_snapshot(_roundtrip_snapshot(pol))
+    assert rebuilt is not None
+    assert rebuilt.retro == pol.adapter.retro
+    assert rebuilt.resolved("retro") == pol.adapter.resolved("retro")
+    # without a stage table, retro inherits the base
+    assert policy.load(None).adapter.resolved("retro") == policy.ResolvedAdapter("claude", "", None)
+
+
+def test_retro_stage_adapter_must_be_a_table():
+    with pytest.raises(policy.PolicyError, match=r"\[adapter\.retro\] must be a table"):
+        policy.loads('[adapter]\nretro = "codex"\n')
+
+
+def test_retro_is_a_policy_stage():
+    # `STAGES` fans the `adapter.{stage}` settings template out (settings_schema)
+    assert "retro" in policy.STAGES
 
 
 def test_review_enabled_default_and_override(tmp_path):
@@ -1283,6 +1462,24 @@ def test_template_operator_block_parses_to_the_default():
     # unlike [mux]'s commented anchor, this key ships uncommented — the template
     # must therefore agree with the dataclass, not merely parse
     assert policy.loads(policy.POLICY_TEMPLATE).operator.enabled is True
+
+
+def test_operator_on_review_demotion_default_parse_and_template():
+    """Default "escalate" is today's behavior byte-for-byte (DW-383); "park" is the
+    opt-in. The template ships the key commented at its default, so the template
+    must still parse to the dataclass default."""
+    assert policy.loads("").operator.on_review_demotion == "escalate"
+    assert policy.OperatorPolicy().on_review_demotion == "escalate"
+    for mode in sorted(policy.OPERATOR_ON_REVIEW_DEMOTION_MODES):
+        loaded = policy.loads(f'[operator]\non_review_demotion = " {mode} "\n')
+        assert loaded.operator.on_review_demotion == mode
+    assert policy.loads(policy.POLICY_TEMPLATE).operator.on_review_demotion == "escalate"
+    assert '# on_review_demotion = "escalate"' in policy.POLICY_TEMPLATE
+
+
+def test_operator_on_review_demotion_invalid():
+    with pytest.raises(policy.PolicyError, match=r"operator\.on_review_demotion"):
+        policy.loads('[operator]\non_review_demotion = "defer"\n')
 
 
 # ---------------------------------------------------------------------------
