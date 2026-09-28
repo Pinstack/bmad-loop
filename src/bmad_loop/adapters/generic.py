@@ -356,8 +356,19 @@ class _ResultFileMixin:
         skill-written ``result.json`` (briefly awaiting it on the Stop event,
         reading once otherwise). Subclasses whose skill writes no result.json
         (GenericDevAdapter) override this to synthesize the dict from another
-        on-disk artifact."""
-        return self._await_result(handle.task_id) if wait else self._read_result(handle.task_id)
+        on-disk artifact.
+
+        A present document the read-back refuses still reads as None — the
+        verdict is unchanged — but not silently (DW-451): ``wait=True`` names it
+        in the grace-expiry resultless-stop record (see `_await_result`), and this
+        one-shot read, reached only from `_final`, leaves a
+        ``result-json-refused`` crumb (``error``)."""
+        if wait:
+            return self._await_result(handle.task_id)
+        result, refusal = self._probe_result(handle.task_id)
+        if refusal is not None:
+            self._note_lifecycle(handle.task_id, "result-json-refused", error=refusal)
+        return result
 
     def _produced_work(self, handle: SessionHandle, stop_seen: bool) -> bool:
         """Whether this session shows ANY evidence it actually ran, for the #261
@@ -669,22 +680,38 @@ class _ResultFileMixin:
         except OSError:
             pass
 
-    def _read_result(self, task_id: str) -> dict | None:
+    def _probe_result(self, task_id: str) -> tuple[dict | None, str | None]:
+        """`load_result_document` with its refusal kept apart from absence: the
+        document (or None when absent) and None, or None and the refusal as
+        ``"<ExcType>: <message>"`` for a present document the read-back refuses."""
         try:
-            return load_result_document(self.tasks_dir, task_id)
-        except (OSError, ValueError, RecursionError):
-            return None
+            return load_result_document(self.tasks_dir, task_id), None
+        except (OSError, ValueError, RecursionError) as e:
+            return None, f"{type(e).__name__}: {e}"
+
+    def _read_result(self, task_id: str) -> dict | None:
+        """The result dict, or None for absent AND refused alike. The silent
+        primitive: callers that must tell the two apart use `_probe_result`."""
+        return self._probe_result(task_id)[0]
 
     def _await_result(self, task_id: str, grace_s: float = RESULT_GRACE_S) -> dict | None:
         deadline = time.monotonic() + grace_s
         while True:
-            result = self._read_result(task_id)
+            result, refusal = self._probe_result(task_id)
             if result is not None:
                 return result
             if time.monotonic() >= deadline:
-                self._note_resultless_stop(
-                    task_id, "no-result-json", f"no readable {self._result_path(task_id)}"
-                )
+                # One record per give-up, never one per poll. It reflects the
+                # final poll (DW-451): a present-but-refused document is
+                # `malformed-result-json` with the refusal, so it no longer reads
+                # as a document that was never written.
+                path = self._result_path(task_id)
+                if refusal is not None:
+                    self._note_resultless_stop(
+                        task_id, "malformed-result-json", f"{path}: {refusal}"
+                    )
+                else:
+                    self._note_resultless_stop(task_id, "no-result-json", f"no readable {path}")
                 return None
             time.sleep(RESULT_POLL_S)
 
@@ -760,6 +787,12 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         self.logs_dir = run_dir / LOGS_DIR
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
+        # task_id -> launched_ns of the session whose `log-evidence-failed` crumb
+        # is already written (DW-450): one exit can consult `_log_evidence` up to
+        # three times (the #727 verdict, `_final`'s #261 gate, the post-kill
+        # rescue), and a fault must read as one record, not three. Keyed by
+        # launch, not task id alone, because a re-armed run reuses task ids.
+        self._log_evidence_faulted: dict[str, int] = {}
 
     # --------------------------------------------------------- multiplexer
 
@@ -1531,10 +1564,22 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         on arrival reports False (rendered nothing) rather than None (no such signal):
         the DOA case is the gate's whole purpose and must not read as unknown. What
         is left in the None state is a handle this adapter never launched — unit
-        fixtures — for which "unknown never blocks" is the right and only answer."""
+        fixtures — for which "unknown never blocks" is the right and only answer.
+
+        Any other stat fault also returns None — the verdict is unchanged — but it
+        opens the gate on a log this adapter created, so it is not silent (DW-450):
+        a ``log-evidence-failed`` crumb (``error``), once per session however many
+        verdict sites ask."""
         try:
             size = (self.logs_dir / f"{handle.task_id}.log").stat().st_size
-        except OSError:
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            if self._log_evidence_faulted.get(handle.task_id) != handle.launched_ns:
+                self._log_evidence_faulted[handle.task_id] = handle.launched_ns
+                self._note_lifecycle(
+                    handle.task_id, "log-evidence-failed", error=f"{type(e).__name__}: {e}"
+                )
             return None
         return size > PROOF_OF_WORK_MIN_LOG_BYTES
 
@@ -1705,7 +1750,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         raises ``MultiplexerError``; a duck-typed backend may lack the method),
         a capture fault, or a search that blows ``PARKED_PROMPT_MATCH_TIMEOUT_S``
         all read as "no match": a due nudge goes out, or the final stall ends
-        unparked, exactly as before."""
+        unparked, exactly as before. The two faults are not silent (DW-448): a
+        ``parked-probe-failed`` crumb (``reason`` = ``capture-failed`` or
+        ``match-timeout`` + its ``pattern``; ``error``) records that the look
+        at the pane failed. No patterns and a backend without ``capture_pane``
+        are configuration, not faults, and stay silent."""
         patterns = self._parked_prompt_patterns
         if not patterns:
             return None
@@ -1714,19 +1763,32 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             return None
         try:
             screen = capture(handle.native_id)
-        except MultiplexerError:
+        except MultiplexerError as e:
+            self._note_lifecycle(
+                handle.task_id,
+                "parked-probe-failed",
+                reason="capture-failed",
+                error=f"{type(e).__name__}: {e}",
+            )
             return None
         if not isinstance(screen, str):
             return None
         text = _ANSI_RE.sub("", screen.replace("\r", "\n"))
-        try:
-            for line in text.split("\n"):
-                for pat in patterns:
+        for line in text.split("\n"):
+            for pat in patterns:
+                try:
                     hit = pat.search(line, timeout=PARKED_PROMPT_MATCH_TIMEOUT_S)
-                    if hit is not None:
-                        return f"pane matched {pat.pattern!r}: {_excerpt(line, hit.start())}"
-        except TimeoutError:
-            return None
+                except TimeoutError as e:
+                    self._note_lifecycle(
+                        handle.task_id,
+                        "parked-probe-failed",
+                        reason="match-timeout",
+                        pattern=pat.pattern,
+                        error=f"{type(e).__name__}: {e}",
+                    )
+                    return None
+                if hit is not None:
+                    return f"pane matched {pat.pattern!r}: {_excerpt(line, hit.start())}"
         return None
 
     def _session_vanished(self, task_id: str) -> bool:

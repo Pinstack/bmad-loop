@@ -1274,6 +1274,52 @@ def test_resultless_stop_breadcrumb_base_no_result_json(tmp_path):
     assert "result.json" in crumb["detail"]
 
 
+def test_resultless_stop_breadcrumb_base_malformed_result_json(tmp_path, monkeypatch):
+    """DW-451: a present result.json the read-back refuses still awaits to None,
+    but the give-up record says `malformed-result-json` with the refusal instead
+    of reading as a document never written — one record per give-up, however
+    many polls saw it.
+
+    Ablation: record every give-up as `no-result-json` and this fails."""
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    adapter = make_adapter(tmp_path, mux=_UnitMux())
+    path = adapter.tasks_dir / "3-1-dev-1" / "result.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("{broken")
+    assert adapter._await_result("3-1-dev-1", grace_s=0.05) is None
+    (crumb,) = _breadcrumbs(adapter)
+    assert crumb["verdict"] == "malformed-result-json"
+    assert crumb["detail"].startswith(f"{path}: JSONDecodeError: ")
+
+
+def test_final_readback_crumbs_a_refused_result_json(tmp_path):
+    """DW-451, the wait=False read `_final` makes: a refused document keeps the
+    fallback verdict (unchanged) and leaves one `result-json-refused` crumb;
+    absent and valid documents leave none.
+
+    Ablation: drop the crumb in `_ResultFileMixin._result_json` and the
+    refused row fails."""
+    adapter = make_adapter(tmp_path, mux=_UnitMux())
+    spec = _dev_spec(tmp_path)
+    path = adapter.tasks_dir / "3-1-dev-1" / "result.json"
+    path.parent.mkdir(parents=True)
+
+    res = adapter._final(_dev_handle(), spec, "crashed", None, None)  # absent
+    assert (res.status, res.result_json) == ("crashed", None)
+    assert _lifecycle_events(adapter, "result-json-refused") == []
+
+    path.write_text('["not a dict"]')
+    res = adapter._final(_dev_handle(), spec, "crashed", None, None)
+    assert (res.status, res.result_json) == ("crashed", None)
+    (crumb,) = _lifecycle_events(adapter, "result-json-refused")
+    assert crumb["error"] == "ValueError: result.json is not a JSON object: list"
+
+    path.write_text('{"clean": true}')
+    res = adapter._final(_dev_handle(), spec, "crashed", None, None)
+    assert (res.status, res.result_json) == ("completed", {"clean": True})
+    assert len(_lifecycle_events(adapter, "result-json-refused")) == 1
+
+
 def test_resultless_stop_breadcrumb_only_on_stop_readback(tmp_path):
     """wait=False reads (the _final stall/crash re-checks) must not write
     breadcrumbs — only the Stop-event read-back diagnoses a result-less Stop."""
@@ -6678,6 +6724,53 @@ def test_log_evidence_mro_is_not_shadowed_by_the_mixin():
     assert GenericTmuxAdapter._READBACK_NEEDS_PROOF_OF_WORK is False
 
 
+def _fail_stat_of(monkeypatch, target: Path, exc: OSError) -> None:
+    """Make `stat()` of exactly `target` raise `exc`; every other path stats
+    normally (the crumb writer's own `mkdir` stats its parent)."""
+    real_stat = Path.stat
+
+    def stat(self, *args, **kwargs):
+        if self == target:
+            raise exc
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+
+
+def test_log_evidence_stat_fault_is_crumbed_once_per_session(tmp_path, monkeypatch):
+    """DW-450: a stat fault on the pane log this adapter created still reads as
+    None ("unknown never blocks" — both #261 and #727 verdicts unchanged), but
+    leaves one `log-evidence-failed` crumb per session, however many verdict
+    sites ask: `_work_verdict` and `_produced_work` both consult it on one exit.
+    A later launch of the same task id (a re-armed run) crumbs afresh.
+
+    Ablation: drop the crumb and the first assertion on it fails; drop the
+    per-launch latch and the count reads 3."""
+    adapter = make_adapter(tmp_path, mux=_UnitMux())
+    log = _pane_log(adapter, "3-1-dev-1", 0)
+    _fail_stat_of(monkeypatch, log, PermissionError(13, "Permission denied"))
+    handle = _dev_handle()
+
+    assert adapter._log_evidence(handle) is None
+    assert adapter._work_verdict(handle, False, False) is True
+    assert adapter._produced_work(handle, False) is True
+    (crumb,) = _lifecycle_events(adapter, "log-evidence-failed")
+    assert crumb["error"] == "PermissionError: [Errno 13] Permission denied"
+
+    assert adapter._log_evidence(_dev_handle(launched_ns=1)) is None
+    assert len(_lifecycle_events(adapter, "log-evidence-failed")) == 2
+
+
+def test_log_evidence_absent_or_readable_log_writes_no_crumb(tmp_path):
+    """The negative rows of DW-450: an absent log is the documented silent None,
+    a readable one answers — neither is a fault, so neither is crumbed."""
+    adapter = make_adapter(tmp_path, mux=_UnitMux())
+    assert adapter._log_evidence(_dev_handle()) is None  # absent
+    _pane_log(adapter, "3-1-dev-1", generic.PROOF_OF_WORK_MIN_LOG_BYTES + 1)
+    assert adapter._log_evidence(_dev_handle()) is True
+    assert _lifecycle_events(adapter, "log-evidence-failed") == []
+
+
 def test_classify_env_fault_marks_a_dropped_suffix(tmp_path):
     """A window that dropped a SUFFIX says so. Marking only the head made a
     truncated excerpt read as a complete line that simply ended there — the one
@@ -8380,6 +8473,7 @@ def test_clean_pane_nudges_exactly_as_today(tmp_path, monkeypatch):
     assert (result.status, result.parked) == ("stalled", False)
     assert _stall_nudges(mux) == [generic.STALL_NUDGE_TEXT] * 2
     assert mux.captures == ["@1", "@1", "@1"]
+    assert _lifecycle_events(adapter, "parked-probe-failed") == []  # a clean look (DW-448)
 
 
 def test_pane_matched_prompt_marks_the_stall_when_no_nudges_are_configured(tmp_path, monkeypatch):
@@ -8433,6 +8527,13 @@ def test_failed_pane_capture_degrades_to_the_nudge(tmp_path, monkeypatch):
     result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
     assert (result.status, result.parked) == ("stalled", False)
     assert _stall_nudges(mux) == [generic.STALL_NUDGE_TEXT] * 2
+    # ...but not silently (DW-448): one crumb per failed look, i.e. per expiry
+    # (two nudging ones plus the final stall). Ablation: drop the capture-arm
+    # `_note_lifecycle` and this fails on an empty list.
+    crumbs = _lifecycle_events(adapter, "parked-probe-failed")
+    assert [(c["reason"], c["error"]) for c in crumbs] == [
+        ("capture-failed", "MultiplexerError: capture-pane: can't find window")
+    ] * 3
 
 
 def test_backend_without_capture_pane_degrades_to_the_nudge(tmp_path, monkeypatch):
@@ -8455,6 +8556,8 @@ def test_backend_without_capture_pane_degrades_to_the_nudge(tmp_path, monkeypatc
     result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
     assert (result.status, result.parked) == ("stalled", False)
     assert _stall_nudges(old) == [generic.STALL_NUDGE_TEXT] * 2
+    # configuration, not a fault: no `parked-probe-failed` crumb (DW-448)
+    assert _lifecycle_events(adapter, "parked-probe-failed") == []
 
 
 def test_the_seam_default_capture_pane_raises_the_seam_error():
@@ -8482,6 +8585,12 @@ def test_runaway_parked_pattern_degrades_to_the_nudge(tmp_path, monkeypatch):
     result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
     assert (result.status, result.parked) == ("stalled", False)
     assert _stall_nudges(mux) == [generic.STALL_NUDGE_TEXT]
+    # ...but not silently (DW-448): one crumb per expiry, naming the pattern.
+    # Ablation: drop the timeout-arm `_note_lifecycle` and this fails.
+    crumbs = _lifecycle_events(adapter, "parked-probe-failed")
+    assert [(c["reason"], c["pattern"], c["error"]) for c in crumbs] == [
+        ("match-timeout", "runaway", "TimeoutError: ")
+    ] * 2
 
 
 def test_profile_without_parked_patterns_never_captures(tmp_path, monkeypatch):
@@ -8491,6 +8600,7 @@ def test_profile_without_parked_patterns_never_captures(tmp_path, monkeypatch):
     result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
     assert (result.status, result.parked) == ("stalled", False)
     assert mux.captures == []
+    assert _lifecycle_events(adapter, "parked-probe-failed") == []  # config, not a fault
 
 
 def test_capture_pane_argv_reads_the_visible_screen(monkeypatch, force_tmux_backend):

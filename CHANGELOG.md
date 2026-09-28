@@ -172,6 +172,14 @@ breaking changes may land in a minor release.
   `status` (DW-453).
 - Flag verdicts reached with liveness unknown: `over-budget-fired` and `kill-escalated`
   gain `liveness_unknown` (DW-454).
+- Crumb a failed parked-prompt look at stall expiry: `parked-probe-failed` with
+  `reason = "capture-failed"` or `"match-timeout"` (+ `pattern`) and `error`. Still reads
+  as not parked (DW-448).
+- Crumb a pane-log stat fault other than absence: `log-evidence-failed` (`error`), once
+  per session. The proof-of-work signal still reads as unknown (DW-450).
+- Tell a refused `result.json` from a missing one: the Stop read-back's give-up records
+  `malformed-result-json` with the refusal, and the exit read-back writes
+  `result-json-refused` (`error`). Still no result (DW-451).
 - Name an untracked ledger or board whose leaf symlink targets a file outside the project
   in `worktree-seed-dropped` (DW-432). The file is still not seeded; only the silent drop
   is gone.
