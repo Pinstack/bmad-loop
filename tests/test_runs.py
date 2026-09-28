@@ -444,6 +444,29 @@ def test_read_pid_identity_tells_an_unreadable_file_from_a_missing_one(tmp_path)
     assert runs.read_named_pid_identity(tmp_path / "absent" / "engine.pid") == (None, None)
 
 
+def test_read_pid_identity_reads_undecodable_bytes_as_unreadable(tmp_path, monkeypatch):
+    """DW-465, the decode half. A pid file of non-UTF-8 bytes (a torn write, a
+    planted file) raised `UnicodeDecodeError` out of the reader, which aborted
+    every command that iterates runs — `clean`, `delete`, `status`, the TUI. The
+    file exists and cannot be read as text, so it is a read fault other than
+    absence: the unreadable sentinel, and liveness `'unknown'`, never a raise.
+
+    No host is consulted: there is no pid to hand it.
+
+    ABLATION: drop the `UnicodeDecodeError` arm and this raises instead."""
+    run_dir = _make_run(tmp_path, "r1")
+    (run_dir / "engine.pid").write_bytes(b"\xff\xfe 1.0")
+
+    def _no_host():
+        raise AssertionError("an undecodable pid file has no pid to probe")
+
+    monkeypatch.setattr(runs, "get_process_host", _no_host)
+    assert runs.read_pid_identity(run_dir) == (None, runs._PID_FILE_UNREADABLE)
+    assert runs.read_pid(run_dir) is None
+    assert runs.engine_liveness(run_dir) == "unknown"
+    assert runs.engine_alive(run_dir) is False
+
+
 def test_engine_liveness(tmp_path, monkeypatch):
     run_dir = _make_run(tmp_path, "r1")
     assert runs.engine_liveness(run_dir) == "dead"  # no pid file → nothing to gate on

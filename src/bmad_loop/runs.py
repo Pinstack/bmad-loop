@@ -1027,12 +1027,15 @@ def read_named_pid_identity(pidfile: Path) -> tuple[int | None, float | None]:
     is unchanged; :func:`engine_liveness` routes the sentinel to ``'unknown'``.
     Absence is ``FileNotFoundError`` and ``NotADirectoryError`` — the latter when a
     path component above the file is not a directory (a stray file where a run dir
-    would be), which holds no pid file just as surely."""
+    would be), which holds no pid file just as surely. Non-UTF-8 bytes (a torn
+    write, a planted file) are a read fault too: ``UnicodeDecodeError`` used to
+    escape and abort every command that iterates runs. Only that error is caught —
+    the int/float parse arms below keep their own ``ValueError`` semantics."""
     try:
         tokens = pidfile.read_text(encoding="utf-8").split()
     except (FileNotFoundError, NotADirectoryError):
         return None, None
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None, _PID_FILE_UNREADABLE
     if not tokens:
         return None, None

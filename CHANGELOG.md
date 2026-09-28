@@ -200,9 +200,10 @@ breaking changes may land in a minor release.
 - Warn on stderr when a pane-pid read, a window-option read or a `display-message`
   probe folds a fault into its sentinel (`[]`, `""`, `None`). A dead window, an unset
   option, a gone server and not being inside the multiplexer stay silent (DW-463).
-- Read an `engine.pid` that exists but cannot be read as liveness `unknown`, not `dead`:
-  `delete`/`archive`/`clean`/`cleanup` now give their unverifiable-pid warning for it
-  and `resolve` wants `--force`. A missing file still reads as no pid (DW-465).
+- Read an `engine.pid` that exists but cannot be read, or holds non-UTF-8 bytes, as
+  liveness `unknown`, not `dead` or a crash: `delete`/`archive`/`clean`/`cleanup` now
+  give their unverifiable-pid warning for it and `resolve` wants `--force`. A missing
+  file still reads as no pid (DW-465).
 - Warn when the removal guard's backend selection or session listing raises: on stderr
   from the CLI, and as a warning toast from the TUI's `D`/`A`, where stderr is not
   shown. The run is still removed as if no session were live (DW-466).
