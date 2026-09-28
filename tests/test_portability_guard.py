@@ -1261,6 +1261,11 @@ JOURNAL_KINDS = frozenset(
         "retro-auto-skipped",
         "retro-auto-start",
         "retro-auto-uncommitted",
+        # DW-488: the retrospective gate fired (or refused) for the run's last
+        # epic at run end. `epic` is benign; the closed `reason` and an unreadable
+        # board's `error` are dropped like every other `reason` / `error`.
+        "retro-run-end",
+        "retro-run-end-skipped",
         "review-budget-committed",
         "review-budget-ledger-unreadable",
         "review-followup-damped",

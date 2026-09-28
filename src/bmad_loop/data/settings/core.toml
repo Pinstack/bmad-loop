@@ -28,7 +28,7 @@ key = "retrospective"
 kind = "select"
 options_ref = "RETRO_MODES"
 default_ref = "GatesPolicy.retrospective"
-description = "at each epic boundary: never, notify (suggest /bmad-retrospective), or auto (run a headless /bmad-retrospective session on [adapter.retro] and commit its doc + board)"
+description = "at each epic boundary, and at run end for a finished last epic: never, notify (suggest /bmad-retrospective), or auto (run a headless /bmad-retrospective session on [adapter.retro] and commit its doc + board)"
 # `on_escalation` is reserved and deliberately has no field here (HIDDEN in
 # tests/test_settings_schema.py): `pause` is its only documented value and the
 # default. policy.py parses it, but nothing reads it — CRITICAL escalations

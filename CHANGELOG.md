@@ -156,6 +156,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Fire the retrospective gate at run end for the run's last epic. `auto` runs the retro
+  and `notify` nudges, before the run-end sweep and on a `--max-stories` stop, only when
+  every story of the epic reads `done` and its retro does not. A single-epic run, or the
+  final epic of any run, used to get no retrospective (DW-488).
 - Surface the auto retrospective's verdict: `retro-auto-finished` and the done notice
   carry the retro doc's frontmatter `verdict` (`unknown` when absent or unreadable, never
   folded into accepted), and a `rejected` epic adds an `ATTENTION` line. The run is not

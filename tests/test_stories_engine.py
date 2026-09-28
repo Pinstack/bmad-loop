@@ -18,6 +18,7 @@ from conftest import (
     write_gated_ledger,
     write_ledger,
     write_spec,
+    write_sprint,
 )
 
 from bmad_loop import stories, verify
@@ -308,6 +309,35 @@ def test_two_story_happy_path(project):
         assert status_of(read_frontmatter(story_spec(project, sid))) == "done"
     assert engine.state.tasks["1"].phase == Phase.DONE
     assert engine.state.tasks["2"].phase == Phase.DONE
+
+
+def test_run_end_retrospective_is_inert_in_stories_mode(project, monkeypatch):
+    """DW-488: stories mode has no epics (every picked story is the epic-0
+    sentinel), so run end fires no retrospective gate — even over a board whose
+    epic-0 stories all read done, which the Engine's gate would take as a
+    complete epic.
+
+    Ablation: delete `StoriesEngine._run_end_retrospective` and the nudge fires
+    and `retro-run-end` is journaled."""
+    from bmad_loop import gates
+
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(gates, "notify", lambda _p, _d, title, msg, **_k: sent.append((title, msg)))
+    write_sprint(project, {"epic-0": "done", "0-1-x": "done", "epic-0-retrospective": "optional"})
+    setup_stories(project, [entry("1")])
+    engine, _ = make_engine(
+        project,
+        [stories_dev_effect()],
+        policy=_stories_policy(gates=GatesPolicy(mode="none", retrospective="notify")),
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1 and engine.state.finished
+    assert engine.state.current_epic == 0
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert not any(k.startswith("retro-") for k in kinds)
+    assert not any("retrospective" in f"{title} {msg}" for title, msg in sent)
 
 
 def test_story_review_gate_journals_its_verify_commands(project):

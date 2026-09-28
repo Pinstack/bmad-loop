@@ -1530,11 +1530,15 @@ class Engine:
             self._check_stop_request()
             if self.max_stories is not None and self._dispatched_count() >= self.max_stories:
                 self.journal.append("max-stories-reached", count=self._dispatched_count())
+                self._run_end_retrospective()
                 return
             self._emit("pre_pick_next")
             story = self._pick_next()
             self._emit("post_pick_next", story_key=(story.key if story is not None else None))
             if story is None:
+                # Before the run-end sweep, as the per-epic retro precedes the
+                # per-epic sweep: the sweep then sees the committed retro (DW-488).
+                self._run_end_retrospective()
                 self._maybe_auto_sweep("run-end", "run-end")
                 return
             # Before ANY state mutation for this story, and deliberately so — see
@@ -9984,6 +9988,64 @@ class Engine:
             f"{epic}'s work",
         )
 
+    def _nudge_retrospective(self, epic: int) -> None:
+        """The ``gates.retrospective = "notify"`` half of the retrospective gate: one
+        "retrospective suggested" nudge for a finished epic. ``auto`` is
+        :meth:`_maybe_auto_retro`; each half checks its own mode, so a caller fires
+        the gate by calling both and never switches on the mode itself."""
+        if self.policy.gates.retrospective == "notify":
+            gates.notify(
+                self.policy,
+                self.run_dir,
+                f"epic {epic} stories complete",
+                "retrospective suggested: run /bmad-retrospective when convenient",
+            )
+
+    def _run_end_retrospective(self) -> None:
+        """Fire the retrospective gate for the run's last epic at run end (DW-488).
+
+        :meth:`_epic_boundary` fires only when a story of a *different* epic is
+        picked, so the final epic of a run (every epic of a single-epic run) never
+        crossed one. Called from both of :meth:`_loop`'s run-end returns: the
+        exhausted queue, ahead of the run-end sweep, and ``--max-stories`` — a run
+        that stops there is recorded ``finished`` too, and a later run starts with
+        no ``current_epic``, so no boundary would ever fire for that epic. A pause,
+        stop or crash unwinds past both returns and never reaches this.
+
+        Fires only when ``state.current_epic`` (the epic of the last story this run
+        dispatched) reads complete on the board — at least one story of it, every
+        one ``done`` — and ``epic-N-retrospective`` is not already ``done``: a
+        truncated run with the epic's stories left fires nothing. Each refusal is
+        journaled ``retro-run-end-skipped`` with a closed ``reason``
+        (``epic-incomplete``, ``already-done``, ``board-unreadable``); an unreadable
+        board is a refusal, never read as a complete epic.
+
+        The gate itself is the epic boundary's, unchanged: ``auto`` runs
+        :meth:`_maybe_auto_retro` (its failures notify and never fail the run; a
+        dirty tree after it pauses at ``PAUSE_EPIC_BOUNDARY``, and resume re-enters
+        here, where an already-done retro is skipped) and ``notify`` sends
+        :meth:`_nudge_retrospective`'s nudge."""
+        epic = self.state.current_epic
+        if epic is None or self.policy.gates.retrospective == "never":
+            return  # no epic dispatched, or no gate to fire: leave the board unread
+        try:
+            board = load_sprint_status(self.paths.sprint_status)
+        except (SprintStatusError, OSError, UnicodeDecodeError) as e:
+            self.journal.append(
+                "retro-run-end-skipped", epic=epic, reason="board-unreadable", error=str(e)
+            )
+            return
+        stories = [s for s in board.stories if s.epic == epic]
+        if not stories or any(s.status != "done" for s in stories):
+            self.journal.append("retro-run-end-skipped", epic=epic, reason="epic-incomplete")
+            return
+        if board.retros.get(epic) == "done":
+            self.journal.append("retro-run-end-skipped", epic=epic, reason="already-done")
+            return
+        self.journal.append("retro-run-end", epic=epic)
+        self._maybe_auto_retro(epic)
+        self._nudge_retrospective(epic)
+
     def _epic_boundary(self, finished_epic: int, next_epic: int) -> None:
         self.journal.append("epic-boundary", finished=finished_epic, next=next_epic)
         self._emit("pre_epic_boundary", epic=finished_epic)
@@ -9991,13 +10053,7 @@ class Engine:
         # the retro's committed action items (DW-388 ingests them).
         self._maybe_auto_retro(finished_epic)
         self._maybe_auto_sweep("per-epic", f"epic-{finished_epic}")
-        if self.policy.gates.retrospective == "notify":
-            gates.notify(
-                self.policy,
-                self.run_dir,
-                f"epic {finished_epic} stories complete",
-                "retrospective suggested: run /bmad-retrospective when convenient",
-            )
+        self._nudge_retrospective(finished_epic)
         self._emit("post_epic_boundary", epic=finished_epic)
         if gates.pause_at_epic_boundary(self.policy):
             self.state.current_epic = next_epic  # don't re-trigger this gate on resume

@@ -230,6 +230,11 @@ class StoriesEngine(Engine):
                 gates.notify(self.policy, self.run_dir, f"unresolved escalation: {key}", reason)
                 raise RunPaused(reason, PAUSE_ESCALATION, key)
 
+    def _run_end_retrospective(self) -> None:
+        """Inert: stories mode has no epics (every ``_StoryRef.epic`` is the 0
+        sentinel), so there is no finished epic to run a retrospective for — the
+        run-end twin of the epic boundary that never fires here (DW-488)."""
+
     def _unresolved_escalation_key(self) -> str | None:
         """Only an in-run escalation (``attempt > 0``) blocks ``finished``. A
         pick-time wedge / unknown-selector task (``attempt == 0``) is re-classified

@@ -21614,6 +21614,8 @@ RETRO_DOC = "epic-1-retro-2026-09-26.md"
 
 
 def _two_epic_sprint(project, retro_status: str = "optional") -> None:
+    # Epic 2's retro reads `done` so the run-end gate (DW-488) stays silent and
+    # these rows see epic 1's boundary alone.
     write_sprint(
         project,
         {
@@ -21622,7 +21624,7 @@ def _two_epic_sprint(project, retro_status: str = "optional") -> None:
             "epic-1-retrospective": retro_status,
             "epic-2": "backlog",
             "2-1-b": "ready-for-dev",
-            "epic-2-retrospective": "optional",
+            "epic-2-retrospective": "done",
         },
     )
 
@@ -22310,6 +22312,220 @@ def test_auto_retro_unreadable_verdict_doc_is_unknown(project, monkeypatch):
 
     assert _only(engine, "retro-auto-finished")["verdict"] == "unknown"
     assert _REJECTED_TITLE not in (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+
+
+# ------------------------------------ run-end retrospective (DW-488)
+#
+# The epic boundary fires only when a story of another epic is picked, so a run's
+# last epic reaches the retrospective gate at run end instead: `_loop`'s exhausted
+# queue (ahead of the run-end sweep) and its `--max-stories` return. It fires only
+# when every story of `state.current_epic` reads done and its retro is not done.
+
+
+def _one_epic_sprint(project, *, retro_status: str = "optional") -> None:
+    write_sprint(
+        project,
+        {
+            "epic-1": "backlog",
+            "1-1-a": "ready-for-dev",
+            "1-2-b": "ready-for-dev",
+            "epic-1-retrospective": retro_status,
+        },
+    )
+
+
+def _one_epic_script(project, stories=("1-1-a", "1-2-b")) -> list:
+    return [
+        effect
+        for key in stories
+        for effect in (dev_effect(project, key), review_effect(project, key, clean=True))
+    ]
+
+
+def _record_run_end_sweep(engine, monkeypatch, probe) -> list[tuple[str, object]]:
+    """Stand in for `_maybe_auto_sweep`, recording each trigger with `probe()` read
+    at call time, so a row can tell whether the retro fired before the sweep."""
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        engine, "_maybe_auto_sweep", lambda _kind, trigger: calls.append((trigger, probe()))
+    )
+    return calls
+
+
+def test_run_end_retro_auto_fires_for_a_complete_single_epic_before_the_sweep(project, monkeypatch):
+    """A single-epic run never crosses a boundary; with every story done at run
+    end, `auto` runs epic 1's retro on the retro adapter and commits it, all
+    before the run-end sweep is asked, and the run finishes.
+
+    Ablation: delete the exhausted-queue `_run_end_retrospective()` call in `_loop`
+    and this reddens on the retro adapter's empty session list."""
+    sent = _record_notify(monkeypatch)
+    _one_epic_sprint(project)
+    retro = MockAdapter([retro_effect(project)])
+    engine, adapter = make_engine(
+        project, _one_epic_script(project), policy=AUTO_RETRO, retro_adapter=retro
+    )
+    sweeps = _record_run_end_sweep(engine, monkeypatch, lambda: len(retro.sessions))
+
+    summary = engine.run()
+
+    assert summary.done == 2 and not summary.paused
+    assert engine.state.finished
+    assert [s.role for s in retro.sessions] == ["retro"]
+    assert retro.sessions[0].prompt.startswith("/bmad-retrospective -H 1\n")
+    assert all(s.role != "retro" for s in adapter.sessions)
+    assert sweeps == [("run-end", 1)]
+    assert _only(engine, "retro-run-end")["epic"] == 1
+    kinds = _kinds(engine)
+    assert "epic-boundary" not in kinds and "retro-run-end-skipped" not in kinds
+    assert kinds.index("retro-run-end") < kinds.index("retro-auto-finished")
+    assert "chore(retro): epic 1 retrospective" in git(project.project, "log", "--format=%s")
+    assert worktree_clean(project.project)
+    assert not any("retrospective suggested" in msg for _t, msg in sent)
+
+
+def test_run_end_retro_notify_nudges_a_complete_single_epic_before_the_sweep(project, monkeypatch):
+    """Under `notify` the same run end sends the boundary's one nudge, before the
+    run-end sweep, and dispatches nothing.
+
+    Ablation: delete the exhausted-queue `_run_end_retrospective()` call in `_loop`
+    and the nudge count reads 0."""
+    sent = _record_notify(monkeypatch)
+    _one_epic_sprint(project)
+    engine, adapter = make_engine(
+        project,
+        _one_epic_script(project),
+        policy=Policy(gates=GatesPolicy(mode="none", retrospective="notify"), notify=QUIET),
+    )
+
+    def nudges() -> int:
+        return sum("retrospective suggested" in msg for _t, msg in sent)
+
+    sweeps = _record_run_end_sweep(engine, monkeypatch, nudges)
+
+    summary = engine.run()
+
+    assert summary.done == 2 and not summary.paused
+    assert nudges() == 1
+    assert (
+        "epic 1 stories complete",
+        "retrospective suggested: run /bmad-retrospective when convenient",
+    ) in sent
+    assert sweeps == [("run-end", 1)]
+    assert all(s.role != "retro" for s in adapter.sessions)
+    assert not any(k.startswith("retro-auto-") for k in _kinds(engine))
+
+
+def test_run_end_retro_fires_when_max_stories_stops_on_a_complete_epic(project, monkeypatch):
+    """`--max-stories` is a run end too: a finished run has no later boundary, so an
+    epic the cap happened to complete gets its retro there.
+
+    Ablation: delete the `max-stories-reached` `_run_end_retrospective()` call and
+    this reddens on the retro adapter's empty session list."""
+    _record_notify(monkeypatch)
+    _two_epic_sprint(project, retro_status="optional")
+    retro = MockAdapter([retro_effect(project)])
+    engine, _ = make_engine(
+        project,
+        _one_epic_script(project, stories=("1-1-a",)),
+        policy=AUTO_RETRO,
+        retro_adapter=retro,
+        max_stories=1,
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1 and engine.state.finished
+    assert [s.role for s in retro.sessions] == ["retro"]
+    assert "max-stories-reached" in _kinds(engine)
+    assert _only(engine, "retro-auto-finished")["epic"] == 1
+
+
+@pytest.mark.parametrize("mode", ["auto", "notify"])
+def test_run_end_retro_truncated_run_with_stories_left_fires_nothing(project, monkeypatch, mode):
+    """`--max-stories` stops the run with epic 1's `1-2-b` still `ready-for-dev`:
+    the epic is not complete, so neither the retro nor the nudge fires. An empty
+    retro script would fail a dispatched session."""
+    sent = _record_notify(monkeypatch)
+    _one_epic_sprint(project)
+    retro = MockAdapter([])
+    engine, _ = make_engine(
+        project,
+        _one_epic_script(project, stories=("1-1-a",)),
+        policy=Policy(gates=GatesPolicy(mode="none", retrospective=mode), notify=QUIET),
+        retro_adapter=retro,
+        max_stories=1,
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1 and engine.state.finished
+    assert retro.sessions == []
+    assert _only(engine, "retro-run-end-skipped")["reason"] == "epic-incomplete"
+    assert "retro-run-end" not in _kinds(engine)
+    assert not any(k.startswith("retro-auto-") for k in _kinds(engine))
+    assert not any("retrospective" in f"{title} {msg}" for title, msg in sent)
+
+
+@pytest.mark.parametrize("mode", ["auto", "notify"])
+def test_run_end_retro_already_retrod_epic_fires_nothing(project, monkeypatch, mode):
+    """`epic-1-retrospective: done` on the board (a human ran it): the run-end gate
+    refuses before either half, so no session, no `retro-auto-skipped`, no nudge."""
+    sent = _record_notify(monkeypatch)
+    _one_epic_sprint(project, retro_status="done")
+    retro = MockAdapter([])
+    engine, _ = make_engine(
+        project,
+        _one_epic_script(project),
+        policy=Policy(gates=GatesPolicy(mode="none", retrospective=mode), notify=QUIET),
+        retro_adapter=retro,
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 2 and not summary.paused
+    assert retro.sessions == []
+    assert _only(engine, "retro-run-end-skipped")["reason"] == "already-done"
+    assert "retro-run-end" not in _kinds(engine)
+    assert not any(k.startswith("retro-auto-") for k in _kinds(engine))
+    assert not any("retrospective" in f"{title} {msg}" for title, msg in sent)
+
+
+def test_run_end_retro_never_fires_nothing_and_reads_no_board(project, monkeypatch):
+    """`never` leaves the run end silent: no session, no nudge, no run-end row."""
+    sent = _record_notify(monkeypatch)
+    _one_epic_sprint(project)
+    retro = MockAdapter([])
+    engine, _ = make_engine(
+        project,
+        _one_epic_script(project),
+        policy=Policy(gates=GatesPolicy(mode="none", retrospective="never"), notify=QUIET),
+        retro_adapter=retro,
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 2 and not summary.paused
+    assert retro.sessions == []
+    assert not any(k.startswith("retro-") for k in _kinds(engine))
+    assert not any("retrospective" in f"{title} {msg}" for title, msg in sent)
+
+
+def test_run_end_retro_unreadable_board_is_a_journaled_refusal(project, monkeypatch):
+    """An unreadable board at run end is never read as a complete epic: the gate
+    journals `board-unreadable` and fires nothing."""
+    _record_notify(monkeypatch)
+    _one_epic_sprint(project)
+    retro = MockAdapter([])
+    engine, _ = make_engine(project, [], policy=AUTO_RETRO, retro_adapter=retro)
+    engine.state.current_epic = 1
+    project.sprint_status.write_text("development_status: [not, a, mapping\n")
+
+    engine._run_end_retrospective()
+
+    assert retro.sessions == []
+    row = _only(engine, "retro-run-end-skipped")
+    assert row["reason"] == "board-unreadable" and row["error"]
 
 
 # ------------------------------------------ engine worktree-mount writer pin (DW-445)

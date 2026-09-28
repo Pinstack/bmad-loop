@@ -1372,7 +1372,7 @@ POLICY_TEMPLATE = """\
 
 [gates]
 mode = "per-epic"            # none | per-epic | per-story-spec-approval
-retrospective = "notify"     # never | notify | auto — auto runs a headless /bmad-retrospective -H session at each epic boundary ([adapter.retro]) and commits its doc + board
+retrospective = "notify"     # never | notify | auto — auto runs a headless /bmad-retrospective -H session at each epic boundary and for a finished last epic at run end ([adapter.retro]) and commits its doc + board
 
 [limits]
 max_review_cycles = 3
