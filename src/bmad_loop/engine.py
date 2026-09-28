@@ -7098,10 +7098,8 @@ class Engine:
         # lost-session diagnosis (#489): rides the same chokepoint so EVERY
         # role — dev, review, fix, migration, triage, injected workflows —
         # leaves the greppable record, not only the dev decision. The boolean
-        # inherits the probe's weak False (`TerminalMultiplexer.has_session`):
-        # a lookup the backend failed for any reason counts as vanished,
-        # accepted because the window-death verdict proved the transport
-        # healthy moments before the probe asked.
+        # is not `has_session`'s weak False alone: the adapter confirms that
+        # negative with a listing that proves the session gone (DW-459).
         if result.session_vanished:
             extras["session_vanished"] = True
         # no-work diagnosis (#727): same convention — present only when the

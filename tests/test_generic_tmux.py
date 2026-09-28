@@ -4356,17 +4356,27 @@ def test_wait_for_completion_genuine_window_death_still_crashes(tmp_path, monkey
 
 
 class _SessionProbeMux:
-    """Mux stand-in exposing only what `_session_vanished` asks: has_session."""
+    """Mux stand-in exposing only what `_session_vanished` asks: has_session, and
+    the list_window_ids that confirms its False (DW-459). ``windows`` defaults to
+    the proved-gone `[]`; an Exception there is a confirm that raises."""
 
-    def __init__(self, answer):
+    def __init__(self, answer, windows=()):
         self._answer = answer
+        self._windows = windows
         self.calls: list[str] = []
+        self.listed: list[str] = []
 
     def has_session(self, name):
         self.calls.append(name)
         if isinstance(self._answer, Exception):
             raise self._answer
         return self._answer
+
+    def list_window_ids(self, session):
+        self.listed.append(session)
+        if isinstance(self._windows, Exception):
+            raise self._windows
+        return list(self._windows)
 
 
 @pytest.mark.parametrize(
@@ -4395,6 +4405,9 @@ def test_window_death_distinguishes_a_destroyed_session_from_an_exited_cli(
     assert result.status == "crashed"
     assert result.session_vanished is expect_vanished
     assert adapter.mux.calls == [adapter.session_name]
+    # Only a negative lookup is confirmed (DW-459); a live or unaskable session
+    # never reaches the listing.
+    assert adapter.mux.listed == ([adapter.session_name] if has_session is False else [])
     # The durable half of the diagnosis: CHANGELOG and FEATURES both promise this
     # crumb, and without an assertion deleting the write keeps the suite green.
     crumbs = _lifecycle_events(adapter, "session-vanished")
@@ -4412,6 +4425,103 @@ def test_window_death_distinguishes_a_destroyed_session_from_an_exited_cli(
         assert probe_failed[0]["error"] == "MultiplexerError: server wedged"
     else:
         assert probe_failed == []
+
+
+def _crash_with_mux(tmp_path, monkeypatch, mux):
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    adapter, _ = make_dev_adapter(tmp_path)
+    adapter._window_alive = lambda handle: False
+    adapter.mux = mux
+    adapter.watcher = _ScriptedWatcher([])
+    return adapter, adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+
+def _psmux_answering(monkeypatch, stderr):
+    """A real PsmuxMultiplexer whose every spawn exits 1 with ``stderr`` — the
+    #525 transcript rows, so has_session's weak False and list_window_ids'
+    `_SESSION_GONE_STDERR` classification are the shipped code, not a stub."""
+    from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
+
+    argvs: list[list[str]] = []
+
+    def run(argv, **_kw):
+        argvs.append(argv)
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr=stderr)
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", run)
+    return PsmuxMultiplexer(), argvs
+
+
+def test_a_proved_gone_psmux_session_is_still_recorded_as_vanished(tmp_path, monkeypatch):
+    """The genuinely-gone side of DW-459 is unchanged: psmux's own wording for a
+    vanished session is in `_SESSION_GONE_STDERR`, so the confirm answers [] and
+    the crumb is `session-vanished`, not a probe failure."""
+    mux, argvs = _psmux_answering(monkeypatch, "psmux: no server running on session 'x'\n")
+    adapter, result = _crash_with_mux(tmp_path, monkeypatch, mux)
+
+    assert (result.status, result.session_vanished) == ("crashed", True)
+    assert [a[1] for a in argvs] == ["has-session", "list-windows"]
+    vanished = _lifecycle_events(adapter, "session-vanished")
+    assert [(c["session"], c["status"]) for c in vanished] == [(adapter.session_name, "crashed")]
+    assert _lifecycle_events(adapter, "session-probe-failed") == []
+
+
+@pytest.mark.parametrize("stderr", ["psmux: Invalid session key", "psmux: connection timed out"])
+def test_a_psmux_probe_fault_is_not_recorded_as_a_vanished_session(tmp_path, monkeypatch, stderr):
+    """DW-459: psmux exits 1 with these while the session and its windows are
+    ALIVE (the #525 transcript), and has_session maps every non-zero exit to
+    False. The confirm step's listing raises on them — not proved gone — so the
+    fact recorded is `session-probe-failed` (DW-382's `session`/`error` shape),
+    never `session-vanished`. The verdict stays `crashed`: the flag was only
+    ever its label.
+    ABLATION: return `not has_session(...)` without the list_window_ids confirm
+    and both rows fail on `session_vanished is True` and a `session-vanished`
+    crumb."""
+    mux, argvs = _psmux_answering(monkeypatch, stderr + "\n")
+    adapter, result = _crash_with_mux(tmp_path, monkeypatch, mux)
+
+    assert (result.status, result.session_vanished) == ("crashed", False)
+    assert [a[1] for a in argvs] == ["has-session", "list-windows"]
+    assert _lifecycle_events(adapter, "session-vanished") == []
+    failed = _lifecycle_events(adapter, "session-probe-failed")
+    assert [c["session"] for c in failed] == [adapter.session_name]
+    assert failed[0]["error"] == (
+        f"TmuxError: psmux list-windows on {adapter.session_name} exited 1 "
+        f"without proving the session gone: {stderr}"
+    )
+
+
+def test_a_raising_confirm_is_a_probe_failure_not_a_vanishing(tmp_path, monkeypatch):
+    """has_session answered False, then the confirming listing could not be taken
+    at all (a transport fault): unknown is not vanished (DW-459)."""
+    mux = _SessionProbeMux(False, MultiplexerError("list-windows timed out"))
+    adapter, result = _crash_with_mux(tmp_path, monkeypatch, mux)
+
+    assert (result.status, result.session_vanished) == ("crashed", False)
+    assert mux.listed == [adapter.session_name]
+    assert _lifecycle_events(adapter, "session-vanished") == []
+    failed = _lifecycle_events(adapter, "session-probe-failed")
+    assert [(c["session"], c["error"]) for c in failed] == [
+        (adapter.session_name, "MultiplexerError: list-windows timed out")
+    ]
+
+
+def test_a_confirm_that_lists_windows_contradicts_the_negative_lookup(tmp_path, monkeypatch):
+    """has_session said no, yet the session lists windows: the lookup was wrong,
+    not the session gone. Recorded as a probe failure naming the contradiction."""
+    mux = _SessionProbeMux(False, ["@3", "@4"])
+    adapter, result = _crash_with_mux(tmp_path, monkeypatch, mux)
+
+    assert result.session_vanished is False
+    assert _lifecycle_events(adapter, "session-vanished") == []
+    failed = _lifecycle_events(adapter, "session-probe-failed")
+    assert [(c["session"], c["error"]) for c in failed] == [
+        (
+            adapter.session_name,
+            "has_session denied the session but list_window_ids listed 2 window(s)",
+        )
+    ]
 
 
 def test_session_probe_is_skipped_for_non_crash_verdicts(tmp_path, monkeypatch):

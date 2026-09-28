@@ -156,6 +156,12 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Stop recording a failed session probe as a vanished session: a negative `has_session`
+  on a crashed window is confirmed by listing the session's windows, and only a listing
+  that proves the session gone writes `session-vanished`. psmux's `Invalid session key`
+  or `connection timed out` from a live session, a listing that raises, or one that still
+  finds windows writes `session-probe-failed` (`session`, `error`) instead. Verdict
+  unchanged (DW-459).
 - Leave a crumb when a generic-adapter liveness probe raises: `liveness-probe-failed`
   (`site`, `error`) at the first failed wait-loop tick and at the over-budget, stall
   and post-kill re-probes, `liveness-probe-recovered` (`failures`) when a later tick

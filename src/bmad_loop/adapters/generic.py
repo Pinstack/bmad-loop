@@ -533,6 +533,8 @@ class _ResultFileMixin:
         seam's declared "couldn't ask" and the override degrades it to False —
         visibly, with a ``session-probe-failed`` crumb under ``task_id``
         (DW-382), so "not vanished" and "could not ask" stay distinguishable.
+        A negative ``has_session`` that the override cannot confirm as a proved-
+        gone session degrades the same way (DW-459): True means proved gone.
         Anything else propagates, exactly as it does from the liveness probe —
         this is a label on a verdict already made, so it degrades rather than
         second-guessing the verdict, but it does not swallow unknown faults."""
@@ -1857,19 +1859,38 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # Safe to ask this late: `run()`'s teardown kills the WINDOW, never the
         # session, so our own kill cannot fake a vanishing, and a session once
         # gone stays gone.
+        #
+        # has_session's False is weak by contract (#489): every non-zero exit maps
+        # to it, including psmux's "Invalid session key" and "connection timed
+        # out", which a LIVE session answers (DW-459). So a False is only a lead,
+        # confirmed through list_window_ids, whose [] is a positive claim (the
+        # session was listed empty or proved gone — for the tmux family, a stderr
+        # in _SESSION_GONE_STDERR) and which raises when the listing proves
+        # nothing. A raise or a listing that still finds windows is "not proved
+        # gone": crumbed as a probe failure, never as a vanishing.
         try:
-            return not self.mux.has_session(self.session_name)
+            if self.mux.has_session(self.session_name):
+                return False
+            windows = self.mux.list_window_ids(self.session_name)
         except MultiplexerError as e:
             # Unknown is not vanished — the same rule the liveness probe follows —
             # but the degrade leaves a crumb (DW-382): without it a mux that could
             # not answer reads exactly like a session that answered "still here".
-            self._note_lifecycle(
+            self._note_session_probe_failed(task_id, f"{type(e).__name__}: {e}")
+            return False
+        if windows:
+            self._note_session_probe_failed(
                 task_id,
-                "session-probe-failed",
-                session=self.session_name,
-                error=f"{type(e).__name__}: {e}",
+                f"has_session denied the session but list_window_ids listed "
+                f"{len(windows)} window(s)",
             )
             return False
+        return True
+
+    def _note_session_probe_failed(self, task_id: str, error: str) -> None:
+        self._note_lifecycle(
+            task_id, "session-probe-failed", session=self.session_name, error=error
+        )
 
     def send_text(self, handle: SessionHandle, text: str) -> None:
         self.mux.send_text(handle.native_id, text)

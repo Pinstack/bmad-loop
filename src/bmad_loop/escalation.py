@@ -249,11 +249,11 @@ def session_failure_reason(role: str, result: SessionResult) -> str:
     stamped nowhere else), so on the timeout/stall paths the suffix never appears.
 
     The wording states what the evidence *withdraws*, not what it proves. All the
-    probe establishes is that a session lookup came back negative — see
-    ``TerminalMultiplexer.has_session``, whose False is "the backend did not
-    confirm it", not "the session provably no longer exists". That is enough to
-    stop an operator reading window death as a CLI exit, and not enough to assert
-    the session was destroyed."""
+    probe establishes is that the multiplexer no longer reports the session — a
+    negative ``TerminalMultiplexer.has_session`` confirmed by a listing that
+    proves it gone (DW-459) — not what removed it. That is enough to stop an
+    operator reading window death as a CLI exit, and not enough to assert the
+    session was destroyed."""
     reason = f"{role} session {result.status}"
     if result.session_vanished:
         return (
