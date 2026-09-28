@@ -358,7 +358,7 @@ def all_run_dirs(project: Path) -> list[Path] | None:
     not the same answer as the empty list a missing root gives. Callers that act
     on "no live runs" have to tell those apart; see :func:`_run_dir_names`.
     """
-    names = _run_dir_names(project)
+    names, _fault = _run_dir_names(project)
     if names is None:
         return None
     root = project / RUNS_DIR
@@ -3094,33 +3094,49 @@ def reclaimable(run_dir: Path) -> bool:
     return bool(state and (state.finished or state.stopped))
 
 
-def reconcile_orphan_worktrees(repo: Path, run_dir: Path, *, dry_run: bool = False) -> list[Path]:
+def reconcile_orphan_worktrees(
+    repo: Path, run_dir: Path, *, dry_run: bool = False
+) -> tuple[list[Path], str | None]:
     """Force-remove every git worktree whose path lies under ``run_dir``, then
     prune git's admin entries. Reconciles from ``git worktree list`` (on-disk
     truth), NOT from policy — orphans created under a previous isolation=worktree
-    config persist after a switch back to isolation=none. Returns the worktree
-    paths handled (or that would be, under dry_run). Callers gate on
-    ``reclaimable``; the main checkout is never under a run dir, so it is safe."""
+    config persist after a switch back to isolation=none. Callers gate on
+    ``reclaimable``; the main checkout is never under a run dir, so it is safe.
+
+    ``(handled, fault)``: the worktree paths removed (or that would be, under
+    dry_run), and ``None`` — or an operator-facing line when the reconcile is
+    incomplete (DW-470). Non-raising, since `clean` must still run its other
+    passes, but a listing that failed is not "nothing orphaned": ``[]`` over an
+    unlisted repo let `clean` go on to trim the run's ``worktrees/`` tree with
+    git's admin entries for it still registered, and say nothing. A worktree
+    whose fallback ``rmtree`` left it on disk is named too, and is not in
+    ``handled`` — reporting it removed would be false."""
     run_res = run_dir.resolve()
     try:
         worktrees = verify.worktree_list(repo)
-    except verify.GitError:
-        return []
+    except verify.GitError as exc:
+        return [], f"cannot list git worktrees, so none were reconciled: {exc}"
     handled: list[Path] = []
+    left: list[str] = []
     for wt in worktrees:
         try:
             wt.resolve().relative_to(run_res)
         except (ValueError, OSError):
             continue  # not this run's worktree (incl. the main checkout)
-        handled.append(wt)
         if not dry_run:
             try:
                 verify.worktree_remove(repo, wt, force=True)
             except verify.GitError:
                 shutil.rmtree(wt, ignore_errors=True)
-    if handled and not dry_run:
+                if os.path.lexists(wt):
+                    left.append(str(wt))
+                    continue
+        handled.append(wt)
+    if (handled or left) and not dry_run:
         verify.worktree_prune(repo)
-    return handled
+    if left:
+        return handled, "worktree(s) still on disk after a failed removal: " + ", ".join(left)
+    return handled, None
 
 
 def reconcile_stale_worktrees(
@@ -3132,21 +3148,28 @@ def reconcile_stale_worktrees(
     is still resumable, so its worktree is left for `resume`/`clean` to handle and
     never stranded out from under the operator.
 
-    ``(handled, fault)``: ``fault`` is :func:`list_run_dirs`' (DW-468) — a run the
-    listing could not read was not reconciled, and the caller says so rather
-    than letting "reclaimed nothing" stand for it."""
+    ``(handled, fault)``: ``fault`` joins :func:`list_run_dirs`' (DW-468) — a run
+    the listing could not read was not reconciled — with each distinct
+    :func:`reconcile_orphan_worktrees` fault (DW-470), so the caller says so
+    rather than letting "reclaimed nothing" stand for either."""
     handled: list[Path] = []
     run_dirs, fault = list_run_dirs(project)
+    faults = [fault] if fault is not None else []
     for run_dir in run_dirs:
         if not is_finished(run_dir):
             continue
-        handled += reconcile_orphan_worktrees(repo, run_dir, dry_run=dry_run)
-    return handled, fault
+        run_handled, run_fault = reconcile_orphan_worktrees(repo, run_dir, dry_run=dry_run)
+        handled += run_handled
+        # A listing fault is repo-wide and repeats per run verbatim; say it once.
+        if run_fault is not None and run_fault not in faults:
+            faults.append(run_fault)
+    return handled, "; ".join(faults) or None
 
 
-def _run_dir_names(project: Path) -> set[str] | None:
-    """Every *directory name* under the runs dir, or ``None`` when that listing
-    could not be taken.
+def _run_dir_names(project: Path) -> tuple[set[str] | None, str | None]:
+    """``(names, fault)``: every *directory name* under the runs dir, or ``None``
+    — paired with an operator-facing ``fault`` — when that listing could not be
+    taken.
 
     Deliberately not :func:`list_run_dirs`, which is ``state.json``-gated: this
     answers "does a run dir by this name exist", and a run whose ``state.json`` is
@@ -3159,15 +3182,18 @@ def _run_dir_names(project: Path) -> set[str] | None:
     unreadable one answers nothing at all, and a sweep run against "no live names"
     would remove every state dir this project has. ``None`` is that second case.
     """
+    runs_dir = project / RUNS_DIR
     try:
-        return {entry.name for entry in os.scandir(project / RUNS_DIR) if entry.is_dir()}
+        return {entry.name for entry in os.scandir(runs_dir) if entry.is_dir()}, None
     except FileNotFoundError:
-        return set()
-    except OSError:
-        return None
+        return set(), None
+    except OSError as exc:
+        return None, f"{runs_dir}: cannot list the runs dir: {type(exc).__name__}: {exc}"
 
 
-def reconcile_orphan_state_dirs(project: Path, *, dry_run: bool = False) -> list[Path]:
+def reconcile_orphan_state_dirs(
+    project: Path, *, dry_run: bool = False
+) -> tuple[list[Path], str | None]:
     """Remove this project's out-of-tree control-plane dirs whose run dir is gone.
 
     The GC backstop for the events channel (#494). :func:`_discard_state_dir`
@@ -3178,8 +3204,9 @@ def reconcile_orphan_state_dirs(project: Path, *, dry_run: bool = False) -> list
     forever, on a path outside the project that no operator thinks to look at.
 
     Shaped like :func:`reconcile_orphan_worktrees`: enumerate on-disk truth,
-    containment-test each path, remove with failures tolerated. Returns what was
-    removed (or, under ``dry_run``, what would be).
+    containment-test each path, remove with failures tolerated. Returns
+    ``(handled, fault)``: what was removed (or, under ``dry_run``, what would be),
+    and ``None`` or an operator-facing line saying why the sweep is incomplete.
 
     Every path is built from an entry name this function itself enumerated —
     never from a caller-supplied ref, which is what :func:`_is_path_escape`
@@ -3194,7 +3221,12 @@ def reconcile_orphan_state_dirs(project: Path, *, dry_run: bool = False) -> list
     Degrades to no-op rather than raising, in either direction: an underivable
     state root, an unreadable root, or an unreadable runs dir all sweep nothing.
     This is reclamation, not repair — leaving disk behind is the cheap outcome,
-    and removing a live run's control plane is not.
+    and removing a live run's control plane is not. **But visibly** (DW-470): each
+    of those answers ``([], fault)``, so `clean` reports "could not sweep" rather
+    than "swept 0". So does an entry the containment test could not resolve, or
+    one ``rmtree`` left on disk (which is kept out of ``handled``); the rest of the
+    sweep stands. Only a missing state root is silent — nothing was ever minted
+    there, so nothing is orphaned.
 
     Both guards hold ``RuntimeError`` alongside ``OSError`` for the same reason
     :func:`_discard_state_dir` does: every path here is resolved (the project by
@@ -3222,14 +3254,20 @@ def reconcile_orphan_state_dirs(project: Path, *, dry_run: bool = False) -> list
     """
     try:
         root = project_state_root(project)
+    except (StateRootError, OSError, RuntimeError) as exc:
+        return [], f"cannot name this project's state root: {type(exc).__name__}: {exc}"
+    try:
         entries = sorted(root.iterdir())
         root_res = root.resolve()
-    except (StateRootError, OSError, RuntimeError):
-        return []
-    live = _run_dir_names(project)
+    except (FileNotFoundError, NotADirectoryError):
+        return [], None
+    except (OSError, RuntimeError) as exc:
+        return [], f"{root}: cannot list the state root: {type(exc).__name__}: {exc}"
+    live, live_fault = _run_dir_names(project)
     if live is None:
-        return []
+        return [], f"{live_fault} — no state dir could be proven orphaned"
     handled: list[Path] = []
+    skipped: list[str] = []
     for entry in entries:
         if entry.name in live or entry.is_symlink() or not entry.is_dir():
             continue
@@ -3249,12 +3287,20 @@ def reconcile_orphan_state_dirs(project: Path, *, dry_run: bool = False) -> list
             continue
         try:
             entry.resolve().relative_to(root_res)
-        except (OSError, RuntimeError, ValueError):
+        except ValueError:
+            continue  # resolves outside the root (a junction): not ours to reap
+        except (OSError, RuntimeError) as exc:
+            skipped.append(f"{entry.name} (cannot resolve: {type(exc).__name__}: {exc})")
             continue
-        handled.append(entry)
         if not dry_run:
             shutil.rmtree(entry, ignore_errors=True)
-    return handled
+            if os.path.lexists(entry):
+                skipped.append(f"{entry.name} (still on disk after removal)")
+                continue
+        handled.append(entry)
+    if skipped:
+        return handled, f"{root}: state dir(s) not swept: " + "; ".join(skipped)
+    return handled, None
 
 
 def _unlink_redirect(p: Path) -> None:
@@ -6615,19 +6661,24 @@ def _clear_sentinel(
     breadcrumb of what blocked planning), journal ``sentinel-cleared`` — carrying
     both the fixed slug (``sentinel_kind``) and the *recorded blocking condition*
     parsed from the sentinel's ``## Auto Run Result`` (the reason planning halted) —
-    then delete the sentinel so the next dispatch is clean."""
+    then delete the sentinel so the next dispatch is clean.
+
+    A sentinel whose text cannot be read still gets preserved and deleted, so the
+    re-arm completes, but its row says so (DW-471): ``condition_unreadable=true``
+    and the fault in ``error``, beside the empty ``condition``. Without them the
+    row read exactly like a sentinel that recorded no blocking condition. A
+    readable sentinel's row is unchanged — neither key is written."""
     from .stories import recorded_blocking_condition
 
     dest_dir = run_dir / "sentinels"
     dest_dir.mkdir(parents=True, exist_ok=True)
     condition = ""
+    read_fault: dict[str, object] = {}
     if spec_path.is_file():
         try:
             condition = recorded_blocking_condition(spec_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError):
-            # An unreadable/binary sentinel still gets preserved+deleted so re-arm
-            # completes; we just journal an empty blocking condition.
-            condition = ""
+        except (OSError, UnicodeDecodeError) as exc:
+            read_fault = {"condition_unreadable": True, "error": f"{type(exc).__name__}: {exc}"}
         shutil.copy2(spec_path, dest_dir / spec_path.name)
         spec_path.unlink()
     journal.append(
@@ -6636,4 +6687,5 @@ def _clear_sentinel(
         sentinel_kind=sentinel_kind,
         condition=condition,
         sentinel=spec_path.name,
+        **read_fault,
     )

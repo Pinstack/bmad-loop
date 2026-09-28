@@ -512,6 +512,10 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # `diagnostics._JOURNAL_DROP_FIELDS` and would ship as a presence marker.
         "compared",
         "condition",
+        # `sentinel-cleared`'s read-fault flag (DW-471): the sentinel's text could
+        # not be read, so its empty `condition` is not "none recorded". A bare
+        # boolean; the fault text rides in `error`, which diagnostics drops.
+        "condition_unreadable",
         "contradiction",
         "converted",
         "count",

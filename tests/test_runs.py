@@ -2691,7 +2691,10 @@ def test_the_state_dir_gc_reclaims_the_config_digest(tmp_path):
     digest = runs.config_digest_path_for(tmp_path, "r1")
     assert digest.is_file()
 
-    assert runs.reconcile_orphan_state_dirs(tmp_path) == [runs.state_dir_for(tmp_path, "r1")]
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == (
+        [runs.state_dir_for(tmp_path, "r1")],
+        None,
+    )
 
     assert not digest.exists()
 
@@ -5752,7 +5755,7 @@ def test_reconcile_orphan_state_dirs_removes_only_what_has_no_run_dir(tmp_path):
     kept = _seed_state_dir(tmp_path, "live-1")
     orphan = _seed_state_dir(tmp_path, "gone-1")
 
-    assert runs.reconcile_orphan_state_dirs(tmp_path) == [orphan]
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == ([orphan], None)
 
     assert not orphan.exists()
     assert kept.is_dir()
@@ -5769,7 +5772,7 @@ def test_reconcile_orphan_state_dirs_keeps_a_run_dir_with_no_state_json(tmp_path
     _make_run(tmp_path, "corrupt-1", with_state=False)
     kept = _seed_state_dir(tmp_path, "corrupt-1")
 
-    assert runs.reconcile_orphan_state_dirs(tmp_path) == []
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == ([], None)
 
     assert kept.is_dir()
 
@@ -5779,7 +5782,7 @@ def test_reconcile_orphan_state_dirs_dry_run_reports_without_removing(tmp_path):
     the disk alone, so the count a caller pre-flights is the count they get."""
     orphan = _seed_state_dir(tmp_path, "gone-1")
 
-    assert runs.reconcile_orphan_state_dirs(tmp_path, dry_run=True) == [orphan]
+    assert runs.reconcile_orphan_state_dirs(tmp_path, dry_run=True) == ([orphan], None)
 
     assert orphan.is_dir()
 
@@ -5793,7 +5796,7 @@ def test_reconcile_orphan_state_dirs_sweeps_a_project_whose_runs_dir_is_gone(tmp
     orphan = _seed_state_dir(tmp_path, "gone-1")
     assert not (tmp_path / ".bmad-loop" / "runs").exists()
 
-    assert runs.reconcile_orphan_state_dirs(tmp_path) == [orphan]
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == ([orphan], None)
 
     assert not orphan.exists()
 
@@ -5823,9 +5826,13 @@ def test_reconcile_orphan_state_dirs_sweeps_nothing_when_the_runs_dir_cannot_be_
 
     monkeypatch.setattr(runs.os, "scandir", _refuse_only_the_runs_dir)
 
-    assert runs.reconcile_orphan_state_dirs(tmp_path) == []
+    handled, fault = runs.reconcile_orphan_state_dirs(tmp_path)
 
+    assert handled == []
     assert kept.is_dir()
+    # DW-470: and says so, rather than reading as "nothing orphaned".
+    assert fault is not None
+    assert "cannot list the runs dir" in fault and "PermissionError" in fault
 
 
 def test_reconcile_orphan_state_dirs_leaves_another_projects_subtree_alone(tmp_path):
@@ -5841,7 +5848,7 @@ def test_reconcile_orphan_state_dirs_leaves_another_projects_subtree_alone(tmp_p
     # my own orphan, so the sweep provably enumerates rather than finding nothing
     orphan = _seed_state_dir(mine, "gone-1")
 
-    assert runs.reconcile_orphan_state_dirs(mine) == [orphan]
+    assert runs.reconcile_orphan_state_dirs(mine) == ([orphan], None)
 
     assert not orphan.exists()
     assert foreign.is_dir()
@@ -5865,7 +5872,7 @@ def test_reconcile_orphan_state_dirs_never_removes_through_a_symlink(tmp_path):
     link = runs.project_state_root(tmp_path) / "ghost-1"
     link.symlink_to(target)
 
-    assert runs.reconcile_orphan_state_dirs(tmp_path) == []
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == ([], None)
 
     assert link.is_symlink()  # not followed, not removed
     assert target.is_dir()
@@ -5893,7 +5900,12 @@ def test_reconcile_orphan_state_dirs_degrades_when_the_root_cannot_be_named(
     the measured version split."""
     monkeypatch.setattr(runs, attr, _raising(exc))
 
-    assert runs.reconcile_orphan_state_dirs(tmp_path) == []
+    handled, fault = runs.reconcile_orphan_state_dirs(tmp_path)
+
+    assert handled == []
+    # DW-470: a sweep that could not run is not "swept 0".
+    assert fault is not None
+    assert "cannot name this project's state root" in fault and type(exc).__name__ in fault
 
 
 def test_reconcile_orphan_state_dirs_keeps_a_run_that_starts_mid_sweep(tmp_path, monkeypatch):
@@ -5932,7 +5944,7 @@ def test_reconcile_orphan_state_dirs_keeps_a_run_that_starts_mid_sweep(tmp_path,
 
     monkeypatch.setattr(runs, "_run_dir_names", _names_then_a_new_run)
 
-    assert runs.reconcile_orphan_state_dirs(tmp_path) == [orphan]
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == ([orphan], None)
 
     assert not orphan.exists()
     assert racer[0].is_dir(), "swept the control plane of a run that was starting"
@@ -5965,8 +5977,115 @@ def test_reconcile_orphan_state_dirs_skips_an_entry_it_cannot_resolve(tmp_path, 
 
     monkeypatch.setattr(Path, "resolve", _resolve)
 
-    assert runs.reconcile_orphan_state_dirs(tmp_path) == [good]
+    handled, fault = runs.reconcile_orphan_state_dirs(tmp_path)
+    assert handled == [good]
     assert not good.exists() and bad.is_dir()
+    # DW-470: the skip is named — the rest of the sweep still stands.
+    assert fault is not None and "ghost-loop (cannot resolve: RuntimeError" in fault
+
+
+def test_reconcile_orphan_state_dirs_names_an_unreadable_state_root(tmp_path, monkeypatch):
+    """DW-470: a state root that exists but cannot be listed answers the fault,
+    not `([], None)` — `clean` used to report that as swept 0. Ablate the fault
+    arm (fold it back into the silent return) and this fails."""
+    orphan = _seed_state_dir(tmp_path, "gone-1")
+    root = runs.project_state_root(tmp_path)
+    real_iterdir = Path.iterdir
+
+    def _refuse_the_root(self: Path):
+        if self == root:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", _refuse_the_root)
+
+    handled, fault = runs.reconcile_orphan_state_dirs(tmp_path)
+
+    assert handled == []
+    assert orphan.is_dir()
+    assert fault is not None and "cannot list the state root" in fault
+    assert "PermissionError" in fault
+
+
+def test_reconcile_orphan_state_dirs_is_silent_when_no_state_root_exists(tmp_path):
+    """The healthy twin of the test above: no run ever minted a state dir here,
+    so nothing is orphaned and there is nothing to warn about."""
+    assert not runs.project_state_root(tmp_path).exists()
+
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == ([], None)
+
+
+def test_reconcile_orphan_state_dirs_names_an_entry_rmtree_left_behind(tmp_path, monkeypatch):
+    """DW-470: `rmtree(ignore_errors=True)` can leave the tree, and counting it as
+    swept would be false. It is kept out of `handled` and named. Ablate the
+    `lexists` check and `handled` claims the orphan with no fault."""
+    orphan = _seed_state_dir(tmp_path, "gone-1")
+    monkeypatch.setattr(runs.shutil, "rmtree", lambda *a, **k: None)
+
+    handled, fault = runs.reconcile_orphan_state_dirs(tmp_path)
+
+    assert handled == []
+    assert orphan.is_dir()
+    assert fault is not None and "gone-1 (still on disk after removal)" in fault
+
+
+def _sentinel_row(run_dir: Path) -> dict:
+    return next(e for e in Journal(run_dir).entries() if e["kind"] == "sentinel-cleared")
+
+
+def test_clear_sentinel_records_an_unreadable_condition(tmp_path, monkeypatch):
+    """DW-471: a sentinel whose text cannot be read still gets preserved and
+    deleted, but its row says the condition was unreadable. Before this the
+    empty `condition` read exactly like "none recorded". Ablate the flag and
+    this fails."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    spec = tmp_path / "1-1-x-unresolved.md"
+    spec.write_text("## Auto Run Result\n\nintent too vague\n", encoding="utf-8")
+    real_read_text = Path.read_text
+
+    def _refuse_the_spec(self: Path, *args, **kwargs):
+        if self == spec:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _refuse_the_spec)
+
+    runs._clear_sentinel(run_dir, Journal(run_dir), spec, "1-1-x", "unresolved")
+
+    assert not spec.exists()
+    assert (run_dir / "sentinels" / spec.name).is_file()
+    row = _sentinel_row(run_dir)
+    assert row["condition"] == ""
+    assert row["condition_unreadable"] is True
+    assert row["error"].startswith("PermissionError")
+
+
+def test_clear_sentinel_records_an_undecodable_condition(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    spec = tmp_path / "1-1-x-unresolved.md"
+    spec.write_bytes(b"\xff\xfe not utf-8")
+
+    runs._clear_sentinel(run_dir, Journal(run_dir), spec, "1-1-x", "unresolved")
+
+    row = _sentinel_row(run_dir)
+    assert row["condition"] == "" and row["condition_unreadable"] is True
+    assert row["error"].startswith("UnicodeDecodeError")
+
+
+def test_clear_sentinel_readable_row_is_unchanged(tmp_path):
+    """The healthy row keeps its old shape: neither fault key is written."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    spec = tmp_path / "1-1-x-unresolved.md"
+    spec.write_text("# Sentinel\n", encoding="utf-8")
+
+    runs._clear_sentinel(run_dir, Journal(run_dir), spec, "1-1-x", "unresolved")
+
+    row = _sentinel_row(run_dir)
+    assert "condition_unreadable" not in row and "error" not in row
+    assert row["sentinel_kind"] == "unresolved" and row["sentinel"] == spec.name
 
 
 # ---- run inventory (moved from tui/data.py, #650)
@@ -7386,7 +7505,7 @@ def test_orphan_state_sweep_never_reaps_the_registry(tmp_path):
     port = registry / "bmad-loop-r1.port"
     port.write_text("54321\n")
 
-    assert runs.reconcile_orphan_state_dirs(tmp_path) == []
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == ([], None)
     assert port.exists()
 
 
@@ -7397,7 +7516,7 @@ def test_orphan_state_sweep_still_reaps_a_real_orphan_beside_the_registry(tmp_pa
     orphan = runs.state_dir_for(tmp_path, "20260101-000000-dead")
     orphan.mkdir(parents=True)
 
-    assert runs.reconcile_orphan_state_dirs(tmp_path) == [orphan]
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == ([orphan], None)
     assert not orphan.exists()
     assert runs.mux_registry_root(tmp_path).exists()
 

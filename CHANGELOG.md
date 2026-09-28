@@ -170,6 +170,13 @@ breaking changes may land in a minor release.
   backend selectable) on stderr, in the TUI, and as additive
   `sessions.legacy_unverified` in `cleanup --json`, instead of reading as one with
   nothing left (DW-469).
+- Warn instead of reading as "nothing orphaned" when `clean` cannot reconcile a run's
+  worktrees (git would not list them, or a failed removal left one on disk) or cannot
+  sweep orphaned state dirs (unnameable or unreadable state root, unreadable runs dir,
+  entries skipped); `clean --json` gains additive `worktree_faults` / `state_dir_fault`,
+  and the run-start reconcile warns too. Other passes still run (DW-470).
+- Journal `condition_unreadable` and the fault in `error` on `sentinel-cleared` when
+  the sentinel's text cannot be read, instead of an empty `condition` alone (DW-471).
 - Carry story edits to skip-worktree-pinned hook configs in the `changes.patch` of a
   merged unit escalated on a failed merge-back, as the DEFERRED unit's patch does (DW-501).
 - Drop a DEFERRED unit's pinned-config record (a copy of the operator's hook settings)

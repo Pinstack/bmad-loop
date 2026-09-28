@@ -429,11 +429,10 @@ def _reconcile_stale(project: Path, paths: bmadconfig.ProjectPaths, pol) -> None
     if freed:
         print(f"reclaimed {len(freed)} stale worktree(s) from prior runs")
     if fault is not None:
-        # DW-468: an unread run was not reconciled; "reclaimed nothing" must not
-        # stand for it. Advisory — the new run does not depend on this sweep.
-        print(
-            f"warning: stale-worktree reconcile skipped unreadable runs: {fault}", file=sys.stderr
-        )
+        # DW-468/DW-470: an unread run, or a worktree list git would not give, was
+        # not reconciled; "reclaimed nothing" must not stand for it. Advisory — the
+        # new run does not depend on this sweep.
+        print(f"warning: stale-worktree reconcile incomplete: {fault}", file=sys.stderr)
 
 
 # ----------------------------------------------------------------- commands
@@ -5582,6 +5581,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
     archived: list[str] = []
     deleted: list[str] = []
     unverifiable: list[str] = []
+    worktree_faults: list[str] = []
     for run_dir in reclaimable:
         if runs.live_session_may_be_ours(project, run_dir.name):
             # `reclaimable` is keyed on engine pid liveness, so an orphan — engine
@@ -5619,7 +5619,17 @@ def cmd_clean(args: argparse.Namespace) -> int:
         run_bytes = _dir_size(run_dir)
         # collect, never print-as-you-mutate: the document is emitted once at the
         # end, so every per-item line has to survive the loop as data
-        run_worktrees = runs.reconcile_orphan_worktrees(repo, run_dir, dry_run=dry)
+        run_worktrees, wt_fault = runs.reconcile_orphan_worktrees(repo, run_dir, dry_run=dry)
+        if wt_fault is not None:
+            # DW-470: not "no orphaned worktrees". The passes below still run —
+            # their git admin entries may outlive a trim, which `git worktree
+            # prune` clears once git answers again.
+            worktree_faults.append(f"{run_dir.name}: {wt_fault}")
+            if not args.json:
+                print(
+                    f"warning: run {run_dir.name}: worktree reconcile incomplete: {wt_fault}",
+                    file=sys.stderr,
+                )
         for wt in run_worktrees:
             worktrees.append(str(wt))
             if not args.json:
@@ -5680,7 +5690,12 @@ def cmd_clean(args: argparse.Namespace) -> int:
     # `freed` on purpose: a state dir holds consumed event files and nothing else,
     # so sizing every one of them would buy kilobytes of accuracy for a walk of a
     # second tree. The count is the honest report of what went.
-    swept = len(runs.reconcile_orphan_state_dirs(project, dry_run=dry))
+    swept_dirs, state_dir_fault = runs.reconcile_orphan_state_dirs(project, dry_run=dry)
+    swept = len(swept_dirs)
+    if state_dir_fault is not None and not args.json:
+        # DW-470: a sweep that could not run is not "swept 0" — and not "nothing
+        # to reclaim" either, which the summary below still prints on its own terms.
+        print(f"warning: orphaned state-dir sweep incomplete: {state_dir_fault}", file=sys.stderr)
 
     if args.json:
         machine.emit(
@@ -5697,6 +5712,8 @@ def cmd_clean(args: argparse.Namespace) -> int:
                 unverifiable_pid=unverifiable,
                 state_dirs_swept=swept,
                 listing_fault=listing_fault,
+                worktree_faults=worktree_faults,
+                state_dir_fault=state_dir_fault,
             )
         )
         return 0

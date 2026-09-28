@@ -489,6 +489,8 @@ def clean_document(
     unverifiable_pid: list[str],
     state_dirs_swept: int,
     listing_fault: str | None = None,
+    worktree_faults: list[str] | None = None,
+    state_dir_fault: str | None = None,
 ) -> dict[str, object]:
     """The `clean --json` document: the disk this invocation reclaimed, or —
     under ``--dry-run`` — would reclaim.
@@ -533,6 +535,13 @@ def clean_document(
     stat'd. Those runs are in no list — never reclaimed, never counted toward
     retention — so without it an unreadable runs dir documents as "nothing to
     reclaim". The text mode's stderr warning; additive, no schema bump.
+
+    `worktree_faults` holds one ``"<run id>: <fault>"`` line per touched run whose
+    worktree reconcile was incomplete — git would not list worktrees, or a failed
+    removal left one on disk — and `state_dir_fault` is ``null`` unless the
+    orphaned state-dir sweep could not run or skipped entries (DW-470). Without
+    them either fault documents as nothing orphaned, `state_dirs_swept: 0`. The
+    text mode's stderr warnings; additive, no schema bump.
     """
     return {
         "schema_version": CLEAN_SCHEMA_VERSION,
@@ -552,4 +561,6 @@ def clean_document(
         "unverifiable_pid": list(unverifiable_pid),
         "state_dirs_swept": state_dirs_swept,
         "listing_fault": listing_fault,
+        "worktree_faults": list(worktree_faults or ()),
+        "state_dir_fault": state_dir_fault,
     }
