@@ -679,8 +679,14 @@ breaking changes may land in a minor release.
 - Pin the exact-path candidate worktree's `.git` gitfile beside its root: it must name
   this candidate's own worktree admin dir in this repository, and a gitfile rewritten or
   replaced before a later candidate git call is refused instead of steering that call into
-  another repository or worktree. The admin dir and its `commondir` are checked only at the
-  pin, and a rewrite racing git's own read of the gitfile still wins (DW-442).
+  another repository or worktree. A rewrite racing git's own read of the gitfile still
+  wins (DW-442).
+- Pin the exact-path candidate worktree's admin dir and its `commondir` beside the
+  gitfile: an admin dir swapped for a link, an intermediate directory link on the
+  gitfile's `gitdir:` path retargeted, or a rewritten `commondir` is refused before the next
+  candidate git call instead of steering it elsewhere with the gitfile untouched. No
+  canonical-path check is added. A change racing git's own read still wins (DW-493,
+  DW-495).
 - Create missing artifact destination parents, and a missing artifacts directory, through
   anchored no-follow opens pinned to the accepted root instead of `mkdir(parents=True)`, so
   a root swapped for a link gets nothing created outside the repository (DW-421). On

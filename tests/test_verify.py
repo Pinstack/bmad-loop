@@ -11112,6 +11112,231 @@ def test_commit_path_bound_refuses_a_non_regular_candidate_gitfile(
     assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
 
 
+def _admin_copy_into(parent, admin):
+    """A copy of the candidate admin dir `admin` at `parent/<its name>` whose
+    `commondir` is a hard link to the pinned one — same `(st_dev, st_ino)`, same
+    bytes — so only the admin dir's own identity tells the two apart. With
+    `parent` directly under the common dir, the relative `commondir` still
+    resolves there: a working stand-in git would take the candidate's index,
+    HEAD and commit through without a complaint."""
+    copy = parent / admin.name
+    shutil.copytree(admin, copy, symlinks=True)
+    (copy / "commondir").unlink()
+    os.link(admin / "commondir", copy / "commondir")
+    return copy
+
+
+@pytest.mark.parametrize("tamper_point", _CANDIDATE_POINTS[1:])
+@pytest.mark.parametrize("tamper", ["admin-link", "commondir", "intermediate-link"])
+def test_commit_path_bound_refuses_a_candidate_admin_dir_changed_after_the_pin(
+    project, tmp_path_factory, monkeypatch, tamper, tamper_point
+):
+    """DW-493/DW-495: git re-resolves the admin dir the candidate gitfile names,
+    and that dir's `commondir`, by path on every call, so both are pinned beside
+    the gitfile and every re-check refuses — the gitfile untouched — when after
+    the pin:
+
+    - `admin-link`: `<common-dir>/worktrees/<name>` is swapped for a link to a
+      working copy of itself (POSIX symlinks);
+    - `commondir`: its `commondir` is rewritten in place (same inode) to name
+      another repository's gitdir;
+    - `intermediate-link`: the gitfile, rewritten before the pin to reach the
+      admin dir through `L -> <common-dir>/worktrees` (which the pin accepts),
+      keeps its bytes while `L` is retargeted to a tree holding a working copy
+      of the admin dir (DW-495; POSIX symlinks).
+
+    Nothing moves: this repo's HEAD, the other repository's HEAD and index, and
+    the registration is gone after cleanup.
+
+    The link rows' stand-in shares the pinned `commondir` by hard link and sits
+    where its relative `commondir` still names this repo's common dir, so the
+    `commondir` half cannot see the swap. Ablations, each failing its rows:
+    drop the admin-dir half of `_require_pinned_candidate` and the link rows
+    run the candidate calls in the stand-in and publish (`intermediate-link`
+    then fails only its cleanup); drop its `commondir` half and the `commondir`
+    rows run them against `outside`'s objects and refs — refused later on
+    another reason ("candidate commit failed"), or not at all."""
+    if tamper != "commondir" and sys.platform == "win32":
+        pytest.skip("POSIX symlinks")
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    common_dir = repo / ".git"
+    outside = _outside_repo(tmp_path_factory)
+    outside_head = verify.rev_parse_head(outside)
+    outside_index = (outside / ".git" / "index").read_bytes()
+    stand_in = common_dir / "stand-in"
+    stand_in.mkdir()
+    link = tmp_path_factory.mktemp("link-parent") / "wt-link"
+    tampered = []
+    restore = []
+
+    if tamper == "intermediate-link":
+
+        def via_link(candidate_root):
+            admin = _gitfile_target(candidate_root / ".git")
+            link.symlink_to(admin.parent, target_is_directory=True)
+            (candidate_root / ".git").write_bytes(
+                f"gitdir: {(link / admin.name).as_posix()}\n".encode()
+            )
+
+        _intercept_candidate_checkout(monkeypatch, via_link)
+
+    def tamper_with(candidate_root):
+        admin = _gitfile_target(candidate_root / ".git")
+        if tamper == "admin-link":
+            copy = _admin_copy_into(stand_in, admin)
+            pinned = common_dir / f"{admin.name}-pinned"
+            admin.rename(pinned)
+            admin.symlink_to(copy, target_is_directory=True)
+
+            def put_back():
+                admin.unlink()
+                pinned.rename(admin)
+
+            restore.append(put_back)
+        elif tamper == "commondir":
+            (admin / "commondir").write_bytes(f"{(outside / '.git').as_posix()}\n".encode())
+        else:
+            _admin_copy_into(stand_in, admin)
+            link.unlink()
+            link.symlink_to(stand_in, target_is_directory=True)
+        tampered.append(True)
+
+    _at_candidate_point(monkeypatch, tamper_point, tamper_with)
+    # The cleanup `worktree remove` follows a linked admin entry (DW-494); put the
+    # pinned one back first and observe only the candidate calls.
+    real_git = verify._git
+
+    def restore_then_git(git_repo, *args, **kwargs):
+        if args[:2] == ("worktree", "remove"):
+            while restore:
+                restore.pop()()
+        return real_git(git_repo, *args, **kwargs)
+
+    monkeypatch.setattr(verify, "_git", restore_then_git)
+    expected = "commondir was rewritten" if tamper == "commondir" else "admin dir was replaced"
+
+    with pytest.raises(verify.GitError, match=expected):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert tampered
+    assert verify.rev_parse_head(repo) == original
+    assert verify.rev_parse_head(outside) == outside_head
+    assert (outside / ".git" / "index").read_bytes() == outside_index
+    assert git(outside, "status", "--porcelain") == ""
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_commit_path_bound_publishes_through_an_intact_intermediate_admin_link(
+    project, tmp_path_factory, monkeypatch
+):
+    """DW-495: the pin holds the admin dir through the path the gitfile names,
+    with no canonical-path check, so a gitfile reaching the admin dir through an
+    intermediate `L -> <common-dir>/worktrees` link that stays put publishes as
+    before. Ablation (the other direction): add a canonical-path check at the
+    pin — the resolved `gitdir:` path against its lexical spelling — and this
+    publish is refused."""
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    link = tmp_path_factory.mktemp("link-parent") / "wt-link"
+    seen = []
+
+    def via_link(candidate_root):
+        admin = _gitfile_target(candidate_root / ".git")
+        link.symlink_to(admin.parent, target_is_directory=True)
+        (candidate_root / ".git").write_bytes(
+            f"gitdir: {(link / admin.name).as_posix()}\n".encode()
+        )
+        seen.append(True)
+
+    _intercept_candidate_checkout(monkeypatch, via_link)
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert seen
+    assert published == verify.rev_parse_head(repo)
+    assert git(repo, "show", f"{published}:src.txt") == accepted.rstrip("\n")
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+@pytest.mark.parametrize("which", ["admin-dir", "commondir"])
+def test_commit_path_bound_pin_refuses_a_zero_inode_admin_dir_or_commondir(
+    project, monkeypatch, which
+):
+    """DW-493: an admin dir or `commondir` whose stat carries a zero inode (some
+    win32 filesystems) has no identity to hold, so the pin refuses it outright,
+    as it does a zero-inode gitfile, rather than letting the first re-check
+    report it as replaced. Ablation: drop the matching zero-inode check in
+    `_pin_candidate_gitfile` and the refusal moves to that re-check ("admin dir
+    was replaced" / "commondir was rewritten")."""
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    if which == "admin-dir":
+        real_identity = verify.pinned_root_identity
+
+        def zero_admin(root):
+            info = real_identity(root)
+            if info is not None and Path(root).parent.name == "worktrees":
+                return os.stat_result((info.st_mode, 0, *tuple(info)[2:10]))
+            return info
+
+        monkeypatch.setattr(verify, "pinned_root_identity", zero_admin)
+    else:
+        real_read = verify._read_candidate_commondir
+        monkeypatch.setattr(
+            verify,
+            "_read_candidate_commondir",
+            lambda admin: dataclasses.replace(real_read(admin), ino=0),
+        )
+    expected = "admin dir" if which == "admin-dir" else "commondir"
+
+    with pytest.raises(verify.GitError, match=f"worktree {expected} carries no file identity"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+def _unit_candidate_pin(tmp_path):
+    """A candidate root and a full `_CandidateGitdirPin` for it, built without
+    git: a gitfile, and an admin dir holding a `commondir`."""
+    root = tmp_path / "candidate"
+    root.mkdir()
+    admin = tmp_path / "worktrees" / "candidate"
+    admin.mkdir(parents=True)
+    (admin / "commondir").write_bytes(b"../..\n")
+    (root / ".git").write_bytes(f"gitdir: {admin.as_posix()}\n".encode())
+    identity = platform_util.pinned_root_identity(root)
+    admin_identity = platform_util.pinned_root_identity(admin)
+    assert identity is not None and admin_identity is not None
+    pin = verify._CandidateGitdirPin(
+        verify._read_candidate_gitfile(root),
+        admin,
+        admin_identity,
+        verify._read_candidate_commondir(admin),
+    )
+    verify._require_pinned_candidate(root, identity, pin)
+    return root, identity, pin
+
+
 def test_require_pinned_candidate_holds_the_gitfile_identity_and_bytes(tmp_path, monkeypatch):
     """DW-442: the re-check refuses a gitfile whose bytes changed in place, one
     replaced by an identical copy (a new inode), and any pin with a zero inode —
@@ -11121,33 +11346,93 @@ def test_require_pinned_candidate_holds_the_gitfile_identity_and_bytes(tmp_path,
     only that compare refuses); drop BOTH zero-inode guards and the
     zero-against-zero case passes. Either guard alone refuses that case, since
     it only arises when both sides are zero, so dropping just one stays green."""
-    root = tmp_path / "candidate"
-    root.mkdir()
+    root, identity, pin = _unit_candidate_pin(tmp_path)
     gitfile = root / ".git"
-    gitfile.write_bytes(b"gitdir: /nowhere/.git/worktrees/candidate\n")
-    identity = platform_util.pinned_root_identity(root)
-    assert identity is not None
-    pin = verify._read_candidate_gitfile(root)
-    verify._require_pinned_candidate(root, identity, pin)
 
-    zero = dataclasses.replace(pin, ino=0)
+    zero = dataclasses.replace(pin.gitfile, ino=0)
+    zero_pin = dataclasses.replace(pin, gitfile=zero)
     with pytest.raises(verify.GitError, match="gitfile was rewritten"):
-        verify._require_pinned_candidate(root, identity, zero)
+        verify._require_pinned_candidate(root, identity, zero_pin)
     with monkeypatch.context() as patched:
         patched.setattr(verify, "_read_candidate_gitfile", lambda _root: zero)
         with pytest.raises(verify.GitError, match="gitfile was rewritten"):
-            verify._require_pinned_candidate(root, identity, zero)
+            verify._require_pinned_candidate(root, identity, zero_pin)
 
     copy = root / "gitfile-copy"
-    copy.write_bytes(pin.data)
+    copy.write_bytes(pin.gitfile.data)
     os.replace(copy, gitfile)
     with pytest.raises(verify.GitError, match="gitfile was rewritten"):
         verify._require_pinned_candidate(root, identity, pin)
 
-    repinned = verify._read_candidate_gitfile(root)
+    repinned = dataclasses.replace(pin, gitfile=verify._read_candidate_gitfile(root))
+    verify._require_pinned_candidate(root, identity, repinned)
     gitfile.write_bytes(b"gitdir: /elsewhere/.git\n")
     with pytest.raises(verify.GitError, match="gitfile was rewritten"):
         verify._require_pinned_candidate(root, identity, repinned)
+
+
+def test_require_pinned_candidate_holds_the_commondir_identity_and_bytes(tmp_path, monkeypatch):
+    """DW-493: the re-check holds the admin dir's `commondir` as it holds the
+    gitfile — bytes changed in place, an identical copy (a new inode) and a
+    zero-inode pin all refuse, the gitfile untouched. Ablation: drop the
+    `commondir` half of `_require_pinned_candidate` and every case passes."""
+    root, identity, pin = _unit_candidate_pin(tmp_path)
+    commondir = pin.admin_dir / "commondir"
+
+    zero = dataclasses.replace(pin.commondir, ino=0)
+    zero_pin = dataclasses.replace(pin, commondir=zero)
+    with pytest.raises(verify.GitError, match="commondir was rewritten"):
+        verify._require_pinned_candidate(root, identity, zero_pin)
+    with monkeypatch.context() as patched:
+        patched.setattr(verify, "_read_candidate_commondir", lambda _admin: zero)
+        with pytest.raises(verify.GitError, match="commondir was rewritten"):
+            verify._require_pinned_candidate(root, identity, zero_pin)
+
+    copy = pin.admin_dir / "commondir-copy"
+    copy.write_bytes(pin.commondir.data)
+    os.replace(copy, commondir)
+    with pytest.raises(verify.GitError, match="commondir was rewritten"):
+        verify._require_pinned_candidate(root, identity, pin)
+
+    repinned = dataclasses.replace(pin, commondir=verify._read_candidate_commondir(pin.admin_dir))
+    verify._require_pinned_candidate(root, identity, repinned)
+    commondir.write_bytes(b"/elsewhere/.git\n")
+    with pytest.raises(verify.GitError, match="commondir was rewritten"):
+        verify._require_pinned_candidate(root, identity, repinned)
+    commondir.unlink()
+    with pytest.raises(verify.GitError, match="commondir was rewritten") as raised:
+        verify._require_pinned_candidate(root, identity, repinned)
+    assert "could not be opened" in str(raised.value.__cause__)
+
+
+def test_require_pinned_candidate_holds_the_admin_dir_identity(tmp_path):
+    """DW-493: the re-check refuses an admin dir replaced — by a fresh directory
+    holding identical files (a new inode), or by a link to it on POSIX — with the
+    gitfile untouched and the `commondir` bytes the same, and refuses a zero-inode
+    admin pin. Ablation: drop the admin-dir half of `_require_pinned_candidate`
+    and every case fails: the zero-inode pin and the link — it names the
+    original admin dir, so its `commondir` still matches — pass, and the fresh
+    directory is refused only as a rewritten `commondir`."""
+    root, identity, pin = _unit_candidate_pin(tmp_path)
+    zero = os.stat_result((pin.admin_identity.st_mode, 0, *tuple(pin.admin_identity)[2:10]))
+    with pytest.raises(verify.GitError, match="admin dir was replaced"):
+        verify._require_pinned_candidate(
+            root, identity, dataclasses.replace(pin, admin_identity=zero)
+        )
+
+    moved = tmp_path / "moved-admin"
+    pin.admin_dir.rename(moved)
+    pin.admin_dir.mkdir()
+    (pin.admin_dir / "commondir").write_bytes(pin.commondir.data)
+    with pytest.raises(verify.GitError, match="admin dir was replaced"):
+        verify._require_pinned_candidate(root, identity, pin)
+
+    if sys.platform == "win32":
+        return  # POSIX symlinks
+    shutil.rmtree(pin.admin_dir)
+    pin.admin_dir.symlink_to(moved, target_is_directory=True)
+    with pytest.raises(verify.GitError, match="admin dir was replaced"):
+        verify._require_pinned_candidate(root, identity, pin)
 
 
 def test_commit_path_bound_publishes_through_a_relative_candidate_gitfile(project, monkeypatch):
