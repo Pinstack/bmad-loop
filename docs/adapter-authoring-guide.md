@@ -86,6 +86,14 @@ seams of a full OS port are in
   `kill_session`, `list_sessions`, `session_options` (read a user option
   across all sessions), `set_session_option`.
 
+  `list_sessions_reporting(on_fault=)` is non-abstract and defaults to
+  `list_sessions()`, which is right if your listing raises
+  `MultiplexerError` when it fails. If it instead answers `[]` for a failed
+  listing (as the tmux family does), override it and hand the fault to
+  `on_fault` in place of your own warning. The removal guard reads the listing
+  as "no live session", and this is how the TUI, which cannot see stderr,
+  learns that the listing was never really taken.
+
   One session method carries a default the seam cannot verify for your
   transport: `session_name_key(name)`, the canonical comparison key — two
   names denote the same live session exactly when their keys are equal. The

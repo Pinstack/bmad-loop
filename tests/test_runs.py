@@ -27,7 +27,7 @@ from conftest import (
 
 from bmad_loop import envvars, platform_util, runs, verify
 from bmad_loop.adapters import tmux_base
-from bmad_loop.adapters.multiplexer import MultiplexerError
+from bmad_loop.adapters.multiplexer import MultiplexerError, TerminalMultiplexer
 from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
 from bmad_loop.journal import Journal, load_state, save_state
 from bmad_loop.model import RunState, StoryTask
@@ -3022,6 +3022,106 @@ def test_removal_routes_the_unasked_guard_warning_to_one_channel(
     assert not run_dir.exists()
     assert notes == [note]
     assert capsys.readouterr().err == ""
+
+
+def _folding_tmux(stderr: str, *, installed: bool = True) -> TerminalMultiplexer:
+    """A bundled-shaped backend: the real tmux-family `list_sessions` fold, with
+    `list-sessions` exiting 1 on ``stderr``. `_BINARY` names a file that exists
+    on every box (the running interpreter) or one that exists on none, so the
+    fold's `shutil.which` gate is decided without patching PATH lookups for the
+    whole process."""
+
+    class _Folding(tmux_base.BaseTmuxBackend):
+        _BINARY = sys.executable if installed else "bmad-loop-no-such-multiplexer"
+
+        def _run(self, argv, *, check=True, env=None):
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr=stderr)
+
+        def available(self):  # the guard must not consult it
+            raise AssertionError("available() consulted")
+
+    return _Folding()
+
+
+_UNPROVEN_LISTING = "error connecting to /tmp/tmux-1001/default (Permission denied)\n"
+
+
+@pytest.mark.parametrize("helper", ["delete_run", "archive_run"])
+def test_removal_routes_a_folded_listing_fault_to_one_channel(
+    tmp_path, monkeypatch, capsys, helper
+):
+    """The bundled backends never raise from the listing: they fold a failed
+    `list-sessions` into `[]` and warn on stderr (DW-458), which the TUI never
+    shows. So the guard reads the listing through `list_sessions_reporting`:
+    with a ``warn`` sink the fault arrives there, run-scoped like the DW-466
+    raise, and stderr stays empty; without one (the CLI) the backend's own
+    stderr line is the one report, byte-for-byte what DW-458 prints.
+
+    Ablation: pass `on_fault=None` unconditionally from the guard and the sink
+    row fails (the fault goes to stderr instead)."""
+    remove = getattr(runs, helper)
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: _folding_tmux(_UNPROVEN_LISTING))
+    detail = "error connecting to /tmp/tmux-1001/default (Permission denied)"
+
+    run_dir = _make_state_run(tmp_path, "r1")
+    remove(tmp_path, run_dir)
+    assert not run_dir.exists()
+    assert capsys.readouterr().err == (
+        f"warning: {sys.executable} list-sessions exited 1 without proving the "
+        f"session gone; reading it as empty: {detail}\n"
+    )
+
+    run_dir = _make_state_run(tmp_path, "r1")
+    notes: list[str] = []
+    remove(tmp_path, run_dir, warn=notes.append)
+    assert not run_dir.exists()
+    assert notes == [
+        "run r1: could not check for a live agent session — the session listing "
+        f"failed: {sys.executable} list-sessions exited 1 without proving the session "
+        f"gone: {detail}; proceeding as if none is live"
+    ]
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize(
+    "mux",
+    [
+        lambda: _folding_tmux("no server running on /tmp/tmux-1001/default\n"),
+        lambda: _folding_tmux(_UNPROVEN_LISTING, installed=False),
+    ],
+    ids=["no-server", "no-multiplexer"],
+)
+def test_removal_says_nothing_when_the_listing_answered(tmp_path, monkeypatch, capsys, mux):
+    """A gone server and a missing multiplexer are answers — there is no live
+    session — so neither route hears a word, sink or no sink."""
+    monkeypatch.setattr(runs, "get_multiplexer", mux)
+    run_dir = _make_state_run(tmp_path, "r1")
+    runs.delete_run(tmp_path, run_dir)
+    run_dir = _make_state_run(tmp_path, "r1")
+    notes: list[str] = []
+    runs.delete_run(tmp_path, run_dir, warn=notes.append)
+    assert not run_dir.exists()
+    assert notes == []
+    assert capsys.readouterr().err == ""
+
+
+def test_list_sessions_reporting_default_serves_a_released_backend():
+    """An out-of-tree backend released before the sink existed declares only
+    `list_sessions(self)`. The seam's non-abstract default answers for it —
+    the listing unchanged, nothing reported — so a TUI removal through the
+    guard cannot die of a keyword the override never declared."""
+
+    class _Released:
+        def list_sessions(self):  # no keyword: the released signature
+            return ["bmad-loop-x"]
+
+    faults: list[str] = []
+    listing = TerminalMultiplexer.list_sessions_reporting(
+        _Released(),  # pyright: ignore[reportArgumentType]
+        on_fault=faults.append,
+    )
+    assert listing == ["bmad-loop-x"]
+    assert faults == []
 
 
 def test_delete_run_refuses_when_the_tag_read_raises(tmp_path, monkeypatch):
@@ -6934,6 +7034,10 @@ class _LivenessMux:
         if self._unanswerable:
             raise MultiplexerError("simulated transport failure")
         return list(self._sessions)
+
+    # The seam's own default: a raising listing reports nothing through the
+    # sink, so the guard hears it as the raise.
+    list_sessions_reporting = TerminalMultiplexer.list_sessions_reporting
 
     def session_options(self, option):
         if self._unanswerable:

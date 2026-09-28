@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from .multiplexer import MultiplexerError, TerminalMultiplexer, fold_version
@@ -188,7 +189,10 @@ class BaseTmuxBackend(TerminalMultiplexer):
         return any(f.lower() in err for f in fragments if f.strip())
 
     def _warn_unproven_listing(
-        self, verb: str, proc: subprocess.CompletedProcess[str] | BaseException
+        self,
+        verb: str,
+        proc: subprocess.CompletedProcess[str] | BaseException,
+        on_fault: Callable[[str], None] | None = None,
     ) -> None:
         """Say out loud that a METADATA listing failed for a reason other than the
         session being gone (#525).
@@ -222,7 +226,12 @@ class BaseTmuxBackend(TerminalMultiplexer):
 
         Warn-only by construction, like every other diagnostic in this module:
         under the TUI stderr is captured for the app's whole run (see
-        ``tui/app.py``), so this is a CLI-visible signal.
+        ``tui/app.py``), so this is a CLI-visible signal. A caller that owns a
+        channel the operator does see passes ``on_fault`` (see
+        :meth:`list_sessions_reporting`): the fault goes there, without the
+        ``warning:`` prefix and the "reading it as empty" consequence — the
+        caller words its own — and is not also printed. The same gates decide
+        whether anything is said at all.
         """
         if not shutil.which(self._BINARY):
             return
@@ -233,6 +242,9 @@ class BaseTmuxBackend(TerminalMultiplexer):
                 return
             outcome = f"exited {proc.returncode}"
             detail = proc.stderr.strip() or "(no stderr)"
+        if on_fault is not None:
+            on_fault(f"{self._BINARY} {verb} {outcome} without proving the session gone: {detail}")
+            return
         print(
             f"warning: {self._BINARY} {verb} {outcome} without proving "
             f"the session gone; reading it as empty: {detail}",
@@ -323,16 +335,24 @@ class BaseTmuxBackend(TerminalMultiplexer):
         # server's socket — so it warns until the first server of the boot
         # leaves its socket behind. psmux's list-sessions exits 0 even with no
         # sessions (source-read at v3.3.8), so it never reaches the warning.
+        return self.list_sessions_reporting()
+
+    def list_sessions_reporting(
+        self, *, on_fault: Callable[[str], None] | None = None
+    ) -> list[str]:
+        # The body of list_sessions (see its comment), with the fault warning
+        # routed to on_fault when given — the removal guard's warn sink, so a
+        # TUI removal past a failed listing is not silent (DW-458 → DW-466).
         if not shutil.which(self._BINARY):
             return []
         try:
             proc = self._run(["list-sessions", "-F", "#{session_name}"], check=False)
         except (subprocess.SubprocessError, OSError, UnicodeError) as exc:
             # UnicodeError for the reason session_options names it.
-            self._warn_unproven_listing("list-sessions", exc)
+            self._warn_unproven_listing("list-sessions", exc, on_fault)
             return []
         if proc.returncode != 0:
-            self._warn_unproven_listing("list-sessions", proc)
+            self._warn_unproven_listing("list-sessions", proc, on_fault)
             return []
         return [line for line in proc.stdout.splitlines() if line]
 

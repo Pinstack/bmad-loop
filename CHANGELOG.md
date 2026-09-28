@@ -194,9 +194,12 @@ breaking changes may land in a minor release.
   unreadable or undecodable spec `unreadable-spec` (not `not-terminal` or `no-artifact`),
   with the error; a one-shot or dead-window read-back writes `spec-readback-failed`
   (`reason`, `spec`, `error`). Still no result (DW-457).
-- Warn on stderr when the tmux-family session listing fails for a reason other than no
-  server running; it still reads as no sessions, so a `delete`/`archive`/`clean` past a
-  live session is no longer unrecorded (DW-458).
+- Warn when the tmux-family session listing fails for a reason other than no server
+  running: on stderr, or as a warning toast from the TUI's `D`/`A` instead. It still
+  reads as no sessions, so a `delete`/`archive`/`clean` past a live session is no
+  longer unrecorded. A backend that folds its own listing faults can route them the
+  same way by overriding the new non-abstract
+  `TerminalMultiplexer.list_sessions_reporting(on_fault=)` (DW-458).
 - Warn on stderr when a pane-pid read, a window-option read or a `display-message`
   probe folds a fault into its sentinel (`[]`, `""`, `None`). A dead window, an unset
   option, a gone server and not being inside the multiplexer stay silent (DW-463).

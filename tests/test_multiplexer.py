@@ -626,6 +626,34 @@ def test_list_sessions_warns_on_an_absent_socket_file(monkeypatch, capsys):
     assert "No such file or directory" in err
 
 
+def test_list_sessions_reporting_hands_the_fault_to_the_sink(monkeypatch, capsys, boom_run):
+    """With a sink, the DW-458 fault goes there instead of stderr — one route,
+    not both — for the unproven exit and the transport raise alike; without
+    one, `list_sessions_reporting()` warns exactly as `list_sessions()` does.
+    The value is `[]` either way."""
+    mux = TmuxMultiplexer()
+    faults: list[str] = []
+    assert mux.list_sessions_reporting(on_fault=faults.append) == []  # boom_run
+    assert faults == [
+        "tmux list-sessions failed without proving the session gone: "
+        f"{type(boom_run).__name__}: {boom_run}"
+    ]
+    assert capsys.readouterr().err == ""
+
+    _failing_listing(monkeypatch, "error connecting to /tmp/x (Permission denied)\n")
+    faults.clear()
+    assert mux.list_sessions_reporting(on_fault=faults.append) == []
+    assert faults == [
+        "tmux list-sessions exited 1 without proving the session gone: "
+        "error connecting to /tmp/x (Permission denied)"
+    ]
+    assert capsys.readouterr().err == ""
+    assert mux.list_sessions_reporting() == []
+    unrouted = capsys.readouterr().err
+    assert mux.list_sessions() == []
+    assert capsys.readouterr().err == unrouted != ""
+
+
 def test_list_window_ids_decode_fault_raises_the_seam_type(monkeypatch):
     """A byte the codec cannot decode is a transport failure like a timeout: the
     liveness probe must answer MultiplexerError ("unknowable"), not leak the raw

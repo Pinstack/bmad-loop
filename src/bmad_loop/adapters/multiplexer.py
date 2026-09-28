@@ -144,6 +144,34 @@ class TerminalMultiplexer(ABC):
     def list_sessions(self) -> list[str]:
         """Names of all live sessions."""
 
+    def list_sessions_reporting(
+        self, *, on_fault: Callable[[str], None] | None = None
+    ) -> list[str]:
+        """:meth:`list_sessions`, with a fault the listing folds into ``[]``
+        handed to ``on_fault`` instead of the backend's own channel.
+
+        A backend that answers a failed listing with ``[]`` — the bundled
+        tmux family does, warning on stderr (DW-458) — makes that fault look
+        like "no live session" to a caller that cannot read stderr: the TUI,
+        where Textual captures it for the app's whole run, and whose removal
+        guard reads the listing (DW-466). Given a sink, such a backend calls it
+        with a one-line description of the fault (no ``warning:`` prefix, no
+        consequence clause — the caller states its own) and does NOT also warn
+        on its own channel: one route per frontend. ``None`` keeps the
+        backend's own channel, so ``list_sessions()`` and
+        ``list_sessions_reporting()`` answer and warn alike. An answer —
+        a missing multiplexer, no server running — is not a fault and reaches
+        neither.
+
+        Non-abstract, and a method of its own rather than a keyword on
+        :meth:`list_sessions`, so released out-of-tree backends keep working
+        unchanged: an override declared ``list_sessions(self)`` cannot take a
+        keyword core would pass it, and this default never passes one. It
+        reports nothing, which is right for a backend that raises
+        :class:`MultiplexerError` on a failed listing (the caller hears it as
+        the raise). A backend that folds a fault into ``[]`` overrides this."""
+        return self.list_sessions()
+
     @abstractmethod
     def session_options(self, option: str) -> dict[str, str]:
         """Map of session name -> value of ``option`` across all sessions."""

@@ -1471,10 +1471,12 @@ def lock_path_for(data_path: Path, *, follow_final_symlink: bool = True) -> Path
     return state_root() / "locks" / f"{digest}-{resolved.name}.lock"
 
 
-def mux_sessions() -> list[str]:
+def mux_sessions(*, on_fault: Callable[[str], None] | None = None) -> list[str]:
     """All live session names, or [] when the multiplexer is missing, no server
-    is running, or the query fails."""
-    return get_multiplexer().list_sessions()
+    is running, or the query fails. ``on_fault`` receives a failed query's
+    description in place of the backend's own stderr warning (see
+    :meth:`~.adapters.multiplexer.TerminalMultiplexer.list_sessions_reporting`)."""
+    return get_multiplexer().list_sessions_reporting(on_fault=on_fault)
 
 
 def session_project_tags() -> dict[str, str]:
@@ -2477,8 +2479,9 @@ def live_session_may_be_ours(
     nothing to say which. None of the three raises: the bundled backend folds
     ``SubprocessError`` and ``OSError`` into that same sentinel, and only an
     out-of-tree backend raises ``MultiplexerError`` here. A failed query does
-    now say so on stderr (DW-458, ``_warn_unproven_listing``), but a warning is
-    not a signal this function can condition on — and the reap reaches none of
+    now say so (DW-458, ``_warn_unproven_listing`` — on stderr, or through
+    ``warn`` below), but a report is not a signal this function conditions on
+    — and the reap reaches none of
     those branches anyway, because its exit is 0. So it leaves neither a
     signal nor a word on stderr.
 
@@ -2571,9 +2574,14 @@ def live_session_may_be_ours(
     ``BaseTmuxBackend.list_sessions`` folds its own faults into ``[]`` and warns
     for them itself (DW-458) — so the exception this arm catches comes only
     from an out-of-tree backend or from selection, and no layer below has said
-    anything about it. That DW-458 warning is stderr-only and ``warn`` does not
-    reach it: the seam hands back a bare list, so a bundled listing fault is
-    not visible to this function to forward, and under the TUI it stays unseen. The ``ctl_session_for`` and tag-read arms stay silent on
+    anything about it. The bundled fold reaches ``warn`` too: given a sink, the
+    listing is read through
+    :meth:`~.adapters.multiplexer.TerminalMultiplexer.list_sessions_reporting`,
+    which hands this function the fault its DW-458 warning would have printed
+    instead of printing it, and the fault is reported here in the same words
+    as the raise. Left ``None``, the listing keeps its own stderr warning and
+    this function adds nothing: still exactly one line per fault on each route.
+    The ``ctl_session_for`` and tag-read arms stay silent on
     purpose: both degrade toward refusal, the safe direction."""
     try:
         mux = get_multiplexer()
@@ -2591,8 +2599,13 @@ def live_session_may_be_ours(
         pass  # namespace unanswerable: only the fixed name is knowable
     if key(name) in {key(c) for c in control}:
         return False
+
+    def folded(fault: str) -> None:
+        _warn_unasked_session_guard(run_id, "the session listing failed", fault, warn)
+
     try:
-        if key(name) not in {key(s) for s in mux_sessions()}:
+        listing = mux_sessions(on_fault=folded if warn is not None else None)
+        if key(name) not in {key(s) for s in listing}:
             return False
     except MultiplexerError as exc:
         _warn_unasked_session_guard(run_id, "the session listing raised", exc, warn)
@@ -2606,7 +2619,7 @@ def live_session_may_be_ours(
 
 
 def _warn_unasked_session_guard(
-    run_id: str, what: str, exc: MultiplexerError, warn: Callable[[str], None] | None
+    run_id: str, what: str, exc: MultiplexerError | str, warn: Callable[[str], None] | None
 ) -> None:
     # The removal guard's one I/O edge (see live_session_may_be_ours, DW-466).
     note = (

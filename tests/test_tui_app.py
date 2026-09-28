@@ -49,7 +49,7 @@ from bmad_loop import bmadconfig, documents, platform_util
 from bmad_loop import policy as policy_mod
 from bmad_loop import runs as runs_mod
 from bmad_loop import verify
-from bmad_loop.adapters.multiplexer import MultiplexerError
+from bmad_loop.adapters.multiplexer import MultiplexerError, TerminalMultiplexer
 from bmad_loop.journal import UNREADABLE_LINE_KIND, Journal, save_state
 from bmad_loop.model import Phase, RunState, SessionRecord, StoryTask, TokenUsage
 from bmad_loop.runs import RUNS_DIR
@@ -5417,6 +5417,8 @@ class _UnaskableMux:
     def list_sessions(self):
         raise MultiplexerError("simulated transport failure")
 
+    list_sessions_reporting = TerminalMultiplexer.list_sessions_reporting
+
 
 def _unselectable_mux():
     raise MultiplexerError("[mux] backend = 'ghost' matches no registered backend")
@@ -5476,6 +5478,73 @@ async def test_lifecycle_workers_toast_an_unasked_session_guard(
 
     assert not run_dir.exists()
     assert not [p for p in printed if "could not check for a live agent session" in p]
+
+
+@pytest.mark.parametrize(
+    "stderr, faulted",
+    [
+        ("error connecting to /tmp/tmux-1001/default (Permission denied)\n", True),
+        ("no server running on /tmp/tmux-1001/default\n", False),
+    ],
+    ids=["unproven", "no-server"],
+)
+@pytest.mark.parametrize(
+    "key, removed",
+    [("D", "run 20260611-100000-aaaa deleted"), ("A", "run 20260611-100000-aaaa archived")],
+    ids=["delete", "archive"],
+)
+async def test_lifecycle_workers_toast_a_folded_session_listing(
+    project, monkeypatch, stderr, faulted, key, removed
+):
+    """The stock backends never raise from the listing: a failed `list-sessions`
+    folds into `[]` with a stderr warning (DW-458), and Textual captures stderr,
+    so a D/A past it removed the run dir with nothing shown. The guard now
+    reads the listing with the worker's sink, so the fault is toasted like the
+    DW-466 raise — and neither the backend nor the guard prints on top of it.
+    A gone server is an answer, not a fault: no warning toast.
+
+    Drives the real removal helpers and the real tmux-family fold; only the
+    spawn is faked (see test_runs._folding_tmux).
+
+    Ablation: pass `on_fault=None` unconditionally from the guard and the
+    `unproven` rows fail at the toast wait. Verified."""
+    from test_runs import _folding_tmux
+
+    from bmad_loop.adapters import tmux_base
+
+    monkeypatch.setattr(data, "liveness", lambda _run_dir: "dead")
+    monkeypatch.setattr(runs_mod, "get_multiplexer", lambda: _folding_tmux(stderr))
+    run_dir = make_run(project.project, "20260611-100000-aaaa", finished=True)
+    printed: list[str] = []
+    for module in (runs_mod, tmux_base):
+        monkeypatch.setattr(
+            module, "print", lambda *a, **_kw: printed.append(" ".join(map(str, a))), raising=False
+        )
+    note = (
+        "run 20260611-100000-aaaa: could not check for a live agent session — the "
+        f"session listing failed: {sys.executable} list-sessions exited 1 without "
+        "proving the session gone: error connecting to"
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: dashboard(app).selected_run_id == run_dir.name)
+        await pilot.press(key)
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: any(removed in m for m in notifications(app)))
+        if faulted:
+            await until(
+                pilot,
+                lambda: any(
+                    m.startswith(note) and sev == "warning"
+                    for m, sev in notifications_with_severity(app)
+                ),
+            )
+        warnings = [m for m, sev in notifications_with_severity(app) if sev == "warning"]
+
+    assert not run_dir.exists()
+    assert len(warnings) == (1 if faulted else 0)
+    assert printed == []
 
 
 # ------------------------------------------------------------ graceful stop (S)
