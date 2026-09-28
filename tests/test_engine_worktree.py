@@ -2227,6 +2227,55 @@ def test_worktree_defer_without_keep_drops_worktree_but_saves_patch(project):
     assert "story deferred: 1-1-a" in attention and "kept on branch" not in attention
 
 
+def _track_hook_config(project) -> None:
+    """Commit a TRACKED `.claude/settings.json` that provisioning will rewrite and
+    pin skip-worktree (DW-368) — the shape whose story edits `git diff` cannot see."""
+    settings = project.project / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(
+        json.dumps({"permissions": {"allow": ["Bash(ls)"]}}, indent=2) + "\n", encoding="utf-8"
+    )
+    git(project.project, "add", "-f", ".claude/settings.json")
+
+
+def _editing_hook_config(effect):
+    """``effect``, preceded by a story edit to the pinned hook config."""
+
+    def dev(spec):
+        cfg_path = spec.cwd / ".claude" / "settings.json"
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg["storyAddedKey"] = "dw-479"
+        cfg_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+        return effect(spec)
+
+    return dev
+
+
+def _assert_patch_carries_the_pinned_edit(patch: Path) -> None:
+    text = patch.read_text(encoding="utf-8")
+    git_part, _, pinned_part = text.partition("# bmad-loop (DW-479)")
+    assert "change for 1-1-a" in git_part
+    # the premise: the pin is real, so `git diff` alone never saw the edit
+    assert "storyAddedKey" not in git_part
+    assert "# .claude/settings.json: changed outside the relay hooks" in pinned_part
+    assert '# +  "storyAddedKey": "dw-479"' in pinned_part
+
+
+def _run_pinned_edit_defer(project, keep_failed: bool):
+    _track_hook_config(project)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    assert verify.path_tracked(project.project, ".claude/settings.json")
+    script = _defer_script(project, "1-1-a")
+    script[0] = _editing_hook_config(script[0])
+    engine, adapter = make_engine(
+        project, script, policy=wt_policy(keep_failed=keep_failed, limits=_NO_DAMP)
+    )
+    attach_profile(adapter)
+    summary = engine.run()
+    assert summary.deferred == 1
+    return engine
+
+
 @pytest.mark.parametrize("keep_failed", [False, True], ids=["dropped", "kept"])
 def test_worktree_defer_patch_carries_a_pinned_hook_config_edit(project, keep_failed):
     """DW-479: provisioning pins a TRACKED hook config skip-worktree after rewriting
@@ -2236,45 +2285,35 @@ def test_worktree_defer_patch_carries_a_pinned_hook_config_edit(project, keep_fa
 
     Ablation: drop `forensic_extra=` from the DEFERRED arm's `close_unit_workspace`
     call and the patch lacks the key."""
-    settings = project.project / ".claude" / "settings.json"
-    settings.parent.mkdir(parents=True, exist_ok=True)
-    settings.write_text(
-        json.dumps({"permissions": {"allow": ["Bash(ls)"]}}, indent=2) + "\n", encoding="utf-8"
-    )
-    git(project.project, "add", "-f", ".claude/settings.json")
-    commit_sprint(project, {"1-1-a": "ready-for-dev"})
-    assert verify.path_tracked(project.project, ".claude/settings.json")
+    engine = _run_pinned_edit_defer(project, keep_failed)
 
-    script = _defer_script(project, "1-1-a")
-    inner = script[0]
-
-    def dev(spec):
-        cfg_path = spec.cwd / ".claude" / "settings.json"
-        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-        cfg["storyAddedKey"] = "dw-479"
-        cfg_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
-        return inner(spec)
-
-    script[0] = dev
-    engine, adapter = make_engine(
-        project, script, policy=wt_policy(keep_failed=keep_failed, limits=_NO_DAMP)
-    )
-    attach_profile(adapter)
-    summary = engine.run()
-
-    assert summary.deferred == 1
     patch = engine.run_dir / "failed" / "1-1-a" / "changes.patch"
-    text = patch.read_text(encoding="utf-8")
-    git_part, _, pinned_part = text.partition("# bmad-loop (DW-479)")
-    assert "change for 1-1-a" in git_part
-    # the premise: the pin is real, so `git diff` alone never saw the edit
-    assert "storyAddedKey" not in git_part
-    assert "# .claude/settings.json: changed outside the relay hooks" in pinned_part
-    assert '# +  "storyAddedKey": "dw-479"' in pinned_part
+    _assert_patch_carries_the_pinned_edit(patch)
     # the commented section must not break an all-or-nothing `git apply` of the rest
     git(project.project, "apply", "--check", str(patch))
     # kept or dropped, the patch is the same record; only the mount's fate differs
     assert (len(worktree_list(project.project)) == 2) is keep_failed
+
+
+@pytest.mark.parametrize("keep_failed", [False, True], ids=["dropped", "kept"])
+def test_worktree_defer_drops_the_pinned_config_record_only_with_the_mount(project, keep_failed):
+    """DW-502: the pinned-config record holds a copy of the operator's settings
+    text. A DEFERRED teardown that removed the worktree drops it, as the DONE path
+    does; a kept worktree keeps it (the record backs `gc_run_worktrees`' refusal).
+    Asserted on state.json, which is where the copy would linger.
+
+    Ablation: drop the `_drop_pinned_config_record` call from the DEFERRED arm and
+    the dropped row keeps the record; gate it on nothing (clear unconditionally) and
+    the kept row loses it."""
+    engine = _run_pinned_edit_defer(project, keep_failed)
+
+    task = load_state(engine.run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.DEFERRED
+    assert Path(task.worktree_path).is_dir() is keep_failed
+    if keep_failed:
+        assert set(task.pinned_config_rewrites) == {".claude/settings.json"}
+    else:
+        assert task.pinned_config_rewrites == {}
 
 
 _HARVEST_CARRY = {
@@ -4872,6 +4911,47 @@ def test_worktree_merge_conflict_escalates_and_keeps_branch(project):
     assert task.phase == Phase.ESCALATED
     # the unit branch is kept for manual merge
     assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")
+
+
+def test_worktree_merge_escalation_patch_carries_a_pinned_hook_config_edit(project, monkeypatch):
+    """DW-501: a DONE unit whose merge-back fails is escalated through
+    `keep_branch_and_escalate`, whose `changes.patch` must record a story edit to a
+    skip-worktree-pinned hook config just as a DEFERRED unit's does (DW-479). The
+    worktree is kept, and so is the pinned-config record.
+
+    Ablation: drop `forensic_extra=` from `keep_branch_and_escalate`'s
+    `close_unit_workspace` call and the patch lacks the pinned section."""
+    _track_hook_config(project)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [
+            _editing_hook_config(wt_dev_effect(project, "1-1-a")),
+            wt_review_effect(project, "1-1-a", clean=True),
+        ],
+        policy=wt_policy(merge_strategy="ff"),
+    )
+    attach_profile(adapter)
+    import bmad_loop.engine as eng
+
+    real_open = eng.open_unit_workspace
+
+    def diverging_open(*a, **k):
+        unit = real_open(*a, **k)
+        (project.project / "diverge.txt").write_text("target moved\n")
+        git(project.project, "add", "-A")
+        git(project.project, "commit", "-q", "-m", "target diverges")
+        return unit
+
+    monkeypatch.setattr(eng, "open_unit_workspace", diverging_open)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED
+    assert Path(task.worktree_path).is_dir()
+    _assert_patch_carries_the_pinned_edit(engine.run_dir / "failed" / "1-1-a" / "changes.patch")
+    assert set(task.pinned_config_rewrites) == {".claude/settings.json"}
 
 
 def test_branch_per_run_escalation_pauses_without_dispatching_next_unit(project):

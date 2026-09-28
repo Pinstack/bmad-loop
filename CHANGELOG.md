@@ -160,6 +160,11 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Carry story edits to skip-worktree-pinned hook configs in the `changes.patch` of a
+  merged unit escalated on a failed merge-back, as the DEFERRED unit's patch does (DW-501).
+- Drop a DEFERRED unit's pinned-config record (a copy of the operator's hook settings)
+  from `state.json` once teardown removed its worktree, as the DONE path does; a kept
+  worktree keeps it (DW-502).
 - Shape pause reasons for terminal display through `gates.notice_line`: `status`, the TUI
   header and resume modal, and the run summary now print a multi-line or ESC-bearing
   reason on one line, escaped and folded. `state.json` and `status --json` keep the raw

@@ -2850,20 +2850,6 @@ class WorktreeFlow:
             task.isolated_ledger_carried = True
             self._save()
         else:  # DEFERRED — capture the diff, keep or drop per keep_failed
-            # `git diff` reads a skip-worktree-pinned hook config as clean, so a
-            # story's edit to one would miss the patch and die with the worktree
-            # (DW-479). Built here, while the worktree is still mounted.
-            forensic_extra = ""
-            if task.pinned_config_rewrites:
-                try:
-                    mounted = unit.path.is_dir()
-                except OSError:
-                    # an unprovable mount: the per-file reads below name the fault
-                    mounted = True
-                if mounted:
-                    forensic_extra = _pinned_config_forensics(
-                        unit.path, task.pinned_config_rewrites
-                    )
             patch = close_unit_workspace(
                 unit,
                 success=False,
@@ -2876,7 +2862,7 @@ class WorktreeFlow:
                 on_teardown_degraded=lambda msg: self.journal.append(
                     "worktree-teardown-degraded", story_key=task.story_key, error=msg
                 ),
-                forensic_extra=forensic_extra,
+                forensic_extra=self._pinned_config_forensic_extra(task, unit),
             )
             self.journal.append(
                 "unit-closed",
@@ -2890,6 +2876,29 @@ class WorktreeFlow:
             if task.ledger_seed_text is not None:
                 task.ledger_seed_text = None
                 self._save()
+            # A torn-down worktree takes the record's purpose with it; a kept one
+            # keeps the record, which gc_run_worktrees' refusal reads (DW-502).
+            self._drop_pinned_config_record(task)
+
+    @staticmethod
+    def _pinned_config_forensic_extra(task: StoryTask, unit: UnitWorkspace) -> str:
+        """The ``forensic_extra`` every failed-unit teardown passes to
+        ``close_unit_workspace``: `git diff` reads a skip-worktree-pinned hook config
+        as clean, so a story's edit to one would miss ``changes.patch`` (DW-479).
+        Built while the worktree is still mounted; ``""`` without pins or a mount.
+        Shared by the DEFERRED arm of :meth:`integrate_unit` and
+        :meth:`keep_branch_and_escalate`, so both record the same edits (DW-501).
+        """
+        if not task.pinned_config_rewrites:
+            return ""
+        try:
+            mounted = unit.path.is_dir()
+        except OSError:
+            # an unprovable mount: the per-file reads name the fault
+            mounted = True
+        if not mounted:
+            return ""
+        return _pinned_config_forensics(unit.path, task.pinned_config_rewrites)
 
     def _carried_artifact_rels(self, repo: Path, task: StoryTask) -> tuple[str, ...]:
         """The repo-relative posix paths the RUN commits for itself after the merge —
@@ -4875,7 +4884,9 @@ class WorktreeFlow:
         escalate. Shared by every merge-back failure path: a target dirtied with
         stray work, a merge git refused at pre-flight, a merge that died part-way
         through its checkout, a merge whose COMMIT git refused, a genuine content
-        conflict, and a failure nothing classified."""
+        conflict, and a failure nothing classified. Its ``changes.patch`` records
+        pinned-config edits as the DEFERRED arm's does (DW-501); the worktree is kept,
+        so the pinned-config record stays."""
         close_unit_workspace(
             unit,
             success=False,
@@ -4884,6 +4895,7 @@ class WorktreeFlow:
             unit_key=task.story_key,
             delete_branch=False,
             diff_max_file_bytes=self.failed_diff_max_bytes(),
+            forensic_extra=self._pinned_config_forensic_extra(task, unit),
         )
         self.escalate_unit(task, reason)  # always raises RunPaused
 
