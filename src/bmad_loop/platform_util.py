@@ -1345,7 +1345,8 @@ def open_dir_confined(
     ``runs.live_spec_root_identity`` — DW-423), and the engine's and
     ``recovery_flow``'s mount writers — repair/reset/review, marker repair,
     reconcile, adoption, park-record write and restore, attempt-owned status
-    normalization and snapshot restore — which confine to
+    normalization and snapshot restore, and the deferred-work ledger restores
+    (DW-498) — which confine to
     ``workspace.paths.project``/``workspace.root`` and, when that workspace is a
     unit mount, pin it through ``runs.mount_root_identity`` (DW-445). A pinned
     spec writer's EXTERNAL arm (a target outside ``confine_root``) pre-checks the

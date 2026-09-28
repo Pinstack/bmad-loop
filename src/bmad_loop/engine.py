@@ -76,6 +76,7 @@ from .platform_util import (
     atomic_replace,
     atomic_write_text,
     atomic_write_text_confined,
+    make_dirs_confined,
     require_root_pinned,
     retrying_unlink,
     safe_segment,
@@ -6590,6 +6591,11 @@ class Engine:
         an explicit snapshot. Write and lock faults propagate to the call site's
         net, which preserves an in-flight ``RunPaused`` rather than being
         replaced by a secondary repair failure.
+
+        Both the write and the unlink are pinned to a unit mount
+        (:meth:`_publish_restored_ledger`, :meth:`_retract_ledger`, DW-498): a
+        mount swapped for a link refuses, as such a fault, rather than writing or
+        deleting at the link's target.
         """
         ledger = self.workspace.paths.deferred_work
         # Read IMMEDIATELY after `_rollback_or_pause` returned: only pure Python
@@ -6652,12 +6658,11 @@ class Engine:
                     # unlink this replaces took a concurrent writer's ledger with
                     # the harvest.
                     if ours:
-                        ledger.unlink(missing_ok=True)
+                        self._retract_ledger(task, ledger)
                     else:
                         diverged = True
                 elif ours or reset_owned:
-                    ledger.parent.mkdir(parents=True, exist_ok=True)
-                    atomic_write_text(ledger, snapshot)
+                    self._publish_restored_ledger(task, ledger, snapshot)
                 else:
                     diverged = True
         # Journaled outside the hold: the lock covers this ledger's
@@ -6668,6 +6673,60 @@ class Engine:
                 story_key=task.story_key,
                 ledger=str(ledger),
             )
+
+    def _publish_restored_ledger(self, task: StoryTask, ledger: Path, text: str) -> None:
+        """Publish a ledger restore's ``text`` at ``ledger`` — the one write both
+        restores (:meth:`_restore_ledger`, :meth:`_restore_defer_ledger`) end in.
+
+        Under worktree isolation the ledger lies in the unit mount, whose parent is
+        session-writable, so the write is pinned there as DW-445's writers are
+        (DW-498): `_mount_root_identity` pins ``workspace.paths.project``, a
+        ledger under it has its parent created by `platform_util.make_dirs_confined`
+        and is written by `atomic_write_text_confined` against that pin, and one
+        configured outside it (not rebased, so not in the mount) is written as
+        before after a `platform_util.require_root_pinned` pre-check — the spec
+        writers' external arm. A mount swapped for a link refuses with an
+        `UnconfinedWriteError` (an ``OSError``), which propagates to the call
+        site's net like any other write fault, instead of landing at the link's
+        target. The confined write replaces a link at the ledger itself rather
+        than following it, as every mount writer does (#593).
+
+        Unmounted (``None``) the write is unchanged: the operator's project is left
+        unpinned by the pin rule, and its ledger keeps `atomic_write_text`'s
+        symlink-following, mode-preserving default — a ledger or artifacts dir
+        symlinked into the project is a supported shape the confined walk would
+        refuse."""
+        root = self.workspace.paths.project
+        root_identity = self._mount_root_identity(task, root)
+        if root_identity is not None:
+            require_root_pinned(root, root_identity)
+            if ledger.is_relative_to(root):
+                make_dirs_confined(ledger.parent, confine_root=root, root_identity=root_identity)
+                atomic_write_text_confined(
+                    ledger, text, confine_root=root, root_identity=root_identity
+                )
+                return
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(ledger, text)
+
+    def _retract_ledger(self, task: StoryTask, ledger: Path) -> None:
+        """Unlink the ledger this engine's harvest created — :meth:`_restore_ledger`'s
+        ``snapshot is None`` arm — pinned as :meth:`_publish_restored_ledger`'s
+        write is (DW-498): on a unit mount, the `require_root_pinned` pre-check
+        refuses before anything is touched, and a ledger under the mount project
+        is unlinked by `platform_util.unlink_confined`, so a link at the mount or
+        below it never gets a same-named ledger deleted at its target.
+        Unmounted, the by-path unlink is unchanged."""
+        root = self.workspace.paths.project
+        root_identity = self._mount_root_identity(task, root)
+        if root_identity is not None:
+            require_root_pinned(root, root_identity)
+            if ledger.is_relative_to(root):
+                unlink_confined(
+                    ledger, confine_root=root, root_identity=root_identity, missing_ok=True
+                )
+                return
+        ledger.unlink(missing_ok=True)
 
     def _restore_persisted_ledger(self, task: StoryTask, *, replayed: bool) -> None:
         """Restore the snapshot durably armed before this attempt's engine writes.
@@ -8538,7 +8597,10 @@ class Engine:
           cannot destroy anybody's write.
 
         Write and lock faults propagate, as the unguarded write here always did:
-        a repair write that could not be serialized must fail loudly.
+        a repair write that could not be serialized must fail loudly. Both writes
+        (the overwrite and the merge) are pinned to a unit mount through
+        :meth:`_publish_restored_ledger` (DW-498), so a mount swapped for a link
+        is one such fault.
         """
         ledger = self.workspace.paths.deferred_work
         # Read IMMEDIATELY after `_rollback_or_pause` returned: only pure Python
@@ -8584,8 +8646,7 @@ class Engine:
             # deletion, not the reset's. The append-only merge below is the
             # right degrade — it cannot destroy a rival's write.
             if anchor is _LedgerAnchor.BASELINE and current == expected:
-                ledger.parent.mkdir(parents=True, exist_ok=True)
-                atomic_write_text(ledger, snapshot)
+                self._publish_restored_ledger(task, ledger, snapshot)
                 return
             # `isinstance`, not `is not None`: an UNDECODABLE ledger answers the
             # typed `_UndecodableLedger` (DW-231) and an OS-REFUSED one the typed
@@ -8597,8 +8658,7 @@ class Engine:
                     current, snapshot
                 )
                 if restored is not None:
-                    ledger.parent.mkdir(parents=True, exist_ok=True)
-                    atomic_write_text(ledger, restored)
+                    self._publish_restored_ledger(task, ledger, restored)
             # A MISSING ledger falls straight through to the divergence journal.
             # The arm above already claimed the only absence that IS the reset's
             # own work (a baseline determinately lacking the ledger, where

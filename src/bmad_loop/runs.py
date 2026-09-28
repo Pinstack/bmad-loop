@@ -3796,7 +3796,8 @@ def mount_root_identity(
     repair/reset/review, marker-repair, reconcile, adoption and park-record writers
     plus ``recovery_flow``'s attempt-owned status normalization and snapshot restore
     answer it for their ``workspace.paths.project``/``workspace.root`` when that
-    workspace is a unit mount (DW-445). The caller decides mountedness; this only
+    workspace is a unit mount (DW-445), as do the engine's deferred-work ledger
+    restores (DW-498). The caller decides mountedness; this only
     pins — an operator-chosen project root is never handed here.
 
     ``recorded`` is ``StoryTask.worktree_identity``, the mount's ``(st_dev,

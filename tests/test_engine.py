@@ -23028,3 +23028,148 @@ def test_restore_park_record_refuses_a_link_below_the_mount(
     monkeypatch.setattr("bmad_loop.engine.unlink_confined", _by_path_park_unlink)
     engine._restore_park_record(task, restore)
     assert not target.exists()
+
+
+# ------------------------------------ engine deferred-work ledger restore pin (DW-498)
+#
+# `_restore_ledger` and `_restore_defer_ledger` write (and `_restore_ledger` unlinks)
+# `workspace.paths.deferred_work`, which under worktree isolation lies in the unit
+# mount: they pin it as DW-445's writers do. The ownership probes are stubbed — the
+# mounts here are plain copies, not checkouts — so each row reaches the arm it names.
+
+_DW1_ENTRY = (
+    "### DW-1: review found this\n\n"
+    "origin: review, 2026-08-26\nlocation: src.txt\nreason: needs a look.\nstatus: open\n"
+)
+_DW3_ENTRY = (
+    "### DW-3: a rival filed this\n\n"
+    "origin: review, 2026-08-27\nlocation: other.txt\nreason: elsewhere.\nstatus: open\n"
+)
+_LEDGER_SNAPSHOT = "# Deferred Work\n\n" + _DW1_ENTRY
+_LEDGER_HARVESTED = _LEDGER_SNAPSHOT + "\n" + _DW3_ENTRY.replace("DW-3", "DW-2")
+
+# arm -> (ledger text on disk, snapshot handed to the restore, text it lands — None:
+# the ledger is removed)
+_LEDGER_RESTORE_ARMS = {
+    "restore-write": (_LEDGER_HARVESTED, _LEDGER_SNAPSHOT, _LEDGER_SNAPSHOT),
+    "restore-unlink": (_LEDGER_HARVESTED, None, None),
+    "defer-overwrite": ("# Deferred Work\n", _LEDGER_SNAPSHOT, _LEDGER_SNAPSHOT),
+    "defer-merge": (
+        "# Deferred Work\n\n" + _DW3_ENTRY,
+        _LEDGER_SNAPSHOT,
+        "# Deferred Work\n\n" + _DW3_ENTRY + "\n" + _DW1_ENTRY,
+    ),
+}
+
+
+def _arm_ledger_restore(monkeypatch, engine: Engine, task: StoryTask, arm: str):
+    """Stub the ownership probes so ``arm`` is the branch the restore takes, and
+    answer a thunk that runs it."""
+    on_disk, snapshot, _lands = _LEDGER_RESTORE_ARMS[arm]
+    if arm.startswith("restore-"):
+        # untracked, and the bytes on disk are this engine's own harvest
+        monkeypatch.setattr(Engine, "_ledger_is_gits_to_restore", lambda self, task: False)
+        task.post_engine_ledger_digest = _digest_of(on_disk)
+        return lambda: engine._restore_ledger(task, snapshot)
+    assert snapshot is not None
+    monkeypatch.setattr(Engine, "_ledger_is_gits_to_restore", lambda self, task: True)
+    anchor = (
+        (_LedgerAnchor.BASELINE, on_disk)
+        if arm == "defer-overwrite"
+        else (_LedgerAnchor.NONE, None)
+    )
+    monkeypatch.setattr(Engine, "_ledger_baseline_text", lambda self, task: anchor)
+    return lambda: engine._restore_defer_ledger(task, snapshot)
+
+
+def _ledger_in_mount(project, tmp_path, arm: str):
+    """(engine, ledger in the mount, its path in the outside copy, task) — a ledger
+    holding ``arm``'s on-disk text in an engine's unit mount, not yet swapped."""
+    engine = _mount_engine_on(project, _mount_dir(project))
+    ledger = engine.workspace.paths.deferred_work
+    assert ledger.is_relative_to(engine.workspace.paths.project)  # the confined arm
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text(_LEDGER_RESTORE_ARMS[arm][0], encoding="utf-8")
+    outside = tmp_path / "outside" / ledger.relative_to(engine.workspace.root)
+    return engine, ledger, outside, _mount_task(engine, story_key="1-1-a", epic=1)
+
+
+@requires_symlinked_mount_swap
+@pytest.mark.parametrize("arm", list(_LEDGER_RESTORE_ARMS))
+def test_ledger_restores_refuse_a_mount_swapped_for_a_link(project, tmp_path, monkeypatch, arm):
+    """Each ledger restore through a mount swapped for a link refuses at the pin
+    pre-check — raised, the restores' repair-write doctrine — and the outside copy's
+    ledger is neither rewritten nor deleted. The unpinned control shows the same
+    swap really lands outside.
+
+    Ablation: revert `_publish_restored_ledger` (the write and merge arms) or
+    `_retract_ledger` (the unlink arm) to the plain `mkdir` + `atomic_write_text` /
+    `ledger.unlink` and that arm's row lands outside instead of raising."""
+    engine, _ledger, outside, task = _ledger_in_mount(project, tmp_path, arm)
+    restore = _arm_ledger_restore(monkeypatch, engine, task, arm)
+    _swap_engine_mount(engine, tmp_path / "outside")
+    written = outside.read_text(encoding="utf-8")
+
+    with pytest.raises(platform_util.UnconfinedWriteError, match=_PIN_REFUSAL):
+        restore()
+
+    assert outside.read_text(encoding="utf-8") == written
+
+    _unpin(monkeypatch)  # control: unpinned, the same swap reaches the outside ledger
+    restore()
+    lands = _LEDGER_RESTORE_ARMS[arm][2]
+    if lands is None:
+        assert not outside.exists()
+    else:
+        assert outside.read_text(encoding="utf-8") == lands
+
+
+@pytest.mark.parametrize("arm", list(_LEDGER_RESTORE_ARMS))
+def test_ledger_restores_on_an_intact_mount_land_under_the_pin(project, tmp_path, monkeypatch, arm):
+    """The positive half: on an INTACT mount, with the pin live, each restore lands
+    in the mount — the ledger rewritten, merged or removed — with nothing raised.
+
+    Ablation: pin the wrong directory (``self._mount_root_identity(task,
+    ledger.parent)``) and every row here refuses while the swapped-mount rows stay
+    green."""
+    engine, ledger, _outside, task = _ledger_in_mount(project, tmp_path, arm)
+    assert engine._mount_root_identity(task, engine.workspace.paths.project) is not None
+    restore = _arm_ledger_restore(monkeypatch, engine, task, arm)
+
+    restore()
+
+    lands = _LEDGER_RESTORE_ARMS[arm][2]
+    if lands is None:
+        assert not ledger.exists()
+    else:
+        assert ledger.read_text(encoding="utf-8") == lands
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_ledger_restore_without_a_mount_still_writes_through_a_symlinked_ledger(
+    project, tmp_path, monkeypatch
+):
+    """Isolation ``none``: the operator's project is unpinned, and the restore keeps
+    `atomic_write_text`'s symlink-following default — a ledger symlinked into the
+    project stays a link and its TARGET is rewritten, as before DW-498.
+
+    Ablation: send the unmounted arm through `atomic_write_text_confined` and the
+    link is replaced by a regular file, the target left holding the harvest."""
+    engine, _ = make_engine(project, [])
+    assert (
+        engine._mount_root_identity(StoryTask(story_key="1-1-a", epic=1), project.project) is None
+    )
+    target = tmp_path / "shared" / "deferred-work.md"
+    target.parent.mkdir(parents=True)
+    target.write_text(_LEDGER_HARVESTED, encoding="utf-8")
+    ledger = engine.workspace.paths.deferred_work
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.unlink(missing_ok=True)
+    ledger.symlink_to(target)
+    task = StoryTask(story_key="1-1-a", epic=1)
+    restore = _arm_ledger_restore(monkeypatch, engine, task, "restore-write")
+
+    restore()
+
+    assert ledger.is_symlink()
+    assert target.read_text(encoding="utf-8") == _LEDGER_SNAPSHOT

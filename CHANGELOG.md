@@ -683,6 +683,12 @@ breaking changes may land in a minor release.
   or creating directories, at the link's target. The unlink, the empty-directory prune
   and the `mkdir` now walk no-follow from the (pinned) root; on Windows the prune stays
   a path-based check-then-act (DW-497).
+- Pin the engine's deferred-work ledger restores (the harvest rollback's put-back or
+  delete, and the defer ledger's overwrite or merge) to the worktree mount as DW-445's
+  writers are: a mount swapped for a link now refuses, raising through the restore's
+  existing fault path, instead of writing or deleting the ledger at the link's target.
+  Parent directories are created through the confined walk. Without isolation the
+  restore is unchanged and still follows a symlinked ledger (DW-498).
 - Harden the exact-path candidate worktree: check it out `--no-checkout` with
   fsmonitor off and fill its index by `read-tree`, so no repo-configured smudge/process
   filter or fsmonitor command runs before the accepted bytes land (DW-401); re-check the
