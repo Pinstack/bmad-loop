@@ -3352,6 +3352,36 @@ async def test_dashboard_names_an_incomplete_run_listing(project, monkeypatch):
         )
 
 
+async def test_launch_asks_before_launching_over_an_incomplete_run_listing(project, monkeypatch):
+    """DW-468: a run the listing could not read may be a live engine, so with no
+    readable live run the launch guard still asks, naming the fault, rather than
+    reading the listing as "none live" and launching a second engine unprompted.
+    Ablate `or listing_fault is not None` in `_guarded` and this fails — the
+    launch goes straight through."""
+    from bmad_loop import runs
+
+    calls = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "start_run_detached", lambda *a, **kw: calls.append(a))
+    monkeypatch.setattr(
+        runs, "list_run_dirs", lambda _p: ([], "/x/runs: cannot list the runs dir: EACCES")
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("r")
+        await until(pilot, lambda: isinstance(app.screen, StartRunModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        body = app.screen._body.plain
+        assert "live or unknown: none readable" in body
+        assert "run listing incomplete: /x/runs: cannot list the runs dir: EACCES" in body
+        assert not calls
+        # the ask is a real gate: confirming launches
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: calls)
+
+
 async def test_cleanup_warns_about_ctl_windows_that_survived_the_kill(project, monkeypatch):
     # The summary counts only verified removals now (#435), so a window that
     # outlived its kill would otherwise just be missing from the toast with

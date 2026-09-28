@@ -1852,6 +1852,45 @@ def test_pending_missed_decisions_unreadable_ledger_is_a_fault(project):
     assert "UnicodeDecodeError" in missed.fault
 
 
+def _deny_stat_under(monkeypatch, root: Path) -> None:
+    """Every `stat()` of `root` or below raises EACCES — an unreadable dir, as
+    3.14's `is_dir`/`is_file` would fold it into False."""
+    real = Path.stat
+
+    def stat(self, *args, **kwargs):
+        if self == root or root in self.parents:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+
+
+def test_pending_missed_decisions_incomplete_run_listing_is_a_fault(project, monkeypatch):
+    """DW-468: a run dir the listing cannot read holds triage this reader never
+    saw, so the readable run's DW-1 is not the whole answer — the reader names the
+    fault instead, and does not cache it: once the run reads again, so does DW-1.
+
+    Ablation: drop the `listing_fault` return in `pending_missed_decisions` and
+    this reddens — `fault` is None over a partial listing."""
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _write_triage_decision(make_run(project.project, "20260101-000000-aaaa"))
+    bad = make_run(project.project, "20260102-000000-bbbb")
+
+    with monkeypatch.context() as m:
+        _deny_stat_under(m, bad)
+        missed = data.pending_missed_decisions(project.project)
+        assert missed.items == []
+        assert missed.fault is not None and "run listing incomplete" in missed.fault
+        assert "20260102-000000-bbbb" in missed.fault
+
+    missed = data.pending_missed_decisions(project.project)
+    assert missed.fault is None
+    assert [d.id for d in missed.items] == ["DW-1"]
+
+
 def test_pending_missed_decisions_none_pending_is_an_answer(project):
     from conftest import write_ledger
 

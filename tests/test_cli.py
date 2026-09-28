@@ -2658,6 +2658,46 @@ def test_status_names_an_unreadable_runs_dir_instead_of_no_such_run(project, cap
     assert "run listing incomplete" in err and "PermissionError" in err
 
 
+def test_decisions_notes_a_run_whose_triage_could_not_be_read(project, capsys, monkeypatch):
+    """DW-468: a run dir the listing cannot read contributes no decisions, so the
+    readable run's listing is incomplete and `decisions` says so on stderr, naming
+    the unread run. Ablate the `run listing incomplete` note in `cmd_decisions`
+    and this fails."""
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _make_run_with_decision(project, run_id="20260101-000000-aaaa")
+    _make_run_with_decision(project, run_id="20260102-000000-bbbb")
+    _deny_stat_under(monkeypatch, project.project / ".bmad-loop" / "runs" / "20260102-000000-bbbb")
+
+    assert cli.main(["decisions", "--project", str(project.project), "--list"]) == 0
+    captured = capsys.readouterr()
+    assert "DW-1: build the widening?" in captured.out
+    assert "note: run listing incomplete" in captured.err
+    assert "20260102-000000-bbbb" in captured.err
+
+
+def test_reconcile_stale_warns_when_the_run_listing_is_incomplete(project, capsys, monkeypatch):
+    """DW-468: "reclaimed nothing" over an unreadable runs dir is not the answer,
+    so the run-start reconcile warns with the fault. Ablate the warning in
+    `_reconcile_stale` and this fails."""
+    install_bmad_config(project)
+    paths = bmadconfig.load_paths(project.project)
+    pol = policy_mod.load(None)
+    assert pol.cleanup.auto_clean_on_finish, "premise: the reconcile runs"
+    _make_list_run(project, "20260101-000000-aaaa", started_at="x", finished=True)
+
+    cli._reconcile_stale(project.project, paths, pol)
+    assert "stale-worktree reconcile" not in capsys.readouterr().err
+
+    _deny_stat_under(monkeypatch, project.project / ".bmad-loop" / "runs")
+    cli._reconcile_stale(project.project, paths, pol)
+    err = capsys.readouterr().err
+    assert "warning: stale-worktree reconcile incomplete" in err
+    assert "PermissionError" in err
+
+
 def test_list_json_unparseable_state_reported_unknown(project, capsys):
     """A corrupt state.json still lists — enumeration scripts must see every
     run dir, same as the table."""
