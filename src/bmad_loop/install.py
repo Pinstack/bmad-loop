@@ -1701,7 +1701,9 @@ def relay_registered(config: dict, dialect: str, events: Mapping[str, str]) -> b
     a relay under an unmapped native that reports `Stop`, or a canonical event the
     map reports from a different native, is refused too. A relay there reporting a
     canonical event the map never names is accepted: profiles can share a config
-    file, and it may be an alias profile's registration.
+    file, and it may be an alias profile's registration. For agy the same refusal
+    covers every other top-level group, since agy runs them all (DW-490,
+    `foreign_group_relay_hazards`).
     """
     container = hook_event_container(config, dialect)
     stop_natives = [native for native, canonical in events.items() if canonical == "Stop"]
@@ -1728,7 +1730,49 @@ def relay_registered(config: dict, dialect: str, events: Mapping[str, str]) -> b
             for command in _executed_commands_in_handler(handler):
                 if _relay_canonical_event(command) in hazardous:
                     return False
+    if foreign_group_relay_hazards(config, dialect, events):
+        return False
     return all(native in satisfied for native in stop_natives)
+
+
+def foreign_group_relay_hazards(
+    config: dict, dialect: str, events: Mapping[str, str]
+) -> list[tuple[str, str]]:
+    """`(group, native)` for each agy top-level group other than ours that lies.
+
+    agy runs the hooks of EVERY top-level group, not only ANTIGRAVITY_HOOK_GROUP,
+    so a relay hand-added to a user group fires as surely as ours (DW-490). A
+    group's native event lies under the same rules `relay_registered` applies to
+    the managed group: a mapped native whose executed relay reports a different
+    canonical event, or an unmapped one whose relay reports `Stop` or a canonical
+    event the map reports elsewhere. A truthful relay there is accepted but never
+    satisfies registration. Other dialects have one container: always [].
+
+    These groups are the operator's, so this only reports: `merge_hooks` never
+    writes outside the managed group, and `init` warns instead of repairing.
+    """
+    if dialect != "antigravity-hooks-json":
+        return []
+    unmapped_hazardous = {"Stop", *events.values()}
+    found: list[tuple[str, str]] = []
+    for group, container in config.items():
+        if group == ANTIGRAVITY_HOOK_GROUP or not isinstance(container, dict):
+            continue
+        for native, handlers in container.items():
+            if not isinstance(handlers, list):
+                continue
+            expected = events.get(native)
+            for command in (c for h in handlers for c in _executed_commands_in_handler(h)):
+                reported = _relay_canonical_event(command)
+                if reported is None:
+                    continue
+                lies = (
+                    (reported != expected) if native in events else (reported in unmapped_hazardous)
+                )
+                if lies:
+                    found.append((group, native))
+                    break
+    return found
 
 
 def registered_relay_paths(
@@ -1936,6 +1980,15 @@ def _register_hooks(project: Path, profile: CLIProfile) -> int:
         print(f"  hooks registered ({profile.name}): {config_path}")
     else:
         print(f"  hooks already registered ({profile.name})")
+    # DW-490: a lying relay in a group init does not own stays; say where it is.
+    for group, native in foreign_group_relay_hazards(
+        config, profile.hooks.dialect, profile.hooks.events
+    ):
+        print(
+            f"  warning: {config_path} group {group!r} runs a bmad-loop relay under "
+            f"{native!r} that reports the wrong event — init leaves groups it does not "
+            f"own alone; remove that relay by hand"
+        )
     return 0
 
 

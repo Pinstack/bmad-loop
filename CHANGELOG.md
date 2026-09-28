@@ -160,6 +160,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Refuse a lying managed relay in any antigravity top-level hook group, not only
+  `bmad-loop`: agy runs every group, so a hand-added `relay Stop` under e.g. `PreToolUse`
+  in a user group completes sessions early. `validate`/`probe-adapter` flag
+  `hooks.registered`; `init` warns and leaves the operator's group untouched (DW-490).
 - Fire the retrospective gate at run end for the run's last epic. `auto` runs the retro
   and `notify` nudges, before the run-end sweep and on a `--max-stories` stop, only when
   every story of the epic reads `done` and its retro does not. A single-epic run, or the

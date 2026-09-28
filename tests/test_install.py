@@ -639,6 +639,95 @@ def test_non_list_value_under_unmapped_native_is_skipped(name):
     }
 
 
+_USER_GROUP = "user-hooks"
+
+
+@pytest.mark.parametrize(
+    "native,command",
+    [
+        ("PreToolUse", f"{_RELAY_EXE} relay Stop"),
+        ("PreToolUse", _LEGACY_STOP),
+        ("Stop", f"{_RELAY_EXE} relay SessionStart"),
+    ],
+    ids=["unmapped-stop", "unmapped-legacy", "mapped-disagrees"],
+)
+def test_hazardous_relay_in_a_foreign_agy_group_is_refused_and_left_alone(native, command):
+    """DW-490: agy runs every top-level group, so a lying relay in a user group
+    fires as surely as one in ours. `relay_registered` refuses it; the group is
+    the operator's, so `merge_hooks` does not touch it."""
+    profile = get_profile("antigravity")
+    config = _correct_config(profile)
+    assert _registered(profile, config)
+    config[_USER_GROUP] = {native: [_relay_handler(profile, command)]}
+    before = json.loads(json.dumps(config))
+    assert not _registered(profile, config)
+    assert install_mod.foreign_group_relay_hazards(
+        config, profile.hooks.dialect, profile.hooks.events
+    ) == [(_USER_GROUP, native)]
+
+    registrations = _registrations(profile, f"{_RELAY_EXE} relay {{event}}")
+    config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
+    assert not changed
+    assert config == before
+
+
+@pytest.mark.parametrize(
+    "native,command",
+    [
+        ("PreToolUse", "make lint"),
+        ("Stop", f"{_RELAY_EXE} relay Stop"),
+        ("PreCompact", f"{_RELAY_EXE} relay PreCompact"),
+    ],
+    ids=["user-command", "truthful-relay", "unmapped-canonical"],
+)
+def test_clean_foreign_agy_group_is_not_flagged(native, command):
+    profile = get_profile("antigravity")
+    config = _correct_config(profile)
+    config[_USER_GROUP] = {native: [_relay_handler(profile, command)]}
+    config["notes"] = "not a group"
+    assert _registered(profile, config)
+    assert not install_mod.foreign_group_relay_hazards(
+        config, profile.hooks.dialect, profile.hooks.events
+    )
+
+
+def test_truthful_foreign_agy_relay_does_not_satisfy_registration():
+    profile = get_profile("antigravity")
+    config = {_USER_GROUP: {"Stop": [_relay_handler(profile, f"{_RELAY_EXE} relay Stop")]}}
+    assert not _registered(profile, config)
+
+
+def test_managed_agy_group_is_still_repaired_beside_a_flagged_foreign_group():
+    profile = get_profile("antigravity")
+    stop = _relay_handler(profile, f"{_RELAY_EXE} relay Stop")
+    config = _correct_config(profile)
+    config[install_mod.ANTIGRAVITY_HOOK_GROUP]["PreToolUse"] = [stop]
+    config[_USER_GROUP] = {"PreToolUse": [stop]}
+
+    registrations = _registrations(profile, f"{_RELAY_EXE} relay {{event}}")
+    config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
+    assert changed
+    assert config[install_mod.ANTIGRAVITY_HOOK_GROUP] == (
+        _correct_config(profile)[install_mod.ANTIGRAVITY_HOOK_GROUP]
+    )
+    assert config[_USER_GROUP] == {"PreToolUse": [stop]}
+    assert not _registered(profile, config)
+
+
+def test_init_warns_about_a_foreign_agy_group_relay_and_keeps_it(tmp_path, capsys):
+    profile = get_profile("antigravity")
+    config_path = tmp_path / profile.hooks.config_path
+    config_path.parent.mkdir(parents=True)
+    user_group = {"PreToolUse": [{"type": "command", "command": f"{_RELAY_EXE} relay Stop"}]}
+    config_path.write_text(json.dumps({_USER_GROUP: user_group}))
+    capsys.readouterr()
+
+    assert install_into(tmp_path, clis=("antigravity",), skills=False) == 0
+    out = capsys.readouterr().out
+    assert f"group {_USER_GROUP!r}" in out and "'PreToolUse'" in out
+    assert json.loads(config_path.read_text())[_USER_GROUP] == user_group
+
+
 @pytest.mark.parametrize(
     "command,expected",
     [
