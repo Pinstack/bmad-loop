@@ -304,6 +304,13 @@ breaking changes may land in a minor release.
   (same inode, still a real directory), journaling `root-identity-rebound`. An inode
   mismatch is never re-bound. On Windows, the verify stream now refuses a run dir that
   reports a zero inode, where it used to write.
+- Pin the integration snapshots to the run dir's mint-time record (DW-500). The capture
+  root is created, and each sidecar written, only under the run dir whose identity matches
+  `run_dir_identity`: by a no-follow walk from the opened run dir on POSIX, by a
+  record-compared check-then-write elsewhere. With `runs/` or the run dir swapped for a
+  link to a tree holding a real run dir, the capture now refuses and integration pauses,
+  instead of writing the snapshots outside the run. A run with no record refuses as
+  DW-446's writers do, until a `resume` or re-arm records it.
 - On Windows, stop a DW bundle from pausing at baseline capture when the artifacts root
   reports no inode (DW-444). Each degraded read is journaled as
   `artifact-observation-unpinned` with the filesystem. A bundle with artifact

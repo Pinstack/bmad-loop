@@ -11626,19 +11626,22 @@ def test_snapshot_bytes_fallback_refuses_a_linked_snapshot_directory(tmp_path, m
     written through. Ablation: drop the `pinned_root_identity` refusal and this
     fails `DID NOT RAISE`, the sidecar landing in `outside`."""
     monkeypatch.setattr(verify, "DIR_FD_ANCHORED_WRITES", False)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    pin = verify._run_dir_pin(run_dir, platform_util.root_identity_record(run_dir))
     outside = tmp_path / "outside"
     outside.mkdir()
-    snapshots = tmp_path / "snapshots"
+    snapshots = run_dir / "snapshots"
     snapshots.symlink_to(outside, target_is_directory=True)
 
     with pytest.raises(verify.IntegrationEvidenceError, match="missing or redirected"):
-        verify._snapshot_bytes(b"target bytes", snapshots / "sidecar")
+        verify._snapshot_bytes(b"target bytes", snapshots / "sidecar", pin)
 
     assert list(outside.iterdir()) == []
     # Positive control: the same arm writes into a real snapshot directory.
-    real = tmp_path / "real-snapshots"
+    real = run_dir / "real-snapshots"
     real.mkdir()
-    verify._snapshot_bytes(b"target bytes", real / "sidecar")
+    verify._snapshot_bytes(b"target bytes", real / "sidecar", pin)
     assert (real / "sidecar").read_bytes() == b"target bytes"
 
 
@@ -11664,6 +11667,182 @@ def test_stream_snapshot_fallback_refuses_a_linked_snapshot_directory(tmp_path, 
     real.mkdir()
     verify._stream_snapshot(source, real / "sidecar")
     assert (real / "sidecar").read_bytes() == b"target bytes"
+
+
+def _snapshot_arm(arm, monkeypatch):
+    """Select the integration-snapshot arm under test: ``dir-fd`` (POSIX descriptor
+    anchoring, skipped where absent) or ``path`` (the no-dir-fd check-then-write arm)."""
+    if arm == "dir-fd" and not verify.DIR_FD_ANCHORED_WRITES:
+        pytest.skip("dir-fd anchoring is POSIX-only")
+    if arm == "path":
+        monkeypatch.setattr(verify, "DIR_FD_ANCHORED_WRITES", False)
+
+
+def _snapshot_run(project, tmp_path):
+    """A target file to capture and a minted run dir under ``runs/``, with its record."""
+    (project.project / "captured.bin").write_bytes(b"target bytes")
+    runs_dir = tmp_path / "state" / "runs"
+    run_dir = runs_dir / "r1"
+    run_dir.mkdir(parents=True)
+    return runs_dir, run_dir, platform_util.root_identity_record(run_dir)
+
+
+def _swap_for_a_link(runs_dir, run_dir, outside, swapped):
+    """Replace ``runs/`` — or the run dir itself — with a link to a tree holding a
+    REAL ``r1/`` (``outside/r1``, which the caller has populated)."""
+    moved = runs_dir if swapped == "runs" else run_dir
+    moved.rename(moved.with_name(moved.name + "-aside"))
+    moved.symlink_to(outside if swapped == "runs" else outside / "r1", target_is_directory=True)
+
+
+def _files_under(tree):
+    return sorted(p.relative_to(tree).as_posix() for p in tree.rglob("*") if p.is_file())
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("when", ["before-capture", "after-root"])
+@pytest.mark.parametrize("swapped", ["runs", "run-dir"])
+@pytest.mark.parametrize("arm", ["dir-fd", "path"])
+def test_capture_integration_state_refuses_a_run_dir_swapped_after_the_mint(
+    project, tmp_path, monkeypatch, arm, swapped, when
+):
+    """DW-500: the capture root and every sidecar are pinned to the run dir's
+    MINT-TIME record (`RunState.run_dir_identity`, DW-446). `runs/` — or the run
+    dir — swapped after the mint for a link to a tree holding a real `r1/` refuses
+    on both arms, whether the swap lands before the capture (the root's pin) or
+    after the capture root was created (the sidecar writers' pin), and no sidecar
+    lands outside.
+
+    A fresh `lstat` refuses a link only at the final component, and
+    `run_dir.resolve()` follows one anywhere: the run dir reached THROUGH the link
+    is a real directory, so the pre-DW-500 pins accepted it.
+
+    Ablations. Build the pin from `pinned_root_identity(run_dir)` (a fresh `lstat`)
+    instead of the record in `verify._run_dir_pin` and both `runs-before-capture`
+    rows fail `DID NOT RAISE`, the sidecar written under `outside/r1/` (the
+    `run-dir-before-capture` rows stay green: a run dir that is itself a link
+    fails that `lstat` too, the DW-338 leaf refusal). Pass ``pin=None`` to the
+    capture's `_stream_snapshot` (the pre-DW-500 leaf-only writer) and all four
+    `after-root` rows fail `DID NOT RAISE`: the pin is taken once, before the swap,
+    so only the writers' own pin sees a swap that lands mid-capture."""
+    _snapshot_arm(arm, monkeypatch)
+    runs_dir, run_dir, record = _snapshot_run(project, tmp_path)
+    outside = tmp_path / "outside"
+    if when == "before-capture":
+        (outside / "r1").mkdir(parents=True)
+        _swap_for_a_link(runs_dir, run_dir, outside, swapped)
+    else:
+        original = verify._integration_snapshot_root
+
+        def root_then_swap(*args):
+            root = original(*args)
+            # the outside tree holds a real copy of the freshly created capture root
+            shutil.copytree(run_dir, outside / "r1")
+            _swap_for_a_link(runs_dir, run_dir, outside, swapped)
+            return root
+
+        monkeypatch.setattr(verify, "_integration_snapshot_root", root_then_swap)
+
+    with pytest.raises(verify.IntegrationEvidenceError):
+        verify.capture_integration_state(
+            project.project, run_dir, "c" * 32, ("captured.bin",), run_dir_identity=record
+        )
+
+    assert _files_under(outside) == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("arm", ["dir-fd", "path"])
+def test_capture_ignored_entries_refuses_a_runs_dir_swapped_after_the_mint(
+    project, tmp_path, monkeypatch, arm
+):
+    """DW-500 for the ignored-entry sidecar (`_snapshot_bytes`): `runs/` swapped,
+    after the capture, for a link to a tree holding a real copy of the run dir
+    refuses, and the outside copy's capture root gains nothing.
+
+    Ablation: build the pin from `pinned_root_identity(run_dir)` in
+    `verify._run_dir_pin` and both rows fail `DID NOT RAISE`, `ignored.lst`
+    written under `outside/r1/`."""
+    _snapshot_arm(arm, monkeypatch)
+    runs_dir, run_dir, record = _snapshot_run(project, tmp_path)
+    operation = "d" * 32
+    verify.capture_integration_state(
+        project.project, run_dir, operation, ("captured.bin",), run_dir_identity=record
+    )
+    outside = tmp_path / "outside"
+    shutil.copytree(run_dir, outside / "r1")
+    before = _files_under(outside)
+    _swap_for_a_link(runs_dir, run_dir, outside, "runs")
+
+    with pytest.raises(verify.IntegrationEvidenceError):
+        verify.capture_ignored_entries(project.project, run_dir, operation, run_dir_identity=record)
+
+    assert _files_under(outside) == before
+
+
+@pytest.mark.parametrize("arm", ["dir-fd", "path"])
+def test_capture_integration_state_writes_under_an_intact_minted_run_dir(
+    project, tmp_path, monkeypatch, arm
+):
+    """DW-500's positive control: an intact run dir whose record matches captures
+    as before on both arms — the regular file's sidecar and the ignored-entry
+    sidecar land under `integration-snapshots/<operation>/` with their bytes."""
+    _snapshot_arm(arm, monkeypatch)
+    _runs_dir, run_dir, record = _snapshot_run(project, tmp_path)
+    operation = "e" * 32
+
+    [entry], _submodules = verify.capture_integration_state(
+        project.project, run_dir, operation, ("captured.bin",), run_dir_identity=record
+    )
+    ignored = verify.capture_ignored_entries(
+        project.project, run_dir, operation, run_dir_identity=record
+    )
+
+    assert (run_dir / str(entry["sidecar"])).read_bytes() == b"target bytes"
+    assert str(entry["sidecar"]).startswith(f"integration-snapshots/{operation}/")
+    assert (run_dir / str(ignored["sidecar"])).is_file()
+
+
+@pytest.mark.parametrize("arm", ["dir-fd", "path"])
+def test_capture_integration_state_refuses_a_legacy_run_until_its_record_is_backfilled(
+    project, tmp_path, monkeypatch, arm
+):
+    """DW-446's rule for a legacy run, applied to the snapshots (DW-500): a run dir
+    with no mint-time record (a pre-DW-446 state not yet resumed) REFUSES — it never
+    degrades to a fresh `lstat` — and creates nothing; the locked resume/re-arm
+    backfill (`runs.reconcile_root_identities`) records it, and the capture then
+    proceeds.
+
+    Ablation: map a None record to `pinned_root_identity(run_dir)` in
+    `verify._run_dir_pin` and both rows fail `DID NOT RAISE`."""
+    from bmad_loop import runs
+    from bmad_loop.journal import Journal
+    from bmad_loop.model import RunState
+
+    _snapshot_arm(arm, monkeypatch)
+    _runs_dir, run_dir, _record = _snapshot_run(project, tmp_path)
+    state = RunState(run_id="r1", project=str(project.project), started_at="now")
+    assert state.run_dir_identity is None  # the legacy premise
+
+    with pytest.raises(verify.IntegrationEvidenceError):
+        verify.capture_integration_state(
+            project.project,
+            run_dir,
+            "f" * 32,
+            ("captured.bin",),
+            run_dir_identity=state.run_dir_identity,
+        )
+    assert not (run_dir / "integration-snapshots").exists()
+
+    assert runs.reconcile_root_identities(state, run_dir, Journal(run_dir), project.project)
+    [entry], _submodules = verify.capture_integration_state(
+        project.project,
+        run_dir,
+        "f" * 32,
+        ("captured.bin",),
+        run_dir_identity=state.run_dir_identity,
+    )
+    assert (run_dir / str(entry["sidecar"])).read_bytes() == b"target bytes"
 
 
 def test_prepared_ref_timeout_before_commit_is_not_indeterminate(project):

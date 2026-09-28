@@ -16,7 +16,12 @@ from pathlib import Path
 import pytest
 from conftest import git, make_git_noisy, refuse_to_resolve
 
-from bmad_loop import verify
+from bmad_loop import platform_util, verify
+
+
+def _minted(run_dir):
+    """The run dir's mint-time identity record, as the composers persist it (DW-446)."""
+    return platform_util.root_identity_record(run_dir)
 
 
 def commit(repo, name, content="x\n", msg="work"):
@@ -497,6 +502,7 @@ def test_receipt_sidecars_restore_bytes_trackedness_absence_and_dirty_state(proj
         run_dir,
         operation,
         ("tracked-dirt.txt", "ignored.bin", "missing-parent/expected-absent.bin"),
+        run_dir_identity=_minted(run_dir),
     )
     old = verify.rev_parse_head(repo)
     feature.write_bytes(b"integrated feature")
@@ -556,7 +562,7 @@ def test_receipt_snapshot_metadata_stays_bounded_for_large_target_file(project, 
     run_dir.mkdir()
 
     snapshots, _submodules = verify.capture_integration_state(
-        project.project, run_dir, "b" * 32, ("large.bin",)
+        project.project, run_dir, "b" * 32, ("large.bin",), run_dir_identity=_minted(run_dir)
     )
 
     [entry] = snapshots
@@ -581,6 +587,7 @@ def test_receipt_capture_enforces_aggregate_sidecar_limit_before_mutation(projec
             operation,
             ("one.bin", "two.bin"),
             payload_max_bytes=15,
+            run_dir_identity=_minted(run_dir),
         )
 
     assert not (run_dir / "integration-snapshots" / operation).exists()
@@ -599,7 +606,7 @@ def test_receipt_restores_exact_staged_index_and_worktree_bytes(project, tmp_pat
     run_dir.mkdir()
     operation = "8" * 32
     snapshots, submodules = verify.capture_integration_state(
-        repo, run_dir, operation, ("owned.txt",)
+        repo, run_dir, operation, ("owned.txt",), run_dir_identity=_minted(run_dir)
     )
     old = verify.rev_parse_head(repo)
     (repo / "feature.txt").write_text("integrated\n")
@@ -658,7 +665,7 @@ def test_restoration_complete_ignores_operator_dirt_outside_the_receipt_inventor
     run_dir.mkdir()
     operation = "c" * 32
     snapshots, submodules = verify.capture_integration_state(
-        repo, run_dir, operation, ("feature.txt",)
+        repo, run_dir, operation, ("feature.txt",), run_dir_identity=_minted(run_dir)
     )
     old = verify.rev_parse_head(repo)
     (repo / "feature.txt").write_text("integrated\n")
@@ -706,7 +713,7 @@ def test_receipt_restores_intent_to_add_index_entry(project, tmp_path):
     run_dir.mkdir()
     operation = "7" * 32
     snapshots, submodules = verify.capture_integration_state(
-        repo, run_dir, operation, ("intent.txt",)
+        repo, run_dir, operation, ("intent.txt",), run_dir_identity=_minted(run_dir)
     )
     git(repo, "add", "--", "intent.txt")
 
@@ -737,7 +744,7 @@ def test_receipt_restores_extended_index_flags(project, tmp_path, flag):
     run_dir.mkdir()
     operation = ("a" if flag == "assume-unchanged" else "b") * 32
     snapshots, submodules = verify.capture_integration_state(
-        repo, run_dir, operation, ("flagged.txt",)
+        repo, run_dir, operation, ("flagged.txt",), run_dir_identity=_minted(run_dir)
     )
     git(repo, "update-index", f"--no-{flag}", "--", "flagged.txt")
 
@@ -778,7 +785,7 @@ def test_receipt_restores_conflicted_index_stages(project, tmp_path):
     run_dir.mkdir()
     operation = "6" * 32
     snapshots, submodules = verify.capture_integration_state(
-        repo, run_dir, operation, ("conflict.txt",)
+        repo, run_dir, operation, ("conflict.txt",), run_dir_identity=_minted(run_dir)
     )
     conflict.write_text("resolved by hook\n")
     git(repo, "add", "--", "conflict.txt")
@@ -1138,7 +1145,9 @@ def test_cleanup_replay_refuses_a_flag_an_operator_set_after_the_cleanup(project
     pre = verify.rev_parse_head(repo)
     plan = verify.plan_incoming_collisions(repo, "main", "feat")
     assert plan.cleaned == ("src.txt",) and plan.untracked == ()
-    snapshots, _submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, plan.cleaned)
+    snapshots, _submodules = verify.capture_integration_state(
+        repo, run_dir, "c" * 32, plan.cleaned, run_dir_identity=_minted(run_dir)
+    )
 
     def recoverable():
         return verify.integration_cleanup_state_recoverable(
@@ -1252,7 +1261,7 @@ def test_receipt_schema_reads_absent_parents_by_gits_slash_hierarchy(project, tm
     run_dir.mkdir()
     operation = "b" * 32
     snapshots, submodules = verify.capture_integration_state(
-        project.project, run_dir, operation, (rel,)
+        project.project, run_dir, operation, (rel,), run_dir_identity=_minted(run_dir)
     )
     [entry] = snapshots
     parents = rel.split("/")[:-1]
@@ -1295,7 +1304,9 @@ def test_receipt_restores_populated_submodule_checkout(project, tmp_path):
     origin, checkout, old_submodule = _add_test_submodule(repo, tmp_path)
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    snapshots, submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, ())
+    snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "c" * 32, (), run_dir_identity=_minted(run_dir)
+    )
     assert submodules == [
         {
             "path": "module",
@@ -1427,7 +1438,9 @@ def test_receipt_captures_and_restores_a_tracked_entry_type_change(
         incoming = ("d/x", "d")
     old = verify.rev_parse_head(repo)
 
-    snapshots, submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, incoming)
+    snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "c" * 32, incoming, run_dir_identity=_minted(run_dir)
+    )
 
     by_path = {entry["path"]: entry for entry in snapshots}
     if shape != "directory-to-file":
@@ -1510,7 +1523,9 @@ def test_receipt_refuses_a_leaf_beneath_a_symlink_the_integration_keeps(project,
     git(repo, "commit", "-q", "-m", "a is a symlink")
 
     with pytest.raises(verify.IntegrationEvidenceError, match="beneath a symlink"):
-        verify.capture_integration_state(repo, run_dir, "c" * 32, ("a/b",))
+        verify.capture_integration_state(
+            repo, run_dir, "c" * 32, ("a/b",), run_dir_identity=_minted(run_dir)
+        )
 
 
 def _uninitialized_submodule(repo, tmp_path):
@@ -1543,13 +1558,17 @@ def test_receipt_captures_an_uninitialized_submodule_as_unpopulated(project, tmp
     run_dir = tmp_path / "run"
     run_dir.mkdir()
 
-    snapshots, submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, ())
+    snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "c" * 32, (), run_dir_identity=_minted(run_dir)
+    )
 
     assert snapshots == []
     assert submodules == [{"path": "module", "head": None, "gitlink": old, "flags": "0"}]
     (checkout / "stray.txt").write_text("not a checkout\n")
     with pytest.raises(verify.IntegrationEvidenceError, match="changed ownership"):
-        verify.capture_integration_state(repo, run_dir, "d" * 32, ())
+        verify.capture_integration_state(
+            repo, run_dir, "d" * 32, (), run_dir_identity=_minted(run_dir)
+        )
 
 
 @pytest.mark.parametrize("dirty", [False, True])
@@ -1569,7 +1588,9 @@ def test_receipt_removes_a_checkout_a_hook_made_at_an_unpopulated_gitlink(projec
     origin, checkout, old_submodule = _uninitialized_submodule(repo, tmp_path)
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    snapshots, submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, ("module",))
+    snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "c" * 32, ("module",), run_dir_identity=_minted(run_dir)
+    )
     old = verify.rev_parse_head(repo)
     commit(origin, "payload.txt", "submodule new\n", "advance submodule")
     new_submodule = verify.rev_parse_head(origin)
@@ -1629,7 +1650,9 @@ def test_receipt_never_removes_a_foreign_directory_at_an_unpopulated_gitlink(pro
     _origin, checkout, _old_submodule = _uninitialized_submodule(repo, tmp_path)
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    snapshots, submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, ("module",))
+    snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "c" * 32, ("module",), run_dir_identity=_minted(run_dir)
+    )
     old = verify.rev_parse_head(repo)
     commit(repo, "other.txt", "integrated\n", "integrated: unrelated")
     new = verify.rev_parse_head(repo)
@@ -1666,7 +1689,9 @@ def test_integrated_unpopulated_gitlink_a_hook_populated_reads_as_introduced(
     origin, checkout, _old_submodule = _uninitialized_submodule(repo, tmp_path)
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    _snapshots, submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, ("module",))
+    _snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "c" * 32, ("module",), run_dir_identity=_minted(run_dir)
+    )
     commit(origin, "payload.txt", "submodule new\n", "advance submodule")
     new_submodule = verify.rev_parse_head(origin)
     git(repo, "update-index", "--cacheinfo", f"160000,{new_submodule},module")
@@ -1744,7 +1769,7 @@ def test_integrated_directory_replacing_an_unpopulated_gitlink_is_walked(
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     snapshots, submodules = verify.capture_integration_state(
-        repo, run_dir, "e" * 32, ("module", "module/x")
+        repo, run_dir, "e" * 32, ("module", "module/x"), run_dir_identity=_minted(run_dir)
     )
     assert submodules[0]["head"] is None
     assert [entry["path"] for entry in snapshots] == ["module/x"]
@@ -1838,7 +1863,9 @@ def test_receipt_reads_a_captured_checkouts_own_status(project, tmp_path, ignore
     git(repo, "commit", "-q", "-am", "quiet the submodule's dirt")
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    snapshots, submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, ("src.txt",))
+    snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "c" * 32, ("src.txt",), run_dir_identity=_minted(run_dir)
+    )
     assert verify.integration_nonref_state_unchanged(
         repo,
         run_dir,
@@ -1873,7 +1900,9 @@ def test_receipt_detects_index_only_submodule_gitlink_drift(project, tmp_path):
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     operation = "c" * 32
-    snapshots, submodules = verify.capture_integration_state(repo, run_dir, operation, ())
+    snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, operation, (), run_dir_identity=_minted(run_dir)
+    )
     commit(origin, "payload.txt", "new gitlink\n", "advance gitlink")
     new_submodule = verify.rev_parse_head(origin)
     git(repo, "update-index", "--cacheinfo", "160000", new_submodule, "module")
@@ -1897,7 +1926,9 @@ def test_receipt_restores_deleted_or_replaced_old_submodule_from_old_revision(
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     operation = "5" * 32
-    snapshots, submodules = verify.capture_integration_state(repo, run_dir, operation, ("module",))
+    snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, operation, ("module",), run_dir_identity=_minted(run_dir)
+    )
     old = verify.rev_parse_head(repo)
     git(repo, "rm", "-q", "-f", "--", "module")
     if replacement:
@@ -1940,7 +1971,7 @@ def test_receipt_removes_newly_introduced_submodule_checkout(project, tmp_path, 
     run_dir.mkdir()
     operation = "4" * 32
     snapshots, submodules = verify.capture_integration_state(
-        repo, run_dir, operation, ("new-module",)
+        repo, run_dir, operation, ("new-module",), run_dir_identity=_minted(run_dir)
     )
     old = verify.rev_parse_head(repo)
     git(
@@ -1982,7 +2013,9 @@ def test_receipt_never_removes_a_foreign_directory_at_an_absent_path(project, tm
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     operation = "4" * 32
-    snapshots, submodules = verify.capture_integration_state(repo, run_dir, operation, ("fresh",))
+    snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, operation, ("fresh",), run_dir_identity=_minted(run_dir)
+    )
     old = verify.rev_parse_head(repo)
     commit(repo, "src.txt", "integrated\n", "integrated")
     new = verify.rev_parse_head(repo)
@@ -2010,7 +2043,9 @@ def test_receipt_refuses_redirected_submodule_before_external_mutation(project, 
     origin, checkout, _old_submodule = _add_test_submodule(repo, tmp_path)
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    snapshots, submodules = verify.capture_integration_state(repo, run_dir, "d" * 32, ())
+    snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "d" * 32, (), run_dir_identity=_minted(run_dir)
+    )
     old = verify.rev_parse_head(repo)
     commit(repo, "feature.txt", "integrated\n", "integrated target")
     new = verify.rev_parse_head(repo)
@@ -2061,7 +2096,7 @@ def test_receipt_restore_parent_redirect_never_writes_outside_or_moves_ref(
     run_dir.mkdir()
     operation = "3" * 32
     snapshots, submodules = verify.capture_integration_state(
-        repo, run_dir, operation, ("nested/owned.bin",)
+        repo, run_dir, operation, ("nested/owned.bin",), run_dir_identity=_minted(run_dir)
     )
     old = verify.rev_parse_head(repo)
     (repo / "feature.txt").write_text("integrated\n")
@@ -2130,7 +2165,7 @@ def test_checked_path_restore_refuses_a_parent_swapped_for_a_symlink(
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     snapshots, submodules = verify.capture_integration_state(
-        repo, run_dir, "4" * 32, ("nested/owned.bin",)
+        repo, run_dir, "4" * 32, ("nested/owned.bin",), run_dir_identity=_minted(run_dir)
     )
     revision = verify.rev_parse_head(repo)
     external = tmp_path / "external"
@@ -2171,7 +2206,7 @@ def test_receipt_snapshots_and_restores_tolerated_symlink_identity(project, tmp_
     run_dir.mkdir()
     operation = "e" * 32
     snapshots, submodules = verify.capture_integration_state(
-        repo, run_dir, operation, ("operator-link",)
+        repo, run_dir, operation, ("operator-link",), run_dir_identity=_minted(run_dir)
     )
     link.unlink()
     link.symlink_to("hook-target")
@@ -2199,7 +2234,9 @@ def test_receipt_capture_rejects_redirected_roots_without_external_writes(projec
     (run_dir / "integration-snapshots").symlink_to(external, target_is_directory=True)
 
     with pytest.raises(verify.IntegrationEvidenceError, match="redirected"):
-        verify.capture_integration_state(project.project, run_dir, "f" * 32, ())
+        verify.capture_integration_state(
+            project.project, run_dir, "f" * 32, (), run_dir_identity=_minted(run_dir)
+        )
 
     assert not any(external.iterdir())
     (run_dir / "integration-snapshots").unlink()
@@ -2207,7 +2244,9 @@ def test_receipt_capture_rejects_redirected_roots_without_external_writes(projec
     parent.mkdir()
     (parent / ("f" * 32)).symlink_to(external, target_is_directory=True)
     with pytest.raises(verify.IntegrationEvidenceError, match="already exists"):
-        verify.capture_integration_state(project.project, run_dir, "f" * 32, ())
+        verify.capture_integration_state(
+            project.project, run_dir, "f" * 32, (), run_dir_identity=_minted(run_dir)
+        )
     assert not any(external.iterdir())
 
 
@@ -2234,7 +2273,13 @@ def test_receipt_capture_parent_redirect_never_writes_outside(project, tmp_path,
     monkeypatch.setattr(verify.os, "replace", redirect_before_publish)
 
     with pytest.raises(verify.IntegrationEvidenceError, match="changed during capture"):
-        verify.capture_integration_state(project.project, run_dir, operation, ("captured.bin",))
+        verify.capture_integration_state(
+            project.project,
+            run_dir,
+            operation,
+            ("captured.bin",),
+            run_dir_identity=_minted(run_dir),
+        )
 
     assert not any(external.iterdir())
 
@@ -2268,6 +2313,7 @@ def test_receipt_capture_removes_partial_operation_directory(project, tmp_path):
             run_dir,
             operation,
             ("captured.txt", "not-a-file"),
+            run_dir_identity=_minted(run_dir),
         )
 
     assert not (run_dir / "integration-snapshots" / operation).exists()
@@ -2280,7 +2326,11 @@ def test_receipt_schema_binds_sidecar_to_operation_and_path(project, tmp_path):
     (project.project / "two.txt").write_text("two\n")
     operation = "2" * 32
     snapshots, submodules = verify.capture_integration_state(
-        project.project, run_dir, operation, ("one.txt", "two.txt")
+        project.project,
+        run_dir,
+        operation,
+        ("one.txt", "two.txt"),
+        run_dir_identity=_minted(run_dir),
     )
 
     with pytest.raises(verify.IntegrationEvidenceError, match="another operation"):
@@ -2316,7 +2366,9 @@ def test_receipt_captures_and_restores_a_posix_only_git_name(
     git(repo, "commit", "-q", "-m", "posix-only name")
     old = verify.rev_parse_head(repo)
 
-    snapshots, submodules = verify.capture_integration_state(repo, run_dir, "b" * 32, (name,))
+    snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "b" * 32, (name,), run_dir_identity=_minted(run_dir)
+    )
 
     [entry] = snapshots
     assert entry["path"] == name and entry["state"] == "regular"
@@ -2381,7 +2433,9 @@ def test_receipt_capture_fsyncs_sidecar_directory(project, tmp_path, monkeypatch
 
     monkeypatch.setattr(verify, "_fsync_directory", record)
     operation = "4" * 32
-    verify.capture_integration_state(project.project, run_dir, operation, ("durable.txt",))
+    verify.capture_integration_state(
+        project.project, run_dir, operation, ("durable.txt",), run_dir_identity=_minted(run_dir)
+    )
 
     assert run_dir / "integration-snapshots" / operation in fsynced
 
@@ -4389,7 +4443,7 @@ def test_integrated_index_flags_drift_reports_a_hook_s_flag_on_an_incoming_path(
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     snapshots, _submodules = verify.capture_integration_state(
-        repo, run_dir, "e" * 32, ("src.txt", "newdir/tracked")
+        repo, run_dir, "e" * 32, ("src.txt", "newdir/tracked"), run_dir_identity=_minted(run_dir)
     )
     (repo / "newdir").mkdir()
     (repo / "newdir" / "tracked").write_text("incoming\n")
@@ -4438,7 +4492,9 @@ def test_integrated_index_flags_outside_drift_names_a_hook_s_flip(project, tmp_p
         git(repo, "update-index", "--assume-unchanged", "--", "notes.txt")
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    snapshots, _submodules = verify.capture_integration_state(repo, run_dir, "e" * 32, ("src.txt",))
+    snapshots, _submodules = verify.capture_integration_state(
+        repo, run_dir, "e" * 32, ("src.txt",), run_dir_identity=_minted(run_dir)
+    )
     evidence = verify.capture_index_flags(repo, exclude=[entry["path"] for entry in snapshots])
     assert evidence["marked"] == ({"notes.txt": "8000"} if flip == "clear-assume-unchanged" else {})
     (repo / "src.txt").write_text("incoming\n")
@@ -4484,7 +4540,9 @@ def test_integrated_index_flags_outside_drift_names_a_write_under_a_pre_marked_e
     git(repo, "update-index", f"--{flag}", "--", "notes.txt")
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    snapshots, _submodules = verify.capture_integration_state(repo, run_dir, "e" * 32, ("src.txt",))
+    snapshots, _submodules = verify.capture_integration_state(
+        repo, run_dir, "e" * 32, ("src.txt",), run_dir_identity=_minted(run_dir)
+    )
     exclude = [entry["path"] for entry in snapshots]
     evidence = verify.capture_index_flags(repo, exclude=exclude)
     assert set(evidence["unread"]) == {"notes.txt"}
@@ -4576,7 +4634,9 @@ def test_index_flag_readings_walk_debug_records_past_a_newline_in_a_path(project
     assert verify._index_state(repo, "src.txt")["entries"][0]["flags"] == "0"
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    snapshots, _submodules = verify.capture_integration_state(repo, run_dir, "e" * 32, ("src.txt",))
+    snapshots, _submodules = verify.capture_integration_state(
+        repo, run_dir, "e" * 32, ("src.txt",), run_dir_identity=_minted(run_dir)
+    )
     assert verify.integrated_index_flags_outside_drift(repo, evidence, exclude=["src.txt"]) == ()
     assert verify.integration_nonref_state_unchanged(
         repo, run_dir, snapshots, [], operation_identity="e" * 32
@@ -4628,7 +4688,9 @@ def test_index_flag_readings_mask_the_fsmonitor_valid_bit(project, tmp_path):
     assert evidence["marked"] == {"notes.txt": "8000"}
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    snapshots, _submodules = verify.capture_integration_state(repo, run_dir, "f" * 32, ("src.txt",))
+    snapshots, _submodules = verify.capture_integration_state(
+        repo, run_dir, "f" * 32, ("src.txt",), run_dir_identity=_minted(run_dir)
+    )
     # the entry recreated the way a rollback recreates it: no monitor bit
     verify._restore_receipt_index(repo, snapshots)
     assert git(repo, "ls-files", "--debug", "--", "src.txt").endswith("flags: 0")
@@ -4682,7 +4744,7 @@ def test_integrated_index_flags_drift_accepts_git_s_own_words(project, tmp_path,
     if shape == "captured-word-rewritten":
         git(repo, "update-index", "--assume-unchanged", "--", "src.txt")
         snapshots, _submodules = verify.capture_integration_state(
-            repo, run_dir, "e" * 32, ("src.txt",)
+            repo, run_dir, "e" * 32, ("src.txt",), run_dir_identity=_minted(run_dir)
         )
         [entry] = snapshots
         assert entry["index"]["entries"][0]["flags"] == "8000"
@@ -4700,7 +4762,7 @@ def test_integrated_index_flags_drift_accepts_git_s_own_words(project, tmp_path,
         _branch_with(repo, tmp_path, adds={"other/o.txt": "out of the cone\n"})
         git(repo, "sparse-checkout", "set", "--cone", "keep")
         snapshots, _submodules = verify.capture_integration_state(
-            repo, run_dir, "e" * 32, ("other/o.txt",)
+            repo, run_dir, "e" * 32, ("other/o.txt",), run_dir_identity=_minted(run_dir)
         )
         git(repo, "merge", "-q", "--ff-only", "feat")
         assert git(repo, "ls-files", "-t", "--", "other/o.txt") == "S other/o.txt"
@@ -4764,7 +4826,9 @@ def test_integrated_index_flags_drift_reads_an_unread_incoming_entry_from_disk(
         _branch_with(repo, tmp_path, modifies={"src.txt": "incoming\n"})
     git(repo, "checkout", "-q", "--", "src.txt")
     git(repo, "update-index", "--assume-unchanged", "--", incoming)
-    snapshots, _submodules = verify.capture_integration_state(repo, run_dir, "e" * 32, (incoming,))
+    snapshots, _submodules = verify.capture_integration_state(
+        repo, run_dir, "e" * 32, (incoming,), run_dir_identity=_minted(run_dir)
+    )
     git(repo, "merge", "-q", "--ff-only", "feat")
     integrated = verify.rev_parse_head(repo)
     # the hook: touch the checkout, then put the captured bit back
@@ -4813,7 +4877,9 @@ def test_integrated_index_flags_drift_accepts_a_skip_worktree_entry_s_absence(pr
     _branch_with(repo, tmp_path, modifies={"src.txt": "incoming\n"})
     git(repo, "checkout", "-q", "--", "src.txt")
     git(repo, "update-index", "--skip-worktree", "--", "src.txt")
-    snapshots, _submodules = verify.capture_integration_state(repo, run_dir, "e" * 32, ("src.txt",))
+    snapshots, _submodules = verify.capture_integration_state(
+        repo, run_dir, "e" * 32, ("src.txt",), run_dir_identity=_minted(run_dir)
+    )
     git(repo, "merge", "-q", "--ff-only", "feat")
     integrated = verify.rev_parse_head(repo)
     git(repo, "update-index", "--skip-worktree", "--", "src.txt")
@@ -4917,11 +4983,17 @@ def test_ignored_entries_receipt_names_an_entry_added_after_the_hooks(project, t
     git(repo, "commit", "-q", "-m", "populated dir; ignored entries")
     (repo / "stray.log").write_text("untracked, tolerated by the guard\n")
     snapshots, _submodules = verify.capture_integration_state(
-        repo, run_dir, "d" * 32, ("dir/added", "dir/becomes-tracked.tmp")
+        repo,
+        run_dir,
+        "d" * 32,
+        ("dir/added", "dir/becomes-tracked.tmp"),
+        run_dir_identity=_minted(run_dir),
     )
     assert {entry["path"] for entry in snapshots} == {"dir/added", "dir/becomes-tracked.tmp"}
 
-    evidence = verify.capture_ignored_entries(repo, run_dir, "d" * 32)
+    evidence = verify.capture_ignored_entries(
+        repo, run_dir, "d" * 32, run_dir_identity=_minted(run_dir)
+    )
 
     assert set(evidence) == {"sidecar", "size", "sha256"}
     sidecar = run_dir / str(evidence["sidecar"])
@@ -5074,9 +5146,13 @@ def test_ignored_entries_receipt_names_an_entry_removed_after_the_hooks(project,
     # the receipt records `becomes-dir.tmp/y` absent by topology, its parent
     # an ignored file; measured: `merge` clobbers that file and `under-file/x.tmp`
     # alike, `status` silent about both
-    verify.capture_integration_state(repo, run_dir, "e" * 32, incoming)
+    verify.capture_integration_state(
+        repo, run_dir, "e" * 32, incoming, run_dir_identity=_minted(run_dir)
+    )
 
-    evidence = verify.capture_ignored_entries(repo, run_dir, "e" * 32)
+    evidence = verify.capture_ignored_entries(
+        repo, run_dir, "e" * 32, run_dir_identity=_minted(run_dir)
+    )
 
     recorded = (run_dir / str(evidence["sidecar"])).read_bytes().split(b"\0")[::2]
     assert set(recorded) >= {
@@ -5210,10 +5286,12 @@ def test_ignored_entries_receipt_names_a_nested_git_entry_git_lists_nowhere(proj
     (run_dir / "worktrees" / "unit").mkdir(parents=True)
     (run_dir / "worktrees" / "unit" / ".git").write_text("gitdir: elsewhere\n")
     _snapshots, submodules = verify.capture_integration_state(
-        repo, run_dir, "d" * 32, ("dir/added",)
+        repo, run_dir, "d" * 32, ("dir/added",), run_dir_identity=_minted(run_dir)
     )
 
-    evidence = verify.capture_ignored_entries(repo, run_dir, "d" * 32)
+    evidence = verify.capture_ignored_entries(
+        repo, run_dir, "d" * 32, run_dir_identity=_minted(run_dir)
+    )
 
     recorded = (run_dir / str(evidence["sidecar"])).read_bytes().split(b"\0")[::2]
     assert recorded == [
@@ -5319,7 +5397,9 @@ def test_integrated_submodule_ignored_additions_name_a_hooks_write_the_checkout_
     (checkout / "gone.log").write_text("ignored before, removed during\n")
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    _snapshots, submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, ("module",))
+    _snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "c" * 32, ("module",), run_dir_identity=_minted(run_dir)
+    )
     [captured] = submodules
     sidecar = run_dir / str(captured["ignored"]["sidecar"])
     assert sidecar.read_bytes().split(b"\0")[::2] == [b"gone.log", b"old.log"]
@@ -5358,7 +5438,9 @@ def test_integrated_submodule_ignored_additions_name_a_hooks_write_the_checkout_
     # the leftover a tracked directory replaced: the commit's own `.log`
     # under it is the commit's, whatever the leftover's rules say
     (checkout / "old.log").write_text("ignored before\n")
-    _snapshots, submodules = verify.capture_integration_state(repo, run_dir, "e" * 32, ("module",))
+    _snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "e" * 32, ("module",), run_dir_identity=_minted(run_dir)
+    )
     git(repo, "rm", "-q", "--cached", "--", "module")
     (checkout / "report.log").write_text("the commit's own\n")
     # staged the way a merge stages it: `git add` skips a path under the
@@ -5412,13 +5494,17 @@ def test_integrated_submodule_ignored_additions_read_the_automator_directory_lik
     (repo / ".gitignore").write_text(".bmad-loop/\n")
     git(repo, "add", "--", ".gitignore")
     git(repo, "commit", "-q", "-m", "ignore the automator directory")
-    _snapshots, submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, ("module",))
+    _snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "c" * 32, ("module",), run_dir_identity=_minted(run_dir)
+    )
     [captured] = submodules
     sidecar = run_dir / str(captured["ignored"]["sidecar"])
     assert sidecar.read_bytes().split(b"\0")[::2] == [b".bmad-loop/runs/old"]
     # the target's own listing still leaves the run's records out: the
     # checkout's `.git` boundary is its one entry
-    evidence = verify.capture_ignored_entries(repo, run_dir, "c" * 32)
+    evidence = verify.capture_ignored_entries(
+        repo, run_dir, "c" * 32, run_dir_identity=_minted(run_dir)
+    )
     assert (run_dir / str(evidence["sidecar"])).read_bytes().split(b"\0")[::2] == [b"module/.git"]
     integrated = verify.rev_parse_head(repo)
     assert (
@@ -5487,11 +5573,13 @@ def test_tolerated_nested_repository_passes_every_receipt_reading(project, incom
     assert plan == verify.IncomingCollisionPlan(cleaned=(), tolerated=("vendor",), untracked=())
     verify.preflight_integration_paths(plan.tolerated)
     snapshots, _submodules = verify.capture_integration_state(
-        repo, run_dir, "d" * 32, (incoming, *plan.tolerated)
+        repo, run_dir, "d" * 32, (incoming, *plan.tolerated), run_dir_identity=_minted(run_dir)
     )
     # the nested repository is passed over — under the clash it IS the incoming operand
     assert [entry["path"] for entry in snapshots] == ([] if incoming == "vendor" else [incoming])
-    evidence = verify.capture_ignored_entries(repo, run_dir, "d" * 32)
+    evidence = verify.capture_ignored_entries(
+        repo, run_dir, "d" * 32, run_dir_identity=_minted(run_dir)
+    )
     assert (run_dir / str(evidence["sidecar"])).read_bytes().split(b"\0")[::2] == [
         b"vendor/.git",
         b"vendor/tool.py",
@@ -5543,7 +5631,7 @@ def _integrate_new_directory(repo, run_dir):
     the file it tracks. Returns the receipt's snapshots and the integrated
     revision."""
     snapshots, _submodules = verify.capture_integration_state(
-        repo, run_dir, "e" * 32, ("newdir/tracked", "src.txt")
+        repo, run_dir, "e" * 32, ("newdir/tracked", "src.txt"), run_dir_identity=_minted(run_dir)
     )
     [entry] = [entry for entry in snapshots if entry["path"] == "newdir/tracked"]
     assert entry["state"] == "absent" and entry["absent_parents"] == ["newdir"]
@@ -5640,7 +5728,9 @@ def test_integrated_directory_replacing_a_tracked_entry_is_walked(
     git(repo, "commit", "-q", "-m", "a is an entry")
     old = verify.rev_parse_head(repo)
     leaf = "a/b/c" if shape == "file-deep" else "a/b"
-    snapshots, submodules = verify.capture_integration_state(repo, run_dir, "e" * 32, ("a", leaf))
+    snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "e" * 32, ("a", leaf), run_dir_identity=_minted(run_dir)
+    )
     by_path = {entry["path"]: entry for entry in snapshots}
     assert by_path["a"]["state"] == ("symlink" if shape == "symlink" else "regular")
     assert by_path[leaf]["absent_parents"] == (["a/b"] if shape == "file-deep" else [])
@@ -5709,7 +5799,11 @@ def test_integrated_directory_replacing_a_tracked_entry_accepts_its_own_contents
     git(repo, "add", "--", "a", "kept", "gone")
     git(repo, "commit", "-q", "-m", "three files")
     snapshots, _submodules = verify.capture_integration_state(
-        repo, run_dir, "e" * 32, ("a", "a/b", "a/deep/leaf", "kept", "gone")
+        repo,
+        run_dir,
+        "e" * 32,
+        ("a", "a/b", "a/deep/leaf", "kept", "gone"),
+        run_dir_identity=_minted(run_dir),
     )
     git(repo, "rm", "-q", "--", "a", "gone")
     (repo / "a" / "deep").mkdir(parents=True)
@@ -5763,7 +5857,9 @@ def test_integrated_directory_that_was_empty_at_capture_is_walked(
     (repo / "newdir").mkdir()
     assert git(repo, "status", "--porcelain", "-uall", "--ignored") == ""
     leaf = "newdir/deep/tracked" if depth == "deep" else "newdir/tracked"
-    snapshots, submodules = verify.capture_integration_state(repo, run_dir, "e" * 32, (leaf,))
+    snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "e" * 32, (leaf,), run_dir_identity=_minted(run_dir)
+    )
     [entry] = snapshots
     assert entry["absent_parents"] == (["newdir/deep"] if depth == "deep" else [])
     assert entry["empty_parents"] == ["newdir"]
@@ -5841,7 +5937,11 @@ def test_receipt_records_no_empty_parent_for_other_ancestors(project, tmp_path):
     _origin, _checkout, _old = _uninitialized_submodule(repo, tmp_path)
 
     snapshots, _submodules = verify.capture_integration_state(
-        repo, run_dir, "e" * 32, ("held/new.txt", "a/b", "module/x", "root.txt", "src.txt")
+        repo,
+        run_dir,
+        "e" * 32,
+        ("held/new.txt", "a/b", "module/x", "root.txt", "src.txt"),
+        run_dir_identity=_minted(run_dir),
     )
 
     by_path = {entry["path"]: entry for entry in snapshots}
@@ -5872,7 +5972,11 @@ def test_integrated_introduced_directory_accepts_the_commit_s_own_contents(proje
     git(origin, "config", "user.name", "Test")
     commit(origin, "payload.txt", "submodule\n", "submodule baseline")
     snapshots, _submodules = verify.capture_integration_state(
-        repo, run_dir, "e" * 32, ("newdir/tracked", "newdir/deep/leaf", "newdir/link", "newdir/sub")
+        repo,
+        run_dir,
+        "e" * 32,
+        ("newdir/tracked", "newdir/deep/leaf", "newdir/link", "newdir/sub"),
+        run_dir_identity=_minted(run_dir),
     )
     (repo / "newdir" / "deep").mkdir(parents=True)
     (repo / "newdir" / "tracked").write_text("incoming\n")
@@ -5945,9 +6049,11 @@ def test_integrated_submodule_deletion_accepts_the_leftover_checkout(project, tm
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     snapshots, submodules = verify.capture_integration_state(
-        repo, run_dir, "d" * 32, ("module", ".gitmodules")
+        repo, run_dir, "d" * 32, ("module", ".gitmodules"), run_dir_identity=_minted(run_dir)
     )
-    ignored = verify.capture_ignored_entries(repo, run_dir, "d" * 32)
+    ignored = verify.capture_ignored_entries(
+        repo, run_dir, "d" * 32, run_dir_identity=_minted(run_dir)
+    )
     assert submodules == [
         {
             "path": "module",
@@ -5984,7 +6090,7 @@ def test_integrated_submodule_deletion_accepts_a_removed_checkout(project, tmp_p
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     _snapshots, submodules = verify.capture_integration_state(
-        repo, run_dir, "d" * 32, ("module", ".gitmodules")
+        repo, run_dir, "d" * 32, ("module", ".gitmodules"), run_dir_identity=_minted(run_dir)
     )
     integrated = _integrate_submodule_deletion(repo, leftover=False)
     incoming = ("module", ".gitmodules")
@@ -6011,7 +6117,7 @@ def test_integrated_submodule_deletion_refuses_a_changed_leftover(project, tmp_p
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     _snapshots, submodules = verify.capture_integration_state(
-        repo, run_dir, "d" * 32, ("module", ".gitmodules")
+        repo, run_dir, "d" * 32, ("module", ".gitmodules"), run_dir_identity=_minted(run_dir)
     )
     integrated = _integrate_submodule_deletion(repo, leftover=True)
     if drift == "nested-file":
@@ -6047,7 +6153,7 @@ def test_integrated_submodule_deletion_leaves_a_file_at_the_path_to_the_probe(pr
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     _snapshots, submodules = verify.capture_integration_state(
-        repo, run_dir, "d" * 32, ("module", ".gitmodules")
+        repo, run_dir, "d" * 32, ("module", ".gitmodules"), run_dir_identity=_minted(run_dir)
     )
     integrated = _integrate_submodule_deletion(repo, leftover=True)
     shutil.rmtree(checkout)
@@ -6074,7 +6180,7 @@ def test_integrated_submodule_replaced_by_a_file_is_held_by_the_diff_readings(pr
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     _snapshots, submodules = verify.capture_integration_state(
-        repo, run_dir, "d" * 32, ("module", ".gitmodules")
+        repo, run_dir, "d" * 32, ("module", ".gitmodules"), run_dir_identity=_minted(run_dir)
     )
     git(repo, "rm", "-q", "--cached", "--", "module")
     git(repo, "config", "-f", ".gitmodules", "--remove-section", "submodule.module")
@@ -6133,7 +6239,9 @@ def test_integrated_new_submodule_checkout_is_validated(project, tmp_path, drift
     repo = project.project
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    _snapshots, submodules = verify.capture_integration_state(repo, run_dir, "e" * 32, ())
+    _snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "e" * 32, (), run_dir_identity=_minted(run_dir)
+    )
     assert submodules == []
     origin, checkout, new_head = _integrate_new_submodule(repo, tmp_path, ignore_all=True)
     integrated = verify.rev_parse_head(repo)
@@ -6163,7 +6271,9 @@ def test_integrated_new_submodule_at_the_gitlink_is_accepted(project, tmp_path, 
     repo = project.project
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    _snapshots, submodules = verify.capture_integration_state(repo, run_dir, "e" * 32, ())
+    _snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "e" * 32, (), run_dir_identity=_minted(run_dir)
+    )
     _origin, checkout, _new_head = _integrate_new_submodule(repo, tmp_path, ignore_all=False)
     if not populated:
         shutil.rmtree(checkout)
@@ -6192,7 +6302,9 @@ def test_integrated_new_submodule_refuses_an_ignored_file_written_into_it(projec
     repo = project.project
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    _snapshots, submodules = verify.capture_integration_state(repo, run_dir, "e" * 32, ())
+    _snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "e" * 32, (), run_dir_identity=_minted(run_dir)
+    )
     origin = tmp_path / "new-origin"
     origin.mkdir()
     git(origin, "init", "-q")
@@ -6226,7 +6338,9 @@ def test_integrated_gitlink_outside_a_sparse_cone_is_accepted(project, tmp_path)
     repo = project.project
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    _snapshots, submodules = verify.capture_integration_state(repo, run_dir, "e" * 32, ())
+    _snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "e" * 32, (), run_dir_identity=_minted(run_dir)
+    )
     origin = tmp_path / "new-origin"
     origin.mkdir()
     git(origin, "init", "-q")
@@ -6279,7 +6393,9 @@ def test_receipt_preserves_an_operator_s_assume_unchanged_gitlink(project, tmp_p
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     prospective = ("module",) if touched == "updated" else ("src.txt",)
-    snapshots, submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, prospective)
+    snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "c" * 32, prospective, run_dir_identity=_minted(run_dir)
+    )
     assert submodules == [
         {
             "path": "module",
@@ -6353,7 +6469,9 @@ def test_receipt_refuses_a_hook_s_flip_of_a_captured_gitlink_s_flags(project, tm
     _origin, _checkout, _old_submodule = _add_test_submodule(repo, tmp_path)
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    _snapshots, submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, ("module",))
+    _snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "c" * 32, ("module",), run_dir_identity=_minted(run_dir)
+    )
     assert submodules[0]["flags"] == "0"
     revision = verify.rev_parse_head(repo)
     git(repo, "update-index", "--assume-unchanged", "--", "module")
@@ -6377,7 +6495,9 @@ def test_receipt_reads_a_submodule_entry_without_a_flag_word(project, tmp_path):
     _origin, _checkout, old_submodule = _add_test_submodule(repo, tmp_path)
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    snapshots, submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, ())
+    snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "c" * 32, (), run_dir_identity=_minted(run_dir)
+    )
     legacy = [{"path": "module", "head": old_submodule, "gitlink": old_submodule}]
 
     assert verify.integration_nonref_state_unchanged(
@@ -6399,7 +6519,9 @@ def test_integrated_gitlink_with_a_foreign_index_flag_is_refused(project, tmp_pa
     repo = project.project
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    _snapshots, submodules = verify.capture_integration_state(repo, run_dir, "e" * 32, ())
+    _snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "e" * 32, (), run_dir_identity=_minted(run_dir)
+    )
     _integrate_new_submodule(repo, tmp_path, ignore_all=False)
     integrated = verify.rev_parse_head(repo)
     git(repo, "update-index", "--assume-unchanged", "--", "newmod")
@@ -6434,7 +6556,7 @@ def test_integrated_submodule_deletion_in_a_linked_worktree_target(project, tmp_
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     _snapshots, submodules = verify.capture_integration_state(
-        linked, run_dir, "f" * 32, ("module", ".gitmodules")
+        linked, run_dir, "f" * 32, ("module", ".gitmodules"), run_dir_identity=_minted(run_dir)
     )
     assert submodules == [
         {
@@ -6502,7 +6624,11 @@ def test_integrated_submodule_replaced_by_a_directory_retains_the_leftover_check
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     _snapshots, submodules = verify.capture_integration_state(
-        repo, run_dir, "d" * 32, ("module", "module/file.txt", ".gitmodules")
+        repo,
+        run_dir,
+        "d" * 32,
+        ("module", "module/file.txt", ".gitmodules"),
+        run_dir_identity=_minted(run_dir),
     )
     integrated = _integrate_submodule_replacement(repo, checkout)
     assert (checkout / ".git").exists() and (checkout / "payload.txt").exists()
@@ -6546,7 +6672,11 @@ def test_integrated_submodule_replaced_by_a_directory_refuses_a_changed_leftover
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     _snapshots, submodules = verify.capture_integration_state(
-        repo, run_dir, "d" * 32, ("module", "module/file.txt", ".gitmodules")
+        repo,
+        run_dir,
+        "d" * 32,
+        ("module", "module/file.txt", ".gitmodules"),
+        run_dir_identity=_minted(run_dir),
     )
     integrated = _integrate_submodule_replacement(repo, checkout)
     if drift == "nested-file":
@@ -6577,7 +6707,11 @@ def test_integrated_submodule_replaced_by_a_directory_without_a_leftover(project
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     _snapshots, submodules = verify.capture_integration_state(
-        repo, run_dir, "d" * 32, ("module", "module/file.txt", ".gitmodules")
+        repo,
+        run_dir,
+        "d" * 32,
+        ("module", "module/file.txt", ".gitmodules"),
+        run_dir_identity=_minted(run_dir),
     )
     integrated = _integrate_submodule_replacement(repo, checkout)
     (checkout / ".git").unlink()

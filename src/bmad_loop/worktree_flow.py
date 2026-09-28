@@ -3140,6 +3140,7 @@ class WorktreeFlow:
             self.run_dir,
             operation_identity,
             snapshot_paths,
+            run_dir_identity=self.state.run_dir_identity,
             payload_max_bytes=self.policy.limits.artifact_payload_max_mb * 1_048_576,
         )
         # The flag words of the index OUTSIDE the snapshot set — a hook's
@@ -3154,7 +3155,10 @@ class WorktreeFlow:
                 self.paths.repo_root, exclude=[str(entry["path"]) for entry in snapshots]
             )
             ignored = verify.capture_ignored_entries(
-                self.paths.repo_root, self.run_dir, operation_identity
+                self.paths.repo_root,
+                self.run_dir,
+                operation_identity,
+                run_dir_identity=self.state.run_dir_identity,
             )
         except BaseException:
             verify.discard_integration_state(

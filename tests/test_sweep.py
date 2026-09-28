@@ -126,6 +126,9 @@ def make_sweep(
     run_dir = project.project / ".bmad-loop" / "runs" / run_id
     adapter = MockAdapter(script, usage_per_session=TokenUsage(input_tokens=10, output_tokens=5))
     state = RunState(run_id=run_id, project=str(project.project), started_at="now")
+    journal = Journal(run_dir)
+    # the run dir's mint-time identity, as `runsetup.compose_sweep` records it (DW-446)
+    state.run_dir_identity = platform_util.root_identity_record(run_dir)
     inputs = iter(answers)
     prompter = DecisionPrompter(input_fn=lambda _: next(inputs), print_fn=lambda _line: None)
     engine = SweepEngine(
@@ -138,7 +141,7 @@ def make_sweep(
         ),
         adapter=adapter,
         run_dir=run_dir,
-        journal=Journal(run_dir),
+        journal=journal,
         state=state,
         prompting=prompting,
         prompter=prompter,

@@ -24,7 +24,7 @@ from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from stat import S_ISLNK, S_ISREG
-from typing import Any, Literal, assert_never, overload
+from typing import Any, Literal, NamedTuple, assert_never, overload
 
 import yaml
 
@@ -51,6 +51,7 @@ from .platform_util import (
     AT_NOFOLLOW,
     DIR_FD_ANCHORED_WRITES,
     HANDLE_ANCHORED_WRITES,
+    RootIdentityRecord,
     UnconfinedWriteError,
     atomic_replace,
     atomic_write_bytes,
@@ -61,6 +62,8 @@ from .platform_util import (
     open_dir_confined,
     path_is_confined,
     pinned_root_identity,
+    recorded_root_identity,
+    require_root_pinned,
 )
 from .policy import POLICY_FILE, Policy
 from .sprintstatus import STATUS_ORDER, story_status
@@ -659,9 +662,89 @@ def _confined_repo_operand(repo: Path, rel: object) -> tuple[str, Path]:
     return validated, candidate
 
 
-def _integration_snapshot_root(run_dir: Path, operation_identity: str) -> Path:
+class _RunDirPin(NamedTuple):
+    """The run dir a snapshot sidecar is written under, and the identity it is
+    pinned to: `platform_util.recorded_root_identity` of ``RunState.run_dir_identity``,
+    the record the composer took when it minted the run dir (DW-446, DW-500)."""
+
+    run_dir: Path
+    identity: os.stat_result
+
+
+def _run_dir_pin(run_dir: Path, run_dir_identity: RootIdentityRecord | None) -> _RunDirPin:
+    """The pin for ``run_dir``'s mint-time record. A ``None`` record (a pre-DW-446
+    state not yet backfilled by `runs.reconcile_root_identities`, a zero-inode
+    claim) pins to the never-matching identity, so every snapshot write REFUSES —
+    DW-446's rule for a missing record, never a fresh ``lstat``."""
+    return _RunDirPin(run_dir, recorded_root_identity(run_dir_identity))
+
+
+def _require_run_dir_pinned(pin: _RunDirPin) -> None:
+    """The path arms' pin (check-then-write): ``pin.run_dir`` must still ``lstat``
+    as its mint-time directory. A fresh ``lstat`` follows a link at any ancestor,
+    so ``runs/`` swapped for a link to a tree holding a real ``<id>/`` answers the
+    OUTSIDE directory — whose identity is not the record — and refuses."""
+    try:
+        require_root_pinned(pin.run_dir, pin.identity)
+    except UnconfinedWriteError as exc:
+        raise IntegrationEvidenceError(
+            "target integration run directory is not the one minted for this run"
+        ) from exc
+
+
+def _integration_snapshot_root(run_dir: Path, operation_identity: str, pin: _RunDirPin) -> Path:
+    """Create the capture root ``<run_dir>/integration-snapshots/<operation>``.
+
+    Confined to the run dir by its MINT-TIME identity (DW-500, DW-446's rule for
+    `Journal.write_verify_stream`): ``run_dir.resolve()`` follows a link at any
+    ancestor, so ``runs/`` swapped for a link to a tree holding a real ``<id>/``
+    used to carry every snapshot sidecar outside the run. On the dir-fd arm the
+    run dir is OPENED and its ``fstat`` compared against the record before
+    anything is created, and both directories are made relative to that
+    descriptor, the snapshot directory reopened ``O_NOFOLLOW``. The other arms
+    re-``lstat`` the run dir against the record before the first ``mkdir`` and
+    again after the last (check-then-write). A missing record refuses."""
     if not re.fullmatch(r"[0-9a-f]{32}", operation_identity):
         raise IntegrationEvidenceError("persisted target integration operation is malformed")
+    if DIR_FD_ANCHORED_WRITES:
+        run_fd = open_dir_confined(run_dir, run_dir, root_identity=pin.identity)
+        if run_fd is None:
+            raise IntegrationEvidenceError(
+                "target integration run directory is not the one minted for this run"
+            )
+        try:
+            try:
+                os.mkdir(_INTEGRATION_SNAPSHOT_DIR, 0o700, dir_fd=run_fd)
+            except FileExistsError:
+                pass  # an existing entry — the O_NOFOLLOW open below vets it
+            try:
+                parent_fd = os.open(
+                    _INTEGRATION_SNAPSHOT_DIR,
+                    os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=run_fd,
+                )
+            except OSError as exc:
+                raise IntegrationEvidenceError(
+                    "target integration snapshot directory was redirected"
+                ) from exc
+        finally:
+            os.close(run_fd)
+        try:
+            try:
+                os.mkdir(operation_identity, 0o700, dir_fd=parent_fd)
+            except FileExistsError as exc:
+                raise IntegrationEvidenceError(
+                    "target integration snapshot operation already exists"
+                ) from exc
+            try:
+                os.fsync(parent_fd)
+            except OSError:
+                os.rmdir(operation_identity, dir_fd=parent_fd)
+                raise
+        finally:
+            os.close(parent_fd)
+        return run_dir / _INTEGRATION_SNAPSHOT_DIR / operation_identity
+    _require_run_dir_pinned(pin)
     run_root = run_dir.resolve(strict=True)
     parent = run_dir / _INTEGRATION_SNAPSHOT_DIR
     if parent.is_symlink():
@@ -687,7 +770,29 @@ def _integration_snapshot_root(run_dir: Path, operation_identity: str) -> Path:
         raise IntegrationEvidenceError("target integration snapshot directory was redirected")
     if resolved != run_root and not resolved.is_relative_to(run_root):
         raise IntegrationEvidenceError("target integration snapshot directory escaped the run")
+    _require_run_dir_pinned(pin)
     return root
+
+
+def _open_snapshot_directory(directory: Path, pin: _RunDirPin | None) -> int:
+    """The dir-fd arm's descriptor for a sidecar's ``directory``.
+
+    Under a ``pin`` it is reached from the run dir, which is opened and compared
+    against its MINT-TIME record, by an ``O_NOFOLLOW`` walk
+    (`platform_util.open_dir_confined`, DW-500): an ``O_NOFOLLOW`` open of the
+    whole path refuses a link only at its final component, so ``runs/`` swapped
+    for a link to a tree holding a real ``<id>/`` carried the sidecar outside the
+    run, and the post-publication ``lstat`` compare followed the same link. A
+    missing record refuses. Without a pin (the restore's staging file in the
+    target repository) the leaf-``O_NOFOLLOW`` open stands."""
+    if pin is None:
+        return os.open(directory, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+    fd = open_dir_confined(pin.run_dir, directory, root_identity=pin.identity)
+    if fd is None:
+        raise IntegrationEvidenceError(
+            "target integration snapshot directory is missing or redirected"
+        )
+    return fd
 
 
 def _stream_snapshot(
@@ -696,16 +801,30 @@ def _stream_snapshot(
     *,
     max_bytes: int | None = None,
     source_root: Path | None = None,
+    pin: _RunDirPin | None = None,
 ) -> tuple[int, str]:
-    """Publish one file sidecar atomically while keeping memory usage bounded."""
+    """Publish one file sidecar atomically while keeping memory usage bounded.
+
+    ``pin`` holds a destination under the run dir to the run dir's MINT-TIME
+    identity (DW-500): the capture passes it, the restore — whose destination is
+    in the target repository — does not. See `_open_snapshot_directory`."""
     if not DIR_FD_ANCHORED_WRITES:
         # Check-then-write pin of the orchestrator-minted snapshot dir (DW-338).
         # Narrower than `_snapshot_bytes`'s fallback, whose confined writer is
         # handle-anchored wherever HANDLE_ANCHORED_WRITES holds: this arm is
         # path-based, so a link planted between this check and `mkstemp` still
         # redirects the staging file. (A swap after `mkstemp` makes the
-        # path-based `os.replace` miss its source and fail.)
-        if pinned_root_identity(destination.parent) is None:
+        # path-based `os.replace` miss its source and fail.) Under a `pin` the
+        # run dir is compared against its mint-time record rather than a fresh
+        # `lstat` — which follows a swapped ancestor — and every component below
+        # it must be a real directory (DW-500).
+        if pin is not None:
+            _require_run_dir_pinned(pin)
+            if not path_is_confined(pin.run_dir, destination.parent):
+                raise IntegrationEvidenceError(
+                    "target integration snapshot directory is missing or redirected"
+                )
+        elif pinned_root_identity(destination.parent) is None:
             raise IntegrationEvidenceError(
                 "target integration snapshot directory is missing or redirected"
             )
@@ -744,10 +863,7 @@ def _stream_snapshot(
             except FileNotFoundError:
                 pass
         return size, digest.hexdigest()
-    root_fd = os.open(
-        destination.parent,
-        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
-    )
+    root_fd = _open_snapshot_directory(destination.parent, pin)
     temporary = f".capture-{os.getpid():x}-{os.urandom(6).hex()}"
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=root_fd)
     source_fd = -1
@@ -812,23 +928,25 @@ def _stream_snapshot(
     return size, digest.hexdigest()
 
 
-def _snapshot_bytes(data: bytes, destination: Path) -> tuple[int, str]:
+def _snapshot_bytes(data: bytes, destination: Path, pin: _RunDirPin) -> tuple[int, str]:
+    """Publish one in-memory sidecar under the run dir, pinned to the run dir's
+    MINT-TIME identity (DW-500; see `_open_snapshot_directory`)."""
     if not DIR_FD_ANCHORED_WRITES:
-        # Pinned like the POSIX arm's O_NOFOLLOW root open below: the snapshot
-        # directory is orchestrator-minted, so a linked one is refused (DW-338).
-        root_identity = pinned_root_identity(destination.parent)
-        if root_identity is None:
+        # Pinned like the POSIX arm's confined root open below: the snapshot
+        # directory is orchestrator-minted, so a linked one is refused (DW-338),
+        # and the run dir above it is compared against its mint-time record
+        # rather than a fresh `lstat`, which follows a swapped ancestor (DW-500).
+        # The confined writer walks every component from the run dir down.
+        try:
+            atomic_write_bytes_confined(
+                destination, data, confine_root=pin.run_dir, root_identity=pin.identity
+            )
+        except UnconfinedWriteError as exc:
             raise IntegrationEvidenceError(
                 "target integration snapshot directory is missing or redirected"
-            )
-        atomic_write_bytes_confined(
-            destination, data, confine_root=destination.parent, root_identity=root_identity
-        )
+            ) from exc
         return len(data), hashlib.sha256(data).hexdigest()
-    root_fd = os.open(
-        destination.parent,
-        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
-    )
+    root_fd = _open_snapshot_directory(destination.parent, pin)
     temporary = f".capture-{os.getpid():x}-{os.urandom(6).hex()}"
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=root_fd)
     try:
@@ -1215,6 +1333,7 @@ def _capture_integration_state_into(
     root: Path,
     paths: Iterable[str],
     *,
+    pin: _RunDirPin,
     payload_max_bytes: int | None,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     snapshots: list[dict[str, object]] = []
@@ -1313,7 +1432,7 @@ def _capture_integration_state_into(
         sidecar = root / name
         if S_ISLNK(mode):
             target_bytes = os.readlink(os.fsencode(candidate))
-            size, digest = _snapshot_bytes(target_bytes, sidecar)
+            size, digest = _snapshot_bytes(target_bytes, sidecar, pin)
             total_bytes += size
             if payload_max_bytes is not None and total_bytes > payload_max_bytes:
                 raise IntegrationEvidenceError(
@@ -1344,6 +1463,7 @@ def _capture_integration_state_into(
             sidecar,
             max_bytes=remaining,
             source_root=repo,
+            pin=pin,
         )
         total_bytes += size
         if payload_max_bytes is not None and total_bytes > payload_max_bytes:
@@ -1422,7 +1542,7 @@ def _capture_integration_state_into(
                 "path": rel,
                 "head": rev_parse_head(checkout),
                 **_captured_gitlink_entry(_index_state(repo, rel)),
-                "ignored": _seal_ignored_entries(checkout, run_dir, root / name, own_records=False),
+                "ignored": _seal_ignored_entries(checkout, pin, root / name, own_records=False),
             }
         )
     return snapshots, submodules
@@ -1449,16 +1569,24 @@ def capture_integration_state(
     operation_identity: str,
     paths: Iterable[str],
     *,
+    run_dir_identity: RootIdentityRecord | None,
     payload_max_bytes: int | None = None,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    """Capture complete reversible non-ref state into streamed run sidecars."""
-    root = _integration_snapshot_root(run_dir, operation_identity)
+    """Capture complete reversible non-ref state into streamed run sidecars.
+
+    ``run_dir_identity`` is ``RunState.run_dir_identity``, the run dir's MINT-TIME
+    record (DW-446): the capture root and every sidecar are pinned to it (DW-500),
+    so ``runs/`` or the run dir swapped for a link after the mint refuses, and a
+    missing record (a legacy state not yet backfilled on resume/re-arm) refuses."""
+    pin = _run_dir_pin(run_dir, run_dir_identity)
+    root = _integration_snapshot_root(run_dir, operation_identity, pin)
     try:
         return _capture_integration_state_into(
             repo,
             run_dir,
             root,
             paths,
+            pin=pin,
             payload_max_bytes=payload_max_bytes,
         )
     except BaseException:
@@ -3359,7 +3487,11 @@ def _lstat_identity(repo: Path, path: str) -> str | None:
 
 
 def capture_ignored_entries(
-    repo: Path, run_dir: Path, operation_identity: str
+    repo: Path,
+    run_dir: Path,
+    operation_identity: str,
+    *,
+    run_dir_identity: RootIdentityRecord | None,
 ) -> dict[str, object]:
     """The receipt's evidence for the ignored entries of the whole tree.
 
@@ -3375,22 +3507,26 @@ def capture_ignored_entries(
     size and digest — so that after the hooks every ignored entry not on it,
     or on it under another identity, can be NAMED
     (`integrated_ignored_additions`).
+
+    The sidecar is pinned, as `capture_integration_state`'s are, to
+    ``run_dir_identity`` — the run dir's MINT-TIME record (DW-500).
     """
     root = _owned_integration_snapshot_root(run_dir, operation_identity)
-    return _seal_ignored_entries(repo, run_dir, root / _IGNORED_ENTRIES_SIDECAR)
+    pin = _run_dir_pin(run_dir, run_dir_identity)
+    return _seal_ignored_entries(repo, pin, root / _IGNORED_ENTRIES_SIDECAR)
 
 
 def _seal_ignored_entries(
-    repo: Path, run_dir: Path, sidecar: Path, *, own_records: bool = True
+    repo: Path, pin: _RunDirPin, sidecar: Path, *, own_records: bool = True
 ) -> dict[str, object]:
     """Seal `ignored_entries` of ``repo`` into ``sidecar``; the receipt's record of it."""
     data = b"\0".join(
         os.fsencode(path) + b"\0" + identity.encode("ascii")
         for path, identity in ignored_entries(repo, own_records=own_records).items()
     )
-    size, digest = _snapshot_bytes(data, sidecar)
+    size, digest = _snapshot_bytes(data, sidecar, pin)
     return {
-        "sidecar": sidecar.relative_to(run_dir).as_posix(),
+        "sidecar": sidecar.relative_to(pin.run_dir).as_posix(),
         "size": size,
         "sha256": digest,
     }
