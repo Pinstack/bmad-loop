@@ -1600,6 +1600,35 @@ def test_wait_for_completion_accepts_rotated_session_id_stop(tmp_path):
     )
 
 
+def test_wait_for_completion_rebinds_on_clear_source_start(tmp_path):
+    """A /clear fires a fresh SessionStart with a new id and source "clear". That
+    is the launched session rotating its id, not a nested CLI, so attribution
+    rebinds to it: its Stop completes the session under the new id and nothing
+    is journaled as foreign (#767)."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event("SessionStart", session_id="sess-a", transcript_path="/a.jsonl"),
+            _hook_event(
+                "SessionStart", session_id="sess-b", transcript_path="/b.jsonl", source="clear"
+            ),
+            _stop_event("3-1-dev-1", "sess-b", "/b.jsonl"),
+        ]
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == "sess-b"
+    assert result.transcript_path == "/b.jsonl"
+    assert not any(
+        entry["event"] == "foreign-hook-event-ignored" for entry in _lifecycle_lines(adapter)
+    )
+
+
 def test_wait_for_completion_copilot_bound_subagent_stop_not_crumbed(tmp_path):
     """Once Copilot's sessionStart binds the main id, a subagent's toolu_ Stop
     still passes attribution (the toolu_ id never announced a start) and is
@@ -8939,7 +8968,13 @@ BYPASS_FOOTER = "Enter to confirm · Esc " + "to cancel"
 
 
 def _hook_event(
-    kind, notification_type=None, *, task_id="3-1-dev-1", session_id="sess", transcript_path=None
+    kind,
+    notification_type=None,
+    *,
+    task_id="3-1-dev-1",
+    session_id="sess",
+    transcript_path=None,
+    source=None,
 ):
     return HookEvent(
         ts=1,
@@ -8949,6 +8984,7 @@ def _hook_event(
         transcript_path=transcript_path,
         path=Path("x"),
         notification_type=notification_type,
+        source=source,
     )
 
 

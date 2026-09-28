@@ -66,6 +66,14 @@ def _notification_type(payload):
     return value if isinstance(value, str) else None
 
 
+def _source(payload):
+    # A SessionStart payload's `source` (#767): claude/gemini send
+    # startup|resume|clear|compact; codex/copilot send their own values. Only a
+    # string is forwarded, like the notification subtype above.
+    value = payload.get("source")
+    return value if isinstance(value, str) else None
+
+
 def _is_link_like(path):
     """True when `path` redirects elsewhere: a POSIX symlink, or a Windows
     symlink OR DIRECTORY JUNCTION.
@@ -220,6 +228,10 @@ def main() -> int:
         # `notification_type` (e.g. "permission_prompt"); the profile maps it onto
         # a parked kind. Kept only when it is a string; absent everywhere else.
         "notification_type": _notification_type(payload),
+        # Why a SessionStart fired (#767): a "clear"/"compact" start with a new id
+        # is still the launched session, so attribution rebinds instead of
+        # reading it as a nested CLI. Kept only when it is a string.
+        "source": _source(payload),
     }
     # The orchestrator's own events dir when it named one, else the legacy
     # in-tree location this file's older selves are still installed at (see the

@@ -38,6 +38,11 @@ class HookEvent:
     # relay that predates the field, and for a non-string value. APPENDED with a
     # default so every positional construction stays valid.
     notification_type: str | None = None
+    # A SessionStart's `source` (#767) — claude/gemini's startup|resume|clear|
+    # compact, or another CLI's own value. None on every other event, on an older
+    # vendored relay that predates the field, and for a non-string value.
+    # APPENDED with a default, like notification_type above.
+    source: str | None = None
 
 
 def _event_dirs(events_dir: Path, legacy_dir: Path | None) -> list[Path]:
@@ -60,6 +65,7 @@ def _parse_event(entry: Path) -> HookEvent | None:
     if not isinstance(data, dict) or "event" not in data or "task_id" not in data:
         return None
     notification_type = data.get("notification_type")
+    source = data.get("source")
     return HookEvent(
         ts=int(data.get("ts", 0)),
         event=str(data["event"]),
@@ -68,6 +74,7 @@ def _parse_event(entry: Path) -> HookEvent | None:
         transcript_path=data.get("transcript_path"),
         path=entry,
         notification_type=notification_type if isinstance(notification_type, str) else None,
+        source=source if isinstance(source, str) else None,
     )
 
 
@@ -84,6 +91,11 @@ def is_session_event(event: HookEvent, task_id: str, since_ns: int = 0) -> bool:
     second layer, deciding which CLI session inside the attempt's stream is the
     launched one."""
     return event.task_id == task_id and (not since_ns or event.ts >= since_ns)
+
+
+# SessionStart sources that keep the launched session's identity across an id
+# change: claude/gemini rotate the session id on /clear and may on compaction.
+REBIND_SOURCES = frozenset({"clear", "compact"})
 
 
 @dataclass
@@ -106,6 +118,16 @@ class SessionAttribution:
     an anonymous start (a payload the relay could not read) still uses up the
     parent's slot, so a child's identified start after it is foreign.
 
+    A later SessionStart with a new id whose ``source`` is in
+    :data:`REBIND_SOURCES` ("clear", "compact") is the launched session itself
+    rotating its id, so it rebinds rather than going foreign. Deliberately not
+    "resume" — a nested child launched with ``--resume`` must stay foreign, and a
+    bmad-loop resume is a new attempt with a fresh task id and so a fresh
+    attribution — and not "startup", which is exactly what a nested child sends.
+    An older vendored relay forwards no ``source``, so there a clear/compact start
+    with a new id reads as foreign and the session falls back to window death or
+    its timeout; ``bmad-loop init`` re-vendors the relay.
+
     Accepted limitation: a child SessionEnd whose child never announced a
     SessionStart is indistinguishable from the parent's own and is admitted.
     Nested CLIs announce their start, so this is documented, not defended."""
@@ -123,6 +145,10 @@ class SessionAttribution:
                 self.started, self.bound_id = True, sid
                 return True
             if not sid or sid == self.bound_id:
+                return True
+            if event.source in REBIND_SOURCES:
+                self.bound_id = sid
+                self.foreign_ids.discard(sid)
                 return True
             self.foreign_ids.add(sid)
             return False

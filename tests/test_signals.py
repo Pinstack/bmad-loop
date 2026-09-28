@@ -36,6 +36,24 @@ def test_parse_event_reads_the_notification_type(tmp_path, extra, expected):
     assert event.notification_type == expected
 
 
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        ({"source": "clear"}, "clear"),
+        ({"source": 3}, None),  # a non-string is dropped, not coerced
+        ({}, None),  # an older vendored relay forwards no source at all
+    ],
+)
+def test_parse_event_reads_the_session_start_source(tmp_path, extra, expected):
+    """#767: the relay's forwarded SessionStart source lands on the HookEvent
+    (str only)."""
+    watcher = SignalWatcher(tmp_path / "events")
+    write_event(watcher.events_dir, 1, "t1", "SessionStart", **extra)
+    (event,) = watcher.poll()
+    assert event.event == "SessionStart"
+    assert event.source == expected
+
+
 def test_poll_returns_new_events_once(tmp_path):
     watcher = SignalWatcher(tmp_path / "events")
     write_event(watcher.events_dir, 2, "t1", "Stop")
@@ -259,7 +277,7 @@ def test_is_session_event_is_the_rule_wait_for_matches_on(tmp_path):
     assert not is_session_event(event, "t2")
 
 
-def _event(kind, session_id=None, ts=1):
+def _event(kind, session_id=None, ts=1, source=None):
     return HookEvent(
         ts=ts,
         event=kind,
@@ -267,6 +285,7 @@ def _event(kind, session_id=None, ts=1):
         session_id=session_id,
         transcript_path=None,
         path=Path("x"),
+        source=source,
     )
 
 
@@ -315,13 +334,60 @@ def _event(kind, session_id=None, ts=1):
             [True, True, True],
             id="never-announced-toolu-stop-admitted",  # the copilot subagent filter owns it
         ),
+        pytest.param(
+            [
+                ("SessionStart", "A"),
+                ("SessionStart", "B", "clear"),
+                ("Stop", "B"),
+                ("SessionStart", "C", "startup"),
+                ("Stop", "C"),
+                ("Stop", "B"),
+            ],
+            [True, True, True, False, False, True],
+            id="clear-start-rebinds-then-startup-child-is-foreign",
+        ),
+        pytest.param(
+            [
+                ("SessionStart", "A"),
+                ("SessionStart", "B", "compact"),
+                ("Stop", "B"),
+                ("SessionStart", "C", "startup"),
+                ("Stop", "C"),
+                ("Stop", "B"),
+            ],
+            [True, True, True, False, False, True],
+            id="compact-start-rebinds-then-startup-child-is-foreign",
+        ),
+        pytest.param(
+            [("SessionStart", "A"), ("SessionStart", "B", "resume"), ("Stop", "B")],
+            [True, False, False],
+            id="resume-start-is-foreign",  # a nested child launched with --resume
+        ),
+        pytest.param(
+            [("SessionStart", "A"), ("SessionStart", "B", None), ("Stop", "B")],
+            [True, False, False],
+            id="sourceless-start-is-foreign",  # an older relay: no rebind
+        ),
     ],
 )
 def test_session_attribution_admits(sequence, expected):
     """#767: the deny-list rule, event by event. Only an id that announced its
     own SessionStart after the launched session's first one is dropped."""
     attribution = SessionAttribution()
-    assert [attribution.admit(_event(kind, sid)) for kind, sid in sequence] == expected
+    admitted = []
+    for kind, sid, *source in sequence:  # an optional third item is the start's source
+        admitted.append(attribution.admit(_event(kind, sid, source=source[0] if source else None)))
+    assert admitted == expected
+
+
+def test_session_attribution_clear_start_moves_the_binding():
+    """#767: a clear/compact start with a new id is the launched session
+    rotating its id, so the binding follows it rather than marking it foreign."""
+    attribution = SessionAttribution()
+    attribution.admit(_event("SessionStart", "A"))
+    assert attribution.admit(_event("SessionStart", "B", source="clear"))
+    assert attribution.bound_id == "B"
+    assert attribution.foreign_ids == set()
 
 
 def test_attribute_events_returns_admitted_and_foreign_ids():

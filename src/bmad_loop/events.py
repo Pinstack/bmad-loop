@@ -6,8 +6,8 @@ contract (its docstring says so) and cannot import ``bmad_loop`` to reach this
 module — and this module cannot import it back, since it ships as package DATA
 rather than as an importable module. Hence a twin rather than shared code:
 ``_LINK_REPARSE_TAGS``, ``_first_workspace``, ``_notification_type``,
-``_is_link_like``, ``_write_all`` and ``_write_event`` below are byte-identical
-copies of the hook's, pinned that way by
+``_source``, ``_is_link_like``, ``_write_all`` and ``_write_event`` below are
+byte-identical copies of the hook's, pinned that way by
 ``tests/test_events.py::test_the_twinned_source_is_identical`` — which
 AST-extracts both sides and compares the source segments, so a fix applied to one
 writer of the events control plane and not the other cannot pass review silently.
@@ -61,6 +61,14 @@ def _notification_type(payload):
     # Only a string is forwarded: anything else would reach the orchestrator as a
     # value no profile table can key on.
     value = payload.get("notification_type") or payload.get("notificationType")
+    return value if isinstance(value, str) else None
+
+
+def _source(payload):
+    # A SessionStart payload's `source` (#767): claude/gemini send
+    # startup|resume|clear|compact; codex/copilot send their own values. Only a
+    # string is forwarded, like the notification subtype above.
+    value = payload.get("source")
     return value if isinstance(value, str) else None
 
 
@@ -218,6 +226,10 @@ def shape_event(ts: int, event_name: str, task_id: str, payload: dict[str, Any])
         # `notification_type` (e.g. "permission_prompt"); the profile maps it onto
         # a parked kind. Kept only when it is a string; absent everywhere else.
         "notification_type": _notification_type(payload),
+        # Why a SessionStart fired (#767): a "clear"/"compact" start with a new id
+        # is still the launched session, so attribution rebinds instead of
+        # reading it as a nested CLI. Kept only when it is a string.
+        "source": _source(payload),
     }
 
 
