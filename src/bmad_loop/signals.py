@@ -64,14 +64,18 @@ def _parse_event(entry: Path) -> HookEvent | None:
         return None
     if not isinstance(data, dict) or "event" not in data or "task_id" not in data:
         return None
+    session_id = data.get("session_id")
+    transcript_path = data.get("transcript_path")
     notification_type = data.get("notification_type")
     source = data.get("source")
+    # Payload values are forwarded from the CLI unvalidated, so a non-string one
+    # reads as absent rather than reaching attribution's set arithmetic (#767).
     return HookEvent(
         ts=int(data.get("ts", 0)),
         event=str(data["event"]),
         task_id=str(data["task_id"]),
-        session_id=data.get("session_id"),
-        transcript_path=data.get("transcript_path"),
+        session_id=session_id if isinstance(session_id, str) else None,
+        transcript_path=transcript_path if isinstance(transcript_path, str) else None,
         path=entry,
         notification_type=notification_type if isinstance(notification_type, str) else None,
         source=source if isinstance(source, str) else None,
@@ -128,6 +132,13 @@ class SessionAttribution:
     with a new id reads as foreign and the session falls back to window death or
     its timeout; ``bmad-loop init`` re-vendors the relay.
 
+    ``source`` alone is not trusted. An id already found foreign never rebinds
+    (a child compacting under its own id), and a "clear" start right after a
+    foreign id's SessionEnd is that child clearing — claude ends the old session
+    with a SessionEnd before the clear start — so the new id is foreign too. A
+    child that rotates its id without a preceding SessionEnd still rebinds; only
+    a relay-side lineage check could tell it apart.
+
     Accepted limitation: a child SessionEnd whose child never announced a
     SessionStart is indistinguishable from the parent's own and is admitted.
     Nested CLIs announce their start, so this is documented, not defended."""
@@ -135,23 +146,30 @@ class SessionAttribution:
     started: bool = False  # the launched session's first SessionStart was seen
     bound_id: str | None = None  # its id (None when that start was anonymous)
     foreign_ids: set[str] = field(default_factory=set)
+    ended_id: str | None = None  # the most recent identified SessionEnd's id
 
     def admit(self, event: HookEvent) -> bool:
         """Whether ``event`` belongs to the launched session. Stateful: a
         SessionStart can bind the session or mark its id foreign."""
         sid = event.session_id
         if event.event == "SessionStart":
+            ended_id, self.ended_id = self.ended_id, None
             if not self.started:
                 self.started, self.bound_id = True, sid
                 return True
             if not sid or sid == self.bound_id:
                 return True
-            if event.source in REBIND_SOURCES:
+            if (
+                sid not in self.foreign_ids
+                and event.source in REBIND_SOURCES
+                and not (event.source == "clear" and ended_id in self.foreign_ids)
+            ):
                 self.bound_id = sid
-                self.foreign_ids.discard(sid)
                 return True
             self.foreign_ids.add(sid)
             return False
+        if event.event == "SessionEnd" and sid:
+            self.ended_id = sid
         return not (sid and sid in self.foreign_ids)
 
 

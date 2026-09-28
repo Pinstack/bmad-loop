@@ -54,6 +54,21 @@ def test_parse_event_reads_the_session_start_source(tmp_path, extra, expected):
     assert event.source == expected
 
 
+@pytest.mark.parametrize("value", [["A", "B"], {"id": "A"}, 3], ids=["list", "dict", "int"])
+def test_parse_event_drops_a_non_string_session_id(tmp_path, value):
+    """#767: a non-string id reads as absent, so attribution never hashes it —
+    a list-valued child start used to raise TypeError out of the wait."""
+    watcher = SignalWatcher(tmp_path / "events")
+    write_event(watcher.events_dir, 1, "t1", "SessionStart", session_id="A")
+    write_event(
+        watcher.events_dir, 2, "t1", "SessionStart", session_id=value, transcript_path=value
+    )
+    events = watcher.poll()
+    assert [(e.session_id, e.transcript_path) for e in events] == [("A", None), (None, None)]
+    attribution = SessionAttribution()
+    assert [attribution.admit(e) for e in events] == [True, True]
+
+
 def test_poll_returns_new_events_once(tmp_path):
     watcher = SignalWatcher(tmp_path / "events")
     write_event(watcher.events_dir, 2, "t1", "Stop")
@@ -357,6 +372,39 @@ def _event(kind, session_id=None, ts=1, source=None):
             ],
             [True, True, True, False, False, True],
             id="compact-start-rebinds-then-startup-child-is-foreign",
+        ),
+        pytest.param(
+            [
+                ("SessionStart", "A"),
+                ("SessionStart", "B", "startup"),
+                ("SessionStart", "B", "compact"),
+                ("Stop", "B"),
+                ("Stop", "A"),
+            ],
+            [True, False, False, False, True],
+            id="foreign-id-compacting-stays-foreign",
+        ),
+        pytest.param(
+            [
+                ("SessionStart", "A"),
+                ("SessionStart", "B", "startup"),
+                ("SessionEnd", "B"),
+                ("SessionStart", "C", "clear"),
+                ("Stop", "C"),
+                ("Stop", "A"),
+            ],
+            [True, False, False, False, False, True],
+            id="clear-after-foreign-end-is-the-child-clearing",
+        ),
+        pytest.param(
+            [
+                ("SessionStart", "A"),
+                ("SessionEnd", "A"),
+                ("SessionStart", "B", "clear"),
+                ("Stop", "B"),
+            ],
+            [True, True, True, True],
+            id="clear-after-own-end-rebinds",  # claude ends the old id before a clear start
         ),
         pytest.param(
             [("SessionStart", "A"), ("SessionStart", "B", "resume"), ("Stop", "B")],
