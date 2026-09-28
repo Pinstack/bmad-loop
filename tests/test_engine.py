@@ -23173,3 +23173,64 @@ def test_ledger_restore_without_a_mount_still_writes_through_a_symlinked_ledger(
 
     assert ledger.is_symlink()
     assert target.read_text(encoding="utf-8") == _LEDGER_SNAPSHOT
+
+
+def _by_path_ledger_writers(monkeypatch) -> None:
+    """Replay the pre-DW-498 by-path ledger writes behind the pin pre-check — the
+    parent-link rows' control."""
+    monkeypatch.setattr(
+        "bmad_loop.engine.make_dirs_confined",
+        lambda path, **_kw: path.mkdir(parents=True, exist_ok=True),
+    )
+    monkeypatch.setattr(
+        "bmad_loop.engine.atomic_write_text_confined",
+        lambda path, text, **_kw: platform_util.atomic_write_text(path, text),
+    )
+    monkeypatch.setattr(
+        "bmad_loop.engine.unlink_confined",
+        lambda path, *, missing_ok=False, **_kw: path.unlink(missing_ok=missing_ok),
+    )
+
+
+@requires_symlinked_mount_swap
+@pytest.mark.parametrize("arm", list(_LEDGER_RESTORE_ARMS))
+def test_ledger_restores_refuse_a_link_at_the_ledger_parent_below_the_mount(
+    project, tmp_path, monkeypatch, arm
+):
+    """Each ledger restore through an INTACT, pinned mount whose ledger PARENT dir
+    was swapped for a link refuses with `UnconfinedWriteError` — the root pre-check
+    passes, so the refusal is the confined walk's — and the ledger at the link's
+    target is neither rewritten nor deleted. The control replays the by-path writes
+    behind the same pre-check and shows the same link really reaches the outside
+    ledger.
+
+    Ablation: keep `require_root_pinned` but let `_publish_restored_ledger` (the
+    write and merge arms) or `_retract_ledger` (the unlink arm) fall through to the
+    plain `mkdir` + `atomic_write_text` / `ledger.unlink` and that arm's row rewrites
+    or deletes the outside ledger instead of raising — the mount-swap rows above stay
+    green under it."""
+    engine, ledger, _outside, task = _ledger_in_mount(project, tmp_path, arm)
+    assert engine._mount_root_identity(task, engine.workspace.paths.project) is not None
+    restore = _arm_ledger_restore(monkeypatch, engine, task, arm)
+    parent = ledger.parent
+    outside_dir = tmp_path / "outside-parent"
+    shutil.copytree(parent, outside_dir)
+    parent.rename(parent.with_name(parent.name + "-aside"))
+    parent.symlink_to(outside_dir, target_is_directory=True)
+    outside_ledger = outside_dir / ledger.name
+    written = outside_ledger.read_text(encoding="utf-8")
+    assert ledger.read_text(encoding="utf-8") == written  # the ledger path reaches it
+
+    with pytest.raises(platform_util.UnconfinedWriteError) as refused:
+        restore()
+
+    assert _PIN_REFUSAL not in str(refused.value)  # not the root pre-check
+    assert outside_ledger.read_text(encoding="utf-8") == written
+
+    _by_path_ledger_writers(monkeypatch)  # control: by path, the link is followed out
+    restore()
+    lands = _LEDGER_RESTORE_ARMS[arm][2]
+    if lands is None:
+        assert not outside_ledger.exists()
+    else:
+        assert outside_ledger.read_text(encoding="utf-8") == lands
