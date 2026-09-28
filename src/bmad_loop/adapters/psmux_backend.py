@@ -1082,9 +1082,12 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # at rc!=0. Only a pane-shaped value may reach `-t`.
         if not re.fullmatch(r"%\d+", pane):
             return None
+        # A transport fault warns as in the base (DW-463); the unpinnable and
+        # dead-pane Nones above and below are answers and stay silent.
         try:
             proc = self._run(["display-message", "-p", "-t", pane, fmt], check=False)
-        except (subprocess.SubprocessError, OSError):
+        except (subprocess.SubprocessError, OSError) as exc:
+            self._warn_unanswered_display(fmt, exc)
             return None
         return proc.stdout.strip() if proc.returncode == 0 else None
 

@@ -903,6 +903,41 @@ def test_display_message_none_outside_mux_even_with_pane_var(monkeypatch):
     assert rec.calls == []
 
 
+@pytest.mark.parametrize(
+    "exc", [subprocess.TimeoutExpired(["psmux"], 30), FileNotFoundError("psmux")]
+)
+def test_display_message_transport_fault_warns(monkeypatch, capsys, exc):
+    # DW-463: the pinned probe could not be asked. None stays the answer, but
+    # inside psmux it reads as "not attached" (return_attached_client goes
+    # ATTENDED on it), so the fault says so. Ablation: drop the warning in
+    # PsmuxMultiplexer._display_message and this fails.
+    monkeypatch.setenv("TMUX", "/tmp/psmux-1000/default,123,0")
+    monkeypatch.setenv("TMUX_PANE", "%4")
+
+    def boom(*_a, **_k):
+        raise exc
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", boom)
+    assert PsmuxMultiplexer().current_pane_id() is None
+    err = capsys.readouterr().err
+    assert err.startswith("warning: psmux display-message #{pane_id} failed: ")
+    assert type(exc).__name__ in err
+
+
+def test_display_message_answers_stay_silent(monkeypatch, capsys):
+    # The unpinnable, non-pane-shaped and dead-pane Nones are answers: no
+    # warning for any of them (DW-463 warns on the transport arm only).
+    monkeypatch.setenv("TMUX", "/tmp/psmux-1000/default,123,0")
+    monkeypatch.setattr(tmux_base.subprocess, "run", _RecordRun(returncode=1))
+    monkeypatch.delenv("TMUX_PANE", raising=False)
+    assert PsmuxMultiplexer().current_pane_id() is None
+    monkeypatch.setenv("TMUX_PANE", "@3")
+    assert PsmuxMultiplexer().current_pane_id() is None
+    monkeypatch.setenv("TMUX_PANE", "%4")  # pinned, but the pane is dead: rc 1
+    assert PsmuxMultiplexer().current_pane_id() is None
+    assert capsys.readouterr().err == ""
+
+
 def test_current_window_id_bare_on_colon_session(monkeypatch):
     # `a:b:@2` cannot be split back at the right colon, so it degrades to the
     # bare id — and list_windows("a:b", ...) degrades its rows identically, so

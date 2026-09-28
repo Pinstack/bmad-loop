@@ -180,6 +180,12 @@ breaking changes may land in a minor release.
 - Tell a refused `result.json` from a missing one: the Stop read-back's give-up records
   `malformed-result-json` with the refusal, and the exit read-back writes
   `result-json-refused` (`error`). Still no result (DW-451).
+- Warn on stderr when the tmux-family session listing fails for a reason other than no
+  server running; it still reads as no sessions, so a `delete`/`archive`/`clean` past a
+  live session is no longer unrecorded (DW-458).
+- Warn on stderr when a pane-pid read, a window-option read or a `display-message`
+  probe folds a fault into its sentinel (`[]`, `""`, `None`). A dead window, an unset
+  option, a gone server and not being inside the multiplexer stay silent (DW-463).
 - Name an untracked ledger or board whose leaf symlink targets a file outside the project
   in `worktree-seed-dropped` (DW-432). The file is still not seeded; only the silent drop
   is gone.
