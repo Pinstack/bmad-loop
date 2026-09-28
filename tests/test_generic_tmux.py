@@ -799,19 +799,15 @@ class _ScriptedWatcher:
         return self._events.pop(0) if self._events else None
 
 
-def _hook_event(task_id, event, session_id=None, transcript_path=None):
+def _stop_event(task_id, session_id, transcript_path):
     return HookEvent(
         ts=1,
-        event=event,
+        event="Stop",
         task_id=task_id,
         session_id=session_id,
         transcript_path=transcript_path,
         path=Path("x"),
     )
-
-
-def _stop_event(task_id, session_id, transcript_path):
-    return _hook_event(task_id, "Stop", session_id, transcript_path)
 
 
 def _dev_handle(launched_ns=0) -> SessionHandle:
@@ -1484,8 +1480,10 @@ def test_wait_for_completion_skips_transcriptless_subagent_stop(tmp_path):
 
 
 def test_wait_for_completion_ignores_foreign_identified_lifecycle_events(tmp_path):
-    """A nested CLI may inherit the outer task's hook relay, but must not be
-    allowed to overwrite its session identity or terminate its completion loop."""
+    """A nested CLI inherits the relay environment and writes into the parent's
+    stream (#767). Its announced SessionStart marks its id foreign, so neither
+    its Stop nor its SessionEnd may re-point the identity or end the session:
+    only the parent's own Stop completes it."""
     adapter, impl = make_dev_adapter(tmp_path)
     (impl / "spec-3-1-foo.md").write_text(
         "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
@@ -1494,10 +1492,10 @@ def test_wait_for_completion_ignores_foreign_identified_lifecycle_events(tmp_pat
     child_id = "nested-child"
     adapter.watcher = _ScriptedWatcher(
         [
-            _hook_event("3-1-dev-1", "SessionStart", outer_id, "/outer.jsonl"),
-            _hook_event("3-1-dev-1", "SessionStart", child_id, "/child.jsonl"),
+            _hook_event("SessionStart", session_id=outer_id, transcript_path="/outer.jsonl"),
+            _hook_event("SessionStart", session_id=child_id, transcript_path="/child.jsonl"),
             _stop_event("3-1-dev-1", child_id, "/child.jsonl"),
-            _hook_event("3-1-dev-1", "SessionEnd", child_id, "/child.jsonl"),
+            _hook_event("SessionEnd", session_id=child_id, transcript_path="/child.jsonl"),
             _stop_event("3-1-dev-1", outer_id, "/outer.jsonl"),
         ]
     )
@@ -1521,57 +1519,43 @@ def test_wait_for_completion_ignores_foreign_identified_lifecycle_events(tmp_pat
     assert "/child.jsonl" not in json.dumps(ignored)
 
 
-def test_wait_for_completion_ignores_identified_session_end_before_session_start(tmp_path):
-    """An identified SessionEnd cannot crash a SessionStart-capable profile
-    before the launched session has emitted its own start evidence."""
-    adapter, impl = make_dev_adapter(tmp_path)
-    (impl / "spec-3-1-foo.md").write_text(
-        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
-    )
-    outer_id = "outer-session"
-    child_id = "early-nested-child"
+def test_wait_for_completion_accepts_identified_session_end_before_any_start(tmp_path):
+    """An identified SessionEnd that arrives before any SessionStart never
+    announced a foreign id, so it is the launched session's own exit — a CLI
+    that quit before its SessionStart hook fired (the #727 trust-dialog exit,
+    see test_no_work_session_end_after_nudge_echo). It must crash the session,
+    not be dropped (dropping it hung the loop forever: review blocker B2)."""
+    adapter, _ = make_dev_adapter(tmp_path)
     adapter.watcher = _ScriptedWatcher(
-        [
-            _hook_event("3-1-dev-1", "SessionEnd", child_id, "/child.jsonl"),
-            _hook_event("3-1-dev-1", "SessionStart", outer_id, "/outer.jsonl"),
-            _stop_event("3-1-dev-1", outer_id, "/outer.jsonl"),
-        ]
+        [_hook_event("SessionEnd", session_id="outer-session", transcript_path="/outer.jsonl")]
     )
 
     result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
 
-    assert result.status == "completed"
-    assert result.session_id == outer_id
-    assert result.transcript_path == "/outer.jsonl"
-    ignored = [
-        entry
-        for entry in _lifecycle_lines(adapter)
-        if entry["event"] == "unattributed-hook-event-ignored"
-    ]
-    assert [entry["hook_event"] for entry in ignored] == ["SessionEnd"]
-    assert all(
-        set(entry) == {"ts", "event", "hook_event", "foreign_session_id"} for entry in ignored
+    assert result.status == "crashed"
+    assert result.session_id == "outer-session"
+    assert not any(
+        entry["event"] == "foreign-hook-event-ignored" for entry in _lifecycle_lines(adapter)
     )
-    assert "/child.jsonl" not in json.dumps(ignored)
 
 
 def test_wait_for_completion_ignores_child_end_after_unidentified_session_start(tmp_path):
-    """An unidentified SessionStart cannot attribute a later identified end.
-
-    The launched parent must remain live until its own identified start and stop
-    arrive, even when a nested child shares the hook relay in between.
-    """
+    """An anonymous first SessionStart (a payload the relay could not read)
+    still uses up the launched session's slot, so a nested child's identified
+    start after it is foreign: the child's Stop and SessionEnd are dropped and
+    the parent's own identified Stop completes the session."""
     adapter, impl = make_dev_adapter(tmp_path)
     (impl / "spec-3-1-foo.md").write_text(
         "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
     )
     outer_id = "outer-session"
-    child_id = "early-nested-child"
+    child_id = "nested-child"
     adapter.watcher = _ScriptedWatcher(
         [
-            _hook_event("3-1-dev-1", "SessionStart", transcript_path="/unknown.jsonl"),
-            _hook_event("3-1-dev-1", "SessionEnd", child_id, "/child.jsonl"),
-            _hook_event("3-1-dev-1", "SessionStart", outer_id, "/outer.jsonl"),
+            _hook_event("SessionStart", session_id=None),
+            _hook_event("SessionStart", session_id=child_id, transcript_path="/child.jsonl"),
+            _stop_event("3-1-dev-1", child_id, "/child.jsonl"),
+            _hook_event("SessionEnd", session_id=child_id, transcript_path="/child.jsonl"),
             _stop_event("3-1-dev-1", outer_id, "/outer.jsonl"),
         ]
     )
@@ -1584,15 +1568,74 @@ def test_wait_for_completion_ignores_child_end_after_unidentified_session_start(
     ignored = [
         entry
         for entry in _lifecycle_lines(adapter)
-        if entry["event"] == "unattributed-hook-event-ignored"
+        if entry["event"] == "foreign-hook-event-ignored"
     ]
-    assert [entry["hook_event"] for entry in ignored] == ["SessionEnd"]
-    assert [entry["foreign_session_id"] for entry in ignored] == [child_id]
+    assert [entry["hook_event"] for entry in ignored] == ["SessionStart", "Stop", "SessionEnd"]
+    assert [entry["foreign_session_id"] for entry in ignored] == [child_id] * 3
+
+
+def test_wait_for_completion_accepts_rotated_session_id_stop(tmp_path):
+    """A session id can rotate without a new SessionStart (claude /clear or
+    compaction). The rotated id never announced itself, so its Stop is the
+    launched session's own turn-end and completes it (review finding M1: the
+    allow-list dropped it and the session stalled)."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event("SessionStart", session_id="sess-a", transcript_path="/a.jsonl"),
+            _stop_event("3-1-dev-1", "sess-b", "/b.jsonl"),
+        ]
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == "sess-b"
+    assert result.transcript_path == "/b.jsonl"
+    assert not any(
+        entry["event"] == "foreign-hook-event-ignored" for entry in _lifecycle_lines(adapter)
+    )
+
+
+def test_wait_for_completion_copilot_bound_subagent_stop_not_crumbed(tmp_path):
+    """Once Copilot's sessionStart binds the main id, a subagent's toolu_ Stop
+    still passes attribution (the toolu_ id never announced a start) and is
+    dropped by the subagent_stop_without_transcript filter instead — so it is
+    never journaled as a foreign session, and the main Stop completes."""
+    adapter, impl = make_dev_adapter(tmp_path, profile_name="copilot")
+
+    def flush_terminal_spec(call_n):
+        # the spec lands only after the (ignored) subagent Stop, as in
+        # test_wait_for_completion_skips_transcriptless_subagent_stop
+        if call_n == 3:
+            (impl / "spec-3-1-foo.md").write_text(
+                "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+            )
+
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event("SessionStart", session_id="main-sess", transcript_path=None),
+            _stop_event("3-1-dev-1", "toolu_bdrk_subagent", None),  # subagent: ignored
+            _stop_event("3-1-dev-1", "main-sess", "/run/events.jsonl"),  # main turn-end
+        ],
+        on_call=flush_terminal_spec,
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == "main-sess"
+    assert result.transcript_path == "/run/events.jsonl"
+    assert not any(
+        entry["event"] == "foreign-hook-event-ignored" for entry in _lifecycle_lines(adapter)
+    )
 
 
 def test_wait_for_completion_keeps_identified_stop_for_stop_only_profile(tmp_path):
-    """Profiles without SessionStart cannot supply the attribution proof, so
-    their established identified-Stop completion behavior must remain intact."""
+    """A Stop-only profile (no SessionStart) never binds, so attribution admits
+    every event and its established identified-Stop completion stays intact."""
     adapter, impl = make_dev_adapter(tmp_path, profile_name="antigravity")
     (impl / "spec-3-1-foo.md").write_text(
         "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
@@ -1610,12 +1653,14 @@ def test_wait_for_completion_keeps_identified_stop_for_stop_only_profile(tmp_pat
 
 
 def test_wait_for_completion_keeps_matching_parent_session_end_crash(tmp_path):
+    """The launched session's own SessionEnd (same id as its bound start) is
+    admitted and still crashes the session."""
     adapter, _ = make_dev_adapter(tmp_path)
     outer_id = "outer-session"
     adapter.watcher = _ScriptedWatcher(
         [
-            _hook_event("3-1-dev-1", "SessionStart", outer_id, "/outer.jsonl"),
-            _hook_event("3-1-dev-1", "SessionEnd", outer_id, "/outer.jsonl"),
+            _hook_event("SessionStart", session_id=outer_id, transcript_path="/outer.jsonl"),
+            _hook_event("SessionEnd", session_id=outer_id, transcript_path="/outer.jsonl"),
         ]
     )
 
@@ -1628,13 +1673,15 @@ def test_wait_for_completion_keeps_matching_parent_session_end_crash(tmp_path):
 
 
 def test_wait_for_completion_preserves_no_id_hook_compatibility(tmp_path):
+    """Id-less events carry no attribution signal and are always admitted, so a
+    relay/CLI that sends no session id completes exactly as before."""
     adapter, impl = make_dev_adapter(tmp_path)
     (impl / "spec-3-1-foo.md").write_text(
         "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
     )
     adapter.watcher = _ScriptedWatcher(
         [
-            _hook_event("3-1-dev-1", "SessionStart", transcript_path="/legacy.jsonl"),
+            _hook_event("SessionStart", session_id=None, transcript_path="/legacy.jsonl"),
             _stop_event("3-1-dev-1", None, "/legacy.jsonl"),
         ]
     )
@@ -8891,13 +8938,15 @@ BYPASS_HEADING = "WARNING: Claude Code running in Bypass Permissions " + "mode"
 BYPASS_FOOTER = "Enter to confirm · Esc " + "to cancel"
 
 
-def _hook_event(kind, notification_type=None):
+def _hook_event(
+    kind, notification_type=None, *, task_id="3-1-dev-1", session_id="sess", transcript_path=None
+):
     return HookEvent(
         ts=1,
         event=kind,
-        task_id="3-1-dev-1",
-        session_id="sess",
-        transcript_path=None,
+        task_id=task_id,
+        session_id=session_id,
+        transcript_path=transcript_path,
         path=Path("x"),
         notification_type=notification_type,
     )

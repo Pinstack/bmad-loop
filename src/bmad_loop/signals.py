@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -76,8 +76,65 @@ def is_session_event(event: HookEvent, task_id: str, since_ns: int = 0) -> bool:
     the session's own id, which folds in the attempt number and generation
     (``engine._session_task_id``), so another attempt's events never match;
     ``since_ns`` is that attempt's launch floor, which drops a stale event a
-    resumed run left under the same re-minted id (see ``SignalWatcher.wait_for``)."""
+    resumed run left under the same re-minted id (see ``SignalWatcher.wait_for``).
+
+    It is the first of two layers. The task id comes from the relay's inherited
+    environment, so a nested coding-CLI process started inside the session
+    stamps its own events with the same id; :class:`SessionAttribution` is the
+    second layer, deciding which CLI session inside the attempt's stream is the
+    launched one."""
     return event.task_id == task_id and (not since_ns or event.ts >= since_ns)
+
+
+@dataclass
+class SessionAttribution:
+    """Second layer after :func:`is_session_event`: which CLI session inside one
+    attempt's event stream is the launched one (#767).
+
+    A nested coding-CLI process started from inside the session inherits the
+    relay environment, so its SessionStart/Stop/SessionEnd land in the parent's
+    stream under the parent's task id. The rule is a deny-list: an id is foreign
+    only once it has announced its own SessionStart after the launched session's
+    first SessionStart. Every other event is admitted — id-less events, ids that
+    never announced a start (a rotated id, a Copilot ``toolu_`` subagent Stop),
+    and anything before the first start, including an identified SessionEnd from
+    a CLI that exited before its SessionStart fired (#727). Failing toward
+    acceptance keeps attribution a pure filter: it only ever drops a known
+    child's events and never adds a completion path.
+
+    The first SessionStart is the launched session's whether identified or not:
+    an anonymous start (a payload the relay could not read) still uses up the
+    parent's slot, so a child's identified start after it is foreign.
+
+    Accepted limitation: a child SessionEnd whose child never announced a
+    SessionStart is indistinguishable from the parent's own and is admitted.
+    Nested CLIs announce their start, so this is documented, not defended."""
+
+    started: bool = False  # the launched session's first SessionStart was seen
+    bound_id: str | None = None  # its id (None when that start was anonymous)
+    foreign_ids: set[str] = field(default_factory=set)
+
+    def admit(self, event: HookEvent) -> bool:
+        """Whether ``event`` belongs to the launched session. Stateful: a
+        SessionStart can bind the session or mark its id foreign."""
+        sid = event.session_id
+        if event.event == "SessionStart":
+            if not self.started:
+                self.started, self.bound_id = True, sid
+                return True
+            if not sid or sid == self.bound_id:
+                return True
+            self.foreign_ids.add(sid)
+            return False
+        return not (sid and sid in self.foreign_ids)
+
+
+def attribute_events(events: list[HookEvent]) -> tuple[list[HookEvent], set[str]]:
+    """Replay :class:`SessionAttribution` over an oldest-first snapshot (e.g.
+    :func:`session_events`): the admitted events, and every id found foreign."""
+    attribution = SessionAttribution()
+    admitted = [event for event in events if attribution.admit(event)]
+    return admitted, attribution.foreign_ids
 
 
 def session_events(

@@ -1,8 +1,16 @@
 import json
+from pathlib import Path
 
 import pytest
 
-from bmad_loop.signals import SignalWatcher, is_session_event, session_events
+from bmad_loop.signals import (
+    HookEvent,
+    SessionAttribution,
+    SignalWatcher,
+    attribute_events,
+    is_session_event,
+    session_events,
+)
 
 
 def write_event(events_dir, ts, task_id, event, **extra):
@@ -249,3 +257,83 @@ def test_is_session_event_is_the_rule_wait_for_matches_on(tmp_path):
     assert is_session_event(event, "t1", since_ns=7)
     assert not is_session_event(event, "t1", since_ns=8)
     assert not is_session_event(event, "t2")
+
+
+def _event(kind, session_id=None, ts=1):
+    return HookEvent(
+        ts=ts,
+        event=kind,
+        task_id="t1",
+        session_id=session_id,
+        transcript_path=None,
+        path=Path("x"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("sequence", "expected"),
+    [
+        pytest.param(
+            [("SessionStart", "A"), ("Stop", "A")], [True, True], id="first-identified-start-binds"
+        ),
+        pytest.param(
+            [("SessionStart", "A"), ("SessionStart", "A"), ("Stop", "A")],
+            [True, True, True],
+            id="same-id-restart-admitted",
+        ),
+        pytest.param(
+            [
+                ("SessionStart", "A"),
+                ("SessionStart", "B"),
+                ("Stop", "B"),
+                ("SessionEnd", "B"),
+                ("Stop", "A"),
+            ],
+            [True, False, False, False, True],
+            id="announced-child-is-foreign",
+        ),
+        pytest.param(
+            [("SessionStart", None), ("SessionStart", "B"), ("Stop", "B"), ("Stop", "A")],
+            [True, False, False, True],
+            id="anonymous-first-start-uses-the-parent-slot",
+        ),
+        pytest.param(
+            [("SessionStart", "A"), ("Stop", "B"), ("SessionEnd", "B")],
+            [True, True, True],
+            id="unannounced-rotated-id-admitted",  # M1: /clear or compaction
+        ),
+        pytest.param(
+            [("SessionEnd", "A")], [True], id="identified-end-before-any-start-admitted"
+        ),  # B2: the #727 trust-dialog exit
+        pytest.param(
+            [("SessionStart", "A"), ("SessionStart", None), ("Stop", None), ("SessionEnd", None)],
+            [True, True, True, True],
+            id="id-less-events-always-admitted",
+        ),
+        pytest.param(
+            [("SessionStart", "main"), ("Stop", "toolu_bdrk_x"), ("Stop", "main")],
+            [True, True, True],
+            id="never-announced-toolu-stop-admitted",  # the copilot subagent filter owns it
+        ),
+    ],
+)
+def test_session_attribution_admits(sequence, expected):
+    """#767: the deny-list rule, event by event. Only an id that announced its
+    own SessionStart after the launched session's first one is dropped."""
+    attribution = SessionAttribution()
+    assert [attribution.admit(_event(kind, sid)) for kind, sid in sequence] == expected
+
+
+def test_attribute_events_returns_admitted_and_foreign_ids():
+    """The replay form the post-mortem diagnostic uses: admitted events in
+    order, plus every id found foreign."""
+    events = [
+        _event("SessionStart", "A", ts=1),
+        _event("SessionStart", "B", ts=2),
+        _event("Stop", "B", ts=3),
+        _event("SessionStart", "C", ts=4),
+        _event("Stop", "A", ts=5),
+    ]
+    admitted, foreign = attribute_events(events)
+    assert [(e.event, e.session_id) for e in admitted] == [("SessionStart", "A"), ("Stop", "A")]
+    assert foreign == {"B", "C"}
