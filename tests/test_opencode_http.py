@@ -52,6 +52,7 @@ from bmad_loop.adapters.opencode_http import (
     USAGE_STASH_CAP,
     OpencodeDevAdapter,
     OpencodeHttpAdapter,
+    OpencodeNudgeSendError,
     OpencodeServerError,
     _free_port,
     _now_ms,
@@ -3133,7 +3134,8 @@ def test_budget_grace_fires_on_wall_clock_when_monotonic_frozen(tmp_path, monkey
 def test_budget_nudge_send_failure_still_arms_grace(tmp_path, monkeypatch):
     """A dead/hung server can reject the wrap-up nudge (the HTTP send raises);
     the trip must survive it and the grace still arm — the session is then
-    scored via the normal paths (here: grace expiry → over_budget)."""
+    scored via the normal paths (here: grace expiry → over_budget). The
+    undelivered nudge is crumbed `nudge-send-failed` (`budget`, DW-503)."""
     adapter = make_adapter(tmp_path, policy=_budget_policy())
     clock = _install_clock(monkeypatch)
     (adapter.tasks_dir / "t-1").mkdir(parents=True)
@@ -3145,7 +3147,7 @@ def test_budget_nudge_send_failure_still_arms_grace(tmp_path, monkeypatch):
     sess.client = _BigUsageClient()
 
     def boom(handle, text):
-        raise RuntimeError("http send failed")
+        raise OpencodeNudgeSendError("http send failed")
 
     adapter.send_text = boom
 
@@ -3155,6 +3157,9 @@ def test_budget_nudge_send_failure_still_arms_grace(tmp_path, monkeypatch):
 
     assert result.status == "over_budget"
     assert result.budget_weighted == 5_000_000
+    (failed,) = [ln for ln in _lifecycle_lines(adapter) if ln["event"] == "nudge-send-failed"]
+    assert failed["nudge"] == "budget"
+    assert failed["error"] == "OpencodeNudgeSendError: http send failed"
 
 
 def test_budget_zero_grace_dead_server_takes_crash_path(tmp_path, monkeypatch):
@@ -3564,6 +3569,39 @@ def test_dev_stall_arms_at_launch_without_stop(tmp_path, monkeypatch):
 
     assert (result.status, sent) == ("stalled", [STALL_NUDGE_TEXT] * 2)
     assert heartbeats[0]["stall_armed"] is True
+
+
+def test_dev_stall_nudge_send_failure_is_crumbed_and_loop_continues(tmp_path, monkeypatch):
+    """DW-503: an undelivered stall nudge raises out of `send_text`; the stall
+    site crumbs `nudge-send-failed` (`stall`) per failed attempt and the loop
+    reaches the same `stalled` verdict as a delivered pair would. Ablation: drop
+    the site's guard and the typed fault escapes `wait_for_completion`."""
+    adapter, _ = make_dev_adapter(tmp_path)
+    adapter._stall_grace_s = 10.0
+    adapter._stall_nudges = 2
+    adapter.silence_threshold_s = float("inf")
+    clock = _install_clock(monkeypatch)
+    (adapter.tasks_dir / "t-1").mkdir(parents=True)
+
+    def advance():
+        clock["mono"] += 11.0
+
+    _timeout_driven_session(adapter, advance)
+    monkeypatch.setattr(adapter, "_session_status", lambda _sess: False)
+
+    def boom(_handle, text):
+        raise OpencodeNudgeSendError("prompt_async failed: 500")
+
+    monkeypatch.setattr(adapter, "send_text", boom)
+
+    result = adapter.wait_for_completion(
+        SessionHandle(task_id="t-1", native_id="ses_1"),
+        _timeout_spec(tmp_path, timeout_s=100.0),
+    )
+
+    assert result.status == "stalled"
+    failed = [ln for ln in _lifecycle_lines(adapter) if ln["event"] == "nudge-send-failed"]
+    assert [ln["nudge"] for ln in failed] == ["stall", "stall"]
 
 
 def test_dev_activity_rearms_launch_stall_grace(tmp_path, monkeypatch):
@@ -4359,3 +4397,112 @@ def test_env_fault_log_is_dropped_at_session_start(tmp_path, fake_opencode):
     # No token-bearing assistant message: untracked, never stashed as a zero (DW-364).
     assert adapter.read_usage(result) is None
     assert "Usage limit reached" not in stale.read_text(encoding="utf-8", errors="replace")
+
+
+# ---------------------------------- undelivered nudges are not "sent" (DW-503)
+#
+# `send_text` used to swallow every `_prompt` fault, so the `_DevSynthesisMixin`
+# contract nudge's else-arm always crumbed `contract-nudge-sent`. It now raises
+# the typed `OpencodeNudgeSendError` (a `MultiplexerError`), which the mixin's
+# existing except-arm turns into `nudge-send-failed`; the wait loop's own nudge
+# sites catch it locally so the completion loop never breaks.
+
+
+def test_send_text_raises_typed_fault_on_prompt_failure(tmp_path):
+    """The transport contract itself: a failing `_prompt` surfaces as the typed
+    seam fault, chained from the cause, and a nudge to an unknown task is
+    undelivered too — never a silent return."""
+    adapter = make_adapter(tmp_path)
+    _timeout_driven_session(adapter, lambda: None)
+    cause = OpencodeServerError("prompt_async failed: 500 boom")
+
+    def failing(_sess, _text):
+        raise cause
+
+    adapter._prompt = failing
+
+    with pytest.raises(OpencodeNudgeSendError) as info:
+        adapter.send_text(SessionHandle(task_id="t-1", native_id="ses_1"), "nudge")
+    assert isinstance(info.value, generic.MultiplexerError)
+    assert info.value.__cause__ is cause
+    assert str(info.value) == "OpencodeServerError: prompt_async failed: 500 boom"
+
+    with pytest.raises(OpencodeNudgeSendError, match="no live opencode session"):
+        adapter.send_text(SessionHandle(task_id="gone", native_id="ses_2"), "nudge")
+
+
+def test_dev_contract_nudge_send_failure_crumbs_failed_not_sent(tmp_path, monkeypatch):
+    """The seam DW-503 is about: an opencode dev session's contract nudge whose
+    `prompt_async` fails goes through the REAL `send_text`, so the shared mixin
+    crumbs `nudge-send-failed` (`contract`) and never `contract-nudge-sent`; the
+    exactly-once budget still holds and the next stable Stop synthesizes.
+    Ablation: restore the swallowing `send_text` and `contract-nudge-sent`
+    reappears while `nudge-send-failed` vanishes."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    task_id = "3-1-dev-1"
+    (adapter.tasks_dir / task_id).mkdir(parents=True)
+    _timeout_driven_session(adapter, lambda: None, task_id=task_id)
+    calls = {"n": 0}
+
+    def failing(_sess, _text):
+        calls["n"] += 1
+        raise OpencodeServerError("prompt_async failed: 503 unavailable")
+
+    adapter._prompt = failing
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text("---\nstatus: done\nbaseline_revision: abc123\n---\n\n# Story\n\nDone.\n")
+    handle = SessionHandle(task_id=task_id, native_id="ses_1", launched_ns=0)
+    spec = SessionSpec(
+        task_id=task_id,
+        role="dev",
+        prompt="/bmad-dev-auto 3-1",
+        cwd=tmp_path,
+        env={"BMAD_LOOP_STORY_KEY": "3-1"},
+    )
+
+    assert adapter._result_json(handle, spec, wait=True) is None
+
+    assert calls["n"] == 1
+    events = _lifecycle_lines(adapter, task_id)
+    assert [ln for ln in events if ln["event"] == "contract-nudge-sent"] == []
+    (failed,) = [ln for ln in events if ln["event"] == "nudge-send-failed"]
+    assert failed["nudge"] == "contract"
+    assert failed["error"] == (
+        "OpencodeNudgeSendError: OpencodeServerError: prompt_async failed: 503 unavailable"
+    )
+
+    # second stable Stop: already attempted -> no retry, and the fallback harvests
+    rj = adapter._result_json(handle, spec, wait=True)
+    assert rj is not None and rj["synthesized_from_frontmatter"] is True
+    assert calls["n"] == 1
+
+
+def test_e2e_result_less_stop_nudge_send_failure_is_crumbed(tmp_path, fake_opencode):
+    """The stop-nudge site over a real server: the wake-up nudge's POST fails,
+    the site crumbs `nudge-send-failed` (`stop`) and the loop settles through
+    its ordinary verdict paths instead of raising out of `run()`."""
+    launcher, rec = fake_opencode
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    adapter._stall_grace_s = 0.0
+    spec = make_spec(tmp_path, rec, "nudge-then-complete", timeout_s=2.5)
+    real_prompt = adapter._prompt
+    calls = {"n": 0}
+
+    def fail_the_nudge(sess, text):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise OpencodeServerError("prompt_async failed: 500 nudge refused")
+        real_prompt(sess, text)
+
+    adapter._prompt = fail_the_nudge
+
+    result = adapter.run(spec)
+
+    # the wake-up never reached the server, so no second idle arrives: the loop
+    # runs out the clock exactly as it did when the fault was swallowed
+    assert result.status == "timeout"
+    assert prompt_texts(rec)[1:] == []
+    failed = [ln for ln in _lifecycle_lines(adapter) if ln["event"] == "nudge-send-failed"]
+    assert [ln["nudge"] for ln in failed] == ["stop"]
+    assert_server_gone(rec)

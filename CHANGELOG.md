@@ -160,6 +160,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Crumb an undelivered opencode-http nudge `nudge-send-failed` instead of reporting it
+  sent: `send_text` now raises a typed `MultiplexerError` when the prompt POST fails, so
+  a failed contract nudge no longer writes `contract-nudge-sent`; the budget, stall and
+  stop nudges crumb the failure and the wait loop carries on unchanged (DW-503).
 - Skip the ledger-publication candidate cleanup's `git worktree remove --force` and
   `git worktree prune` when `<git-common-dir>/worktrees/` holds a symlinked or junction
   entry, which git follows and empties the target of. Raised as a cleanup fault (or a

@@ -178,6 +178,7 @@ from .generic import (
     _DevSynthesisMixin,
     _ResultFileMixin,
 )
+from .multiplexer import MultiplexerError
 from .profile import CLIProfile
 
 if TYPE_CHECKING:
@@ -330,6 +331,14 @@ def _owned_collision(
 
 class OpencodeServerError(Exception):
     """An ``opencode serve`` instance could not be spawned, readied or driven."""
+
+
+class OpencodeNudgeSendError(MultiplexerError):
+    """A nudge :meth:`OpencodeHttpAdapter.send_text` could not deliver (DW-503).
+
+    A :class:`MultiplexerError` so the shared nudge call sites (the
+    ``_DevSynthesisMixin`` contract nudge) catch it at the seam-level type and
+    crumb ``nudge-send-failed`` instead of reporting the nudge as sent."""
 
 
 def _require_httpx():
@@ -855,16 +864,19 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         sess.floor_ms = max(sess.floor_ms, sent_ms)
 
     def send_text(self, handle: SessionHandle, text: str) -> None:
-        """Nudge the running session. Best-effort: a server that died between
-        the liveness probe and the nudge is caught as `crashed` on the next
-        tick, not by blowing up the completion loop."""
+        """Nudge the running session. An undelivered nudge raises
+        :class:`OpencodeNudgeSendError` (chained from the ``_prompt`` fault) so
+        no caller reports it as sent (DW-503); the wait loop's own nudge sites
+        catch it, crumb ``nudge-send-failed`` and carry on — a server that died
+        between the liveness probe and the nudge is caught as `crashed` on the
+        next tick, not by blowing up the completion loop."""
         sess = self._sessions.get(handle.task_id)
         if sess is None:
-            return
+            raise OpencodeNudgeSendError(f"no live opencode session for task {handle.task_id!r}")
         try:
             self._prompt(sess, text)
-        except Exception:  # nosec B110 - next tick's poll() settles liveness
-            pass
+        except Exception as exc:
+            raise OpencodeNudgeSendError(f"{type(exc).__name__}: {exc}") from exc
 
     def _start_sse_reader(self, sess: _ServerSession, task_id: str) -> None:
         thread = threading.Thread(
@@ -1417,11 +1429,11 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                                 )
                             try:
                                 self.send_text(handle, BUDGET_NUDGE_TEXT)
-                            except Exception:  # nosec B110 - best-effort nudge
+                            except MultiplexerError as e:
                                 # a dead/hung server can't take the nudge; the
                                 # grace still arms — the next tick's process
                                 # poll scores a dead server crashed.
-                                pass
+                                self._note_nudge_send_failed(handle, "budget", e)
                             budget_deadline = time.monotonic() + spec.token_budget_grace_s
                             budget_wall_deadline = time.time() + spec.token_budget_grace_s
             if budget_deadline is not None and (
@@ -1557,7 +1569,10 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                                 # bounded budget converges to an honest stall.
                                 stall_nudges_left -= 1
                                 stall_nudges_sent += 1
-                                self.send_text(handle, STALL_NUDGE_TEXT)
+                                try:
+                                    self.send_text(handle, STALL_NUDGE_TEXT)
+                                except MultiplexerError as e:
+                                    self._note_nudge_send_failed(handle, "stall", e)
                                 stall_deadline = time.monotonic() + self._stall_grace_s
                                 last_activity = sess.activity
                                 continue
@@ -1600,7 +1615,10 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     )
                 if nudges_left > 0:
                     nudges_left -= 1
-                    self.send_text(handle, NUDGE_TEXT)
+                    try:
+                        self.send_text(handle, NUDGE_TEXT)
+                    except MultiplexerError as e:
+                        self._note_nudge_send_failed(handle, "stop", e)
                     continue
                 if self._stall_grace_s <= 0:
                     transcript = self._capture_usage(handle, sess)
