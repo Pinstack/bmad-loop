@@ -213,7 +213,7 @@ breaking changes may land in a minor release.
   silent (DW-467).
 - Mark a stale run header in the TUI: once the same `state.json` fails to parse on two
   polls (or goes away), `⚠ state stale — <fault>` shows under the last good read until
-  a good parse clears it (DW-472).
+  a good parse, or that read's file back unchanged, clears it (DW-472).
 - Tell unreadable missed decisions from none in the TUI: the Deferred Work badge reads
   `decisions unreadable` and `d` toasts the fault (config, ledger, or read) instead of
   "no unanswered decisions". Faults are no longer cached (DW-473).

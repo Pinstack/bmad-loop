@@ -1610,6 +1610,31 @@ def test_watcher_flags_state_json_gone_after_a_good_read(tmp_path):
     assert watcher.state_fault == "state.json is gone"
 
 
+def test_watcher_clears_a_stat_fault_when_state_json_recovers_unchanged(tmp_path, monkeypatch):
+    """A flagged stat fault clears once the last good read's file stats back at the
+    SAME signature: a finished or paused run never rewrites state.json, so no fresh
+    parse would ever arrive to clear it.
+
+    Ablation: drop the clears in `state()`'s `sig == self._state_sig` branch and
+    the recovered look's assertion reddens."""
+    run_dir = make_run(tmp_path, "20260611-100000-aaaa", current_epic=1)
+    watcher = data.RunWatcher(run_dir)
+    watcher.state()
+    with monkeypatch.context() as m:
+        _refuse_stat(m, run_dir / "state.json")
+        watcher.state()
+        watcher.state()
+        assert watcher.state_fault is not None and "PermissionError" in watcher.state_fault
+    for _ in range(3):
+        assert watcher.state().current_epic == 1
+        assert watcher.state_fault is None
+    # The recovery also retired the suspect: one fresh failed look is forgiven again.
+    with monkeypatch.context() as m:
+        _refuse_stat(m, run_dir / "state.json")
+        watcher.state()
+        assert watcher.state_fault is None
+
+
 def test_watcher_state_never_written_is_not_stale(tmp_path):
     watcher = data.RunWatcher(tmp_path / "nope")
     for _ in range(3):

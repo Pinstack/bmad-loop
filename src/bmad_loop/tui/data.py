@@ -92,7 +92,8 @@ class RunWatcher:
     Keeping the last good parse is not the same as presenting it as current
     (DW-472): ``state_fault`` names why the state shown is stale — a state.json
     that will not parse, or one that has gone or cannot be stat'd after a good
-    read — and clears on the next good parse. It is published only once the SAME
+    read — and clears on the next good parse, or when the last good read's file
+    stats back unchanged. It is published only once the SAME
     signature has failed on two consecutive looks: a mid-write file is re-stat'd
     every poll (``_state_sig`` is not advanced on a failure), and a writer still
     working changes the signature, so a torn read that the next write heals never
@@ -128,6 +129,11 @@ class RunWatcher:
                 )
             return self._state
         if sig == self._state_sig:
+            # The last good read's own file is back unchanged, so it is current again.
+            # A finished or paused run never rewrites state.json: waiting for a fresh
+            # parse to clear the flag would leave a recovered header stale forever.
+            self._suspect = None
+            self.state_fault = None
             return self._state
         try:
             self._state = load_state(self.run_dir)
