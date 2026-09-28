@@ -407,6 +407,18 @@ def _event(kind, session_id=None, ts=1, source=None):
             id="clear-after-own-end-rebinds",  # claude ends the old id before a clear start
         ),
         pytest.param(
+            [
+                ("SessionStart", "A"),
+                ("SessionStart", "B", "startup"),
+                ("SessionEnd", "A"),
+                ("SessionEnd", "B"),
+                ("SessionStart", "C", "clear"),
+                ("Stop", "C"),
+            ],
+            [True, False, True, False, True, True],
+            id="child-end-racing-the-parent-clear-still-rebinds",
+        ),
+        pytest.param(
             [("SessionStart", "A"), ("SessionStart", "B", "resume"), ("Stop", "B")],
             [True, False, False],
             id="resume-start-is-foreign",  # a nested child launched with --resume

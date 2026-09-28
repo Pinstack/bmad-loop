@@ -133,11 +133,13 @@ class SessionAttribution:
     its timeout; ``bmad-loop init`` re-vendors the relay.
 
     ``source`` alone is not trusted. An id already found foreign never rebinds
-    (a child compacting under its own id), and a "clear" start right after a
-    foreign id's SessionEnd is that child clearing — claude ends the old session
-    with a SessionEnd before the clear start — so the new id is foreign too. A
-    child that rotates its id without a preceding SessionEnd still rebinds; only
-    a relay-side lineage check could tell it apart.
+    (a child compacting under its own id), and a "clear" start after a foreign
+    id's SessionEnd is that child clearing — claude ends the old session with a
+    SessionEnd before the clear start — so the new id is foreign too, unless the
+    bound session also ended since the last start (the two relays write
+    independently, so a child's end can land between the parent's end and its
+    clear start). A child that rotates its id without a preceding SessionEnd
+    still rebinds; only a relay-side lineage check could tell it apart.
 
     Accepted limitation: a child SessionEnd whose child never announced a
     SessionStart is indistinguishable from the parent's own and is admitted.
@@ -146,14 +148,18 @@ class SessionAttribution:
     started: bool = False  # the launched session's first SessionStart was seen
     bound_id: str | None = None  # its id (None when that start was anonymous)
     foreign_ids: set[str] = field(default_factory=set)
-    ended_id: str | None = None  # the most recent identified SessionEnd's id
+    # Which sessions ended since the last SessionStart: evidence for whose
+    # "clear" start comes next.
+    bound_ended: bool = False
+    foreign_ended: bool = False
 
     def admit(self, event: HookEvent) -> bool:
         """Whether ``event`` belongs to the launched session. Stateful: a
         SessionStart can bind the session or mark its id foreign."""
         sid = event.session_id
         if event.event == "SessionStart":
-            ended_id, self.ended_id = self.ended_id, None
+            bound_ended, foreign_ended = self.bound_ended, self.foreign_ended
+            self.bound_ended = self.foreign_ended = False
             if not self.started:
                 self.started, self.bound_id = True, sid
                 return True
@@ -162,14 +168,17 @@ class SessionAttribution:
             if (
                 sid not in self.foreign_ids
                 and event.source in REBIND_SOURCES
-                and not (event.source == "clear" and ended_id in self.foreign_ids)
+                and not (event.source == "clear" and foreign_ended and not bound_ended)
             ):
                 self.bound_id = sid
                 return True
             self.foreign_ids.add(sid)
             return False
         if event.event == "SessionEnd" and sid:
-            self.ended_id = sid
+            if sid == self.bound_id:
+                self.bound_ended = True
+            elif sid in self.foreign_ids:
+                self.foreign_ended = True
         return not (sid and sid in self.foreign_ids)
 
 
