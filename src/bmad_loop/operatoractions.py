@@ -62,6 +62,7 @@ from .bmadconfig import ProjectPaths
 from .frontmatter import operator_actions_of, read_frontmatter, status_of
 from .platform_util import (
     atomic_write_text_confined,
+    make_dirs_confined,
     require_root_pinned,
     safe_segment,
 )
@@ -191,13 +192,20 @@ def record_park(
     Given one, a ``project`` that is no longer that directory refuses with
     `UnconfinedWriteError` BEFORE the ``mkdir``, so a mount swapped for a link
     gets no directories created at the link's target either. That pre-check is
-    ``lstat``-then-``mkdir`` (`platform_util.require_root_pinned`; the write
-    itself re-pins through its handle). The identity is that of ``project`` reached
-    by an ``O_NOFOLLOW`` walk from the mount's MINT-TIME record (DW-446), so a
-    parent directory ABOVE the worktree swapped for a link refuses too."""
+    ``lstat``-then-``mkdir`` (`platform_util.require_root_pinned`; the ``mkdir``
+    and the write each re-pin through their own handle). The identity is that of
+    ``project`` reached by an ``O_NOFOLLOW`` walk from the mount's MINT-TIME record
+    (DW-446), so a parent directory ABOVE the worktree swapped for a link refuses too.
+
+    The records directory is created by `platform_util.make_dirs_confined`
+    (DW-497), not ``mkdir(parents=True)``: that followed a link planted BELOW
+    ``project`` — at ``.bmad-loop/`` or ``.bmad-loop/operator/`` — and created the
+    tree at its target before the confined write refused. Now such a link refuses
+    with `UnconfinedWriteError` before anything is created through it, pinned or
+    not."""
     path = record_path(project, story_key)
     require_root_pinned(project, root_identity)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    make_dirs_confined(path.parent, confine_root=project, root_identity=root_identity)
     record = {
         "story_key": story_key,
         "actions": list(actions),

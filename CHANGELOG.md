@@ -670,6 +670,12 @@ breaking changes may land in a minor release.
   instead of writing outside the repository. The re-arm/replan pin (DW-423) gains the
   same nested and resolved-path coverage. Parent directories above the worktree are
   still followed (DW-445).
+- Refuse the park-record rollback's delete and the park-record write's directory setup
+  through a link planted below the project — at `.bmad-loop/` or `.bmad-loop/operator/`,
+  with the mount intact or without isolation — instead of deleting a same-named record,
+  or creating directories, at the link's target. The unlink, the empty-directory prune
+  and the `mkdir` now walk no-follow from the (pinned) root; on Windows the prune stays
+  a path-based check-then-act (DW-497).
 - Harden the exact-path candidate worktree: check it out `--no-checkout` with
   fsmonitor off and fill its index by `read-tree`, so no repo-configured smudge/process
   filter or fsmonitor command runs before the accepted bytes land (DW-401); re-check the

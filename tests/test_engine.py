@@ -22963,5 +22963,68 @@ def test_restore_park_record_on_an_intact_mount_rolls_back_under_the_pin(project
     assert "park-record-rollback-failed" not in _kinds(engine)
     if prior is None:
         assert not record.exists()
+        assert not record.parent.exists()  # the emptied records dir is pruned, as before
     else:
         assert record.read_text(encoding="utf-8") == prior
+
+
+def _by_path_park_unlink(path: Path, **_kw) -> None:
+    """The pre-DW-497 ``prior is None`` rollback, by path — the controls' replay."""
+    path.unlink(missing_ok=True)
+    parent = path.parent
+    if parent.is_dir() and not any(parent.iterdir()):
+        parent.rmdir()
+
+
+@requires_symlinked_mount_swap
+@pytest.mark.parametrize(
+    ("link_at", "victim"),
+    [
+        (".bmad-loop", "operator/1-1-a.json"),
+        (".bmad-loop/operator", "1-1-a.json"),
+        (".bmad-loop", "operator"),
+    ],
+    ids=["bmad-loop-record", "operator-record", "bmad-loop-empty-dir"],
+)
+def test_restore_park_record_refuses_a_link_below_the_mount(
+    project, tmp_path, monkeypatch, link_at, victim
+):
+    """DW-497: the ``prior is None`` rollback through an INTACT, pinned mount with a
+    link planted below it — at `.bmad-loop/` or `.bmad-loop/operator/`, after the
+    park wrote its record — refuses and journals `park-record-rollback-failed`
+    (`UnconfinedWriteError`). The same-named record at the link's target survives,
+    and so does an EMPTY `operator/` there, which the by-path prune would have
+    removed. The root pre-check passes (the mount itself is intact), so the
+    refusal is the confined walk's. The control replays the by-path rollback and
+    shows the same link really reaches the outside entry.
+
+    Ablation: revert the unlink arm to `path.unlink(missing_ok=True)` plus the
+    `is_dir`/`iterdir`/`rmdir` prune (what `_by_path_park_unlink` replays) and the
+    record rows lose the outside record, the empty-dir row the outside `operator/`."""
+    engine, record, _outside, restore, task = _park_record_in_mount(project, tmp_path, prior=None)
+    assert engine._mount_root_identity(task, engine.workspace.paths.project) is not None
+    outside = tmp_path / "outside"
+    target = outside / victim
+    if victim.endswith(".json"):
+        target.parent.mkdir(parents=True)
+        target.write_text('{"written": "elsewhere"}', encoding="utf-8")
+    else:
+        target.mkdir(parents=True)
+    planted = engine.workspace.paths.project / link_at
+    planted.rename(planted.with_name(planted.name + "-aside"))
+    planted.symlink_to(outside, target_is_directory=True)
+    assert record.exists() or victim == "operator"  # the record path reaches the victim
+
+    engine._restore_park_record(task, restore)
+
+    (failed,) = [e for e in engine.journal.entries() if e["kind"] == "park-record-rollback-failed"]
+    assert "UnconfinedWriteError" in failed["error"]
+    assert _PIN_REFUSAL not in failed["error"]  # not the root pre-check
+    assert target.exists()
+    if victim.endswith(".json"):
+        assert target.read_text(encoding="utf-8") == '{"written": "elsewhere"}'
+
+    # Control: the by-path rollback follows the same link out.
+    monkeypatch.setattr("bmad_loop.engine.unlink_confined", _by_path_park_unlink)
+    engine._restore_park_record(task, restore)
+    assert not target.exists()

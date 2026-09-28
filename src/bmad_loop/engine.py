@@ -79,6 +79,7 @@ from .platform_util import (
     require_root_pinned,
     retrying_unlink,
     safe_segment,
+    unlink_confined,
 )
 from .plugins import HookBus, HookContext, PluginRegistry
 from .policy import Policy
@@ -4403,12 +4404,20 @@ class Engine:
 
         Under worktree isolation both arms pin the mount project (DW-445,
         `_mount_root_identity`): the put-back through the confined writer's
-        ``root_identity``, and the ``prior is None`` arm — which unlinks and
-        rmdirs BY PATH — through a `platform_util.require_root_pinned` pre-check
-        that refuses before anything is touched, so a mount swapped for a link
-        never has files deleted at the link's target. That pre-check is
-        check-then-act, the no-handle fallback's documented residual; either
-        refusal is an `UnconfinedWriteError` and is journaled like any other."""
+        ``root_identity``, and the ``prior is None`` arm through a
+        `platform_util.require_root_pinned` pre-check that refuses before anything
+        is touched, so a mount swapped for a link never has files deleted at the
+        link's target. That pre-check is check-then-act, the no-handle fallback's
+        documented residual.
+
+        The ``prior is None`` arm unlinks the record and prunes its emptied
+        directory through `platform_util.unlink_confined` (DW-497), not by path: a
+        path unlink followed a link planted BELOW the project — at ``.bmad-loop/``
+        or ``.bmad-loop/operator/`` — and deleted a same-named record at its
+        target. Now the walk from the (pinned) project refuses such a link before
+        anything is removed. A record or directory already gone is still nothing
+        to roll back. Every refusal is an `UnconfinedWriteError` and is journaled
+        like any other."""
         if record is None:
             return
         path, prior = record
@@ -4417,10 +4426,13 @@ class Engine:
             root_identity = self._mount_root_identity(task, root)
             if prior is None:
                 require_root_pinned(root, root_identity)
-                path.unlink(missing_ok=True)
-                parent = path.parent
-                if parent.is_dir() and not any(parent.iterdir()):
-                    parent.rmdir()
+                unlink_confined(
+                    path,
+                    confine_root=root,
+                    root_identity=root_identity,
+                    missing_ok=True,
+                    prune_empty_parent=True,
+                )
             else:
                 atomic_write_text_confined(
                     path,

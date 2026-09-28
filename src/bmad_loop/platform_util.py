@@ -1614,7 +1614,8 @@ def atomic_write_text_confined(
     (``O_NOFOLLOW`` has no opinion on dot-dot). Either refusal raises before
     anything is walked or staged. ``path.parent`` must
     already EXIST: a confinement walk cannot vouch for a component that is not
-    there, so every adopter mkdirs or gates first.
+    there, so every adopter mkdirs or gates first — :func:`make_dirs_confined`
+    confines that ``mkdir`` too.
 
     Both anchored hosts walk the components with :func:`open_dir_confined` —
     ``dir_fd`` opens on POSIX, :mod:`.win32_at`'s handle-relative opens on
@@ -1806,6 +1807,227 @@ def create_exclusive_confined(
     if root_identity is not None and not _root_still_pinned(confine_root, root_identity):
         raise UnconfinedWriteError(f"{confine_root} is no longer the directory the caller accepted")
     return os.open(path, flags, 0o600)
+
+
+def _open_subdir_at(dir_fd: int, name: str, *, create: bool) -> int:
+    """One directory component below ``dir_fd``, opened without following a
+    link — created first when ``create`` — for :func:`make_dirs_confined` and
+    :func:`unlink_confined`. The caller owns the returned descriptor.
+
+    The arms of ``verify._make_candidate_parents``: POSIX ``mkdir``-s at the
+    descriptor (which never dereferences the final component) and then opens
+    ``O_NOFOLLOW | O_DIRECTORY``; :mod:`.win32_at` creates-or-opens in ONE
+    handle-relative call (``O_CREAT`` without ``O_EXCL``), a junction or symlink
+    opened as the reparse point itself and refused (DW-420). A refused open is
+    re-read with :func:`stat_at`: a link there raises :class:`UnconfinedWriteError`
+    — the confined writers' refusal — and any other failure (a missing
+    component, a file in the way, a permission error) propagates as it was."""
+    flags = os.O_RDONLY | AT_DIRECTORY | AT_NOFOLLOW
+    if create:
+        if DIR_FD_ANCHORED_WRITES:
+            with suppress(FileExistsError):
+                os.mkdir(name, 0o777, dir_fd=dir_fd)
+        else:
+            flags |= os.O_CREAT
+    try:
+        return open_at(dir_fd, name, flags)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        try:
+            info = stat_at(dir_fd, name)
+        except OSError:
+            raise exc from None
+        if link_like_stat(info):
+            raise UnconfinedWriteError(f"{name} is a redirect, not a directory") from exc
+        raise
+
+
+def _only_missing_below(root: Path, target: Path, root_identity: os.stat_result | None) -> bool:
+    """Whether a confined walk from ``root`` to ``target`` failed for a MISSING
+    component alone — nothing to act on — rather than a redirect: the root still
+    pinned, and walking down by ``lstat``, a component that is absent before any
+    that is a link or not a directory. Every other answer is False, so a caller
+    that cannot vouch for the walk refuses."""
+    if root_identity is not None and not _root_still_pinned(root, root_identity):
+        return False
+    cursor = root
+    for part in target.relative_to(root).parts:
+        cursor = cursor / part
+        try:
+            info = os.lstat(cursor)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        if link_like_stat(info) or not stat.S_ISDIR(info.st_mode):
+            return False
+    return False
+
+
+def _confined_relative(path: Path, confine_root: Path) -> Path:
+    """``path`` relative to ``confine_root``: lexically under it, with no ``..``
+    below it, or :class:`UnconfinedWriteError` (see :func:`_atomic_write_confined`)."""
+    if not path.is_relative_to(confine_root):
+        raise UnconfinedWriteError(f"{path} is not under {confine_root}")
+    relative = path.relative_to(confine_root)
+    if has_parent_ref(relative):
+        raise UnconfinedWriteError(f"{path} climbs back out of {confine_root} through '..'")
+    return relative
+
+
+def make_dirs_confined(
+    target: Path, *, confine_root: Path, root_identity: os.stat_result | None = None
+) -> None:
+    """``target.mkdir(parents=True, exist_ok=True)``, with every component below
+    ``confine_root`` created or reached as the confined writers reach it (DW-497).
+
+    For the callers that must create a confined writer's parent first (the
+    writers require it to exist). ``mkdir(parents=True)`` accepts a
+    symlink-to-a-directory at any component, so a link planted at
+    ``.bmad-loop/`` got the rest of the tree created at its target. Here, on
+    both anchored arms (:data:`HANDLE_ANCHORED_WRITES`), ``confine_root`` is
+    opened through :func:`open_dir_confined` — pinned by ``root_identity`` as
+    there — and each component is created and opened no-follow relative to the
+    one above (:func:`_open_subdir_at`), so a link below the root refuses before
+    anything is created through it. A host with neither arm degrades to the
+    confined writers' fallback: a root ``lstat`` compare, then
+    :func:`path_is_confined` before each ``mkdir`` and over ``target`` itself —
+    check-then-act, the residual that fallback documents.
+
+    Refusals raise :class:`UnconfinedWriteError` (an ``OSError``), as the confined
+    writers' do; any other failure is the kernel's own ``OSError``."""
+    relative = _confined_relative(target, confine_root)
+    if HANDLE_ANCHORED_WRITES:
+        fd = open_dir_confined(confine_root, confine_root, root_identity=root_identity)
+        if fd is None:
+            raise UnconfinedWriteError(f"cannot open {confine_root} as the accepted directory")
+        try:
+            for part in relative.parts:
+                nested = _open_subdir_at(fd, part, create=True)
+                fd, previous = nested, fd
+                os.close(previous)
+        finally:
+            os.close(fd)
+        return
+    if root_identity is not None and not _root_still_pinned(confine_root, root_identity):
+        raise UnconfinedWriteError(f"{confine_root} is no longer the directory the caller accepted")
+    current = confine_root
+    for part in relative.parts:
+        current = current / part
+        if not path_is_confined(confine_root, current.parent):
+            raise UnconfinedWriteError(f"{current.parent} is redirected below {confine_root}")
+        current.mkdir(exist_ok=True)
+    if not path_is_confined(confine_root, target):
+        raise UnconfinedWriteError(f"{target} is redirected below {confine_root}")
+
+
+_NOT_EMPTY_ERRNOS = (errno.ENOTEMPTY, errno.EEXIST)
+
+
+def unlink_confined(
+    path: Path,
+    *,
+    confine_root: Path,
+    root_identity: os.stat_result | None = None,
+    missing_ok: bool = False,
+    prune_empty_parent: bool = False,
+) -> None:
+    """``path.unlink()`` with its parent reached as the confined writers reach it
+    (DW-497) — and, with ``prune_empty_parent``, that parent then removed if it
+    is left empty.
+
+    A by-path unlink resolves every directory above the file by name, so a link
+    planted anywhere below ``confine_root`` gets a file of the same name deleted
+    at its target. On both anchored arms the directory holding ``path`` — its
+    grandparent when pruning — is opened through :func:`open_dir_confined`,
+    pinned by ``root_identity`` as there; the pruned parent is opened no-follow
+    below it (:func:`_open_subdir_at`), and the file is removed with
+    :func:`unlink_at`, which removes a link at the file itself rather than
+    following it. POSIX removes the emptied parent with ``rmdir`` relative to
+    the grandparent's descriptor, which never follows the final component.
+    :mod:`.win32_at` has no directory delete, so on that arm the parent is
+    removed by path after :func:`path_is_confined` and a root pin re-check;
+    hosts with neither arm take the same path-based route for the unlink too.
+    Both are check-then-act, the residual the confined writers' fallback
+    documents.
+
+    ``missing_ok`` tolerates an absent file — and an absent directory on the way
+    to it, told apart from a redirect by an ``lstat`` walk that must meet the
+    missing component before any link; without it either raises
+    ``FileNotFoundError``. A non-empty parent is left in place.
+    Refusals raise :class:`UnconfinedWriteError` (an ``OSError``); any other
+    failure is the kernel's own ``OSError``."""
+    relative = _confined_relative(path, confine_root)
+    parent = path.parent
+    if prune_empty_parent and len(relative.parts) < 2:
+        raise UnconfinedWriteError(f"refusing to prune {confine_root} itself")
+    anchor = parent.parent if prune_empty_parent else parent
+    unconfined = f"cannot reach {anchor} from {confine_root} without a redirect"
+    if not HANDLE_ANCHORED_WRITES:
+        if not path_is_confined(confine_root, parent):
+            if _only_missing_below(confine_root, parent, root_identity):
+                if missing_ok:
+                    return
+                raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(parent))
+            raise UnconfinedWriteError(unconfined)
+        require_root_pinned(confine_root, root_identity)
+        path.unlink(missing_ok=missing_ok)
+        if prune_empty_parent:
+            _rmdir_if_empty(parent)
+        return
+    anchor_fd = open_dir_confined(confine_root, anchor, root_identity=root_identity)
+    if anchor_fd is None:
+        if _only_missing_below(confine_root, anchor, root_identity):
+            if missing_ok:
+                return
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(anchor))
+        raise UnconfinedWriteError(unconfined)
+    try:
+        dir_fd = anchor_fd
+        if prune_empty_parent:
+            try:
+                dir_fd = _open_subdir_at(anchor_fd, parent.name, create=False)
+            except FileNotFoundError:
+                if missing_ok:
+                    return
+                raise
+        try:
+            unlink_at(dir_fd, path.name)
+        except FileNotFoundError:
+            if not missing_ok:
+                raise
+        finally:
+            if dir_fd != anchor_fd:
+                os.close(dir_fd)
+        if not prune_empty_parent:
+            return
+        if DIR_FD_ANCHORED_WRITES:
+            try:
+                os.rmdir(parent.name, dir_fd=anchor_fd)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                if exc.errno not in _NOT_EMPTY_ERRNOS:
+                    raise
+            return
+    finally:
+        os.close(anchor_fd)
+    if not path_is_confined(confine_root, parent):
+        raise UnconfinedWriteError(f"cannot reach {parent} from {confine_root} without a redirect")
+    require_root_pinned(confine_root, root_identity)
+    _rmdir_if_empty(parent)
+
+
+def _rmdir_if_empty(directory: Path) -> None:
+    """``directory.rmdir()``, leaving a missing or non-empty directory in place."""
+    try:
+        directory.rmdir()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        if exc.errno not in _NOT_EMPTY_ERRNOS:
+            raise
 
 
 def retrying_unlink(path: Path) -> None:

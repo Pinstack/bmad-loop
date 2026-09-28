@@ -8,6 +8,7 @@ the legacy ``platform_util`` entry points still delegate, plus the real
 from __future__ import annotations
 
 import errno
+import functools
 import ntpath
 import os
 import stat
@@ -2835,6 +2836,138 @@ def test_create_exclusive_confined_refuses_a_symlinked_parent(tmp_path, monkeypa
     fd = platform_util.create_exclusive_confined(root / ".bmad-loop" / "ok.json", confine_root=root)
     os.close(fd)
     assert (root / ".bmad-loop" / "ok.json").exists()
+
+
+# ------------------------- confined mkdir / unlink below a root (DW-497)
+
+
+def _both_confined_arms(monkeypatch):
+    """Yield once per arm: the host's anchored arm, then the no-handle fallback."""
+    yield "anchored"
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+    yield "fallback"
+
+
+def test_make_dirs_confined_creates_missing_parents_idempotently(tmp_path, monkeypatch):
+    """The positive half on both arms: every missing component is created, an
+    existing chain is accepted, and a pinned intact root binds nothing extra."""
+    for arm in _both_confined_arms(monkeypatch):
+        root = tmp_path / arm
+        root.mkdir()
+        target = root / ".bmad-loop" / "operator"
+        platform_util.make_dirs_confined(target, confine_root=root, root_identity=os.lstat(root))
+        platform_util.make_dirs_confined(target, confine_root=root)
+        assert target.is_dir(), arm
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("link_at", [".bmad-loop", ".bmad-loop/operator"])
+def test_make_dirs_confined_refuses_a_link_below_the_root(tmp_path, monkeypatch, link_at):
+    """A link at any component below the root refuses on both arms before
+    anything is created through it; the link's target stays empty.
+
+    Ablation: replace the body with `target.mkdir(parents=True, exist_ok=True)` and
+    the `.bmad-loop` row grows `outside/operator/` while neither row raises."""
+    for arm in _both_confined_arms(monkeypatch):
+        root = tmp_path / arm
+        (root / link_at).parent.mkdir(parents=True, exist_ok=True)
+        outside = tmp_path / f"outside-{arm}"
+        outside.mkdir()
+        (root / link_at).symlink_to(outside, target_is_directory=True)
+
+        with pytest.raises(platform_util.UnconfinedWriteError):
+            platform_util.make_dirs_confined(root / ".bmad-loop" / "operator", confine_root=root)
+        assert list(outside.iterdir()) == [], arm
+
+
+def test_unlink_confined_prunes_only_an_emptied_parent(tmp_path, monkeypatch):
+    """The positive half on both arms: the file goes, a parent still holding
+    another entry stays, the last unlink prunes it, and ``missing_ok`` tolerates a
+    missing file and a missing directory alike — without it, absence raises."""
+    for arm in _both_confined_arms(monkeypatch):
+        root = tmp_path / arm
+        records = root / ".bmad-loop" / "operator"
+        records.mkdir(parents=True)
+        (records / "a.json").write_text("a", encoding="utf-8")
+        (records / "b.json").write_text("b", encoding="utf-8")
+        unlink = functools.partial(
+            platform_util.unlink_confined,
+            confine_root=root,
+            root_identity=os.lstat(root),
+            prune_empty_parent=True,
+        )
+
+        unlink(records / "a.json")
+        assert [p.name for p in records.iterdir()] == ["b.json"], arm
+        unlink(records / "b.json")
+        assert not records.exists(), arm
+        unlink(records / "b.json", missing_ok=True)  # the directory is gone
+        (root / ".bmad-loop").rmdir()
+        unlink(records / "b.json", missing_ok=True)  # and its parent too
+        with pytest.raises(FileNotFoundError):
+            unlink(records / "b.json")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("link_at", [".bmad-loop", ".bmad-loop/operator"])
+def test_unlink_confined_refuses_a_link_below_the_root(tmp_path, monkeypatch, link_at):
+    """A link below the root refuses on both arms — ``missing_ok`` included, since
+    the walk meets the link before anything missing — and the same-named file at
+    its target survives.
+
+    Ablation: replace the body with `path.unlink(missing_ok=missing_ok)` and the
+    outside file is deleted on both arms."""
+    for arm in _both_confined_arms(monkeypatch):
+        root = tmp_path / arm
+        (root / link_at).parent.mkdir(parents=True, exist_ok=True)
+        outside = tmp_path / f"outside-{arm}"
+        victim = outside / Path(".bmad-loop/operator/r.json").relative_to(link_at)
+        victim.parent.mkdir(parents=True)
+        victim.write_text("theirs", encoding="utf-8")
+        (root / link_at).symlink_to(outside, target_is_directory=True)
+
+        with pytest.raises(platform_util.UnconfinedWriteError):
+            platform_util.unlink_confined(
+                root / ".bmad-loop" / "operator" / "r.json",
+                confine_root=root,
+                missing_ok=True,
+                prune_empty_parent=True,
+            )
+        assert victim.read_text(encoding="utf-8") == "theirs", arm
+
+
+@pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES or sys.platform == "win32",
+    reason="dir-fd anchoring and POSIX symlinks",
+)
+def test_unlink_confined_prunes_through_the_walked_descriptor(tmp_path, monkeypatch):
+    """The POSIX prune is relative to the descriptor the walk produced, so an
+    ancestor swapped for a link AFTER the walk — between the unlink and the
+    prune — steers nothing: the real (renamed-aside) directory is pruned and an
+    empty same-named directory at the link's target survives.
+
+    Ablation: prune with `_rmdir_if_empty(parent)` (by path) instead of the
+    `os.rmdir(..., dir_fd=...)` and the outside directory is removed."""
+    root = tmp_path / "project"
+    records = root / ".bmad-loop" / "operator"
+    records.mkdir(parents=True)
+    (records / "r.json").write_text("mine", encoding="utf-8")
+    outside = tmp_path / "outside"
+    (outside / "operator").mkdir(parents=True)
+    real_unlink_at = platform_util.unlink_at
+
+    def unlink_then_swap(dir_fd, name):
+        real_unlink_at(dir_fd, name)
+        (root / ".bmad-loop").rename(root / ".bmad-loop-aside")
+        (root / ".bmad-loop").symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr(platform_util, "unlink_at", unlink_then_swap)
+
+    platform_util.unlink_confined(records / "r.json", confine_root=root, prune_empty_parent=True)
+
+    assert (outside / "operator").is_dir()
+    assert list((root / ".bmad-loop-aside").iterdir()) == []
 
 
 def test_create_exclusive_confined_refuses_out_of_root_and_parent_refs(tmp_path):
