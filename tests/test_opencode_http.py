@@ -731,6 +731,162 @@ def test_sse_parser_accumulates_and_tolerates_junk():
     assert [e["type"] for e in events] == ["server.connected", "session.idle"]
 
 
+def test_parse_sse_lines_reports_each_dropped_frame():
+    """DW-462: an undecodable payload is still skipped, but reported to the
+    caller's `on_drop` — the frames around it parse exactly as before."""
+    lines = [
+        "data: not json",
+        "",
+        "data: " + json.dumps({"type": "server.connected", "properties": {}}),
+        "",
+        "data: {",
+        "",
+    ]
+    drops: list[str] = []
+    events = list(_parse_sse_lines(lines, drops.append))
+    assert [e["type"] for e in events] == ["server.connected"]
+    assert len(drops) == 2 and all(d.startswith("JSONDecodeError: ") for d in drops)
+
+
+class _FakeSseResp:
+    def __init__(self, status_code, lines, end_exc):
+        self.status_code = status_code
+        self._lines = lines
+        self._end_exc = end_exc
+
+    def iter_lines(self):
+        yield from self._lines
+        if self._end_exc is not None:
+            raise self._end_exc
+
+
+class _FakeSseHttpx:
+    """Stands in for the httpx module inside `_sse_loop`, one scripted stream
+    attempt per connect: ``("raise", exc)`` fails the connect,
+    ``("stream", status, lines, end_exc)`` answers and streams ``lines`` then
+    raises ``end_exc`` (None = clean end), and ``("stop", exc)`` is the teardown
+    — it sets ``sse_stop`` and raises as the killed server's socket would."""
+
+    def __init__(self, sess, attempts):
+        self.sess = sess
+        self.attempts = list(attempts)
+
+    def Timeout(self, *_a, **_kw):  # noqa: N802 - mirrors httpx.Timeout
+        return None
+
+    def Client(self, **_kw):  # noqa: N802 - mirrors httpx.Client
+        fake = self
+
+        class _Client:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            @contextlib.contextmanager
+            def stream(self, _method, _path):
+                kind, *rest = fake.attempts.pop(0)
+                if kind == "stop":
+                    fake.sess.sse_stop.set()
+                if kind in ("raise", "stop"):
+                    raise rest[0]
+                yield _FakeSseResp(*rest)
+
+        return _Client()
+
+
+def test_sse_loop_crumbs_each_stream_break_once(tmp_path):
+    """DW-462 acceptance: a raising stream still degrades to a `gap` (the wait
+    loop's poll fallback is unchanged), but each break is crumbed once —
+    `sse-stream-failed` at its first failure with the error and the running
+    dropped-frame count, `sse-stream-recovered` at the next connect — never once
+    per failed reconnect, and never for the teardown's own socket close. The
+    session's first undecodable frame is crumbed and every one is counted."""
+    adapter = make_adapter(tmp_path)
+    adapter.reconnect_sleep_s = 0.0
+    sess = _ServerSession(process=None, port=0, base_url="", password="", log_fh=None)
+    heartbeat = "data: " + json.dumps({"type": "server.heartbeat", "properties": {}})
+    adapter._httpx = _FakeSseHttpx(
+        sess,
+        [
+            ("raise", RuntimeError("refused")),
+            ("raise", RuntimeError("refused")),
+            (
+                "stream",
+                200,
+                ["data: nope", "", heartbeat, "", "data: {", ""],
+                RuntimeError("reset"),
+            ),
+            ("stream", 503, [], None),  # the same break: no second crumb
+            ("stop", RuntimeError("closed by teardown")),
+        ],
+    )
+
+    adapter._sse_loop(sess, "t-sse")
+
+    crumbs = [
+        {k: v for k, v in ln.items() if k != "ts"} for ln in _lifecycle_lines(adapter, "t-sse")
+    ]
+    assert crumbs[0] == {
+        "event": "sse-stream-failed",
+        "error": "RuntimeError: refused",
+        "frames_dropped": 0,
+    }
+    assert crumbs[1] == {"event": "sse-stream-recovered", "failures": 2}
+    assert crumbs[2]["event"] == "sse-frame-dropped"
+    assert crumbs[2]["error"].startswith("JSONDecodeError: ")
+    assert crumbs[3] == {
+        "event": "sse-stream-failed",
+        "error": "RuntimeError: reset",
+        "frames_dropped": 2,
+    }
+    assert len(crumbs) == 4
+    assert sess.sse_frames_dropped == 2 and sess.sse_failures == 2
+    # behaviour unchanged: one gap per ended stream, none after the stop
+    gaps = []
+    while not sess.events.empty():
+        gaps.append(sess.events.get_nowait())
+    assert gaps == ["gap"] * 4
+    assert sess.sse_connected.is_set()
+
+
+def test_sse_loop_healthy_stream_writes_no_crumb(tmp_path):
+    """A stream that connects and ends cleanly leaves the lifecycle file alone."""
+    adapter = make_adapter(tmp_path)
+    adapter.reconnect_sleep_s = 0.0
+    sess = _ServerSession(process=None, port=0, base_url="", password="", log_fh=None)
+    frame = "data: " + json.dumps({"type": "server.heartbeat", "properties": {}})
+    adapter._httpx = _FakeSseHttpx(
+        sess, [("stream", 200, [frame, ""], None), ("stop", RuntimeError("closed"))]
+    )
+
+    adapter._sse_loop(sess, "t-sse")
+
+    assert _lifecycle_lines(adapter, "t-sse") == []
+    assert sess.sse_frames_dropped == 0
+
+
+def test_heartbeat_carries_sse_frames_dropped(tmp_path, monkeypatch):
+    """DW-462: the running dropped-frame count reaches heartbeat.json, where an
+    operator watching a live session can see a stream shipping garbage."""
+    adapter = make_adapter(tmp_path)
+    clock = _install_clock(monkeypatch)
+    (adapter.tasks_dir / "t-1").mkdir(parents=True)
+
+    def advance():
+        clock["mono"] += 11.0
+
+    sess = _timeout_driven_session(adapter, advance)
+    sess.sse_frames_dropped = 3
+    adapter.wait_for_completion(
+        SessionHandle(task_id="t-1", native_id="ses_1"), _timeout_spec(tmp_path)
+    )
+    hb = json.loads((adapter.tasks_dir / "t-1" / "heartbeat.json").read_text(encoding="utf-8"))
+    assert hb["sse_frames_dropped"] == 3
+    assert hb["usage_sample_failures"] == 0
+
+
 def test_sse_dispatch_filters_child_sessions(tmp_path):
     """A child/subagent session's idle must not read as the parent's turn-end,
     but its frames DO count as activity (the parent is silent while a child
@@ -2307,13 +2463,13 @@ def test_capture_usage_stashes_through_the_cap(tmp_path):
 
     for i in range(USAGE_STASH_CAP + 2):
         task_id = f"t{i}"
-        # a missing parent raises into `_capture_usage`'s except and skips the stash
+        # without the task dir the transcript dump fails and the call returns None
         (adapter.tasks_dir / task_id).mkdir(parents=True)
         sess = _ServerSession(process=None, port=0, base_url="", password="", log_fh=None)
         sess.session_id = f"ses_{i}"
         sess.client = _Client200()
         handle = SessionHandle(task_id=task_id, native_id=sess.session_id)
-        assert adapter._capture_usage(handle, sess) is not None  # the stash really ran
+        assert adapter._capture_usage(handle, sess) is not None  # the capture really ran
 
     assert len(adapter._usage) == USAGE_STASH_CAP
     assert adapter.read_usage(SessionResult(status="completed", session_id="ses_0")) is None
@@ -2323,33 +2479,243 @@ def test_capture_usage_stashes_through_the_cap(tmp_path):
     ) == TokenUsage(input_tokens=3, output_tokens=1)
 
 
-def test_sample_weighted_usage_inert_on_http_failure(tmp_path):
-    """The budget guard's mid-session sample must never break the wait loop:
-    no live session yet, a transport error, or a non-200 all read as None
-    (guard inert this tick)."""
+class _ScriptedGetClient:
+    """A control client whose ``/message`` GET answers come off a script, one per
+    call: an int is a bare status code, an Exception is raised, anything else is
+    a 200 whose body is that value. The last entry repeats once the script runs
+    out. Every other GET (the wait loop's ``/session/status`` probe) is a 404, so
+    it reads as unknown and consumes nothing."""
+
+    def __init__(self, *answers):
+        self.answers = list(answers)
+        self.posts: list[str] = []
+
+    def get(self, path):
+        if not path.endswith("/message"):
+            answer: object = 404
+        elif len(self.answers) > 1:
+            answer = self.answers.pop(0)
+        else:
+            answer = self.answers[0]
+        if isinstance(answer, Exception):
+            raise answer
+
+        class _Resp:
+            status_code = answer if isinstance(answer, int) else 200
+
+            @staticmethod
+            def json():
+                return answer
+
+        return _Resp()
+
+    def post(self, path, **_kw):
+        self.posts.append(path)
+
+        class _Resp:
+            status_code = 200
+
+        return _Resp()
+
+    def close(self):
+        pass
+
+
+_HEALTHY_MESSAGES = [
+    {"info": {"role": "assistant", "tokens": {"input": 3, "output": 1}, "time": {"completed": 1}}}
+]
+
+
+def test_sample_weighted_usage_separates_faults_from_inert(tmp_path):
+    """DW-461: the budget guard's mid-session sample never breaks the wait loop,
+    and a sample that FAILED (transport error, non-200, malformed body) is told
+    apart from one that is merely inert (no live session yet, nothing tallied),
+    so the loop can crumb the streak instead of leaving enforce mode silently off."""
     adapter = make_adapter(tmp_path)
     spec = SessionSpec(task_id="t", role="triage", prompt="p", cwd=tmp_path)
     sess = _ServerSession(process=None, port=0, base_url="", password="", log_fh=None)
-    assert adapter._sample_weighted_usage(sess, spec) is None  # no session id yet
+    assert adapter._sample_weighted_usage(sess, spec) == (None, None)  # no session id yet
 
     sess.session_id = "ses_1"
+    sess.client = _ScriptedGetClient(RuntimeError("connection refused"))
+    assert adapter._sample_weighted_usage(sess, spec) == (
+        None,
+        "RuntimeError: connection refused",
+    )
+    sess.client = _ScriptedGetClient(500)
+    assert adapter._sample_weighted_usage(sess, spec) == (None, "HTTP 500")
+    sess.client = _ScriptedGetClient({"error": "not a list"})
+    weighted, fault = adapter._sample_weighted_usage(sess, spec)
+    assert weighted is None and fault == "payload is dict, not a message list"
+    sess.client = _ScriptedGetClient(["not-a-message"])
+    weighted, fault = adapter._sample_weighted_usage(sess, spec)
+    assert weighted is None and fault is not None and fault.startswith("malformed message list")
 
-    class _BoomClient:
-        def get(self, path):
-            raise RuntimeError("connection refused")
+    # healthy: nothing tallied yet is inert, not a fault; a tally is a sample
+    sess.client = _ScriptedGetClient([])
+    assert adapter._sample_weighted_usage(sess, spec) == (None, None)
+    sess.client = _ScriptedGetClient(_HEALTHY_MESSAGES)
+    assert adapter._sample_weighted_usage(sess, spec) == (4, None)
 
-    sess.client = _BoomClient()
-    assert adapter._sample_weighted_usage(sess, spec) is None
 
-    class _Client500:
-        def get(self, path):
-            class _Resp:
-                status_code = 500
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "garbage",
+        {"messages": []},
+        ["not-a-message"],
+        [{"info": "not-a-dict"}],
+        [{"info": {"role": "assistant", "time": "later", "tokens": {"input": 1}}}],
+        [{"info": {"role": "assistant", "tokens": {"input": 1, "cache": "warm"}}}],
+        [{"info": {"role": "assistant", "tokens": {"input": "many"}}}],
+        [{"info": {"role": "assistant", "tokens": {"input": [1]}}}],
+    ],
+    ids=["str", "dict", "entry", "info", "time", "cache", "count-str", "count-list"],
+)
+def test_tally_messages_malformed_is_unknown_with_a_fault(payload):
+    """DW-461: a malformed usage payload is None ("unknown") with a fault, never a
+    real-looking zero or a partial sum, and `_sum_usage` itself never raises on
+    one (the wrong-shaped entries used to raise into the callers' catch-alls)."""
+    usage, fault = opencode_http._tally_messages(payload)
+    assert usage is None and fault
+    assert _sum_usage(payload) is None
 
-            return _Resp()
 
-    sess.client = _Client500()
-    assert adapter._sample_weighted_usage(sess, spec) is None
+def test_tally_messages_healthy_and_untracked_carry_no_fault():
+    """The DW-461 fault channel is for malformed bodies only: a tally, an empty
+    list and an untracked (tokens-less) list all answer with fault None."""
+    assert opencode_http._tally_messages(_HEALTHY_MESSAGES) == (
+        TokenUsage(input_tokens=3, output_tokens=1),
+        None,
+    )
+    assert opencode_http._tally_messages([]) == (None, None)
+    assert opencode_http._tally_messages([{"info": {"role": "assistant"}}]) == (None, None)
+    # a non-dict tokens block is still "no usage on this message", not a fault
+    assert opencode_http._tally_messages([{"info": {"role": "assistant", "tokens": "n/a"}}]) == (
+        None,
+        None,
+    )
+
+
+def _capture(adapter, client, task_id="t-cap", make_dir=True):
+    if make_dir:
+        (adapter.tasks_dir / task_id).mkdir(parents=True, exist_ok=True)
+    sess = _ServerSession(process=None, port=0, base_url="", password="", log_fh=None)
+    sess.session_id = f"ses_{task_id}"
+    sess.client = client
+    handle = SessionHandle(task_id=task_id, native_id=sess.session_id)
+    return adapter._capture_usage(handle, sess), sess
+
+
+def _capture_crumbs(adapter, task_id="t-cap"):
+    return [
+        ln for ln in _lifecycle_lines(adapter, task_id) if ln["event"] == "usage-capture-failed"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("answer", "error"),
+    [(RuntimeError("connection refused"), "RuntimeError: connection refused"), (502, "HTTP 502")],
+    ids=["transport", "non-200"],
+)
+def test_capture_usage_fetch_fault_is_crumbed(tmp_path, answer, error):
+    """DW-461: the pre-teardown usage read failing is crumbed (`stage=fetch`) and
+    stashes nothing, so read_usage() answers None — untracked, never zero."""
+    adapter = make_adapter(tmp_path)
+    transcript, sess = _capture(adapter, _ScriptedGetClient(answer))
+    assert transcript is None
+    assert adapter._usage == {}
+    (crumb,) = _capture_crumbs(adapter)
+    assert crumb["stage"] == "fetch" and crumb["error"] == error
+
+
+def test_capture_usage_malformed_payload_is_crumbed_and_still_dumped(tmp_path):
+    """DW-461: a malformed body stashes nothing (usage unknown, not zero) and is
+    crumbed `stage=payload`; the raw body is still dumped — it is the evidence."""
+    adapter = make_adapter(tmp_path)
+    transcript, sess = _capture(adapter, _ScriptedGetClient({"oops": True}))
+    assert transcript is not None
+    assert json.loads(Path(transcript).read_text(encoding="utf-8")) == {"oops": True}
+    assert adapter.read_usage(SessionResult(status="timeout", session_id=sess.session_id)) is None
+    (crumb,) = _capture_crumbs(adapter)
+    assert crumb["stage"] == "payload"
+    assert crumb["error"] == "payload is dict, not a message list"
+
+
+def test_capture_usage_dump_fault_is_crumbed_and_keeps_the_usage(tmp_path):
+    """DW-461: an unwritable transcript is crumbed `stage=dump`, and the tally is
+    stashed before the dump, so the write fault no longer costs the usage."""
+    adapter = make_adapter(tmp_path)
+    # no task dir: the dump's write_text raises FileNotFoundError; the crumb's own
+    # write creates the dir, so it still lands
+    transcript, sess = _capture(adapter, _ScriptedGetClient(_HEALTHY_MESSAGES), make_dir=False)
+    assert transcript is None
+    assert adapter.read_usage(
+        SessionResult(status="completed", session_id=sess.session_id)
+    ) == TokenUsage(input_tokens=3, output_tokens=1)
+    (crumb,) = _capture_crumbs(adapter)
+    assert crumb["stage"] == "dump" and crumb["error"].startswith("FileNotFoundError")
+
+
+def test_capture_usage_healthy_writes_no_crumb(tmp_path):
+    adapter = make_adapter(tmp_path)
+    transcript, sess = _capture(adapter, _ScriptedGetClient(_HEALTHY_MESSAGES))
+    assert transcript is not None
+    assert adapter.read_usage(
+        SessionResult(status="completed", session_id=sess.session_id)
+    ) == TokenUsage(input_tokens=3, output_tokens=1)
+    assert _lifecycle_lines(adapter, "t-cap") == []
+
+
+def test_usage_sample_fault_streak_is_crumbed_at_transitions(tmp_path, monkeypatch):
+    """DW-461 acceptance, the generic adapter's DW-452 model on the HTTP
+    transport: a streak of failed budget samples crumbs `usage-sample-failed`
+    once at its first failure and `usage-sample-recovered` (with its length) at
+    the first clean sample — never once per failed tick — and heartbeat.json
+    carries the running streak. The guard's verdicts are unchanged: the session
+    still runs to its timeout."""
+    adapter = make_adapter(tmp_path)
+    clock = _install_clock(monkeypatch)
+    (adapter.tasks_dir / "t-1").mkdir(parents=True)
+
+    def advance():
+        clock["mono"] += generic.HEARTBEAT_INTERVAL_S + 1  # every tick samples
+
+    sess = _timeout_driven_session(adapter, advance)
+    sess.client = _ScriptedGetClient(503, RuntimeError("reset"), 503, _HEALTHY_MESSAGES)
+    beats: list[dict] = []
+    real_write = adapter._write_heartbeat
+
+    def record(task_id, payload):
+        beats.append(dict(payload))
+        real_write(task_id, payload)
+
+    adapter._write_heartbeat = record
+    spec = SessionSpec(
+        task_id="t-1",
+        role="dev",
+        prompt="p",
+        cwd=tmp_path,
+        timeout_s=(generic.HEARTBEAT_INTERVAL_S + 1) * 6,
+        token_budget=1_000_000,
+        token_budget_mode="warn",
+    )
+
+    result = adapter.wait_for_completion(SessionHandle(task_id="t-1", native_id="ses_1"), spec)
+
+    assert result.status == "timeout"
+    events = [
+        {k: v for k, v in ln.items() if k != "ts"}
+        for ln in _lifecycle_lines(adapter)
+        if ln["event"].startswith("usage-sample")
+    ]
+    assert events == [
+        {"event": "usage-sample-failed", "error": "HTTP 503"},
+        {"event": "usage-sample-recovered", "failures": 3},
+    ]
+    # the heartbeat precedes each tick's sample, so it lags the streak by one
+    assert [b["usage_sample_failures"] for b in beats[:5]] == [0, 1, 2, 3, 0]
+    assert all(b["sse_frames_dropped"] == 0 for b in beats)
 
 
 # ------------------------------------------------------------------- E2E tests

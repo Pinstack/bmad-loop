@@ -148,6 +148,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -361,18 +362,21 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
-def _parse_sse_lines(lines) -> Any:
+def _parse_sse_lines(lines, on_drop: Callable[[str], None] | None = None) -> Any:
     """Minimal SSE frame parser: accumulate ``data:`` lines until a blank line,
     then yield the JSON-decoded payload. Tolerates comments, unknown fields and
-    undecodable payloads (skipped) — the stream is advisory, never trusted."""
+    undecodable payloads (skipped) — the stream is advisory, never trusted.
+    A skipped payload is reported to ``on_drop`` as ``"<ExcType>: <message>"``
+    (DW-462), so the reader can count what the stream lost."""
     data: list[str] = []
     for line in lines:
         if line == "":
             if data:
                 try:
                     yield json.loads("\n".join(data))
-                except (json.JSONDecodeError, ValueError):
-                    pass
+                except (json.JSONDecodeError, ValueError) as e:
+                    if on_drop is not None:
+                        on_drop(f"{type(e).__name__}: {e}")
                 data = []
             continue
         if line.startswith("data:"):
@@ -483,6 +487,15 @@ class _ServerSession:
     # this are stale (a dead reader thread leaves it stale, preserving the
     # degraded path).
     last_frame_monotonic: float = 0.0
+    # SSE frames whose payload would not decode, running count over the session
+    # (DW-462): the parser skips them, so without this a server shipping garbage
+    # reads as a quiet stream. Written by the reader thread, read by the wait
+    # loop's heartbeat (a plain int bump, like `activity`).
+    sse_frames_dropped: int = 0
+    # The reader's running streak of stream attempts that raised; the streak's
+    # transitions are crumbed (`sse-stream-failed` / `sse-stream-recovered`),
+    # never each failed reconnect (DW-462). Reader thread only.
+    sse_failures: int = 0
     # Monotonic completion floor in epoch ms: the poll fallback only
     # synthesizes an idle for an assistant message completed strictly after
     # this. Starts at prompt-send, advances on every prompt this adapter sends
@@ -807,7 +820,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 )
             sess.session_id = resp.json()["id"]
 
-            self._start_sse_reader(sess)
+            self._start_sse_reader(sess, spec.task_id)
             # Wait for the stream to actually attach before prompting: a fast
             # turn can emit session.idle before the subscription exists, and a
             # lost idle degrades every completion to the (slow) poll fallback.
@@ -853,24 +866,32 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         except Exception:  # nosec B110 - next tick's poll() settles liveness
             pass
 
-    def _start_sse_reader(self, sess: _ServerSession) -> None:
+    def _start_sse_reader(self, sess: _ServerSession, task_id: str) -> None:
         thread = threading.Thread(
             target=self._sse_loop,
-            args=(sess,),
+            args=(sess, task_id),
             name=f"opencode-sse-{sess.port}",
             daemon=True,
         )
         sess.sse_thread = thread
         thread.start()
 
-    def _sse_loop(self, sess: _ServerSession) -> None:
+    def _sse_loop(self, sess: _ServerSession, task_id: str) -> None:
         """SSE reader: owns its own client (created and closed here — kill()
         never touches it; killing the server is what unblocks the read, with
         the read timeout as backstop). Filters idle/error to this session's id
         (child sessions share the stream), counts every other non-heartbeat
         frame as activity, and turns any disconnect into a single `gap`
         sentinel so the wait loop probes over HTTP for what the stream may
-        have dropped."""
+        have dropped.
+
+        The fallback to polling is unchanged, but a raising stream is not a
+        silent gap (DW-462): its first failure crumbs `sse-stream-failed`
+        (``error``, ``frames_dropped``) and the next successful connect crumbs
+        `sse-stream-recovered` (``failures``) — once per break, never once per
+        failed reconnect against a dead server. A raise after `sse_stop` is the
+        teardown closing the socket, not a fault, and is not crumbed. ``task_id``
+        names the lifecycle file those crumbs land in."""
         httpx = self._httpx
         while not sess.sse_stop.is_set():
             try:
@@ -885,16 +906,41 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         # The server registers the subscriber once the response
                         # starts; events published after this are delivered.
                         sess.sse_connected.set()
-                        for event in _parse_sse_lines(resp.iter_lines()):
+                        if sess.sse_failures:
+                            self._note_lifecycle(
+                                task_id, "sse-stream-recovered", failures=sess.sse_failures
+                            )
+                            sess.sse_failures = 0
+                        for event in _parse_sse_lines(
+                            resp.iter_lines(),
+                            lambda error: self._note_sse_drop(sess, task_id, error),
+                        ):
                             if sess.sse_stop.is_set():
                                 return
                             self._dispatch_sse(sess, event)
-            except Exception:  # nosec B110 - reader must never die silently
-                pass
+            except Exception as e:  # reader must never die; a break is crumbed
+                if not sess.sse_stop.is_set():
+                    sess.sse_failures += 1
+                    if sess.sse_failures == 1:
+                        self._note_lifecycle(
+                            task_id,
+                            "sse-stream-failed",
+                            error=f"{type(e).__name__}: {e}",
+                            frames_dropped=sess.sse_frames_dropped,
+                        )
             if sess.sse_stop.is_set():
                 return
             sess.events.put("gap")
             sess.sse_stop.wait(self.reconnect_sleep_s)
+
+    def _note_sse_drop(self, sess: _ServerSession, task_id: str, error: str) -> None:
+        """Count an undecodable SSE frame (DW-462); heartbeat.json carries the
+        running count, and the session's first drop is crumbed with its error
+        (`sse-frame-dropped`) — not every drop, so a garbage stream cannot flood
+        the lifecycle file."""
+        sess.sse_frames_dropped += 1
+        if sess.sse_frames_dropped == 1:
+            self._note_lifecycle(task_id, "sse-frame-dropped", error=error)
 
     def _dispatch_sse(self, sess: _ServerSession, event: Any) -> None:
         if not isinstance(event, dict):
@@ -1201,6 +1247,10 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # freezes time.monotonic(), silently stretching the "bounded" wrap-up
         # window; the wall clock may EXPIRE the grace — never extend it.
         budget_wall_deadline: float | None = None
+        # the running streak of budget usage samples that failed (a transport
+        # error, a non-200, a malformed payload — DW-461); heartbeat.json carries
+        # it as of the previous sample (sampling follows the heartbeat write).
+        usage_failures = 0
 
         while True:
             remaining = deadline - time.monotonic()
@@ -1272,6 +1322,10 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         "remaining_s": round(remaining, 3),
                         "stall_armed": stall_deadline is not None,
                         "stall_nudges_sent": stall_nudges_sent,
+                        # the running budget usage-sample failure streak (DW-461)
+                        "usage_sample_failures": usage_failures,
+                        # SSE frames the parser could not decode (DW-462)
+                        "sse_frames_dropped": sess.sse_frames_dropped,
                     },
                 )
                 # Mid-session spec-status transition sampling (#276 M2) rides the
@@ -1286,7 +1340,23 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     and spec.token_budget is not None
                     and spec.token_budget_mode in ("warn", "enforce")
                 ):
-                    weighted = self._sample_weighted_usage(sess, spec)
+                    weighted, usage_fault = self._sample_weighted_usage(sess, spec)
+                    # A failed sample is still "no sample" this tick; its streak
+                    # is crumbed at the transitions only (DW-461), the generic
+                    # adapter's DW-452 model — a persistent fault leaves
+                    # enforce mode off, which must not look like a quiet session.
+                    if usage_fault is not None:
+                        usage_failures += 1
+                        if usage_failures == 1:
+                            self._note_lifecycle(
+                                handle.task_id, "usage-sample-failed", error=usage_fault
+                            )
+                    else:
+                        if usage_failures:
+                            self._note_lifecycle(
+                                handle.task_id, "usage-sample-recovered", failures=usage_failures
+                            )
+                        usage_failures = 0
                     if weighted is not None and weighted > spec.token_budget:
                         budget_tripped = True
                         budget_weighted = weighted
@@ -1604,44 +1674,67 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
 
     # ----------------------------------------------------------------- usage
 
-    def _sample_weighted_usage(self, sess: _ServerSession, spec: SessionSpec) -> int | None:
-        """Mid-session cumulative weighted spend over HTTP, or None when the
-        guard must stay inert this tick (no live session yet, non-200, a
-        transport error). Never raises — sampling must not break the wait
-        loop."""
+    def _sample_weighted_usage(
+        self, sess: _ServerSession, spec: SessionSpec
+    ) -> tuple[int | None, str | None]:
+        """``(weighted, fault)``: the mid-session cumulative weighted spend over
+        HTTP, or None when the guard must stay inert this tick; ``fault`` names
+        why the sample failed (a transport error, a non-200, a malformed
+        payload), else None. Never raises — sampling must not break the wait
+        loop. No live session yet, or nothing tallied yet, is a clean None: the
+        fault is returned apart from it (DW-461) so the wait loop can crumb the
+        streak."""
         if sess.client is None or not sess.session_id:
-            return None
+            return None, None
         try:
             resp = sess.client.get(f"/session/{sess.session_id}/message")
             if resp.status_code != 200:
-                return None
-            usage = _sum_usage(resp.json())
-        except Exception:  # sampling is advisory
-            return None
+                return None, f"HTTP {resp.status_code}"
+            usage, fault = _tally_messages(resp.json())
+        except Exception as e:  # sampling is advisory
+            return None, f"{type(e).__name__}: {e}"
         if usage is None:
-            return None
-        return usage.weighted_total(spec.cache_read_weight)
+            return None, fault
+        return usage.weighted_total(spec.cache_read_weight), None
 
     def _capture_usage(self, handle: SessionHandle, sess: _ServerSession) -> str | None:
         """Read usage over HTTP before teardown (state is server-side sqlite):
         dump the raw messages as the transcript and stash the token sum by
         session id for read_usage(). Best-effort in full — the crashed path
-        runs this against a dead server and the verdict must not change."""
+        runs this against a dead server and the verdict must not change.
+
+        A fault leaves nothing stashed, so read_usage() answers None (untracked)
+        and never a zero; it is crumbed as `usage-capture-failed` with ``stage``
+        (``fetch`` — the GET, its status or its body; ``payload`` — a body that
+        is not a well-formed message list; ``dump`` — the transcript write) and
+        ``error`` (DW-461). The tally is stashed before the dump, so an
+        unwritable transcript no longer costs the usage."""
         if sess.client is None or not sess.session_id:
             return None
         try:
             resp = sess.client.get(f"/session/{sess.session_id}/message")
             if resp.status_code != 200:
+                self._note_usage_capture_failed(handle, "fetch", f"HTTP {resp.status_code}")
                 return None
             messages = resp.json()
+        except Exception as e:  # usage is metadata, never a gate
+            self._note_usage_capture_failed(handle, "fetch", f"{type(e).__name__}: {e}")
+            return None
+        usage, fault = _tally_messages(messages)
+        if usage is not None:
+            self._stash_usage(sess.session_id, usage)
+        elif fault is not None:
+            self._note_usage_capture_failed(handle, "payload", fault)
+        try:
             path = self.tasks_dir / handle.task_id / "messages.json"
             path.write_text(json.dumps(messages, ensure_ascii=False, indent=2), encoding="utf-8")
-            usage = _sum_usage(messages)
-            if usage is not None:
-                self._stash_usage(sess.session_id, usage)
-            return str(path)
-        except Exception:  # usage is metadata, never a gate
+        except Exception as e:  # the transcript is metadata too
+            self._note_usage_capture_failed(handle, "dump", f"{type(e).__name__}: {e}")
             return None
+        return str(path)
+
+    def _note_usage_capture_failed(self, handle: SessionHandle, stage: str, error: str) -> None:
+        self._note_lifecycle(handle.task_id, "usage-capture-failed", stage=stage, error=error)
 
     def _stash_usage(self, session_id: str, usage: TokenUsage) -> None:
         """Write into the capacity-bounded `_usage` stash (see USAGE_STASH_CAP).
@@ -1868,9 +1961,30 @@ def _sum_usage(messages: Any) -> TokenUsage | None:
     ``MessageAbortedError`` ``info.error``. A nonzero sum keeps every message's
     tokens, completed or not. A zero here is load-bearing: the base adapter classifies a timeout
     with a TRACKED zero tally as an environment fault, so a malformed, empty or
-    still-in-flight response must not read as a measured zero."""
+    still-in-flight response must not read as a measured zero.
+
+    A malformed payload (not a list, or an entry the walk cannot read) is None
+    too; :func:`_tally_messages` says why, for the callers that crumb it."""
+    return _tally_messages(messages)[0]
+
+
+def _tally_messages(messages: Any) -> tuple[TokenUsage | None, str | None]:
+    """``(usage, fault)`` — :func:`_sum_usage`'s answer, with a malformed payload
+    kept apart from an untracked one (DW-461): ``fault`` describes a body that is
+    not a list, or whose entries, ``info``/``time``/``cache`` blocks or counts
+    have the wrong shape, and the usage is then None ("unknown"), never a
+    partial sum. Otherwise ``fault`` is None. (A non-dict ``tokens`` block stays
+    what it always was, a message with no usage — skipped, not a fault.)"""
     if not isinstance(messages, list):
-        return None
+        return None, f"payload is {type(messages).__name__}, not a message list"
+    try:
+        return _sum_message_list(messages), None
+    except (AttributeError, TypeError, ValueError) as e:
+        return None, f"malformed message list: {type(e).__name__}: {e}"
+
+
+def _sum_message_list(messages: list[Any]) -> TokenUsage | None:
+    """The :func:`_sum_usage` walk over a list; raises on a wrong-shaped entry."""
     usage: TokenUsage | None = None
     any_completed = False
     for msg in messages:

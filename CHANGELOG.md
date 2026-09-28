@@ -177,6 +177,15 @@ breaking changes may land in a minor release.
   and the run-start reconcile warns too. Other passes still run (DW-470).
 - Journal `condition_unreadable` and the fault in `error` on `sentinel-cleared` when
   the sentinel's text cannot be read, instead of an empty `condition` alone (DW-471).
+- Crumb `opencode-http` usage faults instead of reading as a quiet session: a failing
+  budget sample writes `usage-sample-failed` / `usage-sample-recovered` at the streak's
+  transitions (heartbeat `usage_sample_failures`), a failed pre-teardown capture writes
+  `usage-capture-failed` (`stage`, `error`), and a malformed messages payload is
+  untracked usage, never a zero. The tally now survives an unwritable transcript (DW-461).
+- Crumb `opencode-http` event-stream faults: `sse-stream-failed` once per break (error,
+  `frames_dropped`), `sse-stream-recovered` on reconnect, `sse-frame-dropped` at the
+  first undecodable frame, and heartbeat `sse_frames_dropped`. The polling fallback is
+  unchanged (DW-462).
 - Carry story edits to skip-worktree-pinned hook configs in the `changes.patch` of a
   merged unit escalated on a failed merge-back, as the DEFERRED unit's patch does (DW-501).
 - Drop a DEFERRED unit's pinned-config record (a copy of the operator's hook settings)
