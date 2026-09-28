@@ -156,6 +156,15 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Notify (`ATTENTION`) when a resume restart's reset parks only uncommitted changes,
+  naming the `refs/attempt-preserve-dirty/*` snapshot with a `git diff` and a
+  `git restore --source=` hint (DW-480).
+- Name both refs in one restart notice when the reset parks commits and a snapshot,
+  never one line per ref (DW-482).
+- Notify when a re-drive's best-effort preserve leg fails and the reset runs anyway:
+  journal `attempt-preserve-fallthrough` (`leg`, `head`) and send an `ATTENTION` line
+  naming the leg and the attempt HEAD for a reflog rescue, and saying when uncommitted
+  work was not preserved. The fall-through itself is unchanged (DW-481).
 - Stop recording a failed session probe as a vanished session: a negative `has_session`
   on a crashed window is confirmed by listing the session's windows, and only a listing
   that proves the session gone writes `session-vanished`. psmux's `Invalid session key`

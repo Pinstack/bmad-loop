@@ -4738,8 +4738,14 @@ def test_restart_rollback_notice_waits_for_the_completed_reset(project, tmp_path
     assert not any("commits parked on resume" in line for line in _attention_lines(tmp_path))
 
 
-def test_restart_rollback_dirty_only_sends_no_parked_notice(project, tmp_path):
-    """Nothing above the baseline ⇒ nothing parked ⇒ no notice, even on restart."""
+def test_restart_rollback_notifies_the_uncommitted_snapshot(project, tmp_path):
+    """DW-480: a restart reset that parks only uncommitted changes (no commits
+    above the baseline) sends one ATTENTION line naming the snapshot ref and how
+    to recover from it — no commits branch, no `--accept-baseline` hint (the flag
+    never keeps uncommitted changes).
+
+    Ablation: drop `or snapshot` from the notice gate in `rollback_or_pause` and
+    the line disappears."""
     repo = project.project
     flow = _make_flow(
         workspace=Workspace.default(project),
@@ -4753,7 +4759,198 @@ def test_restart_rollback_dirty_only_sends_no_parked_notice(project, tmp_path):
 
     assert not (repo / "dirty.txt").exists()  # the rollback ran
     assert "attempt-commits-preserved" not in flow.journal.events()
-    assert _attention_lines(tmp_path) == []
+    snapshot = flow.journal.fields("attempt-worktree-preserved")["ref"]
+    lines = _attention_lines(tmp_path)
+    assert len(lines) == 1
+    line = lines[0]
+    assert "uncommitted changes parked on resume for 1-1-a" in line
+    assert task.baseline_commit[:12] in line
+    assert f"were parked on `{snapshot}`" in line
+    assert f'git -C "{repo}" diff {snapshot}~1 {snapshot}' in line
+    assert f'git -C "{repo}" restore --source={snapshot} -- <path>' in line
+    assert "attempt-preserve/" not in line and "cherry-pick" not in line
+    assert "--accept-baseline" not in line
+    # the snapshot really holds the discarded change
+    assert git(repo, "show", f"{snapshot}:dirty.txt") == "uncommitted"
+
+
+def test_restart_rollback_names_commits_and_snapshot_in_one_line(project, tmp_path):
+    """DW-482: commits above the baseline AND uncommitted changes — the reset parks
+    both, and ONE line names both refs (never a second line for either).
+
+    Ablation: drop the snapshot sentence from `_notify_reset_preservation` and the
+    snapshot ref goes missing; send a second notice per ref and the one-line
+    assertion reddens."""
+    repo = project.project
+    flow = _make_flow(
+        workspace=Workspace.default(project),
+        policy=_policy(rollback_on_failure=True),
+        run_dir=tmp_path,
+    )
+    task = _task(repo)
+    _commit_something(repo)
+    (repo / "src.txt").write_text("committed then edited\n")
+
+    flow.rollback_or_pause(task, restart=True)
+
+    assert rev_parse_head(repo) == task.baseline_commit  # the reset proceeded
+    commits_ref = flow.journal.fields("attempt-commits-preserved")["ref"]
+    snapshot = flow.journal.fields("attempt-worktree-preserved")["ref"]
+    lines = _attention_lines(tmp_path)
+    assert len(lines) == 1
+    line = lines[0]
+    assert "commits and uncommitted changes parked on resume for 1-1-a" in line
+    assert "1 commit above it" in line and f"was parked on `{commits_ref}` first" in line
+    assert f"were parked on `{snapshot}` first" in line
+    assert f"log --oneline {task.baseline_commit[:12]}..refs/heads/{commits_ref}" in line
+    assert f"restore --source={snapshot} -- <path>" in line and "cherry-pick <sha>" in line
+    assert "bmad-loop resume run-1 --accept-baseline" in line
+
+
+# ------------------------------------ DW-481: re-drive park failure falls through
+
+
+def _redrive_flow(project, tmp_path):
+    """A plain (non-restart) re-drive rollback: `rollback_on_failure` stays OFF so
+    the resolved re-drive is what carries the auto-recover arm, and its preserve
+    legs run with `allow_pause=False`."""
+    flow = _make_flow(
+        workspace=Workspace.default(project),
+        policy=_policy(rollback_on_failure=False),
+        run_dir=tmp_path,
+    )
+    return flow, _task(project.project)
+
+
+def _fallthrough_line(tmp_path: Path) -> str:
+    lines = _attention_lines(tmp_path)
+    assert len(lines) == 1
+    assert "reset of 1-1-a ran without full preservation" in lines[0]
+    assert "attempt-preserve-fallthrough" in lines[0]
+    return lines[0]
+
+
+def test_redrive_commits_enumerate_failure_notifies_and_still_resets(
+    project, tmp_path, monkeypatch
+):
+    """DW-481: the commits range cannot be counted on a re-drive — the reset still
+    runs (the human-directed fall-through), but a distinct row and one notice name
+    the leg and the attempt HEAD a reflog rescue starts from.
+
+    Ablation: drop `failed_parks or` from the notice gate and the line disappears;
+    drop the `_record_fallthrough` call in the enumerate arm and the row does."""
+    repo = project.project
+    flow, task = _redrive_flow(project, tmp_path)
+    _commit_something(repo)
+    head = rev_parse_head(repo)
+
+    def boom(*a, **k):
+        raise GitError("git log timed out")
+
+    monkeypatch.setattr(verify, "commits_above", boom)
+
+    flow.rollback_or_pause(task, cause="resolved")
+
+    assert flow.calls.pauses == []
+    assert rev_parse_head(repo) == task.baseline_commit  # the reset still ran
+    assert flow.journal.fields("attempt-preserve-fallthrough") == {
+        "story_key": "1-1-a",
+        "leg": "commits-enumerate",
+        "head": head,
+    }
+    line = _fallthrough_line(tmp_path)
+    assert f"rollback reset 1-1-a to its baseline {task.baseline_commit[:12]}" in line
+    assert "could not be counted (leg commits-enumerate)" in line
+    assert f'git -C "{repo}" branch <name> {head}' in line
+    # the commit is unreferenced but still recoverable by that sha
+    assert git(repo, "cat-file", "-t", head) == "commit"
+
+
+def test_redrive_commits_park_failure_notifies_and_still_resets(project, tmp_path, monkeypatch):
+    """DW-481: the commits were counted but the branch did not take on a re-drive.
+
+    Ablation: drop the `_record_fallthrough` call in the park-failed arm and both
+    the row and the line disappear."""
+    repo = project.project
+    flow, task = _redrive_flow(project, tmp_path)
+    _commit_something(repo)
+    head = rev_parse_head(repo)
+    monkeypatch.setattr(verify, "preserve_commits", lambda *a, **k: None)  # ref did not take
+
+    flow.rollback_or_pause(task, cause="resolved")
+
+    assert flow.calls.pauses == []
+    assert rev_parse_head(repo) == task.baseline_commit
+    events = flow.journal.events()
+    assert "attempt-preserve-failed" in events
+    assert flow.journal.fields("attempt-preserve-fallthrough") == {
+        "story_key": "1-1-a",
+        "leg": "commits-park",
+        "head": head,
+    }
+    line = _fallthrough_line(tmp_path)
+    assert "could not be parked (leg commits-park)" in line
+    assert f"branch <name> {head}" in line
+    assert "attempt-preserve/" not in line  # no ref took, so none is named
+
+
+def test_redrive_snapshot_failure_notifies_and_still_resets(project, tmp_path, monkeypatch):
+    """DW-481: the uncommitted-work snapshot fails on a re-drive. The commits are
+    parked and named, the notice says uncommitted work was NOT preserved and names
+    the HEAD, and the reset runs over the edit anyway.
+
+    Ablation: drop the `_record_fallthrough` calls in preserve_attempt_worktree's
+    re-drive arm and both the row and the line disappear."""
+    repo = project.project
+    flow, task = _redrive_flow(project, tmp_path)
+    _commit_something(repo)
+    head = rev_parse_head(repo)
+    (repo / "src.txt").write_text("committed then edited\n")
+    _fail_snapshot(monkeypatch)
+
+    flow.rollback_or_pause(task, cause="resolved")
+
+    assert flow.calls.pauses == []
+    assert rev_parse_head(repo) == task.baseline_commit
+    assert "edited" not in (repo / "src.txt").read_text()  # the reset ran over it
+    assert flow.journal.fields("attempt-preserve-fallthrough") == {
+        "story_key": "1-1-a",
+        "leg": "worktree-snapshot",
+        "head": head,
+    }
+    commits_ref = flow.journal.fields("attempt-commits-preserved")["ref"]
+    line = _fallthrough_line(tmp_path)
+    assert "(leg worktree-snapshot)" in line
+    assert "uncommitted work was NOT preserved" in line
+    assert f"the attempt HEAD was {head}" in line
+    assert f"was parked on `{commits_ref}` first" in line  # the half that did survive
+
+
+def test_fallthrough_with_unreadable_head_points_at_the_reflog(project, tmp_path, monkeypatch):
+    """DW-481: when HEAD itself cannot be read the row carries `head=""` (the fault
+    is on the enumerate row beside it) and the notice sends the operator to the
+    reflog instead of naming a sha it does not have."""
+    repo = project.project
+    flow, task = _redrive_flow(project, tmp_path)
+    failed: list = []
+
+    def boom(*a, **k):
+        raise GitError("git rev-parse timed out")
+
+    monkeypatch.setattr(verify, "rev_parse_head", boom)
+
+    assert flow.preserve_attempt_commits(task, allow_pause=False, failed_parks=failed) is None
+    assert flow.journal.fields("attempt-preserve-fallthrough") == {
+        "story_key": "1-1-a",
+        "leg": "commits-enumerate",
+        "head": "",
+    }
+    flow._notify_reset_preservation(
+        task, restart=False, parked=None, snapshot=None, failed_parks=failed
+    )
+    line = _fallthrough_line(tmp_path)
+    assert f'the attempt HEAD could not be read; find it in `git -C "{repo}" reflog`' in line
+    assert "branch <name>" not in line
 
 
 def test_in_run_rollback_parks_commits_without_notice(project, tmp_path):

@@ -595,7 +595,8 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "generation",
         "graceful",
         "harvest_attempt",
-        "head",
+        # `head` is NOT here any more: a HEAD sha (`attempt-preserve-failed`,
+        # `attempt-preserve-fallthrough`) moved to `_JOURNAL_ALIAS_FIELDS` (DW-481).
         "id_collisions",
         # `session-idle` / `session-active` (#680): seconds the live transcript has
         # sat still — a float the adapter measured from two stats, no identifier.
@@ -624,6 +625,10 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # (`False` label, `True` effect-only) and names nothing.
         "label_matched",
         "ledger",
+        # `attempt-preserve-fallthrough` (DW-481): WHICH best-effort preserve leg
+        # failed, a closed three-value token (`commits-enumerate` / `commits-park`
+        # / `worktree-snapshot`) — names nothing.
+        "leg",
         # `accepted-spec-delivery-unreachable`'s discriminator: whether the locator
         # RESOLVED a project-local rel, or only reported a swallowed filesystem
         # fault. A bare boolean deliberately, exactly like `compared` above —
@@ -1336,6 +1341,10 @@ JOURNAL_KINDS = frozenset(
         "baseline-accepted",
         "attempt-preserve-enumerate-failed",
         "attempt-preserve-failed",
+        # DW-481: a re-drive's best-effort preserve leg failed and fell through to
+        # the reset. `story_key` aliased, `leg` benign, `head` aliased as a commit,
+        # `error` (a HEAD read fault) dropped.
+        "attempt-preserve-fallthrough",
         "attempt-restore-failed",
         "attempt-restored",
         "attempt-worktree-preserve-failed",

@@ -948,6 +948,44 @@ def test_the_two_migration_reset_refusals_alias_one_snapshot_ref():
         assert canary not in rendered, f"LEAK: {canary!r}"
 
 
+def test_the_park_failure_records_alias_one_head_to_one_name():
+    """`head` is the attempt HEAD sha a rollback could not park
+    (`attempt-preserve-failed`) or fell through past on a re-drive
+    (`attempt-preserve-fallthrough`, DW-481) — the sha a reflog rescue starts from.
+    It left the routing guard's benign inventory for the `commit` namespace, so one
+    HEAD gets one alias across both kinds; `leg` is a closed token and ships as-is.
+
+    Ablation: drop `"head"` from `_JOURNAL_ALIAS_FIELDS` and the test dies at the
+    `next(...)` alias lookup with `StopIteration`."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    failed = diagnostics._scrub_entry(
+        {"ts": 1.0, "kind": "attempt-preserve-failed", "story_key": STORY_KEY, "head": SHA},
+        pseudo,
+        {},
+        1.0,
+    )
+    fallthrough = diagnostics._scrub_entry(
+        {
+            "ts": 2.0,
+            "kind": "attempt-preserve-fallthrough",
+            "story_key": STORY_KEY,
+            "leg": "commits-park",
+            "head": SHA,
+        },
+        pseudo,
+        {},
+        1.0,
+    )
+
+    alias = next(a for ns, orig, a in pseudo.entries() if ns == "commit" and orig == SHA)
+    assert failed["head"] == fallthrough["head"] == alias != SHA
+    assert fallthrough["leg"] == "commits-park"
+
+    rendered = json.dumps([failed, fallthrough])
+    for canary in (SHA, PROPRIETARY, *CANARIES):
+        assert canary not in rendered, f"LEAK: {canary!r}"
+
+
 def test_remaining_journal_shapes_route_by_kind_and_preserve_safe_structure():
     """The overloaded names are handled according to the producer shape, not by
     their generic scalar fallback."""

@@ -165,6 +165,10 @@ _JOURNAL_ALIAS_FIELDS = {
     # journaled beside the adopted `baseline` — both shas aliased so the comparison
     # the record exists for survives a dump.
     "previous_baseline": "commit",
+    # The attempt HEAD a rollback could not park (`attempt-preserve-failed`) or
+    # fell through past (`attempt-preserve-fallthrough`, DW-481) — the sha a
+    # reflog rescue starts from, so one HEAD gets one alias across both kinds.
+    "head": "commit",
     # The worktree snapshot `sweep._migration_reset` parked before a reset it then
     # refused (DW-435), on `ledger-snapshot-probe-failed` and
     # `sweep-migration-restore-diverged`. A REF NAME, not a sha —
