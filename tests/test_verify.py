@@ -10,6 +10,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -10245,7 +10246,11 @@ def _stick_candidate_temp_rmtree(monkeypatch):
     one holding `no-hooks`) fail with a non-permission `OSError`, reported to
     the handler it passes exactly as a real rmtree would: from inside an
     `except` block, through `onexc` (3.12+) or `onerror` (3.11). Returns the
-    list the stuck directories are appended to."""
+    list the stuck directories are appended to.
+
+    Debian/Ubuntu's CPython patches `tempfile` to bind `_rmtree =
+    _shutil.rmtree` at import, so `TemporaryDirectory` never sees a later
+    `shutil.rmtree` patch there; that binding is replaced too when present."""
     real_rmtree = shutil.rmtree
     stuck: list[Path] = []
 
@@ -10266,6 +10271,8 @@ def _stick_candidate_temp_rmtree(monkeypatch):
         return None
 
     monkeypatch.setattr(shutil, "rmtree", stuck_rmtree)
+    if getattr(tempfile, "_rmtree", None) is real_rmtree:
+        monkeypatch.setattr(tempfile, "_rmtree", stuck_rmtree)
     return stuck
 
 
