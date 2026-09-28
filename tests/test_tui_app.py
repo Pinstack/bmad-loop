@@ -3264,10 +3264,13 @@ async def test_cleanup_warns_about_sessions_left_in_the_legacy_registry(project,
     monkeypatch.setattr(
         runs,
         "legacy_registry_leftovers",
-        lambda _p: {
-            runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl"],
-            r"D:	heir-own-registry": ["bmad-loop-old-1"],
-        },
+        lambda _p: (
+            {
+                runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl"],
+                r"D:	heir-own-registry": ["bmad-loop-old-1"],
+            },
+            [],
+        ),
     )
     make_run(project.project, "20260611-100000-aaaa")
     app = BmadLoopApp(project.project)
@@ -3293,6 +3296,58 @@ async def test_cleanup_warns_about_sessions_left_in_the_legacy_registry(project,
             lambda: any(
                 r"1 session(s) left in D:	heir-own-registry" in m and "bmad-loop-old-1" in m
                 for m in notifications(app)
+            ),
+        )
+
+
+async def test_cleanup_warns_about_a_legacy_registry_that_could_not_be_asked(project, monkeypatch):
+    """DW-469, the cli arm's twin: a registry whose listing raised used to toast
+    exactly what an empty one toasts — nothing. Ablate the `unverified` toast and
+    this fails."""
+    from bmad_loop import runs
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p: ([], [], set()))
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+    monkeypatch.setattr(
+        runs,
+        "legacy_registry_leftovers",
+        lambda _p: ({}, ["/reg/broken: could not be listed: no server"]),
+    )
+    make_run(project.project, "20260611-100000-aaaa")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("c")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(
+            pilot,
+            lambda: any(
+                "not checked" in m and "/reg/broken" in m and "no server" in m
+                for m in notifications(app)
+            ),
+        )
+
+
+async def test_dashboard_names_an_incomplete_run_listing(project, monkeypatch):
+    """DW-468: an empty runs table over an unreadable runs dir is not "no runs" —
+    the border title says the listing is incomplete and a toast names the fault.
+    Ablate the fault arm in `_apply_runs` and this fails."""
+    from bmad_loop import runs
+
+    monkeypatch.setattr(
+        runs, "list_run_dirs", lambda _p: ([], "/x/runs: cannot list the runs dir: EACCES")
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        table = dashboard(app).query_one("#runs", DataTable)
+        await until(pilot, lambda: "listing incomplete" in str(table.border_title))
+        await until(
+            pilot,
+            lambda: any(
+                "run listing incomplete" in m and "EACCES" in m for m in notifications(app)
             ),
         )
 

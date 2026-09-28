@@ -285,13 +285,62 @@ def is_parsable_run_id(value: str) -> bool:
     return _wellformed_run_id(value) and not run_id_aliases_control_session(value)
 
 
-def list_run_dirs(project: Path) -> list[Path]:
-    """All run dirs containing a state.json, oldest first (run ids sort
-    chronologically)."""
+def list_run_dirs(project: Path) -> tuple[list[Path], str | None]:
+    """``(dirs, fault)``: all run dirs containing a state.json, oldest first (run
+    ids sort chronologically), paired with ``None`` — or with an operator-facing
+    description of what could not be read, when the listing is incomplete.
+
+    **Only genuine absence is silent** (DW-468). A missing runs dir (or a
+    non-directory component above it) is a real "no runs"; a runs dir that cannot
+    be stat'd or listed, or a run dir whose ``state.json`` cannot be stat'd, is
+    not — and it used to read exactly like one on 3.14, whose ``is_dir`` and
+    ``is_file`` swallow every ``OSError`` as False, while 3.11-3.13 raised out of
+    this function. ``stat()`` + ``S_ISDIR``/``S_ISREG`` (the DW-224 shape) gives
+    every runtime the same answer, and the fault travels in the return value
+    because every caller is an observation surface that degrades: `list`, the
+    TUI, `status`/`attach`/`diagnose`'s latest-run pick, and ref resolution,
+    which names it instead of answering "no such run" (see
+    :func:`resolve_run_dir`). An unreadable entry is left out of ``dirs`` and
+    named in ``fault``; the rest of the listing stands."""
+    dirs, _unreadable, fault = _scan_run_dirs(project)
+    return dirs, fault
+
+
+def _scan_run_dirs(project: Path) -> tuple[list[Path], list[str], str | None]:
+    """:func:`list_run_dirs` plus the NAMES of the entries it could not read, which
+    :func:`resolve_run_dir` matches a partial ref against: an unreadable run dir
+    is still a candidate the ref may mean, so resolving past it would pick the
+    wrong run without a word."""
     runs = project / RUNS_DIR
-    if not runs.is_dir():
-        return []
-    return sorted(d for d in runs.iterdir() if (d / "state.json").is_file())
+    try:
+        mode = runs.stat().st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return [], [], None
+    except OSError as exc:
+        return [], [], f"{runs}: cannot stat the runs dir: {type(exc).__name__}: {exc}"
+    if not stat.S_ISDIR(mode):
+        return [], [], None
+    try:
+        entries = sorted(runs.iterdir())
+    except OSError as exc:
+        return [], [], f"{runs}: cannot list the runs dir: {type(exc).__name__}: {exc}"
+    dirs: list[Path] = []
+    unreadable: list[str] = []
+    detail: list[str] = []
+    for d in entries:
+        try:
+            mode = (d / STATE_FILE).stat().st_mode
+        except (FileNotFoundError, NotADirectoryError):
+            continue  # not a run dir (or not a dir at all)
+        except OSError as exc:
+            unreadable.append(d.name)
+            detail.append(f"{d.name} ({type(exc).__name__}: {exc})")
+            continue
+        if stat.S_ISREG(mode):
+            dirs.append(d)
+    if not unreadable:
+        return dirs, [], None
+    return dirs, unreadable, f"{runs}: cannot read run dir(s): " + "; ".join(detail)
 
 
 def all_run_dirs(project: Path) -> list[Path] | None:
@@ -316,9 +365,12 @@ def all_run_dirs(project: Path) -> list[Path] | None:
     return sorted(root / name for name in names)
 
 
-def latest_run_dir(project: Path) -> Path | None:
-    candidates = list_run_dirs(project)
-    return candidates[-1] if candidates else None
+def latest_run_dir(project: Path) -> tuple[Path | None, str | None]:
+    """``(newest run dir or None, fault)`` — :func:`list_run_dirs`' fault passed
+    through, since "newest" over an incomplete listing is only the newest
+    readable one, and ``None`` with a fault is "could not list", not "no runs"."""
+    candidates, fault = list_run_dirs(project)
+    return (candidates[-1] if candidates else None), fault
 
 
 def write_named_pid(pidfile: Path, pid: int) -> None:
@@ -977,18 +1029,35 @@ def resolve_run_dir(project: Path, ref: str) -> Path:
     project, which handed `bmad-loop delete ""` that run. No addressability is
     lost (no directory can be named `""`); every other escape spelling keeps the
     partial fallback so a legacy dir named `"..."` stays matchable by its own
-    spelling."""
+    spelling.
+
+    An incomplete listing (:func:`list_run_dirs`' fault, DW-468) refuses by
+    naming the fault wherever it could change the answer: when nothing matched
+    (an unreadable runs dir is not "no such run") and when an unreadable run
+    dir's name matches the ref too (a unique readable match is then not proven
+    unique). A unique match that no unreadable name could rival still resolves."""
     if not ref:
         raise RunRefError("empty run ref: it would match every run, never name one")
     if not _is_path_escape(ref):
         exact = run_dir_for(project, ref)
-        if is_run(exact):
-            return exact
-    matches = [
-        d
-        for d in list_run_dirs(project)
-        if short_ref(d.name).startswith(ref) or d.name.endswith(ref)
-    ]
+        # stat + S_ISREG rather than `is_run`: a fault here (3.11-3.13 raise it
+        # from `is_file`, 3.14 swallows it) is not proof either way, so it falls
+        # through to the listing below, which names it.
+        try:
+            if stat.S_ISREG((exact / STATE_FILE).stat().st_mode):
+                return exact
+        except OSError:
+            pass
+
+    def _matches(name: str) -> bool:
+        return short_ref(name).startswith(ref) or name.endswith(ref)
+
+    listed, unreadable, fault = _scan_run_dirs(project)
+    matches = [d for d in listed if _matches(d.name)]
+    if fault is not None and (not matches or any(_matches(n) for n in unreadable)):
+        raise RunRefError(
+            f"cannot resolve run ref {ref!r}: the run listing is incomplete — {fault}"
+        )
     if not matches:
         raise RunRefError(f"no such run: {ref}")
     if len(matches) > 1:
@@ -1198,15 +1267,19 @@ _HeaderFields = tuple[str, str, bool, bool, bool, bool, str]
 _header_cache: dict[Path, tuple[_StatSig, _HeaderFields]] = {}
 
 
-def discover_runs(project: Path) -> list[RunInfo]:
-    """One RunInfo per run dir, oldest first; [] when the runs dir is missing.
+def discover_runs(project: Path) -> tuple[list[RunInfo], str | None]:
+    """``(infos, fault)``: one RunInfo per run dir, oldest first; ``[]`` when the
+    runs dir is missing. ``fault`` is :func:`list_run_dirs`' — ``None`` for a
+    complete listing, else what could not be read (DW-468), which `list` and the
+    TUI report so an unreadable runs dir never reads as "no runs".
 
     Parses only the state.json header fields (cached on stat); a state file
     that fails to parse yields status 'unknown' rather than crashing — it is
     transient, the engine writes atomically.
     """
     out: list[RunInfo] = []
-    for run_dir in list_run_dirs(project):
+    run_dirs, fault = list_run_dirs(project)
+    for run_dir in run_dirs:
         state_path = run_dir / STATE_FILE
         sig = _stat_sig(state_path)
         cached = _header_cache.get(state_path)
@@ -1241,7 +1314,7 @@ def discover_runs(project: Path) -> list[RunInfo]:
         # STOPPED/FINISHED/CRASHED classify before liveness, so they never read UNKNOWN.
         stopping = status in (RUNNING, UNKNOWN) and (run_dir / STOP_REQUEST_FILE).is_file()
         out.append(RunInfo(run_dir.name, run_dir, run_type, started_at, status, stage, stopping))
-    return out
+    return out, fault
 
 
 # ----------------------------------------------------------- stop / delete / archive
@@ -1665,7 +1738,14 @@ def prune_sessions(
     if not dry_run:
         for run_id in prunable:
             kill_session(run_id)
-    for legacy in _legacy_registries():
+    try:
+        legacies = _legacy_registries()
+    except MultiplexerError:
+        # Not reported here: the (killed, live, unknown) tuple is a contract, and
+        # `legacy_registry_leftovers`, which every cleanup frontend reads right
+        # after this, asks the same question and carries the fault (DW-469).
+        legacies = []
+    for legacy in legacies:
         extra, extra_live, extra_unknown = prunable_sessions(project, legacy, require_tag=True)
         if not dry_run:
             for run_id in extra:
@@ -1685,11 +1765,20 @@ DEFAULT_REGISTRY_LABEL = "the multiplexer's own default registry"
 
 def legacy_registry_leftovers(
     project: Path, *, announced: Iterable[str] = ()
-) -> dict[str, list[str]]:
-    """Session names a legacy registry **still holds** after :func:`prune_sessions`
-    ran — the migration's honest remainder, for the cleanup frontends to print.
-    ``{}`` when there is no legacy registry, when they hold nothing, or when
-    every listing fails.
+) -> tuple[dict[str, list[str]], list[str]]:
+    """``(grouped, faults)``: session names a legacy registry **still holds** after
+    :func:`prune_sessions` ran — the migration's honest remainder, for the cleanup
+    frontends to print — and one operator-facing line per registry that could not
+    be asked. ``({}, [])`` when there is no legacy registry or they hold nothing.
+
+    **An unanswerable registry is a fault, not an empty one** (DW-469). A backend
+    that cannot be selected (so no legacy registry could even be named) or a
+    registry whose listing raises used to answer ``{}`` — exactly what a clean
+    migration answers, so `cleanup` printed no leftovers line and the TUI no
+    toast: the silence this function exists to remove. Each now lands in
+    ``faults`` (labelled like ``grouped``'s keys), and the frontends print it
+    beside the leftovers. A registry that faults contributes nothing to
+    ``grouped``; the others still do.
 
     **Grouped by registry, and that is load-bearing.** There is more than one
     legacy registry now (:meth:`~.adapters.psmux_backend.PsmuxMultiplexer.legacy_registries`
@@ -1789,12 +1878,21 @@ def legacy_registry_leftovers(
     # names at most one session anywhere — the same collapse that makes its own
     # "killed" count one per id.
     excluded = {session_name(run_id) for run_id in announced}
-    for legacy in _legacy_registries():
+    faults: list[str] = []
+    try:
+        legacies = _legacy_registries()
+    except MultiplexerError as exc:
+        return grouped, [f"no legacy registry could be checked: backend selection failed: {exc}"]
+    for legacy in legacies:
         try:
             names = legacy.list_sessions()
             tags = legacy.session_options(PROJECT_OPTION) if names else {}
-        except MultiplexerError:
-            continue  # observation degrades; the sweep's own report still stands
+        except MultiplexerError as exc:
+            # Observation degrades — the sweep's own report still stands — but
+            # visibly: this registry's remainder is unknown, not empty.
+            label = legacy.registry_root() or DEFAULT_REGISTRY_LABEL
+            faults.append(f"{label}: could not be listed: {exc}")
+            continue
         here: list[str] = []
         for name in names:
             if is_ctl_session_name(legacy.session_name_key(name)):
@@ -1820,7 +1918,7 @@ def legacy_registry_leftovers(
             # rows are merged rather than overwritten.
             label = legacy.registry_root() or DEFAULT_REGISTRY_LABEL
             grouped[label] = sorted(set(grouped.get(label, []) + here))
-    return grouped
+    return grouped, faults
 
 
 def _legacy_registries() -> list[TerminalMultiplexer]:
@@ -1828,13 +1926,13 @@ def _legacy_registries() -> list[TerminalMultiplexer]:
     (see :meth:`~.multiplexer.TerminalMultiplexer.legacy_registries`, which owns
     the concept and every backend's answer).
 
-    Degrades to [] rather than raising: a backend that cannot even be selected
-    has no legacy registry to offer, and a cleanup that already swept the primary
-    registry must report that work rather than die on the migration pass."""
-    try:
-        return list(get_multiplexer().legacy_registries())
-    except MultiplexerError:
-        return []
+    Raises :class:`MultiplexerError` when no backend can be selected, and each
+    caller degrades on its own terms (DW-469): :func:`prune_sessions` skips the
+    migration pass, since a cleanup that already swept the primary registry must
+    report that work rather than die on it, and :func:`legacy_registry_leftovers`
+    reports the fault. Answering ``[]`` made "could not ask" read as "no legacy
+    registry", so cleanup said nothing about sessions it never looked for."""
+    return list(get_multiplexer().legacy_registries())
 
 
 # The run dir of the OUTERMOST engine in this call stack (#319). A nested auto-sweep
@@ -3025,18 +3123,25 @@ def reconcile_orphan_worktrees(repo: Path, run_dir: Path, *, dry_run: bool = Fal
     return handled
 
 
-def reconcile_stale_worktrees(repo: Path, project: Path, *, dry_run: bool = False) -> list[Path]:
+def reconcile_stale_worktrees(
+    repo: Path, project: Path, *, dry_run: bool = False
+) -> tuple[list[Path], str | None]:
     """Safety net for the automatic paths (run/sweep start): tear down worktrees
     left behind by a *finished* run whose clean-finish GC didn't complete (e.g. a
     crash between merge and teardown). Deliberately finished-ONLY — a stopped run
     is still resumable, so its worktree is left for `resume`/`clean` to handle and
-    never stranded out from under the operator."""
+    never stranded out from under the operator.
+
+    ``(handled, fault)``: ``fault`` is :func:`list_run_dirs`' (DW-468) — a run the
+    listing could not read was not reconciled, and the caller says so rather
+    than letting "reclaimed nothing" stand for it."""
     handled: list[Path] = []
-    for run_dir in list_run_dirs(project):
+    run_dirs, fault = list_run_dirs(project)
+    for run_dir in run_dirs:
         if not is_finished(run_dir):
             continue
         handled += reconcile_orphan_worktrees(repo, run_dir, dry_run=dry_run)
-    return handled
+    return handled, fault
 
 
 def _run_dir_names(project: Path) -> set[str] | None:

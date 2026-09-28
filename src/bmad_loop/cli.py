@@ -425,9 +425,15 @@ def _reconcile_stale(project: Path, paths: bmadconfig.ProjectPaths, pol) -> None
     runs, never anything resumable."""
     if not pol.cleanup.auto_clean_on_finish:
         return
-    freed = runs.reconcile_stale_worktrees(paths.repo_root, project)
+    freed, fault = runs.reconcile_stale_worktrees(paths.repo_root, project)
     if freed:
         print(f"reclaimed {len(freed)} stale worktree(s) from prior runs")
+    if fault is not None:
+        # DW-468: an unread run was not reconciled; "reclaimed nothing" must not
+        # stand for it. Advisory — the new run does not depend on this sweep.
+        print(
+            f"warning: stale-worktree reconcile skipped unreadable runs: {fault}", file=sys.stderr
+        )
 
 
 # ----------------------------------------------------------------- commands
@@ -4826,6 +4832,15 @@ def cmd_decisions(args: argparse.Namespace) -> int:
             "no pending decisions could be resolved from it",
             file=sys.stderr,
         )
+    # Same reasoning for the run listing the triage caches are read from (DW-468):
+    # a run dir that cannot be read contributes no decisions, and says so here.
+    _, listing_fault = runs.list_run_dirs(project)
+    if listing_fault is not None:
+        print(
+            f"note: run listing incomplete ({listing_fault}) — "
+            "decisions from those runs' triage could not be read",
+            file=sys.stderr,
+        )
     if args.json:
         # Before the empty-set early return (nothing pending is a valid empty
         # document, not the text line), and regardless of --list: --json *is*
@@ -5002,6 +5017,17 @@ def _sweep_options_line(run_dir: Path, state: RunState) -> str:
     return f"sweep options: {', '.join(parts)}{legacy}"
 
 
+def _latest_run_dir(project: Path) -> Path | None:
+    """:func:`runs.latest_run_dir` for a command that falls back to the newest run,
+    with the listing fault on stderr (DW-468): over an unreadable runs dir the
+    "no runs found" that follows is not the answer, and over an unreadable run
+    dir the pick is only the newest readable run."""
+    run_dir, fault = runs.latest_run_dir(project)
+    if fault is not None:
+        print(f"warning: run listing incomplete: {fault}", file=sys.stderr)
+    return run_dir
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     project = _project(args)
     if args.run_id:
@@ -5011,7 +5037,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             print(str(e), file=sys.stderr)
             return 1
     else:
-        run_dir = runs.latest_run_dir(project)
+        run_dir = _latest_run_dir(project)
     if run_dir is None or not (run_dir / "state.json").is_file():
         print("no runs found", file=sys.stderr)
         return 1
@@ -5094,12 +5120,16 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_list(args: argparse.Namespace) -> int:
     project = _project(args)
-    infos = runs.discover_runs(project)  # oldest first
+    infos, fault = runs.discover_runs(project)  # oldest first
     if args.json:
-        machine.emit(list_document(infos))
+        machine.emit(list_document(infos, listing_fault=fault))
         return 0
+    if fault is not None:
+        # DW-468: an unreadable runs dir (or run dir) is not "no runs".
+        print(f"warning: run listing incomplete: {fault}", file=sys.stderr)
     if not infos:
-        print("no runs found")
+        if fault is None:
+            print("no runs found")
         return 0
     print(f"{'REF':6} {'TYPE':6} {'STATUS':10} RUN ID")
     for ri in infos:
@@ -5118,7 +5148,7 @@ def cmd_attach(args: argparse.Namespace) -> int:
             print(str(e), file=sys.stderr)
             return 1
     else:
-        run_dir = runs.latest_run_dir(project)
+        run_dir = _latest_run_dir(project)
     if run_dir is None:
         print("no runs found", file=sys.stderr)
         return 1
@@ -5313,7 +5343,9 @@ def cmd_archive(args: argparse.Namespace) -> int:
     return 0
 
 
-def _warn_legacy_leftovers(leftovers: dict[str, list[str]]) -> None:
+def _warn_legacy_leftovers(
+    leftovers: dict[str, list[str]], unverified: list[str] | tuple[str, ...] = ()
+) -> None:
     """Name what each legacy multiplexer registry still holds after the sweep.
 
     Silent on the normal path — the list is empty on every platform without a
@@ -5342,7 +5374,16 @@ def _warn_legacy_leftovers(leftovers: dict[str, list[str]]) -> None:
     where there is room to state it.
 
     Deliberately unconditional on dry-run: a preview that omits the remainder
-    would disagree with the run it is previewing."""
+    would disagree with the run it is previewing.
+
+    ``unverified`` names each legacy registry that could not be asked at all
+    (DW-469): without a line for it, a registry that raised printed exactly what
+    a registry holding nothing prints — nothing."""
+    for line in unverified:
+        print(
+            f"legacy registry not checked for sessions left behind (not migrated): {line}",
+            file=sys.stderr,
+        )
     for registry, names in leftovers.items():
         print(
             f"left in {registry} (not migrated): "
@@ -5364,9 +5405,12 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     # Read AFTER the prune, and by presence: what is still standing in the legacy
     # registry now that the sweep has run. On a dry run nothing was killed, so the
     # ids just announced as would-kills are handed over to be excluded — the plan
-    # this command printed, never a second sample of it. Never raises (observation
-    # degrades to []).
-    leftovers = runs.legacy_registry_leftovers(project, announced=killed if args.dry_run else ())
+    # this command printed, never a second sample of it. Never raises: a registry
+    # that could not be asked lands in `unverified` (DW-469), never in an empty
+    # `leftovers` that reads as "nothing left".
+    leftovers, unverified = runs.legacy_registry_leftovers(
+        project, announced=killed if args.dry_run else ()
+    )
     if not args.json:
         for run_id in sorted(unknown):
             # warn-only: unknown never blocks cleanup (same wording as delete/archive).
@@ -5418,6 +5462,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                 # list of names and widening it would bump the schema. The
                 # grouping serves the text mode, which has room to say where.
                 legacy_leftovers=sorted({n for names in leftovers.values() for n in names}),
+                legacy_unverified=unverified,
             )
         )
         return 0
@@ -5431,7 +5476,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                 print(f"would close ctl window {name}")
         if live:
             print(f"leaving {len(live)} live session(s) untouched")
-        _warn_legacy_leftovers(leftovers)
+        _warn_legacy_leftovers(leftovers, unverified)
         return 0
     # The count now excludes non-removals, so on stdout alone a smaller number is
     # indistinguishable from a quieter sweep — and `cleanup > log` keeps only
@@ -5449,7 +5494,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         # Same wording as the TUI toast: one claim, one phrase, so an operator
         # moving between the two surfaces is reading the same thing.
         print(f"ctl window(s) still open after the kill: {', '.join(survived)}", file=sys.stderr)
-    _warn_legacy_leftovers(leftovers)
+    _warn_legacy_leftovers(leftovers, unverified)
     if unverifiable:
         # Not "killed but unverifiable": kill_window is a silent no-op on a
         # transport failure, so whether the kill even reached the server is part
@@ -5509,7 +5554,14 @@ def cmd_clean(args: argparse.Namespace) -> int:
 
     reclaimable: list[Path] = []
     protected: list[str] = []
-    for run_dir in runs.list_run_dirs(project):
+    # A run the listing could not read is never a candidate, which only ever keeps
+    # more: it is neither reclaimed nor counted toward the retention window. The
+    # fault is still reported (DW-468) — "nothing to reclaim" over an unreadable
+    # runs dir is not the answer.
+    run_dirs, listing_fault = runs.list_run_dirs(project)
+    if listing_fault is not None and not args.json:
+        print(f"warning: run listing incomplete: {listing_fault}", file=sys.stderr)
+    for run_dir in run_dirs:
         if run_dir.name in keep:
             protected.append(run_dir.name)
         elif runs.reclaimable(run_dir):
@@ -5644,6 +5696,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
                 protected=protected,
                 unverifiable_pid=unverifiable,
                 state_dirs_swept=swept,
+                listing_fault=listing_fault,
             )
         )
         return 0
@@ -5869,7 +5922,9 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
 
     project = _project(args)
     if args.all:
-        run_dirs = runs.list_run_dirs(project)
+        run_dirs, fault = runs.list_run_dirs(project)
+        if fault is not None:
+            print(f"warning: run listing incomplete: {fault}", file=sys.stderr)
     elif args.run_id:
         try:
             run_dirs = [runs.resolve_run_dir(project, args.run_id)]
@@ -5877,7 +5932,7 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
             print(str(e), file=sys.stderr)
             return 1
     else:
-        latest = runs.latest_run_dir(project)
+        latest = _latest_run_dir(project)
         run_dirs = [latest] if latest is not None else []
     if not run_dirs:
         print("no runs found", file=sys.stderr)

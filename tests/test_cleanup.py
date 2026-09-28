@@ -2,7 +2,9 @@
 artifact trim, and the `clean` CLI command."""
 
 import argparse
+import json
 import os
+from pathlib import Path
 
 import pytest
 from conftest import install_bmad_config, machine_json
@@ -132,11 +134,12 @@ def test_reconcile_stale_worktrees_finished_only(project):
     save_state(fin, RunState(run_id="f", project=str(repo), started_at="x", finished=True))
     save_state(stp, RunState(run_id="s", project=str(repo), started_at="x", stopped=True))
 
-    handled = runs.reconcile_stale_worktrees(repo, repo)
+    handled, fault = runs.reconcile_stale_worktrees(repo, repo)
 
     assert not fin_wt.exists()  # finished run's worktree reclaimed
     assert stp_wt.exists()  # stopped run is resumable — left intact
     assert {p.name for p in handled} == {"u"} and len(handled) == 1
+    assert fault is None
 
 
 # ------------------------------------------------------------- retention
@@ -190,7 +193,7 @@ def test_trim_run_dir_keeps_run_viewable(tmp_path):
     assert (run_dir / "state.json").is_file()
     assert (run_dir / "journal.jsonl").is_file()
     # the run still discovers + lists in the dashboard
-    infos = runs.discover_runs(tmp_path)
+    infos, _ = runs.discover_runs(tmp_path)
     assert [i.run_id for i in infos] == ["20260101-000000-aaaa"]
 
 
@@ -226,7 +229,7 @@ def test_trim_run_dir_reclaims_the_verifier_stream_store(tmp_path):
     # the TUI-visible core the trim exists to preserve
     assert (run_dir / "state.json").is_file()
     assert (run_dir / "journal.jsonl").is_file()
-    infos = runs.discover_runs(tmp_path)
+    infos, _ = runs.discover_runs(tmp_path)
     assert [i.run_id for i in infos] == ["20260101-000000-aaaa"]
 
 
@@ -322,6 +325,51 @@ def test_cmd_clean_warns_for_an_unreadable_pid_file(project, capsys):
     assert cli.cmd_clean(_clean_args(repo)) == 0
     err = capsys.readouterr().err
     assert "run 20260101-000000-aaaa: engine may still be live (unverifiable pid)" in err
+
+
+def _deny_stat_under(monkeypatch, root: Path) -> None:
+    """Every `stat()` of `root` or below raises EACCES — an unreadable dir, as
+    3.14's `is_dir`/`is_file` would fold it into False."""
+    real = Path.stat
+
+    def stat(self, *args, **kwargs):
+        if self == root or root in self.parents:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+
+
+def test_cmd_clean_names_an_unreadable_runs_dir(project, monkeypatch, capsys):
+    """DW-468: "nothing to reclaim" over an unreadable runs dir is not the answer.
+    Text warns on stderr; --json carries `listing_fault` with stderr empty.
+    Ablate the listing fault in `list_run_dirs` and both fail."""
+    install_bmad_config(project)
+    repo = project.project
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", stopped=True))
+    _deny_stat_under(monkeypatch, run_dir.parent)
+
+    assert cli.cmd_clean(_clean_args(repo, dry_run=True)) == 0
+    err = capsys.readouterr().err
+    assert "run listing incomplete" in err and "PermissionError" in err
+
+    assert cli.cmd_clean(_clean_args(repo, dry_run=True, json=True)) == 0
+    captured = capsys.readouterr()
+    assert "PermissionError" in json.loads(captured.out)["listing_fault"]
+    assert captured.err == ""
+
+
+def test_cmd_clean_readable_runs_dir_is_silent(project, capsys):
+    install_bmad_config(project)
+    repo = project.project
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", stopped=True))
+
+    assert cli.cmd_clean(_clean_args(repo, dry_run=True)) == 0
+    assert "run listing incomplete" not in capsys.readouterr().err
+    assert cli.cmd_clean(_clean_args(repo, dry_run=True, json=True)) == 0
+    assert json.loads(capsys.readouterr().out)["listing_fault"] is None
 
 
 def test_cmd_clean_reclaims_and_keeps_protected(project, capsys):

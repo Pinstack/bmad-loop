@@ -123,6 +123,7 @@ class _PollContext:
 class _Snapshot:
     generation: int
     runs: list[data.RunInfo] | None = None  # None: no rescan this tick
+    runs_fault: str | None = None  # the run listing is incomplete (DW-468)
     project_refreshed: bool = False  # sprint + deferred rescanned this tick
     missed_decisions: int = 0  # decisions past sweeps left unanswered
     missed_decisions_fault: str | None = None  # why that count could not be read (DW-473)
@@ -220,6 +221,7 @@ class DashboardScreen(Screen[None]):
         self._pin_task: str | None = None  # show this task's log instead of the active one
         self._pending_jump: tuple[str, int] | None = None  # (task_id, log_pos)
         self._log_follow_tail = True  # stick to newest log lines until a jump pins us
+        self._runs_fault: str | None = None  # last listing fault toasted (DW-468)
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -761,7 +763,7 @@ class DashboardScreen(Screen[None]):
         try:
             snap = _Snapshot(generation=generation)
             if rescan:
-                snap.runs = data.discover_runs(self.project)
+                snap.runs, snap.runs_fault = data.discover_runs(self.project)
                 snap.project_refreshed = True
                 snap.sprint = data.sprint_overview(self.project)
                 snap.deferred = data.deferred_entries(self.project)
@@ -847,7 +849,7 @@ class DashboardScreen(Screen[None]):
         if not self.is_running:
             return
         if snap.runs is not None:
-            self._apply_runs(snap.runs)
+            self._apply_runs(snap.runs, snap.runs_fault)
         if snap.project_refreshed:
             self._apply_sprint_tree(snap.sprint)
             self._apply_deferred(snap.deferred)
@@ -950,9 +952,15 @@ class DashboardScreen(Screen[None]):
                 last = snap.new_attention.strip().splitlines()[-1]
                 self.notify(last, title="attention", severity="warning", timeout=10)
 
-    def _apply_runs(self, runs: list[data.RunInfo]) -> None:
+    def _apply_runs(self, runs: list[data.RunInfo], fault: str | None = None) -> None:
         table = self.query_one("#runs", DataTable)
-        self._apply_attention(table, runs)
+        self._apply_attention(table, runs, fault)
+        if fault != self._runs_fault:
+            # Toasted once per distinct fault, not every rescan; the border title
+            # keeps saying it for as long as it holds.
+            self._runs_fault = fault
+            if fault is not None:
+                self.notify(f"run listing incomplete: {fault}", severity="warning", markup=False)
         ids = [r.run_id for r in runs]
         if not runs:
             if self._run_rows:
@@ -1034,12 +1042,17 @@ class DashboardScreen(Screen[None]):
                 return agent_label(record.adapter, record.model)
         return "-"
 
-    def _apply_attention(self, table: DataTable, runs: list[data.RunInfo]) -> None:
+    def _apply_attention(
+        self, table: DataTable, runs: list[data.RunInfo], fault: str | None = None
+    ) -> None:
         """Global attention indicator: how many runs are paused awaiting a human.
         Shown on the runs-table border title, consistent with the per-run pause
-        badge and the ATTENTION-file notify machinery."""
+        badge and the ATTENTION-file notify machinery. An incomplete listing
+        (DW-468) says so there too: an empty table over an unreadable runs dir is
+        not "no runs"."""
         waiting = sum(1 for r in runs if r.status == data.PAUSED)
-        table.border_title = f"Runs — ⚑ {waiting} need attention" if waiting else "Runs"
+        title = f"Runs — ⚑ {waiting} need attention" if waiting else "Runs"
+        table.border_title = f"{title} — listing incomplete" if fault is not None else title
 
     def _apply_board(self, snap: _Snapshot) -> None:
         """Toggle the sprint tree vs the stories board by the selected run's mode

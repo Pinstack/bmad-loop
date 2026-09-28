@@ -2611,7 +2611,51 @@ def test_list_json_empty_runs_is_valid_empty_document(project, capsys):
     """No runs is a valid empty document with exit 0 — never the text
     "no runs found" (which would corrupt the stream; exit-code parity holds)."""
     doc = _list_json(project, capsys)
-    assert doc == {"schema_version": 1, "runs": []}
+    assert doc == {"schema_version": 1, "runs": [], "listing_fault": None}
+
+
+def _deny_stat_under(monkeypatch, root: Path) -> None:
+    """Every `stat()` of `root` or below raises EACCES — an unreadable dir, as
+    3.14's `is_dir`/`is_file` would fold it into False."""
+    real = Path.stat
+
+    def stat(self, *args, **kwargs):
+        if self == root or root in self.parents:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+
+
+def test_list_names_an_unreadable_runs_dir_instead_of_no_runs(project, capsys, monkeypatch):
+    """DW-468: `list` over an unreadable runs dir warns with the fault rather than
+    printing "no runs found"; `--json` carries it as `listing_fault`, stderr
+    empty. Ablate the listing fault in `list_run_dirs` and this fails."""
+    _make_list_run(project, "20260101-000000-aaaa", started_at="x", finished=True)
+    _deny_stat_under(monkeypatch, project.project / ".bmad-loop" / "runs")
+
+    assert cli.main(["list", "--project", str(project.project)]) == 0
+    captured = capsys.readouterr()
+    assert "no runs found" not in captured.out
+    assert "run listing incomplete" in captured.err and "PermissionError" in captured.err
+
+    doc = _list_json(project, capsys)
+    assert doc["runs"] == [] and "PermissionError" in doc["listing_fault"]
+
+
+def test_status_names_an_unreadable_runs_dir_instead_of_no_such_run(project, capsys, monkeypatch):
+    """The user-facing "no such run" produced by an unreadable runs dir names the
+    fault instead — by ref, and on the no-ref newest-run fallback."""
+    _make_list_run(project, "20260101-000000-aaaa", started_at="x", finished=True)
+    _deny_stat_under(monkeypatch, project.project / ".bmad-loop" / "runs")
+
+    assert cli.main(["status", "aaaa", "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert "no such run" not in err and "PermissionError" in err
+
+    assert cli.main(["status", "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert "run listing incomplete" in err and "PermissionError" in err
 
 
 def test_list_json_unparseable_state_reported_unknown(project, capsys):
@@ -2700,7 +2744,7 @@ def test_list_document_library_call_matches_the_cli(project, capsys):
     )
 
     from_cli = _list_json(project, capsys)
-    from_library = list_document(discover_runs(project.project))
+    from_library = list_document(*discover_runs(project.project))
 
     assert from_library == from_cli
 
@@ -6801,6 +6845,7 @@ def test_cleanup_json_dry_run_plans_without_pruning(tmp_path, monkeypatch, capsy
         "live": ["live-1"],
         "unverifiable_pid": [],
         "legacy_leftovers": [],
+        "legacy_unverified": [],
     }
     assert doc["ctl_windows"] == {
         "removed": ["sweep-fin-1"],
@@ -6857,6 +6902,7 @@ def test_cleanup_json_nothing_to_clean_up_is_a_valid_empty_document(tmp_path, mo
         "live": [],
         "unverifiable_pid": [],
         "legacy_leftovers": [],
+        "legacy_unverified": [],
     }
     assert doc["ctl_windows"] == {
         "removed": [],
@@ -17646,9 +17692,10 @@ def test_cleanup_names_what_the_migration_left_behind(project, capsys, monkeypat
     monkeypatch.setattr(
         runs,
         "legacy_registry_leftovers",
-        lambda _p, announced=(): {
-            runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl", "bmad-loop-old-1"]
-        },
+        lambda _p, announced=(): (
+            {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl", "bmad-loop-old-1"]},
+            [],
+        ),
     )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
 
@@ -17668,7 +17715,7 @@ def test_cleanup_dry_run_previews_what_the_migration_would_leave_behind(
     monkeypatch.setattr(
         runs,
         "legacy_registry_leftovers",
-        lambda _p, announced=(): {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-old-1"]},
+        lambda _p, announced=(): ({runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-old-1"]}, []),
     )
     monkeypatch.setattr(launch, "prunable_ctl_windows", lambda _p: [])
 
@@ -17697,7 +17744,7 @@ def test_cleanup_dry_run_hands_the_remainder_the_plan_it_printed(project, capsys
 
     def _leftovers(_p, announced=()):
         seen.append(sorted(announced))
-        return {}
+        return {}, []
 
     monkeypatch.setattr(runs, "legacy_registry_leftovers", _leftovers)
     monkeypatch.setattr(launch, "prunable_ctl_windows", lambda _p: [])
@@ -17720,7 +17767,7 @@ def test_cleanup_json_carries_the_remainder_and_leaves_stderr_empty(project, cap
     monkeypatch.setattr(
         runs,
         "legacy_registry_leftovers",
-        lambda _p, announced=(): {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-old-1"]},
+        lambda _p, announced=(): ({runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-old-1"]}, []),
     )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
 
@@ -17753,10 +17800,13 @@ def test_cleanup_names_the_registry_each_leftover_is_actually_in(project, capsys
     monkeypatch.setattr(
         runs,
         "legacy_registry_leftovers",
-        lambda _p, announced=(): {
-            runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl"],
-            theirs: ["bmad-loop-old-1"],
-        },
+        lambda _p, announced=(): (
+            {
+                runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl"],
+                theirs: ["bmad-loop-old-1"],
+            },
+            [],
+        ),
     )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
 
@@ -17784,10 +17834,13 @@ def test_cleanup_json_flattens_the_remainder_to_the_documented_list(project, cap
     monkeypatch.setattr(
         runs,
         "legacy_registry_leftovers",
-        lambda _p, announced=(): {
-            runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl"],
-            r"D:\theirs": ["bmad-loop-old-1"],
-        },
+        lambda _p, announced=(): (
+            {
+                runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl"],
+                r"D:\theirs": ["bmad-loop-old-1"],
+            },
+            [],
+        ),
     )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
 
@@ -17802,11 +17855,39 @@ def test_cleanup_says_nothing_about_a_registry_with_no_remainder(project, capsys
     from bmad_loop.tui import launch
 
     monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
-    monkeypatch.setattr(runs, "legacy_registry_leftovers", lambda _p, announced=(): {})
+    monkeypatch.setattr(runs, "legacy_registry_leftovers", lambda _p, announced=(): ({}, []))
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
 
     assert cli.main(["cleanup", "--project", str(project.project)]) == 0
-    assert "not migrated" not in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "not migrated" not in err and "not checked" not in err
+
+
+def test_cleanup_names_a_legacy_registry_that_could_not_be_asked(project, capsys, monkeypatch):
+    """DW-469: a registry whose listing raised used to print exactly what an empty
+    one prints — nothing. Text names it on stderr; --json carries it as
+    `sessions.legacy_unverified` with stderr empty. Ablate the `unverified` loop
+    in `_warn_legacy_leftovers` (or the document field) and this fails."""
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(
+        runs,
+        "legacy_registry_leftovers",
+        lambda _p, announced=(): ({}, ["/reg/broken: could not be listed: no server"]),
+    )
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+
+    assert cli.main(["cleanup", "--project", str(project.project)]) == 0
+    err = capsys.readouterr().err
+    assert "not checked" in err and "/reg/broken" in err and "no server" in err
+
+    assert cli.main(["cleanup", "--json", "--project", str(project.project)]) == 0
+    captured = capsys.readouterr()
+    doc = json.loads(captured.out)
+    assert doc["sessions"]["legacy_unverified"] == ["/reg/broken: could not be listed: no server"]
+    assert doc["sessions"]["legacy_leftovers"] == []
+    assert captured.err == ""
 
 
 @pytest.mark.parametrize("read_target", ["ledger", "archive"])

@@ -160,6 +160,16 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Report an unreadable runs dir (or run dir) instead of listing "no runs": `list`
+  warns on stderr and `list --json` / `clean --json` gain an additive `listing_fault`;
+  `status`/`attach`/`diagnose`, `clean`, `decisions`, the run-start worktree reconcile
+  and the TUI dashboard and launch guard say so; a run ref the incomplete listing
+  cannot settle is refused naming the fault, not `no such run`. Same answer on
+  Python 3.11–3.14, whose `is_dir`/`is_file` now swallow the fault (DW-468).
+- Name a legacy multiplexer registry `cleanup` could not ask (listing failed, or no
+  backend selectable) on stderr, in the TUI, and as additive
+  `sessions.legacy_unverified` in `cleanup --json`, instead of reading as one with
+  nothing left (DW-469).
 - Carry story edits to skip-worktree-pinned hook configs in the `changes.patch` of a
   merged unit escalated on a failed merge-back, as the DEFERRED unit's patch does (DW-501).
 - Drop a DEFERRED unit's pinned-config record (a copy of the operator's hook settings)

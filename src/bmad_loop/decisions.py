@@ -368,7 +368,9 @@ def pending_missed_decisions(project: Path) -> list[Decision]:
 
     # (run-id, cycle) descending == most recent first; run ids sort chronologically
     triage_files: list[tuple[str, int, Path]] = []
-    for run_dir in runs.list_run_dirs(project):
+    # A listing fault (DW-468) is surfaced by the callers, as the ledger fault
+    # above is: `cmd_decisions` notes it on stderr, the TUI reports it as its fault.
+    for run_dir in runs.list_run_dirs(project)[0]:
         for tp in run_dir.glob("triage*.json"):
             m = _TRIAGE_RE.match(tp.name)
             if m:

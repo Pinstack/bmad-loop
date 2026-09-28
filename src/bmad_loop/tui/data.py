@@ -1067,7 +1067,9 @@ def pending_missed_decisions(project: Path) -> MissedDecisions:
     raises, and a ledger that exists but cannot be read each answer a
     ``fault`` (DW-473) — the last because ``decisions.pending_missed_decisions``
     reads an unreadable ledger as "no open ids" and answers ``[]``, the same
-    probe ``cmd_decisions`` makes. A fault is not cached: the next call retries."""
+    probe ``cmd_decisions`` makes. So does an incomplete run listing (DW-468):
+    the triage caches of a run that cannot be read are missing from the answer.
+    A fault is not cached: the next call retries."""
     from .. import decisions  # lazy: pulls sweep; keep this module import-light
 
     paths = _project_paths(project)
@@ -1075,10 +1077,13 @@ def pending_missed_decisions(project: Path) -> MissedDecisions:
         why = _paths_fault.get(project, "BMAD config unavailable")
         return MissedDecisions([], fault=f"BMAD config cannot be loaded ({why})")
     project = paths.project
+    run_dirs, listing_fault = list_run_dirs(project)
+    if listing_fault is not None:
+        return MissedDecisions([], fault=f"run listing incomplete ({listing_fault})")
     sig = (
         _stat_sig(paths.deferred_work),
         _stat_sig(decisions.store_path(project)),
-        tuple(d.name for d in list_run_dirs(project)),
+        tuple(d.name for d in run_dirs),
     )
     cached = _missed_cache.get(project)
     if cached is not None and cached[0] == sig:

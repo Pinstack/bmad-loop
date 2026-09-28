@@ -148,6 +148,9 @@ Two further consequences:
 
   Whatever the sweep leaves standing is **named on stderr** (and in `cleanup --json`, at
   `sessions.legacy_leftovers`) so a removal count never quietly stands for a partial migration.
+  A legacy registry that could not be asked at all — its listing failed, or no backend could be
+  selected to name one — is named the same way (`sessions.legacy_unverified` in `--json`, a toast
+  in the TUI), since "not looked at" is not "nothing left".
   Three kinds stay behind by design:
 
   - An **untagged** `bmad-loop-<run-id>` session. In a shared registry a matching run directory

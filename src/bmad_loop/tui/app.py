@@ -19,6 +19,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeVar
 
+from rich.markup import escape
 from rich.text import Text
 from textual import work
 from textual.app import App, SuspendNotSupported
@@ -269,14 +270,17 @@ class BmadLoopApp(App[None]):
         except verify.GitError as e:
             self.notify(f"git check failed: {e}", severity="error")
             return
-        live = [
-            r.run_id for r in data.discover_runs(self.project) if _engine_possibly_live(r.run_dir)
-        ]
-        if live:
+        infos, listing_fault = data.discover_runs(self.project)
+        live = [r.run_id for r in infos if _engine_possibly_live(r.run_dir)]
+        if live or listing_fault is not None:
+            # DW-468: a run the listing could not read may be live too, so an
+            # incomplete listing asks rather than reading as "none live".
+            # Escaped: the modal body is markup, and a path in the fault is not.
+            unread = f"run listing incomplete: {escape(listing_fault)}\n" if listing_fault else ""
             self.push_screen(
                 ConfirmModal(
                     "another run may be live",
-                    f"live or unknown: {', '.join(live)}\n"
+                    f"live or unknown: {', '.join(live) or 'none readable'}\n{unread}"
                     "launching another engine on the same project may conflict.",
                     confirm_label="launch anyway",
                 ),
@@ -1768,7 +1772,16 @@ class BmadLoopApp(App[None]):
         # One toast per registry, naming it: there is more than one legacy
         # registry (psmux's default, and any root this process displaced), and
         # the operator's next action is to open the one holding these.
-        for registry, names in runs.legacy_registry_leftovers(self.project).items():
+        leftovers, unverified = runs.legacy_registry_leftovers(self.project)
+        # DW-469: a registry that could not be asked is not one holding nothing.
+        for line in unverified:
+            self.call_from_thread(
+                self.notify,
+                f"legacy registry not checked for sessions left behind: {line}",
+                severity="warning",
+                markup=False,
+            )
+        for registry, names in leftovers.items():
             self.call_from_thread(
                 self.notify,
                 f"{len(names)} session(s) left in {registry} (not migrated): "

@@ -121,17 +121,123 @@ class _FakeHost(ProcessHost):
         return "python3"
 
 
+def _discover(project):
+    """`discover_runs` over a readable runs dir: the infos, fault asserted None."""
+    infos, fault = runs.discover_runs(project)
+    assert fault is None
+    return infos
+
+
 def test_list_run_dirs_sorted_and_filtered(tmp_path):
     _make_run(tmp_path, "20260611-120000-bbbb")
     _make_run(tmp_path, "20260610-090000-aaaa")
     _make_run(tmp_path, "20260612-080000-cccc", with_state=False)  # no state.json
-    listed = runs.list_run_dirs(tmp_path)
+    listed, fault = runs.list_run_dirs(tmp_path)
     assert [d.name for d in listed] == ["20260610-090000-aaaa", "20260611-120000-bbbb"]
+    assert fault is None
 
 
 def test_list_run_dirs_missing(tmp_path):
-    assert runs.list_run_dirs(tmp_path) == []
-    assert runs.latest_run_dir(tmp_path) is None
+    assert runs.list_run_dirs(tmp_path) == ([], None)
+    assert runs.latest_run_dir(tmp_path) == (None, None)
+    assert runs.discover_runs(tmp_path) == ([], None)
+
+
+def test_list_run_dirs_non_directory_runs_path_is_silent_absence(tmp_path):
+    """A file where the runs dir belongs holds no runs: the same silent answer
+    `is_dir()` gave, not a fault."""
+    (tmp_path / runs.RUNS_DIR).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / runs.RUNS_DIR).write_text("not a directory", encoding="utf-8")
+    assert runs.list_run_dirs(tmp_path) == ([], None)
+
+
+def _deny_stat_under(monkeypatch, root: Path) -> None:
+    """Every `stat()` of `root` or below raises EACCES — what an unreadable dir
+    does to its subtree, and what 3.14's `is_dir`/`is_file` fold into False."""
+    real = Path.stat
+
+    def stat(self, *args, **kwargs):
+        if self == root or root in self.parents:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+
+
+def test_list_run_dirs_names_an_unreadable_runs_dir(tmp_path, monkeypatch):
+    """DW-468: an unreadable runs dir is not "no runs". Ablate the non-absence
+    `except OSError` arm (fold it into the absent answer) and this fails."""
+    _make_run(tmp_path, "20260610-090000-aaaa")
+    root = tmp_path / runs.RUNS_DIR
+    _deny_stat_under(monkeypatch, root)
+    dirs, fault = runs.list_run_dirs(tmp_path)
+    assert dirs == []
+    assert fault is not None and str(root) in fault and "PermissionError" in fault
+    assert runs.latest_run_dir(tmp_path) == (None, fault)
+    assert runs.discover_runs(tmp_path) == ([], fault)
+
+
+def test_list_run_dirs_names_an_unlistable_runs_dir(tmp_path, monkeypatch):
+    _make_run(tmp_path, "20260610-090000-aaaa")
+    root = tmp_path / runs.RUNS_DIR
+    real = Path.iterdir
+
+    def iterdir(self):
+        if self == root:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self)
+
+    monkeypatch.setattr(Path, "iterdir", iterdir)
+    dirs, fault = runs.list_run_dirs(tmp_path)
+    assert dirs == []
+    assert fault is not None and "cannot list" in fault
+
+
+def test_list_run_dirs_keeps_readable_runs_and_names_an_unreadable_one(tmp_path, monkeypatch):
+    """One run dir whose state cannot be stat'd leaves the listing standing and is
+    named — not silently dropped (3.14) and not a raise that loses the rest
+    (3.11-3.13). Ablate the per-entry `unreadable.append` and this fails."""
+    good = _make_run(tmp_path, "20260610-090000-aaaa")
+    bad = _make_run(tmp_path, "20260611-120000-bbbb")
+    _deny_stat_under(monkeypatch, bad)
+    dirs, fault = runs.list_run_dirs(tmp_path)
+    assert dirs == [good]
+    assert fault is not None and "20260611-120000-bbbb" in fault
+    # "newest" over an incomplete listing is only the newest readable run, and says so
+    assert runs.latest_run_dir(tmp_path) == (good, fault)
+
+
+def test_resolve_run_dir_names_an_unreadable_runs_dir_instead_of_no_such_run(tmp_path, monkeypatch):
+    """DW-468: the user-facing "no such run" over an unreadable runs dir names the
+    fault instead — for a partial ref and for the exact id alike (whose `is_file`
+    probe raises on 3.11-3.13 and folds on 3.14). Ablate the fault arm and this
+    fails with "no such run"."""
+    _make_run(tmp_path, "20260610-090000-aaaa")
+    _deny_stat_under(monkeypatch, tmp_path / runs.RUNS_DIR)
+    for ref in ("aaaa", "20260610-090000-aaaa"):
+        with pytest.raises(runs.RunRefError) as exc:
+            runs.resolve_run_dir(tmp_path, ref)
+        assert "no such run" not in str(exc.value)
+        assert "PermissionError" in str(exc.value)
+
+
+def test_resolve_run_dir_refuses_when_an_unreadable_run_could_be_the_one_meant(
+    tmp_path, monkeypatch
+):
+    """A unique readable match is not proven unique while an unreadable run dir's
+    name matches the ref too — resolving past it could act on the wrong run."""
+    _make_run(tmp_path, "20260610-090000-aaaa")
+    bad = _make_run(tmp_path, "20260611-120000-xaaaa")
+    _deny_stat_under(monkeypatch, bad)
+    with pytest.raises(runs.RunRefError, match="incomplete"):
+        runs.resolve_run_dir(tmp_path, "aaaa")
+
+
+def test_resolve_run_dir_resolves_past_an_unreadable_run_no_ref_could_mean(tmp_path, monkeypatch):
+    good = _make_run(tmp_path, "20260610-090000-aaaa")
+    bad = _make_run(tmp_path, "20260611-120000-bbbb")
+    _deny_stat_under(monkeypatch, bad)
+    assert runs.resolve_run_dir(tmp_path, "aaaa") == good
 
 
 def test_all_run_dirs_includes_state_json_less_dirs(tmp_path):
@@ -164,7 +270,7 @@ def test_all_run_dirs_distinguishes_missing_from_unreadable(tmp_path):
 def test_latest_run_dir(tmp_path):
     _make_run(tmp_path, "20260610-090000-aaaa")
     newest = _make_run(tmp_path, "20260611-120000-bbbb")
-    assert runs.latest_run_dir(tmp_path) == newest
+    assert runs.latest_run_dir(tmp_path) == (newest, None)
 
 
 def test_new_run_id_format():
@@ -5870,7 +5976,7 @@ def test_reconcile_orphan_state_dirs_skips_an_entry_it_cannot_resolve(tmp_path, 
 
 
 def test_discover_runs_missing_dir(tmp_path):
-    assert runs.discover_runs(tmp_path) == []
+    assert _discover(tmp_path) == []
 
 
 def test_discover_runs_classification(tmp_path):
@@ -5881,7 +5987,7 @@ def test_discover_runs_classification(tmp_path):
     gone_dir = _make_state_run(tmp_path, "20260611-130000-dddd", run_type="sweep")
     (gone_dir / "engine.pid").write_text(str(_dead_pid()))
 
-    infos = runs.discover_runs(tmp_path)
+    infos = _discover(tmp_path)
     assert [i.status for i in infos] == [
         runs.FINISHED,
         runs.PAUSED,
@@ -5891,7 +5997,7 @@ def test_discover_runs_classification(tmp_path):
     assert infos[0].started_at == "2026-06-11T10:00:00"
     assert [i.run_type for i in infos] == ["story", "story", "story", "sweep"]
     # statuses re-classify on a second (cached-header) pass
-    assert [i.status for i in runs.discover_runs(tmp_path)] == [i.status for i in infos]
+    assert [i.status for i in _discover(tmp_path)] == [i.status for i in infos]
 
 
 def test_live_pid_with_unreadable_identity_is_unknown_not_interrupted(tmp_path, monkeypatch):
@@ -5907,7 +6013,7 @@ def test_live_pid_with_unreadable_identity_is_unknown_not_interrupted(tmp_path, 
     # in this module to exercise the full delegation path.
     monkeypatch.setattr(runs, "get_process_host", lambda: Host())
     assert runs.liveness(run_dir) == "unknown"
-    assert runs.discover_runs(tmp_path)[0].status == runs.UNKNOWN
+    assert _discover(tmp_path)[0].status == runs.UNKNOWN
 
 
 def test_process_host_misconfig_degrades_to_unknown(tmp_path, monkeypatch):
@@ -5924,12 +6030,12 @@ def test_process_host_misconfig_degrades_to_unknown(tmp_path, monkeypatch):
 
     monkeypatch.setattr(runs, "get_process_host", boom)
     assert runs.liveness(run_dir) == "unknown"
-    assert runs.discover_runs(tmp_path)[0].status == runs.UNKNOWN
+    assert _discover(tmp_path)[0].status == runs.UNKNOWN
 
 
 def test_finished_beats_stopped(tmp_path):
     _make_state_run(tmp_path, "20260611-100000-aaaa", finished=True, stopped=True)
-    assert runs.discover_runs(tmp_path)[0].status == runs.FINISHED
+    assert _discover(tmp_path)[0].status == runs.FINISHED
 
 
 def test_discover_runs_marks_graceful_stop_pending_while_running(tmp_path):
@@ -5937,9 +6043,9 @@ def test_discover_runs_marks_graceful_stop_pending_while_running(tmp_path):
 
     run_dir = _make_state_run(tmp_path, "20260611-120000-cccc")
     runs.write_pid(run_dir)  # test process pid: alive -> RUNNING
-    assert runs.discover_runs(tmp_path)[0].stopping is False  # no request yet
+    assert _discover(tmp_path)[0].stopping is False  # no request yet
     (run_dir / STOP_REQUEST_FILE).write_text("{}", encoding="utf-8")
-    info = runs.discover_runs(tmp_path)[0]
+    info = _discover(tmp_path)[0]
     assert info.status == runs.RUNNING
     assert info.stopping is True
 
@@ -5958,9 +6064,9 @@ def test_discover_runs_marks_graceful_stop_pending_while_unknown(tmp_path, monke
             return "unknown"
 
     monkeypatch.setattr(runs, "get_process_host", lambda: Host())
-    assert runs.discover_runs(tmp_path)[0].stopping is False  # no request yet
+    assert _discover(tmp_path)[0].stopping is False  # no request yet
     (run_dir / STOP_REQUEST_FILE).write_text("{}", encoding="utf-8")
-    info = runs.discover_runs(tmp_path)[0]
+    info = _discover(tmp_path)[0]
     assert info.status == runs.UNKNOWN
     assert info.stopping is True
 
@@ -5975,7 +6081,7 @@ def test_stopping_ignored_on_a_non_running_run(tmp_path):
     (stopped / STOP_REQUEST_FILE).write_text("{}", encoding="utf-8")
     finished = _make_state_run(tmp_path, "20260611-110000-bbbb", finished=True)
     (finished / STOP_REQUEST_FILE).write_text("{}", encoding="utf-8")
-    infos = {i.run_id: i for i in runs.discover_runs(tmp_path)}
+    infos = {i.run_id: i for i in _discover(tmp_path)}
     assert infos["20260611-100000-aaaa"].status == runs.STOPPED
     assert infos["20260611-100000-aaaa"].stopping is False
     assert infos["20260611-110000-bbbb"].status == runs.FINISHED
@@ -5986,7 +6092,7 @@ def test_discover_runs_legacy_no_pid_is_unknown(tmp_path, monkeypatch):
     _make_state_run(tmp_path, "20260611-100000-aaaa")
     # legacy liveness now flows through the multiplexer backend; patch its seam.
     monkeypatch.setattr(tmux_base.shutil, "which", lambda _: None)
-    assert runs.discover_runs(tmp_path)[0].status == runs.UNKNOWN
+    assert _discover(tmp_path)[0].status == runs.UNKNOWN
 
 
 @pytest.mark.usefixtures("force_tmux_backend")  # asserts tmux liveness through the seam
@@ -6004,7 +6110,7 @@ def test_legacy_run_with_live_tmux_session_is_running(tmp_path, monkeypatch):
         return Proc()
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake_run)
-    assert runs.discover_runs(tmp_path)[0].status == runs.RUNNING
+    assert _discover(tmp_path)[0].status == runs.RUNNING
     assert calls[0][:3] == ["tmux", "has-session", "-t"]
     assert calls[0][3] == f"=bmad-loop-{run_dir.name}"
 
@@ -6020,13 +6126,13 @@ def test_legacy_run_liveness_unknown_when_backend_query_fails(tmp_path, monkeypa
         raise tmux_base.subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
 
     monkeypatch.setattr(tmux_base.subprocess, "run", boom)
-    assert runs.discover_runs(tmp_path)[0].status == runs.UNKNOWN
+    assert _discover(tmp_path)[0].status == runs.UNKNOWN
 
 
 def test_discover_runs_corrupt_state_is_unknown_not_crash(tmp_path):
     run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
     (run_dir / "state.json").write_text("{ not json")
-    infos = runs.discover_runs(tmp_path)
+    infos = _discover(tmp_path)
     assert [i.status for i in infos] == [runs.UNKNOWN]
     assert infos[0].run_id == "20260611-100000-aaaa"
 
@@ -6040,7 +6146,7 @@ def test_discover_runs_reports_pause_stage(tmp_path):
         paused_reason="plan checkpoint for 1",
         paused_stage=PAUSE_PLAN_CHECKPOINT,
     )
-    info = runs.discover_runs(tmp_path)[0]
+    info = _discover(tmp_path)[0]
     assert info.status == runs.PAUSED
     assert info.paused_stage == PAUSE_PLAN_CHECKPOINT
 
@@ -6048,7 +6154,7 @@ def test_discover_runs_reports_pause_stage(tmp_path):
 def test_discover_runs_pause_stage_blank_when_not_paused(tmp_path):
     # a finished run keeps its last paused_stage in state; it must not badge.
     _make_state_run(tmp_path, "20260101-000000-aaaa", finished=True, paused_stage="plan-checkpoint")
-    info = runs.discover_runs(tmp_path)[0]
+    info = _discover(tmp_path)[0]
     assert info.status == runs.FINISHED
     assert info.paused_stage == ""
 
@@ -6079,7 +6185,7 @@ def test_stopped_run_classifies_as_stopped_not_interrupted(tmp_path):
     # a deliberate stop leaves a dead pid; it must read STOPPED, not INTERRUPTED
     run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa", stopped=True)
     (run_dir / "engine.pid").write_text(str(_dead_pid()))
-    assert runs.discover_runs(tmp_path)[0].status == runs.STOPPED
+    assert _discover(tmp_path)[0].status == runs.STOPPED
 
 
 def test_classify_crashed(tmp_path):
@@ -6098,7 +6204,7 @@ def test_classify_crashed(tmp_path):
     # a state.json carrying crashed=True surfaces through discover_runs
     run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa", crashed=True)
     (run_dir / "engine.pid").write_text(str(_dead_pid()))
-    assert runs.discover_runs(tmp_path)[0].status == runs.CRASHED
+    assert _discover(tmp_path)[0].status == runs.CRASHED
 
 
 def test_classify_legacy_crash_stays_interrupted(tmp_path):
@@ -6109,7 +6215,7 @@ def test_classify_legacy_crash_stays_interrupted(tmp_path):
     doc.pop("crashed", None)
     (run_dir / "state.json").write_text(json.dumps(doc), encoding="utf-8")
     (run_dir / "engine.pid").write_text(str(_dead_pid()))
-    assert runs.discover_runs(tmp_path)[0].status == runs.INTERRUPTED
+    assert _discover(tmp_path)[0].status == runs.INTERRUPTED
 
 
 # ------------------------------- the stop-request channel's confined write (#593)
@@ -7296,6 +7402,14 @@ def test_orphan_state_sweep_still_reaps_a_real_orphan_beside_the_registry(tmp_pa
     assert runs.mux_registry_root(tmp_path).exists()
 
 
+def _healthy_leftovers(project, **kw):
+    """`legacy_registry_leftovers` where every registry answered: the grouped
+    remainder, with the fault list asserted empty (a healthy registry is silent)."""
+    grouped, faults = runs.legacy_registry_leftovers(project, **kw)
+    assert faults == []
+    return grouped
+
+
 class _RegistryMux:
     """A backend bound to one registry, standing in for the cleanup sweep's
     second pass. Only the verbs the partition, the kill and the remainder use.
@@ -7457,15 +7571,32 @@ def test_export_records_nothing_when_it_displaced_nothing(tmp_path, monkeypatch)
     assert psmux_backend._DISPLACED_ROOT is None
 
 
-def test_legacy_registries_degrades_when_no_backend_can_be_selected(monkeypatch):
-    """A cleanup that already swept the primary registry must report that work
-    rather than die on the migration pass."""
+def test_legacy_registries_raises_when_no_backend_can_be_selected(monkeypatch):
+    """ "Could not ask" is not "no legacy registry" (DW-469): the selection fault
+    reaches the callers, which each degrade on their own terms."""
 
     def boom():
         raise MultiplexerError("no backend")
 
     monkeypatch.setattr(runs, "get_multiplexer", boom)
-    assert runs._legacy_registries() == []
+    with pytest.raises(MultiplexerError, match="no backend"):
+        runs._legacy_registries()
+
+
+def test_prune_sessions_skips_the_migration_pass_when_no_backend_can_be_selected(
+    tmp_path, monkeypatch
+):
+    """A cleanup that already swept the primary registry must report that work
+    rather than die on the migration pass; the fault is reported by
+    `legacy_registry_leftovers`, not by widening this tuple."""
+
+    def boom():
+        raise MultiplexerError("no backend")
+
+    monkeypatch.setattr(runs, "prunable_sessions", lambda *_a, **_k: (["r1"], [], set()))
+    monkeypatch.setattr(runs, "_registry_proves_ownership", lambda _p: True)
+    monkeypatch.setattr(runs, "_legacy_registries", boom)
+    assert runs.prune_sessions(tmp_path, dry_run=True) == (["r1"], [], set())
 
 
 # --------------------------------- legacy registry: ownership and remainder
@@ -7638,9 +7769,7 @@ def test_legacy_registry_leftovers_names_an_untagged_session(tmp_path, monkeypat
     excludes what it chose not to claim reads as "everything is clean"."""
     legacy = _RegistryMux(["bmad-loop-old-1"], {})
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
-    assert runs.legacy_registry_leftovers(tmp_path) == {
-        runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-old-1"]
-    }
+    assert _healthy_leftovers(tmp_path) == {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-old-1"]}
 
 
 def test_legacy_registry_leftovers_keys_each_session_to_its_own_registry(tmp_path, monkeypatch):
@@ -7662,7 +7791,7 @@ def test_legacy_registry_leftovers_keys_each_session_to_its_own_registry(tmp_pat
     displaced = _RegistryMux(["bmad-loop-old-1"], {}, root=theirs)
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [default_reg, displaced])
 
-    assert runs.legacy_registry_leftovers(tmp_path) == {
+    assert _healthy_leftovers(tmp_path) == {
         runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl"],
         theirs: ["bmad-loop-old-1"],
     }
@@ -7677,7 +7806,7 @@ def test_legacy_registry_leftovers_merges_two_registries_that_name_one_root(tmp_
     both = _RegistryMux(["bmad-loop-a"], {}), _RegistryMux(["bmad-loop-b"], {})
     monkeypatch.setattr(runs, "_legacy_registries", lambda: list(both))
 
-    assert runs.legacy_registry_leftovers(tmp_path) == {
+    assert _healthy_leftovers(tmp_path) == {
         runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-a", "bmad-loop-b"]
     }
 
@@ -7688,9 +7817,7 @@ def test_legacy_registry_leftovers_names_a_surviving_control_session(tmp_path, m
     the migration. Naming it is the whole remedy."""
     legacy = _RegistryMux([runs.CTL_SESSION], {})
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
-    assert runs.legacy_registry_leftovers(tmp_path) == {
-        runs.DEFAULT_REGISTRY_LABEL: [runs.CTL_SESSION]
-    }
+    assert _healthy_leftovers(tmp_path) == {runs.DEFAULT_REGISTRY_LABEL: [runs.CTL_SESSION]}
 
 
 def test_legacy_leftovers_names_a_case_variant_ctl_where_the_transport_folds(tmp_path, monkeypatch):
@@ -7705,7 +7832,7 @@ def test_legacy_leftovers_names_a_case_variant_ctl_where_the_transport_folds(tmp
     upper = runs.CTL_SESSION.upper() + "-0123456789ABCDEF"
     legacy = _RegistryMux([upper], {}, fold=True)
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
-    assert runs.legacy_registry_leftovers(tmp_path) == {runs.DEFAULT_REGISTRY_LABEL: [upper]}
+    assert _healthy_leftovers(tmp_path) == {runs.DEFAULT_REGISTRY_LABEL: [upper]}
 
 
 def test_legacy_leftovers_leaves_a_case_variant_alone_where_the_transport_is_exact(
@@ -7722,25 +7849,48 @@ def test_legacy_leftovers_leaves_a_case_variant_alone_where_the_transport_is_exa
     upper = runs.CTL_SESSION.upper() + "-0123456789ABCDEF"
     legacy = _RegistryMux([upper], {})  # identity key: the seam default
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
-    assert runs.legacy_registry_leftovers(tmp_path) == {}
+    assert _healthy_leftovers(tmp_path) == {}
 
 
 def test_legacy_registry_leftovers_degrades_on_a_transport_fault(tmp_path, monkeypatch):
     """Observation degrades: the sweep's own report still stands, and a migration
     remainder nobody could read is not a reason to fail a cleanup that already
-    killed sessions."""
+    killed sessions. But visibly (DW-469): the registry that raised is named in
+    `faults`, and the one that answered still reports its remainder. Ablate the
+    `faults.append` and this fails — the answer is then indistinguishable from a
+    clean migration."""
 
     class _Broken(_RegistryMux):
         def list_sessions(self):
             raise MultiplexerError("no server")
 
-    monkeypatch.setattr(runs, "_legacy_registries", lambda: [_Broken([], {})])
-    assert runs.legacy_registry_leftovers(tmp_path) == {}
+    healthy = _RegistryMux(["bmad-loop-old-1"], {}, root="/reg/displaced")
+    monkeypatch.setattr(
+        runs, "_legacy_registries", lambda: [_Broken([], {}, root="/reg/broken"), healthy]
+    )
+    grouped, faults = runs.legacy_registry_leftovers(tmp_path)
+    assert grouped == {"/reg/displaced": ["bmad-loop-old-1"]}
+    assert len(faults) == 1
+    assert "/reg/broken" in faults[0] and "no server" in faults[0]
+
+
+def test_legacy_registry_leftovers_reports_a_backend_that_cannot_be_selected(tmp_path, monkeypatch):
+    """No backend means no legacy registry could even be named — "could not ask",
+    which `{}` alone used to say exactly like "nothing left" (DW-469). Ablate the
+    `_legacy_registries` raise back to `return []` and this fails."""
+
+    def boom():
+        raise MultiplexerError("no backend")
+
+    monkeypatch.setattr(runs, "get_multiplexer", boom)
+    grouped, faults = runs.legacy_registry_leftovers(tmp_path)
+    assert grouped == {}
+    assert len(faults) == 1 and "no backend" in faults[0]
 
 
 def test_legacy_registry_leftovers_is_empty_with_no_legacy_registry(tmp_path, monkeypatch):
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [])
-    assert runs.legacy_registry_leftovers(tmp_path) == {}
+    assert _healthy_leftovers(tmp_path) == {}
 
 
 # ------------------ legacy remainder: our own stranded sessions (#537)
@@ -7759,9 +7909,7 @@ def test_legacy_registry_leftovers_names_our_own_live_session(tmp_path, monkeypa
     assert runs.prune_sessions(tmp_path) == ([], ["live-1"], set())
     assert legacy.killed == []
     # ...and the remainder says so
-    assert runs.legacy_registry_leftovers(tmp_path) == {
-        runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-live-1"]
-    }
+    assert _healthy_leftovers(tmp_path) == {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-live-1"]}
 
 
 def test_legacy_registry_leftovers_stays_quiet_about_a_dead_session_the_sweep_takes(
@@ -7777,7 +7925,7 @@ def test_legacy_registry_leftovers_stays_quiet_about_a_dead_session_the_sweep_ta
 
     plan = runs.prune_sessions(tmp_path, dry_run=True)
     assert plan == (["fin-1"], [], set())
-    assert runs.legacy_registry_leftovers(tmp_path, announced=plan[0]) == {}
+    assert _healthy_leftovers(tmp_path, announced=plan[0]) == {}
 
 
 def test_legacy_registry_leftovers_still_stays_quiet_about_another_projects_session(
@@ -7791,7 +7939,7 @@ def test_legacy_registry_leftovers_still_stays_quiet_about_another_projects_sess
         {"bmad-loop-theirs-1": "0123456789abcdef"},
     )
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
-    assert runs.legacy_registry_leftovers(tmp_path) == {}
+    assert _healthy_leftovers(tmp_path) == {}
 
 
 # ---------------- legacy remainder: presence, not a resampled partition (#537)
@@ -7833,9 +7981,7 @@ def test_legacy_leftovers_names_a_session_whose_engine_exited_mid_sweep(tmp_path
     assert runs.prune_sessions(tmp_path) == ([], ["race-live"], set())
     assert legacy.killed == []
     # ...and the reader names it even though it now looks prunable
-    assert runs.legacy_registry_leftovers(tmp_path) == {
-        runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-race-live"]
-    }
+    assert _healthy_leftovers(tmp_path) == {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-race-live"]}
 
 
 def test_legacy_leftovers_names_a_session_whose_kill_did_not_land(tmp_path, monkeypatch):
@@ -7853,9 +7999,7 @@ def test_legacy_leftovers_names_a_session_whose_kill_did_not_land(tmp_path, monk
 
     assert runs.prune_sessions(tmp_path) == (["fin-1"], [], set())
     assert legacy.killed == ["bmad-loop-fin-1"]
-    assert runs.legacy_registry_leftovers(tmp_path) == {
-        runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-fin-1"]
-    }
+    assert _healthy_leftovers(tmp_path) == {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-fin-1"]}
 
 
 def test_legacy_leftovers_is_quiet_once_the_sweep_actually_removed_the_session(
@@ -7875,7 +8019,7 @@ def test_legacy_leftovers_is_quiet_once_the_sweep_actually_removed_the_session(
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
 
     assert runs.prune_sessions(tmp_path) == (["fin-1"], [], set())
-    assert runs.legacy_registry_leftovers(tmp_path) == {}
+    assert _healthy_leftovers(tmp_path) == {}
 
 
 def test_legacy_leftovers_dry_run_excludes_what_the_preview_announced(tmp_path, monkeypatch):
@@ -7893,7 +8037,7 @@ def test_legacy_leftovers_dry_run_excludes_what_the_preview_announced(tmp_path, 
 
     plan = runs.prune_sessions(tmp_path, dry_run=True)
     assert plan == (["fin-1"], ["live-1"], set())
-    assert runs.legacy_registry_leftovers(tmp_path, announced=plan[0]) == {
+    assert _healthy_leftovers(tmp_path, announced=plan[0]) == {
         runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-live-1"]
     }
 
@@ -7923,7 +8067,7 @@ def test_legacy_leftovers_dry_run_never_drops_what_the_preview_did_not_announce(
     plan = runs.prune_sessions(tmp_path, dry_run=True)
     assert plan == ([], ["race-live"], set())  # nothing announced as a would-kill
     assert legacy.killed == []
-    assert runs.legacy_registry_leftovers(tmp_path, announced=plan[0]) == {
+    assert _healthy_leftovers(tmp_path, announced=plan[0]) == {
         runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-race-live"]
     }
 
@@ -7956,11 +8100,11 @@ def test_legacy_leftovers_dry_run_keeps_what_the_legacy_pass_cannot_claim(tmp_pa
 
     plan = runs.prune_sessions(tmp_path, dry_run=True)
     assert plan == (["dup"], [], set())  # announced by the primary pass alone
-    preview = runs.legacy_registry_leftovers(tmp_path, announced=plan[0])
+    preview = _healthy_leftovers(tmp_path, announced=plan[0])
 
     assert runs.prune_sessions(tmp_path) == (["dup"], [], set())
     assert legacy.killed == []  # the legacy pass declined it, as it must
-    assert preview == runs.legacy_registry_leftovers(tmp_path)
+    assert preview == _healthy_leftovers(tmp_path)
     assert preview == {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-dup"]}
 
 
