@@ -160,6 +160,11 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Skip the ledger-publication candidate cleanup's `git worktree remove --force` and
+  `git worktree prune` when `<git-common-dir>/worktrees/` holds a symlinked or junction
+  entry, which git follows and empties the target of. Raised as a cleanup fault (or a
+  note on the propagating error) naming the entry: remove the link, then run
+  `git worktree prune` (DW-494).
 - Report an unreadable runs dir (or run dir) instead of listing "no runs": `list`
   warns on stderr and `list --json` / `clean --json` gain an additive `listing_fault`;
   `status`/`attach`/`diagnose`, `clean`, `decisions`, the run-start worktree reconcile

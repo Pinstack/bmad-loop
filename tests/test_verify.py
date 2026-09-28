@@ -10933,7 +10933,9 @@ def test_commit_path_bound_pin_refuses_a_gitfile_naming_no_candidate_admin_dir(
       failure);
     - `linked-admin` names `worktrees/evil`, a symlink to another repository's
       gitdir (back-pointer planted there; POSIX symlinks) — ablate the
-      `pinned_root_identity` link guard and git runs against `outside`;
+      `pinned_root_identity` link guard and git runs against `outside`; the
+      link stays planted through cleanup, so it also holds DW-494's guard on
+      the cleanup `worktree remove` and `worktree prune`;
     - `sibling` names a real sibling linked worktree's admin dir — ablate the
       back-pointer check and the candidate calls run in the sibling's admin dir
       and publication goes through (only cleanup fails);
@@ -11006,11 +11008,10 @@ def test_commit_path_bound_pin_refuses_a_gitfile_naming_no_candidate_admin_dir(
         gitfile.write_bytes(f"gitdir: {value}\n".encode())
 
     _intercept_candidate_checkout(monkeypatch, forge)
-    if forgery in ("linked-admin", "foreign-commondir"):
+    if forgery == "foreign-commondir":
         # With the back-pointer planted, the cleanup's `worktree remove --force`
-        # resolves the candidate path to the `evil` entry, validates it, and
-        # deletes that admin dir — through the link for `linked-admin`,
-        # emptying `outside/.git` — leaving the real entry unpruned. That is
+        # resolves the candidate path to the real `evil` entry, validates it,
+        # and deletes that admin dir, leaving the real entry unpruned. That is
         # the unchanged cleanup flow, not the pin, so undo the plant before it
         # runs and observe only the candidate calls.
         real_git = verify._git
@@ -11018,17 +11019,14 @@ def test_commit_path_bound_pin_refuses_a_gitfile_naming_no_candidate_admin_dir(
         def unplant_then_git(git_repo, *args, **kwargs):
             if args[:2] == ("worktree", "remove"):
                 for evil in Path(git_repo).glob(".git/worktrees/evil"):
-                    if evil.is_symlink():
-                        evil.unlink()
-                    else:
-                        shutil.rmtree(evil)
+                    shutil.rmtree(evil)
                 (outside / ".git" / "gitdir").unlink(missing_ok=True)
             return real_git(git_repo, *args, **kwargs)
 
         monkeypatch.setattr(verify, "_git", unplant_then_git)
 
     try:
-        with pytest.raises(verify.GitError, match="gitfile .* does not name a worktree of"):
+        with pytest.raises(verify.GitError, match="gitfile .* does not name a worktree of") as info:
             verify.commit_path_bound(
                 repo,
                 "chore: bound ledger",
@@ -11039,6 +11037,23 @@ def test_commit_path_bound_pin_refuses_a_gitfile_naming_no_candidate_admin_dir(
     finally:
         (outside / ".git" / "gitdir").unlink(missing_ok=True)
         (outside / ".git" / "commondir").unlink(missing_ok=True)
+
+    if forgery == "linked-admin":
+        # DW-494: the `evil` link stays planted through cleanup. Git follows it
+        # during `worktree remove --force` (its back-pointer claims the
+        # candidate) and during `worktree prune`, emptying `outside/.git`, so
+        # both are skipped and named on the refusal — ablate either guard and
+        # the `outside` asserts below fail. The manual recovery then clears the
+        # left-over registration.
+        evil = repo / ".git" / "worktrees" / "evil"
+        assert (outside / ".git" / "HEAD").is_file()
+        assert verify.rev_parse_head(outside) == outside_head
+        assert evil.is_symlink()
+        notes = "\n".join(getattr(info.value, "__notes__", []))
+        assert f"cleanup also failed in {repo}: linked worktree admin entry {evil}" in notes
+        assert f"git worktree prune skipped in {repo}: linked worktree admin entry {evil}" in notes
+        evil.unlink()
+        git(repo, "worktree", "prune")
 
     assert seen
     assert verify.rev_parse_head(repo) == original
@@ -11203,17 +11218,17 @@ def test_commit_path_bound_refuses_a_candidate_admin_dir_changed_after_the_pin(
         tampered.append(True)
 
     _at_candidate_point(monkeypatch, tamper_point, tamper_with)
-    # The cleanup `worktree remove` follows a linked admin entry (DW-494); put the
-    # pinned one back first and observe only the candidate calls.
-    real_git = verify._git
+    # The cleanup refuses to hand git a linked admin entry (DW-494), which would
+    # leave the registration behind; put the pinned one back before that guard
+    # looks and observe only the candidate calls.
+    real_fault = verify._linked_worktree_admin_fault
 
-    def restore_then_git(git_repo, *args, **kwargs):
-        if args[:2] == ("worktree", "remove"):
-            while restore:
-                restore.pop()()
-        return real_git(git_repo, *args, **kwargs)
+    def restore_then_check(repo_root):
+        while restore:
+            restore.pop()()
+        return real_fault(repo_root)
 
-    monkeypatch.setattr(verify, "_git", restore_then_git)
+    monkeypatch.setattr(verify, "_linked_worktree_admin_fault", restore_then_check)
     expected = "commondir was rewritten" if tamper == "commondir" else "admin dir was replaced"
 
     with pytest.raises(verify.GitError, match=expected):
@@ -11335,6 +11350,77 @@ def _unit_candidate_pin(tmp_path):
     )
     verify._require_pinned_candidate(root, identity, pin)
     return root, identity, pin
+
+
+def test_linked_worktree_admin_fault_names_only_link_entries(project, tmp_path, monkeypatch):
+    """DW-494: no `worktrees/` and a real admin dir under it are no fault; a
+    symlinked entry is, named with the recovery; a failed common-dir probe or an
+    unlistable `worktrees/` fails closed; an entry gone before its stat is
+    skipped, not taken for an empty scan. Ablation: drop the `link_like_stat`
+    filter and the real-dir case faults; return None on the listing fault, the
+    probe's non-zero exit or its `GitError` and that case fails; let the
+    vanished entry's `FileNotFoundError` end the scan and the later link is
+    missed."""
+    repo = project.project
+    worktrees = repo / ".git" / "worktrees"
+    assert not worktrees.exists()
+    assert verify._linked_worktree_admin_fault(repo) is None
+    (worktrees / "real").mkdir(parents=True)
+    assert verify._linked_worktree_admin_fault(repo) is None
+    if sys.platform != "win32":
+        (worktrees / "evil").symlink_to(tmp_path, target_is_directory=True)
+        fault = verify._linked_worktree_admin_fault(repo)
+        assert fault is not None
+        assert str(worktrees / "evil") in fault
+        assert str(worktrees / "real") not in fault
+        assert "then run `git worktree prune`" in fault
+        (worktrees / "evil").unlink()
+
+        # An entry gone between the listing and its stat is skipped, never
+        # taken for an empty scan that hides a later link.
+        real_scandir = os.scandir
+
+        class Vanished:
+            name = "vanished"
+
+            def stat(self, *, follow_symlinks=True):
+                raise FileNotFoundError(2, "gone")
+
+        class Listing:
+            def __init__(self, path):
+                self.inner = real_scandir(path)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self.inner.close()
+
+            def __iter__(self):
+                yield Vanished()
+                yield from self.inner
+
+        (worktrees / "evil").symlink_to(tmp_path, target_is_directory=True)
+        with monkeypatch.context() as patched:
+            patched.setattr(verify.os, "scandir", Listing)
+            assert str(worktrees / "evil") in (verify._linked_worktree_admin_fault(repo) or "")
+        (worktrees / "evil").unlink()
+
+    def unlistable(_path):
+        raise PermissionError("denied")
+
+    def probe_raises(*_args):
+        raise verify.GitError("git timed out")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(verify.os, "scandir", unlistable)
+        assert "could not be listed" in (verify._linked_worktree_admin_fault(repo) or "")
+    with monkeypatch.context() as patched:
+        patched.setattr(verify, "_git_raw_out", lambda *_a: (128, "", "fatal: nope"))
+        assert "probe failed: fatal: nope" in (verify._linked_worktree_admin_fault(repo) or "")
+    with monkeypatch.context() as patched:
+        patched.setattr(verify, "_git_raw_out", probe_raises)
+        assert "probe failed: git timed out" in (verify._linked_worktree_admin_fault(repo) or "")
 
 
 def test_require_pinned_candidate_holds_the_gitfile_identity_and_bytes(tmp_path, monkeypatch):

@@ -11426,6 +11426,58 @@ def _require_pinned_candidate(
         raise GitError("candidate worktree commondir was rewritten or replaced")
 
 
+def _linked_worktree_admin_fault(repo_root: Path) -> str | None:
+    """Why `worktree remove`/`worktree prune` must not run on `repo_root`, or
+    None when its `<git-common-dir>/worktrees/` holds no link-like entry
+    (DW-494).
+
+    Git 2.55 follows a symlinked (or win32 junction) entry under `worktrees/`
+    during `worktree prune`, and during `worktree remove --force` when the
+    entry's back-pointer claims the removed path, emptying whatever the link
+    names — another repository's `.git` included. Each entry is classified by
+    `link_like_stat` over its no-follow `DirEntry` stat. A missing `worktrees/`
+    holds nothing; a failed common-dir probe or an unlistable `worktrees/` is a
+    fault, since it proves nothing safe. The fault names each linked entry and
+    the manual recovery. A check, not a lock: a link planted between it and
+    git's own walk still wins."""
+    try:
+        rc, raw, detail = _git_raw_out(
+            repo_root, "rev-parse", "--path-format=absolute", "--git-common-dir"
+        )
+    except GitError as exc:
+        return f"git common directory probe failed: {exc}"
+    if rc != 0:
+        return f"git common directory probe failed: {detail}"
+    worktrees = Path(raw.removesuffix("\n")) / "worktrees"
+    linked: list[str] = []
+    try:
+        entries = os.scandir(worktrees)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return f"worktree admin directory {worktrees} could not be listed: {exc}"
+    try:
+        with entries:
+            for entry in entries:
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue  # gone since the listing: nothing left for git to follow
+                if platform_util.link_like_stat(info):
+                    linked.append(entry.name)
+    except OSError as exc:
+        return f"worktree admin directory {worktrees} could not be listed: {exc}"
+    linked.sort()
+    if not linked:
+        return None
+    names = ", ".join(str(worktrees / name) for name in linked)
+    return (
+        f"linked worktree admin entry {names} would be followed by git, which "
+        "empties its target; git worktree cleanup skipped — remove the link "
+        "(not its target), then run `git worktree prune`"
+    )
+
+
 def commit_path_bound(
     repo: Path,
     message: str,
@@ -11547,10 +11599,15 @@ def commit_path_bound(
     is named in a note on that error, and tolerated silently on success because
     the published commit is truthful (DW-403). A root that was never pinned or
     has been replaced skips `worktree remove` and counts as such a cleanup
-    fault (DW-425). Missing candidate parents are created component by
-    component beneath the candidate root without following a redirected
-    ancestor, so a swapped-in link refuses before any directory is created
-    outside it (DW-404) — handle-anchored on POSIX and on win32 (DW-420).
+    fault (DW-425). A link-like entry under `<git-common-dir>/worktrees/` —
+    which git follows during both commands, emptying its target — skips the
+    remove the same way, and skips the prune with a note on the propagating
+    error naming the entry and the manual recovery (DW-494); both checks are
+    check-then-act, re-taken right before each command. Missing candidate
+    parents are created component by component beneath the candidate root
+    without following a redirected ancestor, so a swapped-in link refuses
+    before any directory is created outside it (DW-404) — handle-anchored on
+    POSIX and on win32 (DW-420).
 
     Every success return is closed by a final observation. Where Git honours
     `core.fileMode` the live exec bit must match the committed mode, refused
@@ -11658,6 +11715,7 @@ def commit_path_bound(
     if has_non_tree_parent:
         raise GitError("candidate publication path has a non-directory committed parent")
     cleanup_fault = False
+    propagating: BaseException | None = None
     temp_dir: str | None = None
     try:
         # A failed rmtree must not replace the typed error propagating out of
@@ -11814,6 +11872,10 @@ def commit_path_bound(
                     cleanup_detail = "candidate root was never pinned; worktree remove skipped"
                 elif not platform_util._root_still_pinned(candidate_root, candidate_identity):
                     cleanup_detail = "candidate root was replaced; worktree remove skipped"
+                elif (link_fault := _linked_worktree_admin_fault(repo_root)) is not None:
+                    # Git follows a linked admin entry during the remove too,
+                    # when its back-pointer claims the candidate (DW-494).
+                    cleanup_detail = link_fault
                 else:
                     try:
                         rc, out = _git(
@@ -11840,6 +11902,7 @@ def commit_path_bound(
                         f"{cleanup_detail}"
                     )
     except BaseException as exc:
+        propagating = exc
         # Only a failing publication names the leftover; a published commit is
         # truthful, so the success path tolerates it silently.
         if temp_dir is not None and os.path.lexists(temp_dir):
@@ -11851,9 +11914,18 @@ def commit_path_bound(
         raise
     finally:
         # `worktree prune` only drops entries whose directory is gone, so it
-        # runs here, after `TemporaryDirectory` has deleted the checkout.
+        # runs here, after `TemporaryDirectory` has deleted the checkout. A
+        # cleanup fault is always propagating; a linked admin entry git would
+        # follow skips the prune and is named on that error (DW-494).
         if cleanup_fault:
-            worktree_prune(repo_root)
+            link_fault = _linked_worktree_admin_fault(repo_root)
+            if link_fault is None:
+                worktree_prune(repo_root)
+            else:
+                note = f"git worktree prune skipped in {repo_root}: {link_fault}"
+                if propagating is None:
+                    raise GitError(note)
+                propagating.add_note(note)
 
     assert candidate is not None
     _bound_live_ledger_identity(lexical, target, accepted_text, observed=observed)
