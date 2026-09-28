@@ -903,6 +903,51 @@ def test_the_two_commit_probe_records_alias_one_baseline_to_one_name():
         assert canary not in rendered, f"LEAK: {canary!r}"
 
 
+def test_the_two_migration_reset_refusals_alias_one_snapshot_ref():
+    """`snapshot_ref` names the worktree snapshot `sweep._migration_reset` parked
+    before refusing its reset (DW-435), on both of that refusal's records. It is a
+    ref NAME embedding the story slug and a baseline prefix, so it is aliased in a
+    `ref` namespace of its own — one snapshot, one alias across both kinds — rather
+    than left to `scrub_json`, which redacts it only because of its `/`.
+
+    Ablation: drop `"snapshot_ref"` from `_JOURNAL_ALIAS_FIELDS` and the test dies at
+    the `next(...)` alias lookup with `StopIteration`."""
+    ref = f"refs/attempt-preserve-dirty/{PROPRIETARY}-{SHA[:8]}-2"
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    probe_failed = diagnostics._scrub_entry(
+        {
+            "ts": 1.0,
+            "kind": "ledger-snapshot-probe-failed",
+            "story_key": STORY_KEY,
+            "snapshot_ref": ref,
+            "error": f"GitError: git show {ref}:ledger failed in {HOME_PATH}",
+        },
+        pseudo,
+        {},
+        1.0,
+    )
+    diverged = diagnostics._scrub_entry(
+        {
+            "ts": 2.0,
+            "kind": "sweep-migration-restore-diverged",
+            "story_key": STORY_KEY,
+            "ledger": f"{HOME_PATH}/deferred-work.md",
+            "snapshot_ref": ref,
+        },
+        pseudo,
+        {},
+        1.0,
+    )
+
+    alias = next(a for ns, orig, a in pseudo.entries() if ns == "ref" and orig == ref)
+    assert probe_failed["snapshot_ref"] == diverged["snapshot_ref"] == alias != ref
+    assert "error" not in probe_failed and probe_failed["error_present"] is True
+
+    rendered = json.dumps([probe_failed, diverged])
+    for canary in (ref, SHA[:8], PROPRIETARY, HOME_PATH, *CANARIES):
+        assert canary not in rendered, f"LEAK: {canary!r}"
+
+
 def test_remaining_journal_shapes_route_by_kind_and_preserve_safe_structure():
     """The overloaded names are handled according to the producer shape, not by
     their generic scalar fallback."""

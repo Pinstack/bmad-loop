@@ -165,6 +165,16 @@ _JOURNAL_ALIAS_FIELDS = {
     # journaled beside the adopted `baseline` — both shas aliased so the comparison
     # the record exists for survives a dump.
     "previous_baseline": "commit",
+    # The worktree snapshot `sweep._migration_reset` parked before a reset it then
+    # refused (DW-435), on `ledger-snapshot-probe-failed` and
+    # `sweep-migration-restore-diverged`. A REF NAME, not a sha —
+    # `refs/attempt-preserve-dirty/<story slug>-<baseline[:8]>-<attempt>` — so it
+    # embeds the story slug and a baseline prefix, and gets its own `ref` namespace
+    # rather than `commit`: one parked snapshot, one alias across both kinds.
+    # Routed rather than left to `scrub_json`, which redacts it today only because
+    # the `/` fails `_IDENTIFIER_RE` — the accident of shape `repo` and `spec`
+    # above refuse to rest on.
+    "snapshot_ref": "ref",
     # A spec name IS the customer's feature name — `Pseudonymizer`'s own docstring
     # has always listed "spec filenames" among what it exists to alias, so the
     # omission here was a routing gap, not a policy. A producer that journals a

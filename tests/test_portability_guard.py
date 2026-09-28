@@ -1413,6 +1413,11 @@ JOURNAL_KINDS = frozenset(
         "decision-preanswered",
         "decision-preanswers-pruned",
         "decision-skipped-unattended",
+        # DW-435. `_migration_reset` could not read the kept rival migration input
+        # back out of the worktree snapshot it just parked, so no reset ran and the
+        # task re-paused (fail closed). `story_key` and `snapshot_ref` are aliased
+        # (`diagnostics._JOURNAL_ALIAS_FIELDS`); `error` is dropped.
+        "ledger-snapshot-probe-failed",
         "migrate-decision",
         "migrate-duplicate-ids",
         # DW-440: `_ensure_migration`'s input held no legacy entries, so the

@@ -227,6 +227,8 @@ breaking changes may land in a minor release.
   the reset and re-pauses with the newer text live, journaling
   `sweep-migration-restore-diverged` with `snapshot_ref`. A snapshot read fault journals
   `ledger-snapshot-probe-failed` and re-pauses the same way (DW-435).
+- Alias `snapshot_ref` in `diagnose` dumps instead of leaving the snapshot ref name,
+  which embeds the story slug, to the generic scrub (DW-435 follow-up).
 - Pause a sweep migration before dispatch when its input is a tracked ledger that
   differs from its committed version (or the check faults), instead of spending a
   session whose accepted rewrite then fails with
