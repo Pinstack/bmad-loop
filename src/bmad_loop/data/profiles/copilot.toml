@@ -38,6 +38,8 @@ stop_without_result_nudges = 5
 # turn-end: ignore a Stop with no transcript so a subagent's premature Stop is not
 # read as a (result-less) completion. Without this the dev stage (0 nudges) stalls
 # outright on the first subagent Stop, before bmad-dev-auto writes its terminal spec.
+# Session attribution (#767) runs first, but toolu_ ids never announce a
+# sessionStart, so it admits them and this filter still owns them.
 subagent_stop_without_transcript = true
 first_run_note = "run `copilot` once and authenticate (gh / Copilot subscription); requires Copilot CLI GA (>= 2026-02)"
 skill_tree = ".agents/skills"

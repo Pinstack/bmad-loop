@@ -286,10 +286,14 @@ One row per story (or sweep bundle/triage task) in the selected run:
   (the guard's mid-session sample at trip time). The
   matching `tasks/<id>/` dir holds the forensic breadcrumbs the adapter wrote
   while the session ran: `session-lifecycle.jsonl` (timeout-fire — its
-  `probe_failures` counts a liveness-probe failure streak open at the deadline —,
+  `probe_failures` counts a liveness-probe failure streak open at the deadline and
+  its `foreign_hook_events` the hook events dropped as a nested CLI's —,
   budget-guard `budget-tripped` / `over-budget-fired`, kill-escalation — both
   of these carry `liveness_unknown`, true when the verdict's probe raised —,
   `session-vanished` (the mux no longer reported the session during the run, #489),
+  `foreign-hook-event-ignored` (a nested coding CLI's hook events dropped by session
+  attribution, #767 — written once per foreign id, with `hook_event`,
+  `foreign_session_id`, and `dropped_so_far`, the running count of dropped events),
   mux transport faults `liveness-probe-failed` / `liveness-probe-recovered` /
   `nudge-send-failed`, observation faults `parked-probe-failed` /
   `log-evidence-failed` / `result-json-refused` / `usage-sample-failed` /
@@ -302,8 +306,9 @@ One row per story (or sweep bundle/triage task) in the selected run:
   `heartbeat.json` (the wait loop's proof-of-life —
   stale under a live session means the orchestrator itself was frozen; on the
   generic adapter it also carries `probe_failures`, the running liveness-probe
-  failure streak, `stall_nudges_failed`, and `usage_sample_failures`, the running
-  budget usage-sample failure streak), and
+  failure streak, `stall_nudges_failed`, `usage_sample_failures`, the running
+  budget usage-sample failure streak, and `foreign_hook_events`, the running count
+  of hook events dropped as a nested CLI's, #767), and
   `resultless-stops.jsonl` (each give-up Stop with its verdict: `no-result-json` /
   `malformed-result-json`, `no-artifact`, `stat-failed` / `unreadable-spec` (a spec
   read fault, with the error),

@@ -7,6 +7,17 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Ignore hook events from nested coding-CLI sessions that inherit the relay environment,
+  so a child's `Stop`/`SessionEnd` no longer completes or crashes the launched session:
+  an id that announces its own `SessionStart` after the launched session's first is
+  foreign, and its events are dropped, crumbed once per id as
+  `foreign-hook-event-ignored`, counted as `foreign_hook_events` in `heartbeat.json` and
+  `timeout-fired`, and excluded from the sweep diagnostic (`hook_foreign_ids`). Forward
+  SessionStart `source` so a `clear`/`compact` start rebinds; re-run `bmad-loop init` to
+  re-vendor the relay (#767). Contributed by [@Pinstack](https://github.com/Pinstack).
+
 ## [0.13.0] — 2026-09-28
 
 ### Added
