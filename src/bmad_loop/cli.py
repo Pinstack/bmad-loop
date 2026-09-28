@@ -495,6 +495,23 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 conflict,
                 {"repo_root": str(paths.repo_root), "project": str(paths.project)},
             )
+        # DW-485: advisory, one per dir, and silent when nothing is shared — the
+        # same no-`ok`-twin reasoning as the gate above.
+        for key, shared in bmadconfig.shared_artifact_dirs(paths, pol.scm.isolation):
+            report.warn(
+                "policy.isolation-shared-artifact-dir",
+                f"{key} ({shared}) is inside repo_root ({paths.repo_root}) but outside "
+                f'the project ({paths.project}): under isolation = "worktree" it is '
+                "shared with the main checkout, not per-worktree — every isolated "
+                "session reads and writes the main checkout's copy. Move it inside the "
+                "project for a per-worktree copy, or keep it if sharing is intended.",
+                {
+                    "key": key,
+                    "path": str(shared),
+                    "repo_root": str(paths.repo_root),
+                    "project": str(paths.project),
+                },
+            )
 
     # The engine builds its registry from `paths.repo_root` (a `repo_root:` override
     # under isolation = "none" points it at another checkout), so read the manifests

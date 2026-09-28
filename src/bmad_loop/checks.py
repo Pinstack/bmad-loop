@@ -54,6 +54,9 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         # worktree isolation beside a project that is NOT inside repo_root (a
         # disjoint layout, #414); a nested project is supported since DW-379
         "policy.isolation-repo-root",
+        # worktree isolation beside an artifact dir inside repo_root but outside the
+        # project: shared with the main checkout, not per-worktree (DW-485)
+        "policy.isolation-shared-artifact-dir",
         "adapter.profile",
         "adapter.binary",
         "adapter.binary-unrunnable",

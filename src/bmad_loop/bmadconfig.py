@@ -188,6 +188,35 @@ def worktree_isolation_conflict(paths: ProjectPaths, isolation: str) -> str | No
     )
 
 
+ARTIFACT_DIR_KEYS = ("implementation_artifacts", "planning_artifacts", "output_folder")
+
+
+def shared_artifact_dirs(paths: ProjectPaths, isolation: str) -> list[tuple[str, Path]]:
+    """The configured artifact dirs a worktree-isolated run shares with the main
+    checkout, as ``(key, dir)`` in :data:`ARTIFACT_DIR_KEYS` order (DW-485).
+
+    :meth:`ProjectPaths.rebased` moves only a dir inside the PROJECT into the unit
+    worktree. One inside `repo_root` but outside the project — reachable only in a
+    nested layout, the project at ``<repo>/app`` — stays pointed at the main
+    checkout, so every isolated session reads and writes that one copy, though
+    the unit worktree carries its own checkout of the same path. `rebased` is right
+    to keep it (the operator configured that exact dir); this names it so the
+    sharing is not a surprise. A dir inside the project is per-worktree, and one
+    outside `repo_root` entirely is outside every checkout, so neither is listed;
+    nor is anything under ``isolation = "none"``, where there is only one checkout.
+
+    Compares the members as :func:`load_paths` canonicalized them — the same
+    spelling `rebased`'s ``relative_to`` reads."""
+    if isolation != "worktree":
+        return []
+    dirs = (paths.implementation_artifacts, paths.planning_artifacts, paths.output_folder)
+    return [
+        (key, path)
+        for key, path in zip(ARTIFACT_DIR_KEYS, dirs, strict=True)
+        if path.is_relative_to(paths.repo_root) and not path.is_relative_to(paths.project)
+    ]
+
+
 def _canonical(expanded: Path, label: str) -> Path:
     """Canonicalize-or-raise, the shared boundary for every ProjectPaths member.
     `label` names what refused in the operator's terms — a configured string is

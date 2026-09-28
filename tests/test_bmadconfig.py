@@ -154,6 +154,49 @@ def test_rebased_keeps_a_nested_projects_offset(project) -> None:
     assert rebased.planning_artifacts == shared
 
 
+@pytest.mark.parametrize(
+    "where,isolation,expected",
+    [
+        ("repo", "worktree", True),
+        ("repo", "none", False),
+        ("project", "worktree", False),
+        ("outside", "worktree", False),
+    ],
+    ids=["inside-repo-outside-project", "isolation-none", "inside-project", "outside-repo"],
+)
+def test_shared_artifact_dirs_names_a_dir_rebased_leaves_on_the_main_checkout(
+    tmp_path: Path, where: str, isolation: str, expected: bool
+) -> None:
+    """DW-485: the dir `rebased` keeps unmoved in a nested layout (pinned by
+    `test_rebased_keeps_a_nested_projects_offset`) is exactly the one listed — inside
+    `repo_root` but outside the project, and only under worktree isolation. A dir in
+    the project moves into the worktree, and one outside `repo_root` is in no checkout.
+
+    Ablation: drop the `not path.is_relative_to(paths.project)` clause and the
+    inside-project row lists all three dirs; drop the isolation guard and the none row
+    lists one."""
+    repo = tmp_path / "repo"
+    project = repo / NESTED_SUBDIR
+    moved = {
+        "repo": repo / "shared" / "plan",
+        "project": project / "_bmad-output" / "plan",
+        "outside": tmp_path / "elsewhere" / "plan",
+    }[where]
+    paths = ProjectPaths(
+        project=project,
+        implementation_artifacts=project / "_bmad-output" / "impl",
+        planning_artifacts=moved,
+        output_folder=project / "_bmad-output",
+        repo_root=repo,
+    )
+
+    shared = bmadconfig.shared_artifact_dirs(paths, isolation)
+
+    assert shared == ([("planning_artifacts", moved)] if expected else [])
+    # the premise the listing mirrors: the listed dir is the one `rebased` keeps
+    assert (paths.rebased(tmp_path / "mount").planning_artifacts == moved) is (where != "project")
+
+
 def test_rebased_onto_repo_root_is_identity_for_a_nested_project(project) -> None:
     """In place (`isolation = "none"`) callers rebase onto the session cwd, which is
     `repo_root`: for a nested project that must hand back the project's REAL paths,

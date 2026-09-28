@@ -9,6 +9,10 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Warn in `validate` (`policy.isolation-shared-artifact-dir`) when `isolation = "worktree"`
+  and an artifact dir (`implementation_artifacts`, `planning_artifacts`, `output_folder`)
+  lies inside `repo_root` but outside the project: it is shared with the main checkout,
+  not per-worktree. Advisory; the exit code is unchanged (DW-485).
 - Seed agy workspace trust per worktree: a profile may declare `[workspace_trust]`
   (`~/` JSON settings file + top-level list key; `antigravity` ships
   `~/.gemini/antigravity-cli/settings.json` `trustedWorkspaces`). Each provisioned or

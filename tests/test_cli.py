@@ -15561,6 +15561,58 @@ def test_validate_passes_worktree_isolation_under_a_nested_repo_root(project, mo
     _render_findings(doc)
 
 
+@pytest.mark.parametrize(
+    "policy_text,share,expected",
+    [
+        (ISOLATION_WORKTREE_POLICY, True, True),
+        (NO_ISOLATION_POLICY, True, False),
+        (ISOLATION_WORKTREE_POLICY, False, False),
+    ],
+    ids=["worktree-shared-dir", "none-shared-dir", "worktree-dirs-in-project"],
+)
+def test_validate_warns_about_an_artifact_dir_shared_with_the_main_checkout(
+    project, monkeypatch, capsys, policy_text, share, expected
+):
+    """DW-485: in the nested layout, `planning_artifacts` moved to `<repo>/shared/…` —
+    inside `repo_root`, outside the project — is one the unit worktree never gets its
+    own copy of, so validate warns naming it. Silent under `isolation = "none"` and
+    when every dir sits in the project. A warning, so rc stays 0 on every row.
+
+    Ablation: drop the `shared_artifact_dirs` loop from `cmd_validate` and the
+    worktree-shared-dir row reddens."""
+    paths = _nested_validate_pass(project, monkeypatch, capsys, policy=policy_text)
+    shared = paths.repo_root / "shared" / "planning-artifacts"
+    if share:
+        shared.mkdir(parents=True)
+        cfg = paths.project / "_bmad" / "bmm" / "config.yaml"
+        text = cfg.read_text(encoding="utf-8")
+        default = "'{project-root}/_bmad-output/planning-artifacts'"
+        assert default in text, "premise: the nested config's planning key"
+        cfg.write_text(text.replace(default, f"'{shared.as_posix()}'"), encoding="utf-8")
+        git(paths.repo_root, "commit", "-qam", "share the planning dir")
+        assert bmadconfig.load_paths(paths.project).planning_artifacts == shared.resolve()
+
+    doc = machine_json(["validate", "--project", str(paths.project), "--json"], capsys)
+
+    assert doc["ok"] is True
+    hits = [f for f in doc["findings"] if f["check"] == "policy.isolation-shared-artifact-dir"]
+    if not expected:
+        assert hits == []
+        return
+    assert len(hits) == 1
+    (hit,) = hits
+    assert hit["severity"] == "warning"
+    assert str(shared.resolve()) in hit["message"]
+    assert "shared with the main checkout, not per-worktree" in hit["message"]
+    assert hit["detail"] == {
+        "key": "planning_artifacts",
+        "path": str(shared.resolve()),
+        "repo_root": str(paths.repo_root),
+        "project": str(paths.project),
+    }
+    _render_findings(doc)
+
+
 def test_validate_probes_the_code_root_for_a_clean_tree(project, monkeypatch, capsys):
     """`git.worktree-clean` probes `repo_root`, as `cmd_run`/`cmd_sweep` do: in the
     nested layout a dirty TRACKED file outside `app/` — in the checkout the run's git
