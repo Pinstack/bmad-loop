@@ -1470,7 +1470,7 @@ _OTHER_DEFS = "<other>"  # explicit catch-all; a module omitting it refuses unex
 _EXPECTED_E2E_DEF_COUNTS: dict[str, dict[str, int]] = {
     "test_generic_tmux.py": {"test_tmux_": 6},
     "test_stories_e2e.py": {
-        "test_e2e_": 16,
+        "test_e2e_": 17,
         "test_reap_e2e_": 3,
         # Not asserted, and deliberately so — see the residual note above. Today these are
         # the local-process identity harness defs: `test_detach_gate_*`,

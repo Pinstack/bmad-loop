@@ -238,6 +238,32 @@ sleep 30
 # FAKE_CLI in nothing else.
 LEGACY_EVENTS_FAKE_CLI = FAKE_CLI.replace('ed="$BMAD_LOOP_EVENTS_DIR"', 'ed="$rd/events"')
 
+# The same script with a nested coding CLI launched inside the session (#767): the
+# child inherits BMAD_LOOP_TASK_ID/BMAD_LOOP_EVENTS_DIR, so its own SessionStart,
+# Stop and SessionEnd land in the parent's stream, before the parent has written a
+# result. Fresh timestamps (and a pause so they reach the watcher as their own ticks)
+# order every child event ahead of the parent's Stop, which is re-stamped too, so the
+# parent's completion cannot overtake them in one poll.
+_NESTED_CHILD_EVENTS = r"""
+for kind in SessionStart Stop SessionEnd; do
+    cts=$(date +%s%N)
+    printf '{"ts": %s, "event": "%s", "task_id": "%s", "session_id": "child-1"}' \
+        "$cts" "$kind" "$tid" > "$ed/$cts-$tid-$kind.json"
+done
+sleep 2
+"""
+_PARENT_START = """    "$ts" "$tid" > "$ed/$ts-$tid-SessionStart.json"
+"""
+_STORY_STOP_TS = """write_done                       # normal fresh dispatch
+fi
+
+ts2=$(( ts + 1 ))
+"""
+assert FAKE_CLI.count(_PARENT_START) == 1 and FAKE_CLI.count(_STORY_STOP_TS) == 1
+NESTED_CHILD_FAKE_CLI = FAKE_CLI.replace(
+    _PARENT_START, _PARENT_START + _NESTED_CHILD_EVENTS
+).replace(_STORY_STOP_TS, _STORY_STOP_TS.replace("$(( ts + 1 ))", "$(date +%s%N)"))
+
 PROFILE_TOML = """\
 name = "fakestories"
 binary = "{binary}"
@@ -2266,6 +2292,54 @@ def test_e2e_a_relay_that_only_knows_the_legacy_events_dir_still_completes(tmp_p
     run_id = _run_id(root)
     assert list((root / ".bmad-loop" / "runs" / run_id / "events").glob("*.json"))
     assert not list(runs.events_dir_for(root, run_id).glob("*.json"))
+
+
+def test_e2e_nested_child_cli_events_do_not_end_the_parent(tmp_path):
+    """A nested coding CLI started from inside the session writes its own
+    SessionStart, Stop and SessionEnd into the parent's event stream before the
+    parent has finished (#767). Through the real CLI and real tmux, the child's
+    announced start marks it foreign: its SessionEnd must not crash the story and
+    its Stop must not complete it early. Only the parent's own Stop does. The
+    profile maps SessionEnd here (as claude.toml does) so the child's SessionEnd
+    really reaches the wait loop.
+
+    Ablation guard: make `SessionAttribution.admit` always admit and the
+    `foreign-hook-event-ignored` assertion fails. The outcome assertions alone do
+    NOT catch that ablation: the child's SessionEnd then crashes the session, but
+    a crash is graded on the artifact read back within RESULT_GRACE_S (15 s), and
+    the parent's spec lands inside it, so the story still reaches `done`."""
+    assert NESTED_CHILD_FAKE_CLI != FAKE_CLI, "the child splice did not take"
+    session_end_profile = PROFILE_TOML.replace(
+        'Stop = "Stop" }', 'Stop = "Stop", SessionEnd = "SessionEnd" }'
+    )
+    assert session_end_profile != PROFILE_TOML, "the SessionEnd mapping did not take"
+
+    root = tmp_path / "sbx"
+    _scaffold(root, [_entry("1")])
+    fake = root / ".bmad-loop" / "fake-cli.sh"
+    fake.write_text(NESTED_CHILD_FAKE_CLI, encoding="utf-8")
+    (root / ".bmad-loop" / "profiles" / "fakestories.toml").write_text(
+        session_end_profile.format(binary=str(fake)), encoding="utf-8"
+    )
+    _git(root, "commit", "-q", "-am", "nested-child fake")
+    base = _commit_count(root)
+
+    proc = _run(root, "run")
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    assert _status(root, "1") == "done"
+    assert _commit_count(root) == base + 1
+
+    run_id = _run_id(root)
+    lifecycle = root / ".bmad-loop" / "runs" / run_id / "tasks"
+    crumbs = [
+        json.loads(line)
+        for path in lifecycle.glob("*/session-lifecycle.jsonl")
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    ignored = [c for c in crumbs if c["event"] == "foreign-hook-event-ignored"]
+    assert [(c["foreign_session_id"], c["hook_event"]) for c in ignored] == [
+        ("child-1", "SessionStart")
+    ]
 
 
 def test_e2e_sprint_mode_regression(tmp_path):

@@ -909,6 +909,10 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         wall_deadline = time.time() + spec.timeout_s
         session_id: str | None = None
         attribution = SessionAttribution()
+        # events dropped as a nested CLI's (heartbeat + timeout-fired carry the
+        # count); the crumb fires once per foreign id, not once per event.
+        foreign_hook_events = 0
+        crumbed_foreign: set[str] = set()
         transcript_path: str | None = None
         nudges_left = self._stop_nudges
         # Positive grace arms at launch for dev/review sessions, so a CLI that
@@ -1115,6 +1119,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     mono_remaining_s=round(remaining, 3),
                     # nonzero = the deadline landed while liveness was unknown
                     probe_failures=probe_failures,
+                    # nonzero = a nested CLI's events were dropped (the parent's
+                    # own Stop may have been read as foreign)
+                    foreign_hook_events=foreign_hook_events,
                 )
                 return SessionResult(
                     status="timeout",
@@ -1172,6 +1179,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         "probe_failures": probe_failures,
                         # the running budget usage-sample failure streak (DW-452)
                         "usage_sample_failures": usage_failures,
+                        # hook events dropped as a nested CLI's (#767)
+                        "foreign_hook_events": foreign_hook_events,
                     },
                 )
                 # Mid-session spec-status transition sampling (#276 M2) rides the
@@ -1501,12 +1510,17 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             # toolu_ subagent Stops never announce, so they pass here and stay
             # owned by the subagent filter below.
             if not attribution.admit(event):
-                self._note_lifecycle(
-                    handle.task_id,
-                    "foreign-hook-event-ignored",
-                    hook_event=event.event,
-                    foreign_session_id=event.session_id,
-                )
+                foreign_hook_events += 1
+                # admit() only drops identified events, so session_id is set.
+                if event.session_id and event.session_id not in crumbed_foreign:
+                    crumbed_foreign.add(event.session_id)
+                    self._note_lifecycle(
+                        handle.task_id,
+                        "foreign-hook-event-ignored",
+                        hook_event=event.event,
+                        foreign_session_id=event.session_id,
+                        dropped_so_far=foreign_hook_events,
+                    )
                 continue
             if (
                 event.event == "Stop"

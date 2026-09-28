@@ -51,7 +51,7 @@ from .platform_util import (
     safe_segment,
 )
 from .runs import StateRootError, _project_of_run_dir, events_dir_for
-from .signals import session_events
+from .signals import attribute_events, session_events
 from .statemachine import advance
 
 
@@ -1392,7 +1392,10 @@ def _diagnostic_suffix(diagnostic: dict[str, Any] | None) -> str:
     artifact = str(diagnostic["artifact"])
     if diagnostic.get("artifact_error"):
         artifact += f" ({diagnostic['artifact_error']})"
-    return f" [result.json: {artifact}; hook events: {diagnostic['hook_events']}]"
+    hooks = str(diagnostic["hook_events"])
+    if diagnostic.get("hook_foreign_ids"):
+        hooks += f"; foreign ignored: {diagnostic['hook_foreign_ids']}"
+    return f" [result.json: {artifact}; hook events: {hooks}]"
 
 
 class SweepEngine(Engine):
@@ -4923,6 +4926,9 @@ class SweepEngine(Engine):
         the out-of-tree channel and the legacy in-tree ``<run_dir>/events`` through
         ``signals.is_session_event`` — this attempt's session id and launch floor,
         so an earlier healthy attempt's events cannot mask this failure.
+        ``hook_events``, ``hook_event_kinds`` and ``hook_event_count`` cover only the
+        events ``signals.attribute_events`` admits as the launched session's (#767);
+        ``hook_foreign_ids`` counts the nested-CLI session ids it dropped.
 
         Observation degrades, never raises: this runs on a failure path that must
         still reach its retry/escalation decision."""
@@ -4972,10 +4978,14 @@ class SweepEngine(Engine):
         except Exception as exc:  # observation degrades; see docstring
             diagnostic["hook_events"] = f"unreadable: {_bounded(f'{type(exc).__name__}: {exc}')}"
         else:
-            kinds = {event.event for event in events}
+            # The replay wait_for_completion applied live: a nested CLI's Stop
+            # did not end this session, so it must not read as "stop" here.
+            admitted, foreign = attribute_events(events)
+            kinds = {event.event for event in admitted}
             diagnostic["hook_events"] = _hook_verdict(kinds)
             diagnostic["hook_event_kinds"] = sorted(kinds)
-            diagnostic["hook_event_count"] = len(events)
+            diagnostic["hook_event_count"] = len(admitted)
+            diagnostic["hook_foreign_ids"] = len(foreign)
         return diagnostic
 
     def _migrate_prompt(self, manifest: Path, feedback: Path | None) -> str:

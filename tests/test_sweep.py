@@ -5356,7 +5356,9 @@ def failed_session_effect(
     would, the evidence the #752 diagnostic reads: `artifact` (a dict, or raw text
     for a malformed document) at `<run_dir>/tasks/<task_id>/result.json`, and hook
     events on the out-of-tree channel (`BMAD_LOOP_EVENTS_DIR`) and/or the legacy
-    in-tree `<run_dir>/events`, correlated exactly as the relay stamps them.
+    in-tree `<run_dir>/events`, correlated exactly as the relay stamps them. An
+    event is a kind (session id "s") or a `(kind, session_id)` pair; timestamps
+    strictly increase, so events replay in the order given.
     `ledger` rewrites the deferred-work ledger first (a migration's work)."""
 
     def effect(spec):
@@ -5373,11 +5375,13 @@ def failed_session_effect(
             (Path(spec.env["BMAD_LOOP_EVENTS_DIR"]), primary_events),
             (run_dir / "events", legacy_events),
         )
+        last_ts = 0
         for directory, kinds in channels:
-            for kind in kinds:
+            for item in kinds:
+                kind, session_id = (item, "s") if isinstance(item, str) else item
                 directory.mkdir(parents=True, exist_ok=True)
-                ts = time.time_ns()
-                payload = {"ts": ts, "event": kind, "task_id": task_id, "session_id": "s"}
+                ts = last_ts = max(time.time_ns(), last_ts + 1)
+                payload = {"ts": ts, "event": kind, "task_id": task_id, "session_id": session_id}
                 (directory / f"{ts}-{task_id}-{kind}.json").write_text(json.dumps(payload))
         return result if result is not None else SessionResult(status=status)
 
@@ -5519,6 +5523,59 @@ def test_non_completed_triage_reports_hook_evidence_distinctly(project, primary,
     assert diag["hook_events"] == verdict
     assert diag["hook_event_kinds"] == kinds
     assert diag["hook_event_count"] == len(primary)
+
+
+def test_non_completed_triage_diagnostic_replays_session_attribution(project):
+    """A nested CLI launched from inside the triage session writes into its event
+    stream (#767). The diagnostic replays the attribution wait_for_completion
+    applied live: the child's Stop is not this session's, so the verdict, kinds
+    and count cover the parent alone, and the dropped child is counted and named
+    in the escalation text.
+
+    Ablation guard: compute the verdict over every event instead of the admitted
+    ones and `hook_events` reads "stop" from the child's Stop alone."""
+    write_ledger(project, {"DW-1": "open"})
+    effect = failed_session_effect(
+        primary_events=[
+            ("SessionStart", "parent"),
+            ("SessionStart", "child"),
+            ("Stop", "child"),
+        ]
+    )
+    engine, _ = make_sweep(project, [effect, effect])
+    engine.run()
+
+    diag = _decisions(engine, "triage-decision")[-1]["diagnostic"]
+    assert diag["hook_events"] == "session-start-without-stop"
+    assert diag["hook_event_kinds"] == ["SessionStart"]
+    assert diag["hook_event_count"] == 1
+    assert diag["hook_foreign_ids"] == 1
+    assert "hook events: session-start-without-stop; foreign ignored: 1]" in (
+        engine.state.paused_reason
+    )
+
+
+def test_non_completed_triage_diagnostic_counts_parent_stop_beside_a_foreign_child(project):
+    """Parent start/Stop plus a child's start/Stop: the parent's own Stop makes the
+    verdict "stop", the count excludes the child's two events, and the dropped
+    child is still reported."""
+    write_ledger(project, {"DW-1": "open"})
+    effect = failed_session_effect(
+        primary_events=[
+            ("SessionStart", "parent"),
+            ("SessionStart", "child"),
+            ("Stop", "child"),
+            ("Stop", "parent"),
+        ]
+    )
+    engine, _ = make_sweep(project, [effect, effect])
+    engine.run()
+
+    diag = _decisions(engine, "triage-decision")[-1]["diagnostic"]
+    assert diag["hook_events"] == "stop"
+    assert diag["hook_event_count"] == 2
+    assert diag["hook_foreign_ids"] == 1
+    assert "hook events: stop; foreign ignored: 1]" in engine.state.paused_reason
 
 
 def test_non_completed_triage_on_a_hookless_adapter_reports_hooks_not_applicable(project):
